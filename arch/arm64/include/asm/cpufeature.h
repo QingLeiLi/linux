@@ -811,6 +811,24 @@ static inline bool system_has_full_ptr_auth(void)
 	return system_supports_address_auth() && system_supports_generic_auth();
 }
 
+/*
+ * system_uses_irq_prio_masking - 运行时检测系统是否使用 GIC PMR 优先级屏蔽中断
+ *
+ * 返回 true 的条件：系统启用了 CONFIG_ARM64_PSEUDO_NMI 且 GICv3/v4 支持
+ * 优先级屏蔽（ARM64_HAS_GIC_PRIO_MASKING capability 已被标记）。
+ *
+ * 实现原理——静态分支（alternative patching）：
+ *   使用 alternative_has_cap_unlikely() 而非普通的 cpus_have_cap()，
+ *   是为了利用内核的"静态分支"机制：
+ *     1. 内核启动时若检测到该 capability，会将 "nop" 原地 patch 成 "b l_yes"；
+ *     2. 之后每次调用，CPU 直接执行 patch 后的单条指令，无需读取任何变量，
+ *        没有缓存行争用，也没有分支预测惩罚。
+ *   _unlikely 后缀表示"默认预测为 false"（大多数系统不启用伪 NMI），
+ *   对不支持该 capability 的系统零开销（编译器直接消除死代码）。
+ *
+ * 该函数被 arch_local_irq_disable/enable/save/restore 等极热路径调用，
+ * 因此标记为 __always_inline + 静态分支，确保在两种配置下开销都接近零。
+ */
 static __always_inline bool system_uses_irq_prio_masking(void)
 {
 	return alternative_has_cap_unlikely(ARM64_HAS_GIC_PRIO_MASKING);

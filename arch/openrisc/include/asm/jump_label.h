@@ -27,6 +27,23 @@
  * 		Offset from current instruction to target label (label - .)
  * 		Offset from current instruction to key identifier (key - .)
  */
+/*
+	// 向 __jump_table section 写入一个 jump_entry 条目, "aw" 表示该 section 可分配（a）且可写（w）
+	".pushsection	__jump_table, \"aw\"	\n\t"	\
+	// 将当前写入位置对齐到 4 字节边界，确保 jump_entry 结构体对齐，CPU 读取时不会跨 cache line
+	".align 	4 			\n\t"	\
+	// 1b 是数字标签，引用"向上（backward）最近的一个 1 标签
+	// 1f 是引用"向下（forward）最近的一个 1 标签
+	// 数字标签可以重复定义，不要求唯一
+	// "." 是当前写入位置的地址
+	// 1b - . 得到相对偏移，汇编器在编译时直接算出来, 代表NOP 指令相对当前位置的偏移（code 字段）
+	// label - .：跳转目标相对当前位置的偏移（target 字段）
+	".long 		1b - ., " label " - .	\n\t"	\
+	// static_key 变量相对当前位置的偏移（key 字段）
+	".long 		" key " - . 		\n\t"	\
+	// 切回之前的 section
+	".popsection				\n\t" 
+*/
 #define JUMP_TABLE_ENTRY(key, label)			\
 	".pushsection	__jump_table, \"aw\"	\n\t"	\
 	".align 	4 			\n\t"	\

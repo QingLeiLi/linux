@@ -5,6 +5,40 @@
  * (C) Jens Axboe <jens.axboe@oracle.com> 2008
  */
 
+/*
+ * 【文件概述】kernel/smp.c — SMP 处理器间中断（IPI）通用框架
+ *
+ * 在多处理器系统中，一个 CPU 有时需要让另一个 CPU 执行某段代码，
+ * 例如刷新 TLB、迁移任务、调试回调等。这通过"处理器间中断"（IPI）实现：
+ * 发送方向目标 CPU 发射一条硬件中断，目标 CPU 在中断处理程序中取出
+ * 并执行预先排队的回调函数。
+ *
+ * 本文件实现了一套与体系结构无关的 IPI 基础设施，核心数据流如下：
+ *
+ *   发送方                              接收方（目标 CPU）
+ *   --------                            -------------------------
+ *   smp_call_function_single()          arch IPI 中断向量
+ *     -> generic_exec_single()          -> generic_smp_call_function_single_interrupt()
+ *          -> __smp_call_single_queue()      -> __flush_smp_call_function_queue()
+ *               把 CSD 节点入队到目标              按 SYNC -> ASYNC -> TTWU 顺序
+ *               CPU 的 call_single_queue           逐个执行回调
+ *               无锁链表，然后发 IPI
+ *
+ * 关键数据结构：
+ *   - call_single_data_t (CSD)：封装一次回调请求（函数指针 + 参数 + 标志位）
+ *   - call_single_queue：每 CPU 的无锁单链表，存放待执行的 CSD
+ *   - call_function_data (cfd_data)：广播 IPI 时跟踪目标 CPU 集合所用的辅助数据
+ *
+ * CPU 热插拔集成：
+ *   smpcfd_prepare_cpu / smpcfd_dead_cpu / smpcfd_dying_cpu 作为热插拔回调，
+ *   负责 cfd_data 和 call_single_queue 的生命周期管理，确保 CPU 下线时
+ *   不会遗留未处理的回调。
+ *
+ * SMP 启动入口：
+ *   smp_init() 由 kernel_init_freeable() 调用，负责为所有非引导 CPU
+ *   创建 idle 线程、初始化热插拔线程，并逐一唤醒辅助 CPU。
+ */
+
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/irq_work.h>
@@ -37,20 +71,45 @@
 
 #define CSD_TYPE(_csd)	((_csd)->node.u_flags & CSD_FLAG_TYPE_MASK)
 
+/*
+ * 广播 IPI（smp_call_function_many）所需的每 CPU 辅助数据。
+ *
+ * 当一个 CPU 要向多个 CPU 广播 IPI 时，不能重用同一个 CSD，
+ * 因为不同目标 CPU 需要独立的 call_single_data_t。
+ * call_function_data 为每个可能的目标 CPU 预分配一个 CSD，
+ * 并用 cpumask/cpumask_ipi 两张位图分别跟踪"预期目标"和"已发出 IPI 的目标"，
+ * 以避免对同一 CPU 重复发送 IPI。
+ */
 struct call_function_data {
-	call_single_data_t	__percpu *csd;
-	cpumask_var_t		cpumask;
-	cpumask_var_t		cpumask_ipi;
+	call_single_data_t	__percpu *csd;      /* 每个目标 CPU 一个 CSD 槽位 */
+	cpumask_var_t		cpumask;             /* 本次广播的目标 CPU 集合 */
+	cpumask_var_t		cpumask_ipi;         /* 已发出 IPI 的 CPU 集合 */
 };
 
+/* 每个 CPU 自己的 cfd_data，用于发出广播 IPI 时填充目标信息 */
 static DEFINE_PER_CPU_ALIGNED(struct call_function_data, cfd_data);
 
+/*
+ * 每 CPU 的 IPI 回调队列（无锁单链表）。
+ *
+ * 发送方通过 llist_add() 将 CSD 节点原子地插入目标 CPU 的此队列，
+ * 目标 CPU 在 IPI 处理程序中通过 llist_del_all() 一次性取走全部节点并执行。
+ * 使用无锁链表的好处：入队操作无需关中断，发送方和接收方之间无锁竞争。
+ */
 static DEFINE_PER_CPU_SHARED_ALIGNED(struct llist_head, call_single_queue);
 
 static DEFINE_PER_CPU(atomic_t, trigger_backtrace) = ATOMIC_INIT(1);
 
 static void __flush_smp_call_function_queue(bool warn_cpu_offline);
 
+/*
+ * smpcfd_prepare_cpu - CPU 上线前为其分配 IPI 所需的数据结构（热插拔回调）
+ *
+ * 在 CPU 被正式上线（CPUHP_AP_ONLINE_DYN 之前的 CPUHP_SMPCFD_PREPARE 阶段）调用。
+ * 为目标 CPU 的 cfd_data 分配两张 cpumask 位图和一组 per-cpu CSD 数组，
+ * 分配在目标 CPU 所在 NUMA 节点上，降低跨节点内存访问开销。
+ * 任何一步分配失败都会回滚之前已分配的资源并返回 -ENOMEM。
+ */
 int smpcfd_prepare_cpu(unsigned int cpu)
 {
 	struct call_function_data *cfd = &per_cpu(cfd_data, cpu);
@@ -73,6 +132,12 @@ int smpcfd_prepare_cpu(unsigned int cpu)
 	return 0;
 }
 
+/*
+ * smpcfd_dead_cpu - CPU 已完全下线后释放其 IPI 数据结构（热插拔回调）
+ *
+ * 在 CPUHP_SMPCFD_PREPARE 的 teardown 路径调用，与 smpcfd_prepare_cpu 对称。
+ * 此时 CPU 已经离线，不再有任何 IPI 流量，可以安全释放 cpumask 和 CSD 数组。
+ */
 int smpcfd_dead_cpu(unsigned int cpu)
 {
 	struct call_function_data *cfd = &per_cpu(cfd_data, cpu);
@@ -83,6 +148,21 @@ int smpcfd_dead_cpu(unsigned int cpu)
 	return 0;
 }
 
+/*
+ * smpcfd_dying_cpu - CPU 即将下线时主动 flush 残留的 IPI 回调（热插拔回调）
+ *
+ * 在 stop_machine() 内部、关中断的 stopper 任务上下文中调用
+ *（CPUHP_AP_SMPCFD_DYING 阶段）。
+ *
+ * 为什么需要手动 flush？
+ * 其他 CPU 可能在本 CPU 关中断之前或期间向其 call_single_queue 投递了
+ * 回调请求并发出了 IPI，但由于本 CPU 中断已禁用，这些 IPI 永远不会被
+ * 正常的中断处理程序处理。如果不在此处主动消费队列，CPU 就会带着未完成
+ * 的工作下线，而发送方若在等待（wait=true），则会永远阻塞。
+ *
+ * 解决方案：在此处直接调用 __flush_smp_call_function_queue() 主动排空队列，
+ * 无需等待 IPI 到来。stop_machine() 保证了下线操作与 IPI flush 的互斥。
+ */
 int smpcfd_dying_cpu(unsigned int cpu)
 {
 	/*
@@ -101,6 +181,16 @@ int smpcfd_dying_cpu(unsigned int cpu)
 	return 0;
 }
 
+/*
+ * call_function_init - 系统启动时初始化每 CPU 的 IPI 回调队列
+ *
+ * 在 start_kernel() -> rest_init() 之前，由 start_kernel() 直接调用。
+ * 遍历所有 possible CPU，为其 call_single_queue 无锁链表执行 init 操作；
+ * 同时调用 smpcfd_prepare_cpu() 为引导 CPU 自身预分配广播 IPI 所需的 cfd_data。
+ *
+ * 此时系统仍处于单 CPU 运行阶段，不存在并发，初始化是安全的。
+ * 之后每个 CPU 上线时会通过热插拔回调 smpcfd_prepare_cpu() 完成自身初始化。
+ */
 void __init call_function_init(void)
 {
 	int i;
@@ -466,6 +556,22 @@ static int generic_exec_single(int cpu, call_single_data_t *csd)
 	return 0;
 }
 
+/*
+ * generic_smp_call_function_single_interrupt - IPI 的接收端入口
+ *
+ * 当本 CPU 收到一个"call function single"IPI 时，体系结构层的中断处理程序
+ * 会调用此函数（关中断状态下）。
+ *
+ * 本函数只是 __flush_smp_call_function_queue() 的薄包装：
+ *   1. 从本 CPU 的 call_single_queue 无锁链表中原子地取出所有待处理节点。
+ *   2. 按优先级顺序执行：先处理 SYNC 类型（调用方在等待结果），
+ *      再处理 ASYNC 类型和 IRQ_WORK，最后处理 TTWU（任务唤醒）类型。
+ *   3. SYNC 回调执行完毕后立即释放 CSD 锁，唤醒等待中的发送方。
+ *
+ * 分阶段处理的原因：SYNC 调用的发送方处于自旋等待状态，
+ * 应尽早完成以减少跨 CPU 等待延迟；TTWU 放最后是因为它会触发调度器，
+ * 必须在其他回调完成后再进行，避免影响后续回调的执行上下文。
+ */
 /**
  * generic_smp_call_function_single_interrupt - Execute SMP IPI callbacks
  *
@@ -639,6 +745,27 @@ void flush_smp_call_function_queue(void)
 	local_irq_restore(flags);
 }
 
+/*
+ * smp_call_function_single - 向指定 CPU 发送 IPI 并执行回调（IPI 核心发送函数）
+ *
+ * 参数说明：
+ *   @cpu  : 目标 CPU 编号
+ *   @func : 要在目标 CPU 上执行的回调函数，必须是快速、非阻塞的
+ *   @info : 传递给 func 的任意指针
+ *   @wait : 非零表示同步模式——发送方阻塞直到目标 CPU 执行完 func 再返回；
+ *           零表示异步模式——发送方投递请求后立即返回，不等待执行结果
+ *
+ * CSD（call_single_data_t）的作用：
+ *   CSD 是一次 IPI 请求的载体，包含 func、info 以及同步所需的标志位（锁位）。
+ *   同步模式（wait=true）：使用调用栈上的 csd_stack，CSD 锁在目标 CPU 执行完
+ *     func 后由 csd_unlock() 释放，发送方通过 csd_lock_wait() 自旋在锁位上等待。
+ *   异步模式（wait=false）：使用每 CPU 预分配的 csd_data，通过 csd_lock()
+ *     确保上一次异步调用已完成（防止同一 CSD 槽被重用导致数据竞争）。
+ *
+ * 若目标 CPU 就是本 CPU，则直接在本地执行，不经过 IPI 硬件路径。
+ * 函数在关闭抢占（get_cpu/put_cpu）期间执行，防止调用过程中 CPU 热插拔
+ * 导致 cpu_online() 检查与 IPI 发送之间出现竞态。
+ */
 /**
  * smp_call_function_single - Run a function on a specific CPU
  * @cpu: Specific target CPU for this function.
@@ -995,12 +1122,56 @@ unsigned int nr_cpu_ids __read_mostly = NR_CPUS;
 EXPORT_SYMBOL(nr_cpu_ids);
 #endif
 
+/*
+	NR_CPUS vs nr_cpu_ids 的区别
+
+	┌────────┬───────────────────────────────────────┬─────────────────────────┐
+	│        │                NR_CPUS                │       nr_cpu_ids        │
+	├────────┼───────────────────────────────────────┼─────────────────────────┤
+	│ 类型   │ 编译时常量                            │ 运行时变量              │
+	├────────┼───────────────────────────────────────┼─────────────────────────┤
+	│ 含义   │ 内核支持的最大 CPU 数（编译配置决定） │ 实际硬件的 CPU 数量上界 │
+	├────────┼───────────────────────────────────────┼─────────────────────────┤
+	│ 典型值 │ 512 或 4096                           │ 实际核心数，如 8、64    │
+	└────────┴───────────────────────────────────────┴─────────────────────────┘
+
+	NR_CPUS 决定了各种 per-cpu 数组的静态大小，但实际机器可能只有 8 个核。
+	setup_nr_cpu_ids 把 nr_cpu_ids 收紧到实际值，之后所有循环用 nr_cpu_ids 而非 NR_CPUS 作上界，避免遍历大量空槽位浪费时间。
+*/
 /* An arch may set nr_cpu_ids earlier if needed, so this would be redundant */
 void __init setup_nr_cpu_ids(void)
 {
+	// 在 cpu_possible_mask 中找到最高位（最大的 CPU 编号）
+    // 加 1 得到"需要多少个 ID"，赋值给 nr_cpu_ids
 	set_nr_cpu_ids(find_last_bit(cpumask_bits(cpu_possible_mask), NR_CPUS) + 1);
 }
 
+/*
+ * smp_init - SMP 系统初始化入口，唤醒所有辅助 CPU（非引导 CPU）
+ *
+ * 由 kernel_init_freeable() 在内核初始化的中后期调用，此时文件系统、
+ * 内存管理等子系统已初始化完毕，系统处于单 CPU 运行状态。
+ *
+ * 执行顺序及原因：
+ *
+ *   1. idle_threads_init()
+ *      为每个非引导 CPU 预先创建 idle 线程（pid=0 的 swapper/N 内核线程）。
+ *      必须最先完成：CPU 上线后调度器立即需要 idle 线程作为"无任务可运行"
+ *      时的兜底，若此时 idle 线程尚未就绪，CPU 将无法安全进入调度循环。
+ *
+ *   2. cpuhp_threads_init()
+ *      初始化每 CPU 的热插拔控制线程（cpuhp/N）。
+ *      必须在 bringup 之前完成：后续 CPU 上线过程中部分热插拔回调需要
+ *      在目标 CPU 的上下文中执行，缺少热插拔线程将导致上线流程卡死。
+ *
+ *   3. bringup_nonboot_cpus(setup_max_cpus)
+ *      按 setup_max_cpus 的限制，逐一将所有可用的非引导 CPU 拉起上线。
+ *      每个 CPU 经历完整的热插拔状态机（CPUHP_OFFLINE -> CPUHP_ONLINE），
+ *      包括体系结构层的 CPU 启动、调度器注册、IPI 基础设施初始化等步骤。
+ *
+ *   4. smp_cpus_done()
+ *      所有 CPU 上线后的收尾工作，体系结构可在此做最终调优（如 TSC 同步）。
+ */
 /* Called by boot processor to activate the rest. */
 void __init smp_init(void)
 {

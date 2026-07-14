@@ -1806,6 +1806,45 @@ static void __init set_high_memory(void)
  * starts where the previous one ended. For example, ZONE_DMA32 starts
  * at arch_max_dma_pfn.
  */
+/*
+ * free_area_init - 初始化所有 NUMA 节点的内存管理数据结构（buddy 骨架）
+ *
+ * 调用时机：hugetlb_bootmem_alloc() 之后，memblock 仍然可用，
+ * buddy 尚未接管物理内存（free_area[] freelist 初始化为空）。
+ *
+ * 本函数完成六个阶段：
+ *   1. 建立各 zone 的 PFN 边界（arch_zone_limits_init + SPARSEMEM 初始化）
+ *   2. 确定 ZONE_MOVABLE 的 per-node 起始 PFN
+ *   3. 打印 zone/节点/内存范围诊断信息到 dmesg
+ *   4. 全局校验与参数设置（pageflags 布局、nr_node_ids、pageblock_order）
+ *   5. 逐节点初始化 pg_data_t 和 zone 数据结构
+ *   6. 收尾：vmemmap 延迟映射、struct page 初始化、high_memory 指针设置
+ *
+ * 完成后 buddy 的数据结构骨架就绪，但物理页尚未移交。
+ * 真正的"移交"发生在后续 mm_core_init() 中的 memblock_free_all()。
+ */
+/*
+PFN（Page Frame Number，页帧号），就是物理内存按页大小切分后，每一页的编号。
+
+---
+计算方式
+
+PFN = 物理地址 / PAGE_SIZE
+
+例（PAGE_SIZE = 4KB = 4096）：
+  物理地址 0x00000000 → PFN 0
+  物理地址 0x00001000 → PFN 1
+  物理地址 0x40000000 → PFN 0x40000 = 262144
+
+反过来：物理地址 = PFN << PAGE_SHIFT
+
+---
+为什么用 PFN 而不直接用物理地址
+
+1. 节省空间：物理地址 64 位，PFN 可以少 12 位（页内偏移不需要存），struct page 数组用 PFN 作下标
+2. 统一单位：内存管理操作都以页为单位，PFN 是天然的页级索引
+3. 方便计算：zone 边界、内存范围都用 PFN 表示，比较大小只需整数运算
+*/
 static void __init free_area_init(void)
 {
 	unsigned long max_zone_pfn[MAX_NR_ZONES] = { 0 };
@@ -1813,12 +1852,29 @@ static void __init free_area_init(void)
 	int i, nid, zone;
 	bool descending;
 
+	/* 阶段1a：调用架构相关函数填写各 zone 的最高 PFN 上界。
+	 * 例如 x86：DMA 上界=16MiB，DMA32 上界=4GiB，NORMAL 上界=最高物理内存。
+	 * max_zone_pfn[] 决定了每个 zone 的物理地址范围上限。 */
 	arch_zone_limits_init(max_zone_pfn);
+
+	/* 阶段1b：初始化 SPARSEMEM 内存模型。
+	 * 分配 mem_section 数组，建立 section->node 映射，
+	 * 为后续 struct page 的 section 编号标记做准备。 */
 	sparse_init();
 
+	/* DRAM 起始 PFN：跳过固件/ROM 占用的低地址空洞（如 x86 的 0~640K 区域）。
+	 * 各 zone 的 lowest_possible_pfn 不能低于此值。 */
 	start_pfn = PHYS_PFN(memblock_start_of_DRAM());
+
+	/* ARC 架构在无 PAE40 时 zone 顺序递降，其余架构递增。
+	 * descending=true 时从高 zone 向低 zone 遍历，确保 zone 边界连续覆盖。 */
 	descending = arch_has_descending_max_zone_pfns();
 
+	/* 计算每个 zone 的 [lowest_possible_pfn, highest_possible_pfn]。
+	 * 含义：该 zone 理论上可能包含的 PFN 范围（实际含多少页由 memblock 决定）。
+	 * ZONE_MOVABLE 跳过，由 find_zone_movable_pfns_for_nodes() 单独计算。
+	 * start_pfn 在循环中滚动推进，确保各 zone 的范围首尾相连、无重叠。
+	 * end_pfn = max(max_zone_pfn[zone], start_pfn) 防止 zone 上界低于 DRAM 起点。 */
 	for (i = 0; i < MAX_NR_ZONES; i++) {
 		if (descending)
 			zone = MAX_NR_ZONES - i - 1;
@@ -1835,11 +1891,13 @@ static void __init free_area_init(void)
 		start_pfn = end_pfn;
 	}
 
-	/* Find the PFNs that ZONE_MOVABLE begins at in each node */
+	/* 阶段2：确定 ZONE_MOVABLE 在每个 NUMA 节点的起始 PFN。
+	 * 根据命令行参数 kernelcore=/movablecore=/movable_node 计算，
+	 * ZONE_MOVABLE 中的页只能用于可迁移分配，支持内存热拔出。 */
 	memset(zone_movable_pfn, 0, sizeof(zone_movable_pfn));
 	find_zone_movable_pfns_for_nodes();
 
-	/* Print out the zone ranges */
+	/* 阶段3a：打印各 zone 的物理地址范围到 dmesg，供调试和问题排查使用。 */
 	pr_info("Zone ranges:\n");
 	for (i = 0; i < MAX_NR_ZONES; i++) {
 		if (i == ZONE_MOVABLE)
@@ -1856,7 +1914,7 @@ static void __init free_area_init(void)
 					<< PAGE_SHIFT) - 1);
 	}
 
-	/* Print out the PFNs ZONE_MOVABLE begins at in each node */
+	/* 阶段3b：打印每个节点上 ZONE_MOVABLE 的起始物理地址。 */
 	pr_info("Movable zone start for each node\n");
 	for (i = 0; i < MAX_NUMNODES; i++) {
 		if (zone_movable_pfn[i])
@@ -1868,6 +1926,10 @@ static void __init free_area_init(void)
 	 * Print out the early node map, and initialize the
 	 * subsection-map relative to active online memory ranges to
 	 * enable future "sub-section" extensions of the memory map.
+	 *
+	 * 阶段3c：打印 memblock 中所有物理内存范围（node/PFN），
+	 * 同时初始化 SPARSEMEM subsection 映射（比 section 更细粒度，
+	 * 支持以 2MiB 为单位的内存热插拔，而非整个 section）。
 	 */
 	pr_info("Early memory node ranges\n");
 	for_each_mem_pfn_range(i, MAX_NUMNODES, &start_pfn, &end_pfn, &nid) {
@@ -1877,22 +1939,45 @@ static void __init free_area_init(void)
 		sparse_init_subsection_map(start_pfn, end_pfn - start_pfn);
 	}
 
-	/* Initialise every node */
+	/* 阶段4：全局校验与参数设置。 */
+
+	/* 调试模式下断言 page->flags 中各字段（zone/node/section/LRU 等）
+	 * 的位域布局合法，防止编译配置错误导致字段越界覆盖。 */
 	mminit_verify_pageflags_layout();
+
+	/* 设置 nr_node_ids = 最高节点号 + 1，用于各处循环上界。 */
 	setup_nr_node_ids();
+
+	/* 设置 pageblock_order：buddy 迁移类型块（pageblock）的阶数。
+	 * 若 HUGETLB_PAGE_SIZE_VARIABLE，取 HUGETLB_PAGE_ORDER，
+	 * 确保每个 pageblock 至少能容纳一个大页，避免大页跨越迁移类型边界。 */
 	set_pageblock_order();
 
+	/* 阶段5：逐节点初始化 pg_data_t 和 zone 数据结构。 */
 	for_each_node(nid) {
 		pg_data_t *pgdat;
 
 		/*
 		 * If an architecture has not allocated node data for
 		 * this node, presume the node is memoryless or offline.
+		 *
+		 * 若架构未为此节点分配 pg_data_t（无内存节点或离线节点），
+		 * 用 memblock 分配一个空的结构体占位，
+		 * 避免后续代码对 NODE_DATA(nid) 的空指针访问。
+		 * 该节点真正有内存时，由 hotadd_init_pgdat() 完整初始化。
 		 */
 		if (!NODE_DATA(nid))
 			alloc_offline_node_data(nid);
 
 		pgdat = NODE_DATA(nid);
+
+		/* free_area_init_node() 完成该节点的完整初始化：
+		 *   - 填写 pgdat->node_id/node_start_pfn/nr_zones
+		 *   - calculate_node_totalpages()：计算各 zone 的 spanned/present 页数
+		 *   - alloc_node_mem_map()：FLATMEM 模型下分配 struct page 数组
+		 *   - pgdat_set_deferred_range()：标记大内存系统的延迟初始化 PFN 范围
+		 *   - free_area_init_core()：初始化 zone 内部字段和迁移类型 usemap
+		 *   - lru_gen_init_pgdat()：初始化 MGLRU（多代 LRU）相关字段 */
 		free_area_init_node(nid);
 
 		/*
@@ -1902,22 +1987,41 @@ static void __init free_area_init(void)
 		 *program won't be confused by sysfs files/directories of
 		 *memory-less node. The pgdat will get fully initialized by
 		 *hotadd_init_pgdat() when memory is hotplugged into this node.
+		 *
+		 * 只有实际含物理页的节点才标记为 N_MEMORY。
+		 * 无内存节点不标记，sysfs 中不创建其节点目录，
+		 * 防止用户空间对空节点目录感到困惑。
 		 */
 		if (pgdat->node_present_pages) {
 			node_set_state(nid, N_MEMORY);
+			/* 检查该节点是否含 HIGHMEM 或 NORMAL zone，
+			 * 相应设置 N_HIGH_MEMORY/N_NORMAL_MEMORY 节点状态位。 */
 			check_for_memory(pgdat);
 		}
 	}
 
+	/* 阶段6a：SPARSEMEM vmemmap 延迟映射。
+	 * 对有内存的节点完成 vmemmap 页表映射（将 struct page 数组映射到
+	 * 内核虚拟地址空间的 vmemmap 区域），之前 sparse_init() 已建立 section
+	 * 级别的映射，此处补充 subsection 级别的映射。 */
 	for_each_node_state(nid, N_MEMORY)
 		sparse_vmemmap_init_nid_late(nid);
 
+	/* 阶段6b：统计 nr_kernel_pages（低端直接映射页数）和 nr_all_pages（总页数）。 */
 	calc_nr_kernel_pages();
+
+	/* 阶段6c：逐区间初始化所有 struct page：
+	 * 设置 page->flags 中的 zone/node/section 编号字段，
+	 * 对物理空洞（hole）页面调用 init_unavailable_range() 标记为不可用。 */
 	memmap_init();
 
-	/* disable hash distribution for systems with a single node */
+	/* disable hash distribution for systems with a single node.
+	 * 单 NUMA 节点系统关闭哈希分布优化（numa_hash_distance 无意义）。 */
 	fixup_hashdist();
 
+	/* 阶段6d：设置 high_memory 全局变量（内核线性映射区的上限虚拟地址）。
+	 * 若架构在 setup_arch() 中已提前设置则跳过，否则根据 ZONE_HIGHMEM
+	 * 的边界或最高物理内存地址计算并设置。 */
 	set_high_memory();
 }
 
@@ -2685,11 +2789,73 @@ void __init __weak mem_init(void)
 {
 }
 
+/*
+ * mm_core_init_early - 内存管理子系统最早期初始化（buddy 接管之前）
+ *
+ * 调用时机：setup_arch() 之后，mm_core_init() 之前，memblock 仍然可用，
+ * buddy 分配器尚未建立，SMP 尚未启动，不能调用 kmalloc/vmalloc。
+ *
+ * 三步必须按此顺序执行：
+ *   1. hugetlb_cma_reserve()：向 memblock 登记 gigantic 巨页所需的 CMA 保留区域，
+ *      必须在 free_area_init() 之前，因为 zone 边界建立时需要读取这些保留信息。
+ *   2. hugetlb_bootmem_alloc()：通过 memblock 分配 gigantic 巨页物理内存，
+ *      必须在 buddy 接管之前完成，否则无法保证大块连续物理内存的可用性。
+ *   3. free_area_init()：建立所有 NUMA 节点的 pg_data_t/zone 数据结构骨架，
+ *      为后续 memblock_free_all() 将物理内存移交 buddy 做好准备。
+ *
+ * 本函数完成后 buddy 的数据结构骨架已就绪，但 free_area[] freelist 仍为空，
+ * 真正的"物理页移交"发生在 mm_core_init() 中的 memblock_free_all()。
+ */
 void __init mm_core_init_early(void)
 {
+	/* 向 CMA 框架预留 gigantic 巨页所需的连续物理内存区域。
+	 * gigantic 页（如 x86 上的 1GiB 页，order > MAX_PAGE_ORDER）无法通过
+	 * buddy 分配器获取，必须在 memblock 阶段抢先占住连续物理内存，
+	 * 否则内存碎片化后再也无法凑出足够大的连续区域。
+	 * 结果写入 hugetlb_cma[nid] 数组，每个 NUMA 节点一个 CMA 区域指针, 即为每个 NUMA 节点（保证本地分配，减少跨节点延迟）分别预留 CMA 区域（保证物理连续，满足 gigantic 巨页的需求）。 */
+	/*
+		NUMA（Non-Uniform Memory Access，非均匀内存访问）
+
+		多 CPU 系统中，每个 CPU 有自己"本地"的内存控制器，访问本地内存快，访问其他 CPU 的内存要跨总线，延迟更高：
+
+		CPU 0 ──── 本地内存 A        CPU 1 ──── 本地内存 B
+		│                              │
+		└──────────── 互联总线 ─────────┘
+
+		CPU 0 访问内存 A：延迟 ~50ns（本地）
+		CPU 0 访问内存 B：延迟 ~150ns（跨节点）
+
+		内核把每个"CPU + 本地内存"的组合叫一个 NUMA 节点（node），用 pg_data_t 结构体描述。调度器和内存分配器尽量让进程用本地节点的内存，减少跨节点访问。
+
+		单 CPU 服务器或普通 PC 只有一个节点（node 0），NUMA 机制存在但无实际效果。
+	*/
+	/*
+		CMA（Contiguous Memory Allocator，连续内存分配器）
+
+		解决一个特定问题：某些硬件设备（DMA、GPU、大页）需要物理上连续的大块内存，但系统运行一段时间后内存碎片化，buddy 分配器凑不出大块连续内存。
+
+		CMA 的做法：
+
+		系统启动时，从 memblock 预留一块连续区域（如 1GB）
+
+		普通情况：这块区域交给 buddy，可以分配给普通用户页（可迁移类型）
+		需要大块时：把这块区域里的普通页迁移走，腾出连续空间给设备使用
+
+		用完后：把区域还给 buddy，继续供普通分配使用
+
+		关键在于"平时借出去用，需要时迁移回来"，避免提前锁死大块内存。
+	*/
 	hugetlb_cma_reserve();
+
+	/* 通过 memblock 分配命令行（hugepages=N）指定的 gigantic 巨页。
+	 * 同时解析所有巨页相关命令行参数（hugepagesz=/default_hugepagesz=），
+	 * 并初始化 huge_boot_pages[nid] 链表存放已分配的页，
+	 * 普通大页（2MiB/4MiB）的实际分配延迟到后期 hugetlb_init_hstates()。 */
 	hugetlb_bootmem_alloc();
 
+	/* 初始化所有 NUMA 节点的 pg_data_t、zone 数据结构及全部 struct page，
+	 * 建立 buddy allocator 的骨架（zone 边界、迁移类型 usemap 等），
+	 * 但不向 buddy 移交任何物理页（free_area[] freelist 仍为空）。 */
 	free_area_init();
 }
 

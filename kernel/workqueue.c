@@ -7931,28 +7931,81 @@ static void bh_pool_kick_highpri(struct irq_work *irq_work)
 	raise_softirq_irqoff(HI_SOFTIRQ);
 }
 
+/*
+ * restrict_unbound_cpumask - 将 wq_unbound_cpumask 收窄为与 mask 的交集
+ * @name: mask 的名称（仅用于警告日志）
+ * @mask: 要与当前 wq_unbound_cpumask 取交集的 CPU 集合
+ *
+ * unbound workqueue 的 worker 只能运行在 wq_unbound_cpumask 内的 CPU 上。
+ * 此函数用于逐步缩减该集合：先排除被 nohz_full/isolcpus 隔离的 CPU，
+ * 再排除命令行 workqueue.unbound_cpus= 指定的 CPU。
+ *
+ * 安全检查：若交集为空（收窄后无任何 CPU 可用），则忽略本次限制并打印警告，
+ * 保留原有 wq_unbound_cpumask 不变，确保系统始终有 CPU 可处理 unbound work。
+ */
 static void __init restrict_unbound_cpumask(const char *name, const struct cpumask *mask)
 {
+	/* 若当前 wq_unbound_cpumask 与 mask 无交集，收窄后将没有任何 CPU 可用，
+	 * 忽略本次限制并打印警告，否则系统无法处理 unbound workqueue 中的 work。 */
 	if (!cpumask_intersects(wq_unbound_cpumask, mask)) {
 		pr_warn("workqueue: Restricting unbound_cpumask (%*pb) with %s (%*pb) leaves no CPU, ignoring\n",
 			cpumask_pr_args(wq_unbound_cpumask), name, cpumask_pr_args(mask));
 		return;
 	}
 
+	/* 取交集：只保留两个 mask 共同包含的 CPU。
+	 * 结果写回 wq_unbound_cpumask，单调递减，不会增加 CPU。 */
 	cpumask_and(wq_unbound_cpumask, wq_unbound_cpumask, mask);
 }
 
+/*
+ * init_cpu_worker_pool - 初始化一个 per-CPU worker pool
+ * @pool: 指向 per-CPU 静态数组中的 worker_pool 对象（已被 BSS 清零）
+ * @cpu:  该 pool 绑定的物理 CPU 编号
+ * @nice: worker 线程的调度优先级（0=普通，HIGHPRI_NICE_LEVEL=-20=高优先级）
+ *
+ * 每个 CPU 有两个标准 worker pool（普通 + 高优先级），本函数对其中一个做
+ * 完整初始化。初始化后 pool 有全局唯一 ID，可以接受 work 入队，但尚无
+ * worker 线程——线程在后续 workqueue_init() 中创建。
+ */
 static void __init init_cpu_worker_pool(struct worker_pool *pool, int cpu, int nice)
 {
+	/* init_worker_pool() 做通用初始化：
+	 *   - 初始化 pool->lock（raw spinlock）
+	 *   - 初始化 worklist、idle_list、busy_hash 等链表/哈希表
+	 *   - 设置 idle_timer（延迟定时器）和 mayday_timer（救援定时器）
+	 *   - 初始化 worker_ida（为 worker 分配编号的 ID 分配器）
+	 *   - 分配并初始化 pool->attrs（workqueue_attrs 结构体）
+	 * 返回非零表示失败，此时直接 BUG_ON 崩溃（系统无法运行）。 */
 	BUG_ON(init_worker_pool(pool));
+
+	/* 将 pool 绑定到指定物理 CPU。 */
 	pool->cpu = cpu;
+
+	/* 设置 worker 线程的调度亲和性为单个 CPU（cpumask_of(cpu) 仅含该 CPU），
+	 * 确保该 pool 的 worker 只在 cpu 上运行。 */
 	cpumask_copy(pool->attrs->cpumask, cpumask_of(cpu));
+
+	/* __pod_cpumask 是 pod 内部调度用的 cpumask，per-CPU pool 同样只含一个 CPU。
+	 * pod 是 workqueue 亲和性系统的基本调度单位，per-CPU pool 的 pod 就是自身。 */
 	cpumask_copy(pool->attrs->__pod_cpumask, cpumask_of(cpu));
+
+	/* 设置 worker 线程的 nice 值，决定调度优先级。 */
 	pool->attrs->nice = nice;
+
+	/* affn_strict = true：严格亲和性模式，worker 线程只能在 cpumask 指定的 CPU
+	 * 上运行，不允许迁移到其他 CPU（per-CPU pool 必须严格绑定单个 CPU）。 */
 	pool->attrs->affn_strict = true;
+
+	/* 将 pool 关联到 CPU 所在的 NUMA 节点，后续 worker 分配内存时优先在本节点，
+	 * 降低跨 NUMA 内存访问延迟。 */
 	pool->node = cpu_to_node(cpu);
 
-	/* alloc pool ID */
+	/* alloc pool ID
+	 * 在全局 worker_pool_idr 中为该 pool 分配唯一整数 ID（写入 pool->id）。
+	 * work 项的 WORK_OFFQ 字段用此 ID 记录"上次运行在哪个 pool"，
+	 * 用于 work 的 CPU 亲和性保持（cache 热度优化）。
+	 * 必须持 wq_pool_mutex 互斥锁，防止并发分配 ID 冲突。 */
 	mutex_lock(&wq_pool_mutex);
 	BUG_ON(worker_pool_assign_id(pool));
 	mutex_unlock(&wq_pool_mutex);
@@ -7967,77 +8020,167 @@ static void __init init_cpu_worker_pool(struct worker_pool *pool, int cpu, int n
  * boot code to create workqueues and queue/cancel work items. Actual work item
  * execution starts only after kthreads can be created and scheduled right
  * before early initcalls.
+ *
+ * workqueue 子系统三阶段初始化的第一阶段：
+ *   1. workqueue_init_early()  ← 本函数，内存/cpumask/IDR 就绪后立即调用
+ *   2. workqueue_init()        ← kthread 可创建后调用，启动实际 worker 线程
+ *   3. workqueue_init_topology() ← CPU 拓扑可用后调用，建立 NUMA/LLC pod 分组
+ *
+ * 完成后 work 可以入队，但实际执行要等到 workqueue_init() 创建 worker 线程后。
  */
 void __init workqueue_init_early(void)
 {
+	/* pt：WQ_AFFN_SYSTEM pod 类型，"整个系统只有一个调度 pod"的策略，
+	 * 适用于不需要 NUMA/LLC 亲和性的系统级 workqueue。
+	 * wq_pod_types[] 按 wq_affn_scope 枚举索引，每种亲和策略一个 pod 类型。 */
 	struct wq_pod_type *pt = &wq_pod_types[WQ_AFFN_SYSTEM];
+
+	/* 两个标准 worker pool 的优先级：
+	 * [0]=0 普通优先级，[1]=HIGHPRI_NICE_LEVEL(-20) 高优先级。
+	 * 每个 CPU 有这两种 pool，分别服务普通 work 和高优先级 work。 */
 	int std_nice[NR_STD_WORKER_POOLS] = { 0, HIGHPRI_NICE_LEVEL };
+
+	/* BH pool 的 irq_work 回调函数：
+	 * BH（Bottom Half）pool 中的 work 运行在 softirq 上下文，
+	 * 需要通过 irq_work 机制跨 CPU 安全触发 softirq 来唤醒工作：
+	 * [0]=bh_pool_kick_normal 触发 TASKLET_SOFTIRQ（普通软中断）
+	 * [1]=bh_pool_kick_highpri 触发 HI_SOFTIRQ（高优先级软中断）*/
 	void (*irq_work_fns[NR_STD_WORKER_POOLS])(struct irq_work *) =
 		{ bh_pool_kick_normal, bh_pool_kick_highpri };
 	int i, cpu;
 
+	/* 编译期断言：pool_workqueue 的对齐至少为 sizeof(long long)（8 字节）。
+	 * pool_workqueue 指针的低位 bit 被用于存储标志位（如 PWQ_LINKED），
+	 * 必须保证低位可用，8 字节对齐确保低 3 位始终为 0。 */
 	BUILD_BUG_ON(__alignof__(struct pool_workqueue) < __alignof__(long long));
 
+	/* ── 阶段1：分配并初始化全局 cpumask ────────────────────────────────── */
+
+	/* 分配四个核心 cpumask，失败则 BUG_ON（系统无法运行）：
+	 * wq_online_cpumask：当前在线 CPU 的镜像，排除热插拔过渡中的 CPU
+	 * wq_unbound_cpumask：unbound workqueue 实际可用的 CPU 集合（逐步缩减）
+	 * wq_requested_unbound_cpumask：用户通过 sysfs 请求的 unbound CPU 集合
+	 * wq_isolated_cpumask：被 nohz_full/isolcpus 隔离的 CPU 集合（初始清零）*/
 	BUG_ON(!alloc_cpumask_var(&wq_online_cpumask, GFP_KERNEL));
 	BUG_ON(!alloc_cpumask_var(&wq_unbound_cpumask, GFP_KERNEL));
 	BUG_ON(!alloc_cpumask_var(&wq_requested_unbound_cpumask, GFP_KERNEL));
 	BUG_ON(!zalloc_cpumask_var(&wq_isolated_cpumask, GFP_KERNEL));
 
+	/* 初始化在线 CPU 掩码。 */
 	cpumask_copy(wq_online_cpumask, cpu_online_mask);
+
+	/* unbound 掩码从所有 possible CPU 开始，然后逐步收窄：
+	 * 第一步：排除被 nohz_full/isolcpus 隔离的 CPU（HK_TYPE_DOMAIN 是管家 CPU
+	 *         集合，即未被隔离的 CPU）。隔离 CPU 专跑实时任务，不接受内核杂务。 */
 	cpumask_copy(wq_unbound_cpumask, cpu_possible_mask);
 	restrict_unbound_cpumask("HK_TYPE_DOMAIN", housekeeping_cpumask(HK_TYPE_DOMAIN));
+
+	/* 第二步：若用户通过命令行参数 workqueue.unbound_cpus= 指定了额外限制，
+	 * 进一步缩减 unbound 可用 CPU 集合。 */
 	if (!cpumask_empty(&wq_cmdline_cpumask))
 		restrict_unbound_cpumask("workqueue.unbound_cpus", &wq_cmdline_cpumask);
 
+	/* 保存收窄后的 unbound 掩码作为"用户请求值"基准，
+	 * 供后续 sysfs 接口（/sys/devices/virtual/workqueue/cpumask）使用。 */
 	cpumask_copy(wq_requested_unbound_cpumask, wq_unbound_cpumask);
+
+	/* 计算被隔离的 CPU 集合：possible - housekeeping = isolated。
+	 * 用于后续判断某个 CPU 是否被隔离（如调整 work 亲和性时跳过隔离 CPU）。 */
 	cpumask_andnot(wq_isolated_cpumask, cpu_possible_mask,
 						housekeeping_cpumask(HK_TYPE_DOMAIN));
+
+	/* ── 阶段2：创建 slab 缓存和全局缓冲区 ──────────────────────────────── */
+
+	/* 为 pool_workqueue 创建专用 slab 缓存。
+	 * pool_workqueue（pwq）是 workqueue 与 worker_pool 之间的绑定结构，
+	 * 每次 workqueue 绑定到一个 pool 时分配，解绑时释放，频繁操作，
+	 * 专用 slab 缓存比 kmalloc 更快且内存利用率更高。 */
 	pwq_cache = KMEM_CACHE(pool_workqueue, SLAB_PANIC);
 
+	/* 分配全局共用的 workqueue_attrs 临时缓冲区，
+	 * 供 wq_update_unbound_pod_attrs() 在更新 unbound workqueue 配置时使用，
+	 * 受 CPU hotplug 排他锁保护，无需每次分配/释放。 */
 	unbound_wq_update_pwq_attrs_buf = alloc_workqueue_attrs();
 	BUG_ON(!unbound_wq_update_pwq_attrs_buf);
 
 	/*
 	 * If nohz_full is enabled, set power efficient workqueue as unbound.
 	 * This allows workqueue items to be moved to HK CPUs.
+	 *
+	 * nohz_full 启用时（HK_TYPE_TICK 等同于 HK_TYPE_KERNEL_NOISE），
+	 * 将 WQ_POWER_EFFICIENT workqueue 设为 unbound 模式，
+	 * 使 work 项可以迁移到管家 CPU 上执行，避免打扰隔离 CPU 的 nohz 状态。
 	 */
 	if (housekeeping_enabled(HK_TYPE_TICK))
 		wq_power_efficient = true;
 
-	/* initialize WQ_AFFN_SYSTEM pods */
+	/* ── 阶段3：初始化 WQ_AFFN_SYSTEM pod ───────────────────────────────── */
+
+	/* initialize WQ_AFFN_SYSTEM pods
+	 *
+	 * pod（工作组）是 workqueue 亲和性调度的基本单位。WQ_AFFN_SYSTEM 是最宽松
+	 * 的策略：整个系统只有 1 个 pod，所有 CPU 共享同一组 unbound worker。
+	 *
+	 * 分配三个数组（kzalloc_objs 使用类型安全的 typeof 推导分配大小）：
+	 * pod_cpus：pod 编号 → 该 pod 包含哪些 CPU（1 个 cpumask_var_t）
+	 * pod_node：pod 编号 → NUMA 节点（1 个 int，AFFN_SYSTEM 不绑定节点）
+	 * cpu_pod： CPU 编号 → 所属 pod 编号（nr_cpu_ids 个 int，每个 CPU 一项） */
 	pt->pod_cpus = kzalloc_objs(pt->pod_cpus[0], 1);
 	pt->pod_node = kzalloc_objs(pt->pod_node[0], 1);
 	pt->cpu_pod = kzalloc_objs(pt->cpu_pod[0], nr_cpu_ids);
 	BUG_ON(!pt->pod_cpus || !pt->pod_node || !pt->cpu_pod);
 
+	/* 为 pod 0 的 cpumask 分配 bitmap 内存，NUMA_NO_NODE 表示不偏好特定节点。 */
 	BUG_ON(!zalloc_cpumask_var_node(&pt->pod_cpus[0], GFP_KERNEL, NUMA_NO_NODE));
 
+	/* 配置系统级 pod：1 个 pod，包含所有 possible CPU，不绑定 NUMA 节点，
+	 * CPU 0（以及后续通过 cpu hotplug 加入的 CPU）都映射到 pod 0。
+	 * 其他亲和策略（NUMA/LLC/SMT）的 pod 在 workqueue_init_topology() 中建立。 */
 	pt->nr_pods = 1;
 	cpumask_copy(pt->pod_cpus[0], cpu_possible_mask);
 	pt->pod_node[0] = NUMA_NO_NODE;
 	pt->cpu_pod[0] = 0;
 
-	/* initialize BH and CPU pools */
+	/* ── 阶段4：初始化每个 CPU 的 BH 和普通 worker pool ────────────────── */
+
+	/* initialize BH and CPU pools
+	 * 遍历所有 possible CPU，为每个 CPU 初始化 4 个 worker pool（2 BH + 2 普通）。
+	 * 此时只建立数据结构，没有创建任何 worker 线程（线程在 workqueue_init() 创建）。 */
 	for_each_possible_cpu(cpu) {
 		struct worker_pool *pool;
 
+		/* BH worker pool：运行在 softirq 上下文，而非 kthread。
+		 * 适用于 WQ_BH 类型的 work，延迟极低但不能睡眠。
+		 * POOL_BH 标志告知调度器此 pool 由 softirq 驱动而非 kthread。
+		 * init_irq_work 绑定跨 CPU 触发 softirq 的回调，使其他 CPU 能唤醒本 pool。 */
 		i = 0;
 		for_each_bh_worker_pool(pool, cpu) {
 			init_cpu_worker_pool(pool, cpu, std_nice[i]);
 			pool->flags |= POOL_BH;
+			/* 绑定 irq_work 回调：普通 BH pool 用 bh_pool_kick_normal
+			 * 触发 TASKLET_SOFTIRQ，高优先级 BH pool 用 bh_pool_kick_highpri
+			 * 触发 HI_SOFTIRQ，实现跨 CPU 安全唤醒。 */
 			init_irq_work(bh_pool_irq_work(pool), irq_work_fns[i]);
 			i++;
 		}
 
+		/* 普通 CPU worker pool：由 kthread（worker 线程）驱动，可以睡眠。
+		 * 适用于绝大多数 work，两个 pool 分别对应普通和高优先级。 */
 		i = 0;
 		for_each_cpu_worker_pool(pool, cpu)
 			init_cpu_worker_pool(pool, cpu, std_nice[i++]);
 	}
 
-	/* create default unbound and ordered wq attrs */
+	/* ── 阶段5：创建 unbound/ordered workqueue 属性模板 ─────────────────── */
+
+	/* create default unbound and ordered wq attrs
+	 * 为两种优先级（普通 + 高优先级）各创建一对 attrs 模板，
+	 * 作为创建 unbound/ordered workqueue 时的默认参数。 */
 	for (i = 0; i < NR_STD_WORKER_POOLS; i++) {
 		struct workqueue_attrs *attrs;
 
+		/* unbound workqueue 属性模板：不绑定特定 CPU，
+		 * worker 可以在 wq_unbound_cpumask 内的任意 CPU 上运行。 */
 		BUG_ON(!(attrs = alloc_workqueue_attrs()));
 		attrs->nice = std_nice[i];
 		unbound_std_wq_attrs[i] = attrs;
@@ -8045,6 +8188,9 @@ void __init workqueue_init_early(void)
 		/*
 		 * An ordered wq should have only one pwq as ordering is
 		 * guaranteed by max_active which is enforced by pwqs.
+		 *
+		 * ordered workqueue 属性模板：ordered=true 强制 max_active=1，
+		 * 确保同一时刻只有一个 work 在执行，实现严格串行顺序。
 		 */
 		BUG_ON(!(attrs = alloc_workqueue_attrs()));
 		attrs->nice = std_nice[i];
@@ -8052,12 +8198,27 @@ void __init workqueue_init_early(void)
 		ordered_wq_attrs[i] = attrs;
 	}
 
+	/* ── 阶段6：创建系统内置 workqueue ──────────────────────────────────── */
+
+	/* 创建 12 个系统级 workqueue，供内核各子系统直接使用。
+	 * 此时 worker 线程尚未创建，work 入队后会排队等待 workqueue_init() 后执行。
+	 *
+	 * WQ_PERCPU：每个 CPU 独立的 worker pool，work 在提交时的 CPU 上执行
+	 * WQ_UNBOUND：不绑定 CPU，worker 可迁移，适合长时间运行的 work
+	 * WQ_HIGHPRI：使用高优先级 worker pool（nice=-20）
+	 * WQ_FREEZABLE：系统 suspend 时冻结，不执行新 work
+	 * WQ_POWER_EFFICIENT：省电模式，nohz_full 时自动变为 WQ_UNBOUND
+	 * WQ_BH：在 softirq 上下文执行，不能睡眠，延迟极低
+	 * __WQ_DEPRECATED：已弃用，保留是为了兼容旧代码 */
 	system_wq = alloc_workqueue("events", WQ_PERCPU | __WQ_DEPRECATED, 0);
 	system_percpu_wq = alloc_workqueue("events", WQ_PERCPU, 0);
+	/* 高优先级 per-CPU workqueue，网络、存储等延迟敏感路径使用。 */
 	system_highpri_wq = alloc_workqueue("events_highpri",
 					    WQ_HIGHPRI | WQ_PERCPU, 0);
+	/* 长时间运行的 work 应提交到此 wq，避免占用普通 wq 的 worker 导致饥饿。 */
 	system_long_wq = alloc_workqueue("events_long", WQ_PERCPU, 0);
 	system_unbound_wq = alloc_workqueue("events_unbound", WQ_UNBOUND | __WQ_DEPRECATED, WQ_MAX_ACTIVE);
+	/* system_dfl_wq 是 system_unbound_wq 的继任者，新代码应使用此 wq。 */
 	system_dfl_wq = alloc_workqueue("events_unbound", WQ_UNBOUND, WQ_MAX_ACTIVE);
 	system_freezable_wq = alloc_workqueue("events_freezable",
 					      WQ_FREEZABLE | WQ_PERCPU, 0);
@@ -8065,6 +8226,7 @@ void __init workqueue_init_early(void)
 					      WQ_POWER_EFFICIENT | WQ_PERCPU, 0);
 	system_freezable_power_efficient_wq = alloc_workqueue("events_freezable_pwr_efficient",
 					      WQ_FREEZABLE | WQ_POWER_EFFICIENT | WQ_PERCPU, 0);
+	/* BH workqueue：在 softirq 上下文执行，替代传统 tasklet 的推荐方式。 */
 	system_bh_wq = alloc_workqueue("events_bh", WQ_BH | WQ_PERCPU, 0);
 	system_bh_highpri_wq = alloc_workqueue("events_bh_highpri",
 					       WQ_BH | WQ_HIGHPRI | WQ_PERCPU, 0);

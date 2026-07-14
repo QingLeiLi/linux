@@ -1575,6 +1575,7 @@ radix_tree_node_ctor(void *arg)
 	INIT_LIST_HEAD(&node->private_list);
 }
 
+// preload 机制：为了避免在持锁的临界区内分配内存（可能睡眠），radix tree 允许调用者提前在非临界区分配好节点，存入 per-cpu 的 radix_tree_preloads 池。CPU 下线时这些预分配的节点必须归还给 slab，否则内存泄漏。
 static int radix_tree_cpu_dead(unsigned int cpu)
 {
 	struct radix_tree_preload *rtp;
@@ -1595,13 +1596,20 @@ void __init radix_tree_init(void)
 {
 	int ret;
 
+	// 编译时断言（BUILD_BUG_ON），检查常量约束，若不满足直接编译失败，运行时零开销，只是防止配置错误。
 	BUILD_BUG_ON(RADIX_TREE_MAX_TAGS + __GFP_BITS_SHIFT > 32);
 	BUILD_BUG_ON(ROOT_IS_IDR & ~GFP_ZONEMASK);
 	BUILD_BUG_ON(XA_CHUNK_SIZE > 255);
+	// 为 struct radix_tree_node 创建专用 slab 缓存
+	// SLAB_RECLAIM_ACCOUNT：将这类对象纳入内存回收统计，内存压力大时可以被计入可回收内存
+	// radix_tree_node_ctor：构造函数，每次从 slab 分配新对象时调用，将节点清零并初始化 private_list 链表头，避免使用未初始化内存
 	radix_tree_node_cachep = kmem_cache_create("radix_tree_node",
 			sizeof(struct radix_tree_node), 0,
 			SLAB_PANIC | SLAB_RECLAIM_ACCOUNT,
 			radix_tree_node_ctor);
+	// 注册 CPU 下线回调
+	// 向 CPU 热插拔状态机注册一个回调：当某个 CPU 下线时，调用 radix_tree_cpu_dead() 释放该 CPU 的预加载节点池（per-cpu preload pool）。
+	// preload 机制：为了避免在持锁的临界区内分配内存（可能睡眠），radix tree 允许调用者提前在非临界区分配好节点，存入 per-cpu 的 radix_tree_preloads 池。CPU 下线时这些预分配的节点必须归还给 slab，否则内存泄漏。
 	ret = cpuhp_setup_state_nocalls(CPUHP_RADIX_DEAD, "lib/radix:dead",
 					NULL, radix_tree_cpu_dead);
 	WARN_ON(ret < 0);

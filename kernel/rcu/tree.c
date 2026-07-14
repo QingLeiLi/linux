@@ -4328,6 +4328,17 @@ bool rcu_cpu_beenfullyonline(int cpu)
  * Near the end of the CPU-online process.  Pretty much all services
  * enabled, and the CPU is now very much alive.
  */
+/*
+ * rcutree_online_cpu - CPU 上线的最后一步：置 ffmask 位并释放 tick 依赖
+ * @cpu: 正在上线的 CPU 编号
+ *
+ * 调用时机：CPU 热插拔 online 阶段（cpuhp_step），或 boot 时由 rcu_init()
+ * 在 rcutree_report_cpu_starting() 之后调用，此时调度器基本可用。
+ *
+ * "fully functional"（ffmask）表示该 CPU 已完全就绪，可参与回调卸载决策。
+ * 与 qsmaskinitnext（下次 GP 等待集合）不同，ffmask 用于 NOCB 子系统判断
+ * 目标 CPU 是否能接收卸载的回调。
+ */
 int rcutree_online_cpu(unsigned int cpu)
 {
 	unsigned long flags;
@@ -4337,12 +4348,18 @@ int rcutree_online_cpu(unsigned int cpu)
 	rdp = per_cpu_ptr(&rcu_data, cpu);
 	rnp = rdp->mynode;
 	raw_spin_lock_irqsave_rcu_node(rnp, flags);
+	/* 将该 CPU 加入叶节点的 ffmask（fully functional mask），
+	 * 标志该 CPU 已完全上线，可以安全地接收 NOCB 卸载回调。 */
 	rnp->ffmask |= rdp->grpmask;
 	raw_spin_unlock_irqrestore_rcu_node(rnp, flags);
+
 	if (rcu_scheduler_active == RCU_SCHEDULER_INACTIVE)
 		return 0; /* Too early in boot for scheduler work. */
 
 	// Stop-machine done, so allow nohz_full to disable tick.
+	// CPU online 过程使用了 stop-machine，期间 RCU 强制 tick 持续运行以
+	// 确保 QS（静默状态）能被及时检测。现在 CPU 完全在线，stop-machine 结束，
+	// 清除 RCU 对 tick 的依赖位，允许 nohz_full CPU 再次停掉周期性 tick。
 	tick_dep_clear(TICK_DEP_BIT_RCU);
 	return 0;
 }
@@ -4361,6 +4378,20 @@ int rcutree_online_cpu(unsigned int cpu)
  *
  * This mirrors the effects of rcutree_report_cpu_dead().
  */
+/*
+ * rcutree_report_cpu_starting - 将正在启动的 CPU 注册到 RCU rcu_node 树
+ * @cpu: 正在启动的 CPU 编号
+ *
+ * 调用时机：目标 CPU 自身在极早期启动（secondary_start_kernel）中调用，
+ * 此时中断必须关闭（有 lockdep 断言保证）。
+ *
+ * 主要工作：
+ *   1. 将该 CPU 加入叶节点的 qsmaskinitnext（下次 GP 开始时需等待的 CPU 集合）
+ *   2. 将该 CPU 加入 expmaskinitnext（expedited GP 等待集合）
+ *   3. 若是首次上线，递增 rcu_state.ncpus
+ *   4. 处理 offline 期间可能发生的 GP 序号回绕
+ *   5. 设置 beenonline 标志，发出完整内存屏障
+ */
 void rcutree_report_cpu_starting(unsigned int cpu)
 {
 	unsigned long mask;
@@ -4368,30 +4399,64 @@ void rcutree_report_cpu_starting(unsigned int cpu)
 	struct rcu_node *rnp;
 	bool newcpu;
 
+	/* 严格要求中断关闭：arch_spin_lock（ofl_lock）不能在中断上下文中使用，
+	 * 且整个注册过程需要原子性。 */
 	lockdep_assert_irqs_disabled();
 	rdp = per_cpu_ptr(&rcu_data, cpu);
+
+	/* 幂等保护：CPU 热插拔路径可能重入，已执行过则直接返回。 */
 	if (rdp->cpu_started)
 		return;
 	rdp->cpu_started = true;
 
 	rnp = rdp->mynode;
+	/* 该 CPU 在父节点 qsmask 中对应的位掩码。 */
 	mask = rdp->grpmask;
+
+	/* ofl_lock（offline lock）：arch spinlock，不参与调度器，
+	 * 专为极早期/极晚期 CPU 状态变更设计，保护 CPU online/offline 的原子性。 */
 	arch_spin_lock(&rcu_state.ofl_lock);
+
+	/* 通知 RCU watching 机制该 CPU 即将在线，更新 dyntick-idle/EQS 账本。 */
 	rcu_watching_online();
+
+	/* barrier_lock 保护 rcu_barrier() 操作期间的 CPU 集合一致性：
+	 * rcu_barrier() 需要看到一致的 qsmaskinitnext，
+	 * 必须在修改该掩码时持有此锁。 */
 	raw_spin_lock(&rcu_state.barrier_lock);
 	raw_spin_lock_rcu_node(rnp);
+
+	/* 将该 CPU 加入"下次 GP 开始时需等待"的掩码。
+	 * 使用 WRITE_ONCE 避免编译器将此写操作与相邻操作合并或重排。 */
 	WRITE_ONCE(rnp->qsmaskinitnext, rnp->qsmaskinitnext | mask);
+
+	/* barrier_lock 只需要保护 qsmaskinitnext 的一致性，此处可提前释放。 */
 	raw_spin_unlock(&rcu_state.barrier_lock);
+
+	/* 判断是否是该 CPU 首次出现在 expedited 掩码中（区分新 CPU vs 热插拔重上线）。 */
 	newcpu = !(rnp->expmaskinitnext & mask);
+	/* 将该 CPU 加入 expedited GP 等待集合。 */
 	rnp->expmaskinitnext |= mask;
-	/* Allow lockless access for expedited grace periods. */
+
+	/* Allow lockless access for expedited grace periods.
+	 * smp_store_release：release 语义写，确保 expmaskinitnext 的修改对
+	 * 无锁读取 ncpus 的 expedited GP 扫描路径可见（^^^注释指向此保证）。
+	 * 若是新 CPU（newcpu=true），递增全系统 RCU 感知的 CPU 计数。 */
 	smp_store_release(&rcu_state.ncpus, rcu_state.ncpus + newcpu); /* ^^^ */
 	ASSERT_EXCLUSIVE_WRITER(rcu_state.ncpus);
+
+	/* 处理 GP 序号回绕：CPU offline 期间可能发生多个 GP 轮转，
+	 * 导致 rdp->gp_seq 远落后于 rnp->gp_seq，需要同步修正。 */
 	rcu_gpnum_ovf(rnp, rdp); /* Offline-induced counter wrap? */
+
+	/* 记录上线时的 GP 序号和阶段，用于调试和 stall 超时检测。 */
 	rdp->rcu_onl_gp_seq = READ_ONCE(rcu_state.gp_seq);
 	rdp->rcu_onl_gp_state = READ_ONCE(rcu_state.gp_state);
 
-	/* An incoming CPU should never be blocking a grace period. */
+	/* An incoming CPU should never be blocking a grace period.
+	 * 正常情况下该 CPU offline 时应已从 qsmask 中清除。
+	 * 若 qsmask 中仍有该 CPU 的位，说明出现了异常，
+	 * 需要立即补报 QS，防止 GP 永久阻塞。 */
 	if (WARN_ON_ONCE(rnp->qsmask & mask)) { /* RCU waiting on incoming CPU? */
 		/* rcu_report_qs_rnp() *really* wants some flags to restore */
 		unsigned long flags;
@@ -4401,11 +4466,19 @@ void rcutree_report_cpu_starting(unsigned int cpu)
 		/* Report QS -after- changing ->qsmaskinitnext! */
 		rcu_report_qs_rnp(mask, rnp, rnp->gp_seq, flags);
 	} else {
+		/* 正常路径：释放叶节点锁。 */
 		raw_spin_unlock_rcu_node(rnp);
 	}
 	arch_spin_unlock(&rcu_state.ofl_lock);
+
+	/* release 语义：标记该 CPU 已至少完整上线过一次。
+	 * rcu_cpu_beenfullyonline() 用 smp_load_acquire 读取此标志。 */
 	smp_store_release(&rdp->beenonline, true);
-	smp_mb(); /* Ensure RCU read-side usage follows above initialization. */
+
+	/* Ensure RCU read-side usage follows above initialization.
+	 * 完整内存屏障：确保后续的 RCU 读端临界区（rcu_read_lock/unlock）
+	 * 能看到上述所有初始化操作的结果，防止乱序执行导致安全漏洞。 */
+	smp_mb();
 }
 
 /*
@@ -4764,20 +4837,41 @@ static void __init rcu_init_one(void)
 /*
  * Force priority from the kernel command-line into range.
  */
+/*
+ * sanitize_kthread_prio - 将 RCU kthread 优先级限制到合法范围
+ *
+ * kthread_prio 可通过内核命令行参数 rcutree.kthread_prio=N 设置，
+ * 用于控制 rcuc/N（QS 强制推进）、rcuo/N（NOCB 卸载）等 RCU kthread 的
+ * 实时调度优先级（SCHED_FIFO，范围 0~99）。
+ *
+ * 各条件的来由：
+ *   CONFIG_RCU_BOOST + torture：最低 2，torture 测试需要更高优先级以保证
+ *     宽限期能及时推进（否则可能触发误报超时）
+ *   CONFIG_RCU_BOOST 无 torture：最低 1，boosting kthread 必须是实时优先级，
+ *     以便能抢占持有 rcu_read_lock 的低优先级任务
+ *   无 CONFIG_RCU_BOOST：允许 0（普通 SCHED_OTHER），无实时优先级要求
+ *   上界 99：SCHED_FIFO 的最大合法优先级
+ */
 static void __init sanitize_kthread_prio(void)
 {
+	/* 保存原始值，供日志对比使用。 */
 	int kthread_prio_in = kthread_prio;
 
+	/* RCU_BOOST + torture：最低 2，确保 torture 场景下 kthread 能抢占目标任务。 */
 	if (IS_ENABLED(CONFIG_RCU_BOOST) && kthread_prio < 2
 	    && IS_BUILTIN(CONFIG_RCU_TORTURE_TEST))
 		kthread_prio = 2;
+	/* RCU_BOOST 无 torture：最低 1，boosting kthread 必须具备实时优先级。 */
 	else if (IS_ENABLED(CONFIG_RCU_BOOST) && kthread_prio < 1)
 		kthread_prio = 1;
+	/* 不允许负值。 */
 	else if (kthread_prio < 0)
 		kthread_prio = 0;
+	/* SCHED_FIFO 优先级上界为 99。 */
 	else if (kthread_prio > 99)
 		kthread_prio = 99;
 
+	/* 若值被修正，发出 ALERT 级日志，提示用户参数超出合法范围。 */
 	if (kthread_prio != kthread_prio_in)
 		pr_alert("%s: Limited prio to %d from %d\n",
 			 __func__, kthread_prio, kthread_prio_in);
@@ -4900,18 +4994,56 @@ static void __init rcu_dump_rcu_node_tree(void)
 
 struct workqueue_struct *rcu_gp_wq;
 
+/*
+ * rcu_init - 初始化 Tree RCU 子系统（SMP 版本）
+ *
+ * 调用时机：start_kernel() 中，内存分配器和 cpumask 就绪后，
+ * 调度器完全启动前。此时只有 boot CPU 在运行，无需 CPU 热插拔保护。
+ *
+ * Tree RCU 是 SMP 系统上的 RCU 实现，使用层次化的 rcu_node 树来追踪
+ * 各 CPU 的静默状态（QS），避免所有 CPU 都竞争同一把锁。
+ *
+ * 初始化顺序有严格依赖关系：
+ *   rcu_init_geometry → rcu_init_one → prepare/report/online（三步 CPU 注册）
+ * 每一步都依赖前一步的结果，不能调换顺序。
+ */
 void __init rcu_init(void)
 {
 	int cpu = smp_processor_id();
 
+	/* 若开启 CONFIG_PROVE_RCU 自测，注册早期 RCU/SRCU 回调，
+	 * 供 late_initcall 阶段的 rcu_verify_early_boot_tests() 验证正确性。
+	 * 非 PROVE_RCU 配置下此函数为空实现，零开销。 */
 	rcu_early_boot_tests();
 
+	/* 打印 RCU 变体名称（Preemptible/Hierarchical）和所有非默认启动参数的警告。
+	 * 同时修正 nohz_full_patience_delay 的越界值并转换为 jiffies。 */
 	rcu_bootup_announce();
+
+	/* 将 kthread_prio 夹在合法范围内（0~99），
+	 * CONFIG_RCU_BOOST 时最低 1（torture 测试时最低 2）。 */
 	sanitize_kthread_prio();
+
+	/* 根据实际 nr_cpu_ids 和 rcu_fanout_leaf 计算 rcu_node 树的几何形状：
+	 * rcu_num_lvls（层数）、num_rcu_lvl[]（每层节点数）、rcu_num_nodes（总节点数），
+	 * 以及 FQS（Force Quiescent State）扫描的 jiffies 延迟。
+	 * 必须在 rcu_init_one() 之前调用，因为后者依赖这些计算结果。 */
 	rcu_init_geometry();
+
+	/* 初始化 rcu_state 中所有 rcu_node 节点和每 CPU rcu_data：
+	 * 建立父子指针、grplo/grphi CPU 范围、qsmask 位掩码，
+	 * 初始化各节点的锁、等待队列、回调链表等数据结构。
+	 * 完成后树结构就绪，可以开始接受 GP 请求。 */
 	rcu_init_one();
+
+	/* 可选：通过 rcutree.dump_tree=1 命令行参数触发，
+	 * 将完整的 rcu_node 树结构打印到 dmesg，用于调试树形拓扑。 */
 	if (dump_tree)
 		rcu_dump_rcu_node_tree();
+
+	/* 注册 RCU softirq 处理函数 rcu_core_si（处理回调执行和 QS 检测）。
+	 * use_softirq=0（rcutree.use_softirq=0）时 RCU 核心处理由 rcuc/N kthread 承担，
+	 * 避免 softirq 抢占实时任务；默认（use_softirq=1）用 softirq，延迟更低。 */
 	if (use_softirq)
 		open_softirq(RCU_SOFTIRQ, rcu_core_si);
 
@@ -4919,32 +5051,68 @@ void __init rcu_init(void)
 	 * We don't need protection against CPU-hotplug here because
 	 * this is called early in boot, before either interrupts
 	 * or the scheduler are operational.
+	 *
+	 * 注册电源管理通知回调 rcu_pm_notify，在系统 suspend/resume 时
+	 * 确保 RCU 宽限期能安全暂停和恢复，避免 suspend 时 GP 永久阻塞。
 	 */
 	pm_notifier(rcu_pm_notify, 0);
+
+	/* 断言此时只有 boot CPU 在线——三步 CPU 注册假设单 CPU 环境，
+	 * 无需持锁保护。若此时已有其他 CPU 上线则说明初始化顺序有误。 */
 	WARN_ON(num_online_cpus() > 1); // Only one CPU this early in boot.
+
+	/* boot CPU 的三步注册（对应 CPU 热插拔的三个阶段）：
+	 *
+	 * prepare：初始化 per-CPU rcu_data（回调链表、GP 序号、IRQ work 等），
+	 *          在叶节点中标记 CPU 为 pending-online，创建 rcuc/rcuog kthread。
+	 *
+	 * report_starting：将 CPU 加入 qsmaskinitnext 和 expmaskinitnext，
+	 *                  递增 ncpus，设置 beenonline，发出完整内存屏障。
+	 *                  必须在中断关闭时调用（arch_spin_lock 要求）。
+	 *
+	 * online：置叶节点 ffmask 位（fully functional），
+	 *         清除 RCU 对 tick 的依赖（允许 nohz_full 停掉 tick）。 */
 	rcutree_prepare_cpu(cpu);
 	rcutree_report_cpu_starting(cpu);
 	rcutree_online_cpu(cpu);
 
-	/* Create workqueue for Tree SRCU and for expedited GPs. */
+	/* Create workqueue for Tree SRCU and for expedited GPs.
+	 *
+	 * rcu_gp_wq（WQ_MEM_RECLAIM | WQ_PERCPU）：
+	 *   用于 Tree SRCU 的宽限期推进和 expedited GP 的异步启动。
+	 *   WQ_MEM_RECLAIM 确保内存压力下仍能分配 worker，防止死锁。
+	 *
+	 * sync_wq（WQ_MEM_RECLAIM | WQ_UNBOUND）：
+	 *   用于 synchronize_rcu() 等同步操作的等待，WQ_UNBOUND 允许跨 CPU 调度。 */
 	rcu_gp_wq = alloc_workqueue("rcu_gp", WQ_MEM_RECLAIM | WQ_PERCPU, 0);
 	WARN_ON(!rcu_gp_wq);
 
 	sync_wq = alloc_workqueue("sync_wq", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
 	WARN_ON(!sync_wq);
 
-	/* Fill in default value for rcutree.qovld boot parameter. */
-	/* -After- the rcu_node ->lock fields are initialized! */
+	/* Fill in default value for rcutree.qovld boot parameter.
+	 * -After- the rcu_node ->lock fields are initialized!
+	 *
+	 * qovld_calc：回调队列过载阈值，超过此值时 GP 推进会更积极。
+	 * qovld < 0 表示用户未通过命令行指定，使用 DEFAULT_RCU_QOVLD_MULT * qhimark
+	 * 作为默认值（qhimark 是回调队列高水位，乘以倍数得到过载阈值）。
+	 * 必须在 rcu_node 锁初始化后计算，因为后续使用此值时需要持锁。 */
 	if (qovld < 0)
 		qovld_calc = DEFAULT_RCU_QOVLD_MULT * qhimark;
 	else
 		qovld_calc = qovld;
 
 	// Kick-start in case any polled grace periods started early.
+	// 若在 rcu_init 之前就有代码调用了 start_poll_synchronize_rcu_expedited()
+	// 注册了 polled GP 请求，此处启动 expedited GP 确保它们能被处理。
 	(void)start_poll_synchronize_rcu_expedited();
 
+	/* 对同步原语（synchronize_rcu 等）做基本正确性断言测试，
+	 * 验证 rcu_init 完成后基本 RCU 操作可以正常工作。 */
 	rcu_test_sync_prims();
 
+	/* 初始化 Tasks RCU 的回调链表（用于追踪任务上下文的 RCU 宽限期，
+	 * 如 BPF、ftrace 等需要等待所有正在执行的任务通过安全点）。 */
 	tasks_cblist_init_generic();
 }
 

@@ -7,6 +7,48 @@
  */
 
 /*
+ * Binder 驱动整体架构说明
+ *
+ * 一、Binder 是什么，解决什么问题
+ * Binder 是 Android 的核心 IPC（进程间通信）机制，几乎所有 Android 系统服务
+ * 调用（如 ActivityManagerService、WindowManagerService、SurfaceFlinger 等）
+ * 都依赖 Binder。
+ *
+ * Linux 原有 IPC 机制（pipe、socket、共享内存、信号量等）的问题：
+ *   - pipe/socket：数据需要经过两次拷贝（发送方→内核缓冲区→接收方），延迟高；
+ *   - 共享内存：没有内置的同步/调用语义，需要额外的同步机制；
+ *   - 这些机制缺少对"调用者身份（UID/PID）"的可信验证，容易被伪造。
+ *
+ * Binder 的优势：
+ *   1. 只需"1.5次拷贝"（详见下文），性能接近共享内存；
+ *   2. 内核负责传递调用方真实的 UID/PID，接收方可用于权限验证（安全性）；
+ *   3. 提供同步 RPC（远程过程调用）语义，调用方可阻塞等待回复；
+ *   4. 支持 Binder 对象引用计数与死亡通知，便于管理跨进程对象生命周期。
+ *
+ * 二、核心数据结构
+ *   - binder_proc   : 代表一个打开了 /dev/binder 的进程，维护该进程的线程池、
+ *                     binder 节点、引用表和内存映射信息。
+ *   - binder_thread : 代表进程内的一个 Binder 工作线程，维护当前事务栈和
+ *                     待处理的 todo 队列。
+ *   - binder_node   : 代表一个 Binder 服务对象（即服务端在内核中的实体），
+ *                     由服务进程创建，持有指向用户空间 Binder 对象的指针。
+ *   - binder_ref    : 代表客户端对某个 binder_node 的引用（句柄），
+ *                     客户端通过整数 handle 查找到对应的 binder_ref，
+ *                     再经 binder_ref → binder_node → target_proc 找到目标进程。
+ *   - binder_transaction : 代表一次正在进行中的 IPC 事务，记录发送方/接收方、
+ *                     数据缓冲区、回复路径等信息。
+ *
+ * 三、"1.5次拷贝"原理
+ * 传统 IPC 需要两次拷贝：发送方用户空间 → 内核缓冲区 → 接收方用户空间。
+ * Binder 通过 mmap 将接收方用户空间和内核的同一块物理内存建立映射，因此：
+ *   第1次（也是唯一的）拷贝：调用 copy_from_user，将数据从发送方用户空间
+ *       直接写入接收方已映射的内核内存页（物理内存只有一份）；
+ *   第0.5次：接收方读取数据时直接访问自己 mmap 的虚拟地址，无需拷贝，
+ *       相当于"半次拷贝"（仅需更新页表/虚拟地址映射）。
+ * 整体只有 1.5 次拷贝开销，远低于传统 IPC 的两次拷贝。
+ */
+
+/*
  * Locking overview
  *
  * There are 3 main spinlocks which must be acquired in the
@@ -78,15 +120,33 @@
 #include "binder_internal.h"
 #include "binder_trace.h"
 
+/*
+ * 全局链表：延迟工作队列
+ * binder_deferred_list 保存需要延迟执行清理工作的 binder_proc，
+ * 例如进程关闭时的资源释放、引用计数清零等操作会被提交到该队列，
+ * 由内核工作队列（workqueue）在合适时机统一处理，避免在关键路径上阻塞。
+ */
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
 
 static HLIST_HEAD(binder_devices);
 static DEFINE_SPINLOCK(binder_devices_lock);
 
+/*
+ * 全局链表：所有活跃的 binder_proc
+ * binder_procs 保存系统中所有已打开 /dev/binder 的进程（binder_proc）。
+ * 用于遍历所有 Binder 进程，例如 BINDER_FREEZE 冻结指定 pid 时需要从此
+ * 链表查找目标进程，以及 debugfs 输出全局状态时遍历所有进程。
+ */
 static HLIST_HEAD(binder_procs);
 static DEFINE_MUTEX(binder_procs_lock);
 
+/*
+ * 全局链表：已死亡但仍有引用的 binder_node
+ * binder_dead_nodes 保存服务进程已退出，但客户端仍持有其 binder_ref
+ * （引用句柄）的 binder_node。这些节点不能立即释放，需等到所有客户端
+ * 的引用计数降为零，同时负责向持有引用的客户端发送死亡通知（BR_DEAD_BINDER）。
+ */
 static HLIST_HEAD(binder_dead_nodes);
 static DEFINE_SPINLOCK(binder_dead_nodes_lock);
 
@@ -3052,6 +3112,47 @@ free_skb:
 	nlmsg_free(skb);
 }
 
+/*
+ * binder_transaction - Binder IPC 最核心的函数，处理一次完整的 IPC 事务
+ *
+ * @proc   : 发起调用的进程（调用方的 binder_proc）
+ * @thread : 发起调用的线程（调用方的 binder_thread）
+ * @tr     : 用户空间传入的事务描述符，包含目标 handle、数据缓冲区指针、
+ *           数据大小等信息
+ * @reply  : 非零表示这是一次 BC_REPLY（服务端回复），零表示 BC_TRANSACTION（客户端调用）
+ * @extra_buffers_size : 额外缓冲区大小（用于 scatter-gather 和 LSM 安全上下文）
+ *
+ * 主要工作流程（"1.5次拷贝"IPC 全流程）：
+ *
+ * 【步骤1：区分 reply 与 call 两条路径】
+ *   - reply 路径：服务端处理完请求后调用 BC_REPLY，从当前线程的
+ *     transaction_stack 取出 in_reply_to，找到等待回复的客户端线程。
+ *   - call 路径：客户端发起 BC_TRANSACTION，通过 tr->target.handle
+ *     （整数句柄）查找 binder_ref → binder_node → target_proc，
+ *     若 handle 为 0 则直接发往 servicemanager（context manager）。
+ *
+ * 【步骤2：找到目标进程/线程】
+ *   - reply 路径：目标线程就是 in_reply_to->from（发起原始调用的线程）。
+ *   - call 路径：通过 handle → binder_ref → binder_node → target_proc，
+ *     再由 binder_select_thread_ilocked 在目标进程的线程池中选择一个
+ *     空闲线程，或挂到进程的 todo 队列等待任意线程处理。
+ *
+ * 【步骤3：从目标进程的 mmap 区域分配 binder_buffer】
+ *   调用 binder_alloc_new_buf(&target_proc->alloc, ...)，在目标进程
+ *   通过 binder_mmap 建立的共享内存区域内分配一块 binder_buffer。
+ *   这块内存同时映射到内核地址空间和目标进程的用户地址空间。
+ *
+ * 【步骤4：copy_from_user — "1.5次拷贝"中的"1次"】
+ *   调用 binder_alloc_copy_user_to_buffer，通过 copy_from_user 将数据
+ *   从发送方用户空间直接拷贝到目标进程的 mmap 物理内存页（内核地址写入）。
+ *   目标进程读取时直接通过自己的用户态虚拟地址访问，无需再次拷贝，
+ *   这就是"0.5次"——目标进程只需访问自己已映射的虚拟地址，不产生额外拷贝。
+ *
+ * 【步骤5：将事务加入目标线程/进程的 todo 队列并唤醒目标线程】
+ *   将 t->work 入队到目标线程（或目标进程）的 todo 链表，
+ *   然后调用 wake_up_interruptible 唤醒正在 binder_thread_read 中等待的
+ *   目标线程，使其从 todo 队列取出事务并处理。
+ */
 static void binder_transaction(struct binder_proc *proc,
 			       struct binder_thread *thread,
 			       struct binder_transaction_data *tr, int reply,
@@ -3125,6 +3226,13 @@ static void binder_transaction(struct binder_proc *proc,
 	if (!reply && !(tr->flags & TF_ONE_WAY))
 		t->from = thread;
 
+	/*
+	 * 步骤1：区分 reply 路径与 call 路径
+	 *
+	 * reply 路径（BC_REPLY）：服务端已处理完请求，现在向客户端发回结果。
+	 * 从当前线程的 transaction_stack 弹出 in_reply_to，它记录了最初发来
+	 * 请求的客户端线程，后续将向该线程的 todo 队列投递回复。
+	 */
 	if (reply) {
 		binder_inner_proc_lock(proc);
 		in_reply_to = thread->transaction_stack;
@@ -3184,6 +3292,18 @@ static void binder_transaction(struct binder_proc *proc,
 		target_proc->tmp_ref++;
 		binder_inner_proc_unlock(target_thread->proc);
 	} else {
+		/*
+		 * 步骤2：call 路径 — 通过 handle 找到目标进程
+		 *
+		 * tr->target.handle 是客户端持有的整数句柄（binder_ref 的编号）。
+		 * 查找路径：handle → binder_ref（在 proc->refs_by_desc 红黑树）
+		 *         → binder_node（服务端在内核的实体）
+		 *         → target_proc（服务端的 binder_proc）
+		 *
+		 * 若 handle == 0，目标是 servicemanager（context manager），
+		 * servicemanager 是 Android 的全局服务注册与查询中心，
+		 * 所有服务的注册（addService）和查找（getService）都经过它。
+		 */
 		if (tr->target.handle) {
 			struct binder_ref *ref;
 
@@ -3372,6 +3492,16 @@ static void binder_transaction(struct binder_proc *proc,
 
 	trace_binder_transaction(reply, t, target_node);
 
+	/*
+	 * 步骤3：在目标进程的 mmap 区域分配 binder_buffer
+	 *
+	 * binder_alloc_new_buf 从 target_proc->alloc（即目标进程通过
+	 * binder_mmap 建立的共享内存管理器）中分配一块连续内存。
+	 * 这块内存的物理页同时映射到：
+	 *   - 内核地址空间（供驱动写入数据）
+	 *   - 目标进程的用户地址空间（供目标进程直接读取，无需再次拷贝）
+	 * 这是"1.5次拷贝"得以实现的物理基础。
+	 */
 	t->buffer = binder_alloc_new_buf(&target_proc->alloc, tr->data_size,
 		tr->offsets_size, extra_buffers_size,
 		!reply && (t->flags & TF_ONE_WAY));
@@ -3416,6 +3546,15 @@ static void binder_transaction(struct binder_proc *proc,
 	t->buffer->clear_on_free = !!(t->flags & TF_CLEAR_BUF);
 	trace_binder_transaction_alloc_buf(t->buffer);
 
+	/*
+	 * 步骤4："1.5次拷贝"中的第1次拷贝 — 将 offsets 表从发送方拷贝到目标缓冲区
+	 *
+	 * offsets 表记录了数据缓冲区中每个 Binder 对象（flat_binder_object）
+	 * 的偏移量，驱动需要遍历这些对象以完成 Binder 引用的翻译（handle ↔ node）。
+	 * binder_alloc_copy_user_to_buffer 内部通过 copy_from_user 完成拷贝，
+	 * 目标地址是 target_proc 的 mmap 物理内存，因此目标进程可通过自己的
+	 * 虚拟地址直接读取，不需要第二次拷贝（这就是"0.5次"的由来）。
+	 */
 	if (binder_alloc_copy_user_to_buffer(
 				&target_proc->alloc,
 				t->buffer,
@@ -3744,6 +3883,24 @@ static void binder_transaction(struct binder_proc *proc,
 		tcomplete->type = BINDER_WORK_TRANSACTION_COMPLETE;
 	}
 
+	/*
+	 * 步骤5：将事务加入目标线程/进程的 todo 队列并唤醒目标线程
+	 *
+	 * 根据事务类型分三条子路径：
+	 *   a) reply：直接投递到 target_thread->todo，然后
+	 *      wake_up_interruptible_sync(&target_thread->wait) 唤醒
+	 *      正在 binder_thread_read 中等待的客户端线程，使其接收回复。
+	 *
+	 *   b) 同步 call（非 one-way）：通过 binder_proc_transaction 投递
+	 *      到目标线程的 todo 队列，调用方线程自身则挂起，将 transaction
+	 *      压入 thread->transaction_stack 等待对方回复（形成调用栈）。
+	 *      同时延迟发送 TRANSACTION_COMPLETE 通知，减少一次上下文切换
+	 *      以降低延迟。
+	 *
+	 *   c) 异步 one-way：投递后调用方不等待回复，立即返回；
+	 *      若目标进程处于冻结状态，事务被放入冻结队列，
+	 *      并向调用方返回 BR_TRANSACTION_PENDING_FROZEN 状态码。
+	 */
 	if (reply) {
 		binder_enqueue_thread_work(thread, tcomplete);
 		binder_inner_proc_lock(target_proc);
@@ -5768,6 +5925,43 @@ static int binder_ioctl_get_extended_error(struct binder_thread *thread,
 	return 0;
 }
 
+/*
+ * binder_ioctl - Binder 驱动的控制接口，所有 Binder 操作均通过此入口
+ *
+ * 用户态通过 ioctl(fd, cmd, arg) 与驱动交互，这是 Binder 唯一的控制通道。
+ * libbinder（C++ 层）、libbinder_ndk（NDK 层）和 Java 层的 BinderProxy
+ * 最终都通过此函数与内核驱动通信。
+ *
+ * 主要 cmd 说明：
+ *
+ *   BINDER_WRITE_READ（最核心的命令）：
+ *     发送命令（BC_*）给驱动并读取驱动返回的事件（BR_*）。
+ *     write 部分：BC_TRANSACTION（发起调用）、BC_REPLY（回复）、
+ *                 BC_FREE_BUFFER（释放接收缓冲区）等；
+ *     read  部分：BR_TRANSACTION（收到调用）、BR_REPLY（收到回复）、
+ *                 BR_DEAD_BINDER（服务死亡通知）等。
+ *     线程通常在此命令上循环阻塞，等待任务（Binder 线程池的核心循环）。
+ *
+ *   BINDER_SET_CONTEXT_MGR / BINDER_SET_CONTEXT_MGR_EXT：
+ *     将当前进程注册为 context manager（即 servicemanager）。
+ *     系统中只能有一个 context manager，handle=0 的所有事务都发往它。
+ *     servicemanager 是 Android 所有系统服务的注册中心（类似 DNS），
+ *     服务通过它注册（addService），客户端通过它查找服务（getService）。
+ *
+ *   BINDER_SET_MAX_THREADS：
+ *     告知驱动该进程 Binder 线程池的最大线程数（默认 15）。
+ *     驱动会在线程不足时通过 BR_SPAWN_LOOPER 通知应用创建新线程。
+ *
+ *   BINDER_VERSION：
+ *     协议版本协商，用户态库与内核驱动互相确认 Binder 协议版本号，
+ *     版本不匹配时拒绝工作，保证 ABI 兼容性。
+ *
+ *   BINDER_FREEZE：
+ *     冻结指定 PID 进程的 Binder 通信（Android App 进程冻结机制的一部分）。
+ *     冻结后该进程发来的 Binder 调用将被挂起或返回错误，
+ *     解冻后挂起的 one-way 事务会继续投递。
+ *     配合 SIGSTOP/cgroup freezer 用于 Android 后台进程管理以节省 CPU。
+ */
 static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int ret;
@@ -5788,11 +5982,13 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	switch (cmd) {
+	/* 核心命令：发送 BC_* 命令并读取 BR_* 事件，Binder 线程主循环在此阻塞 */
 	case BINDER_WRITE_READ:
 		ret = binder_ioctl_write_read(filp, arg, thread);
 		if (ret)
 			goto err;
 		break;
+	/* 设置线程池最大线程数，驱动据此决定何时通过 BR_SPAWN_LOOPER 请求创建新线程 */
 	case BINDER_SET_MAX_THREADS: {
 		u32 max_threads;
 
@@ -5806,6 +6002,11 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		binder_inner_proc_unlock(proc);
 		break;
 	}
+	/*
+	 * 注册为 servicemanager（带扩展 flat_binder_object 参数）
+	 * EXT 版本允许传入带有安全标签的 binder 对象描述符，
+	 * 供 SELinux 等安全框架验证注册者身份
+	 */
 	case BINDER_SET_CONTEXT_MGR_EXT: {
 		struct flat_binder_object fbo;
 
@@ -5818,6 +6019,7 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			goto err;
 		break;
 	}
+	/* 注册为 servicemanager（简单版本），handle=0 的所有事务都路由到此进程 */
 	case BINDER_SET_CONTEXT_MGR:
 		ret = binder_ioctl_set_ctx_mgr(filp, NULL);
 		if (ret)
@@ -5829,6 +6031,10 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		binder_thread_release(proc, thread);
 		thread = NULL;
 		break;
+	/*
+	 * 协议版本协商：向用户态返回内核支持的 Binder 协议版本号，
+	 * 用户态库据此判断是否与当前内核兼容，版本不匹配时拒绝初始化
+	 */
 	case BINDER_VERSION: {
 		struct binder_version __user *ver = ubuf;
 
@@ -5876,6 +6082,12 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 		break;
 	}
+	/*
+	 * 冻结指定进程的 Binder 通信（Android 进程冻结机制）：
+	 * 冻结后目标进程的同步 Binder 调用将返回 BR_FROZEN_REPLY，
+	 * 异步（one-way）事务则进入待处理队列，待进程解冻后继续投递。
+	 * 与 SIGSTOP/cgroup freezer 配合，用于 Android 后台进程管理节省资源。
+	 */
 	case BINDER_FREEZE: {
 		struct binder_freeze_info info;
 		struct binder_proc **target_procs = NULL, *target_proc;
@@ -6021,6 +6233,31 @@ static const struct vm_operations_struct binder_vm_ops = {
 	.fault = binder_vm_fault,
 };
 
+/*
+ * binder_mmap - 建立 Binder 共享内存映射，"1.5次拷贝"的基础
+ *
+ * 当进程调用 mmap(/dev/binder, ...) 时触发此函数。
+ * 这一步为 Binder 的"1.5次拷贝"机制奠定物理内存基础：
+ *
+ * 核心思路：
+ *   binder_alloc_mmap_handler 会在内核地址空间和用户进程地址空间（vma）
+ *   建立对同一组物理内存页的双重映射。
+ *   之后当发送方通过 copy_from_user 将数据写入这块内核地址时，
+ *   接收方进程无需再次拷贝，直接通过自己的用户态虚拟地址（vma 范围内）
+ *   访问同一份物理内存，从而实现"1次拷贝到达接收方"的效果。
+ *
+ * 为何清除 VM_MAYWRITE（禁止接收方写入共享区域）：
+ *   vm_flags_mod 移除 VM_MAYWRITE，这意味着接收方进程不能对这块内存
+ *   调用 mprotect 打开写权限。数据的写入只能由内核驱动（发送路径上的
+ *   copy_from_user）完成，接收方只读，防止接收方篡改其他进程的 IPC 数据，
+ *   保证 IPC 通道的数据完整性与安全性。
+ *
+ * VM_DONTCOPY：进程 fork 时不复制此 VMA，避免子进程意外继承 Binder 缓冲区。
+ *
+ * 典型调用时机：
+ *   Java 层 ProcessState::open_driver() → mmap(256KB or 1MB) → binder_mmap
+ *   servicemanager 映射 128KB，普通应用映射最大 1MB。
+ */
 static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct binder_proc *proc = filp->private_data;
@@ -6039,14 +6276,36 @@ static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
 		       proc->pid, vma->vm_start, vma->vm_end, "bad vm_flags", -EPERM);
 		return -EPERM;
 	}
+	/* 清除 VM_MAYWRITE：接收方不得写入共享缓冲区，保证 IPC 数据安全 */
 	vm_flags_mod(vma, VM_DONTCOPY | VM_MIXEDMAP, VM_MAYWRITE);
 
 	vma->vm_ops = &binder_vm_ops;
 	vma->vm_private_data = proc;
 
+	/* 建立内核↔用户双重映射，后续 copy_from_user 写入即可被接收方直接读取 */
 	return binder_alloc_mmap_handler(&proc->alloc, vma);
 }
 
+/*
+ * binder_open - 进程第一次打开 /dev/binder 时的入口
+ *
+ * 对应系统调用 open("/dev/binder", O_RDWR)，每个使用 Binder 的进程
+ * 在初始化时（通常通过 libbinder 的 ProcessState::self()）都会调用此函数。
+ *
+ * 主要工作：
+ *   1. 为当前进程分配并初始化一个 binder_proc 结构体，它是该进程在
+ *      Binder 驱动中的"身份证"，贯穿该进程所有 Binder 操作的生命周期。
+ *   2. 保存进程关键信息：
+ *      - proc->tsk  : 指向进程主线程的 task_struct（group_leader），
+ *                     用于后续内存映射（mmap）的合法性校验和进程生命周期管理；
+ *      - proc->pid  : 进程的 tgid（线程组 ID，即用户态 PID），
+ *                     用于服务查找、日志、调试和 BINDER_FREEZE 等操作；
+ *      - proc->cred : 打开文件时的进程凭证（UID/GID/capabilities 等），
+ *                     保存到 binder_proc，供后续事务中的权限检查（SELinux
+ *                     security_binder_transaction 等）使用，防止 TOCTOU 攻击。
+ *   3. 将 proc 注册到全局 binder_procs 链表，并与 binder_device（设备上下文）关联。
+ *   4. 将 proc 指针存入 filp->private_data，后续 ioctl/mmap 通过此字段快速取得 proc。
+ */
 static int binder_open(struct inode *nodp, struct file *filp)
 {
 	struct binder_proc *proc, *itr;
@@ -6065,8 +6324,11 @@ static int binder_open(struct inode *nodp, struct file *filp)
 	dbitmap_init(&proc->dmap);
 	spin_lock_init(&proc->inner_lock);
 	spin_lock_init(&proc->outer_lock);
+	/* 保存主线程 task_struct，用于 mmap 校验和进程生命周期管理 */
 	proc->tsk = get_task_struct(current->group_leader);
+	/* 保存 tgid 作为进程 ID（线程组 ID = 用户态 PID） */
 	proc->pid = current->tgid;
+	/* 保存打开时的进程凭证，供后续跨进程事务的权限验证使用 */
 	proc->cred = get_cred(filp->f_cred);
 	INIT_LIST_HEAD(&proc->todo);
 	init_waitqueue_head(&proc->freeze_wait);
@@ -7086,6 +7348,39 @@ static int __init init_binder_device(const char *name)
 	return ret;
 }
 
+/*
+ * binder_init - Binder 驱动模块初始化入口
+ *
+ * 通过 device_initcall(binder_init) 注册，在内核启动的 do_initcalls 阶段
+ * （device_initcall 优先级，level 6）被自动调用，早于用户态 init 进程启动。
+ *
+ * 主要初始化工作：
+ *
+ *   1. binder_alloc_shrinker_init()：
+ *      注册内存 shrinker，当系统内存紧张时内核可回调此函数，
+ *      释放空闲的 Binder 内存缓冲区，配合内存压力管理。
+ *
+ *   2. 初始化 debugfs 条目（/sys/kernel/debug/binder/）：
+ *      - /sys/kernel/debug/binder/state    : 全局状态（所有进程/节点/引用）
+ *      - /sys/kernel/debug/binder/stats    : 统计信息（事务数量、内存使用等）
+ *      - /sys/kernel/debug/binder/transactions : 当前活跃事务列表
+ *      - /sys/kernel/debug/binder/proc/<pid>   : 每个进程的详细信息
+ *      这些文件是调试 Binder 问题（死锁、内存泄漏、性能分析）的重要工具。
+ *
+ *   3. 创建 /dev/binder 等设备节点（非 binderfs 模式）：
+ *      遍历 binder_devices_param（模块参数，默认 "binder,hwbinder,vndbinder"）
+ *      为每个设备名调用 init_binder_device，注册 misc 设备节点。
+ *      不同设备节点隔离不同 Binder 域（framework/HAL/vendor 分离，
+ *      对应 Android Treble 架构的 IPC 隔离需求）。
+ *
+ *   4. genl_register_family：注册 Generic Netlink 家族，
+ *      用于向用户态上报 Binder 事件通知（如 one-way spam 检测报告）。
+ *
+ *   5. init_binderfs()：
+ *      挂载 binderfs 虚拟文件系统，允许在容器/沙箱环境中为每个
+ *      挂载命名空间提供独立的 Binder 设备节点，支持 Android 容器化部署
+ *      （如 Android in a VM / Chrome OS ARC++ 等场景）。
+ */
 static int __init binder_init(void)
 {
 	int ret;
@@ -7102,6 +7397,7 @@ static int __init binder_init(void)
 	atomic_set(&binder_transaction_log.cur, ~0U);
 	atomic_set(&binder_transaction_log_failed.cur, ~0U);
 
+	/* 创建 /sys/kernel/debug/binder/ 目录及各调试文件 */
 	binder_debugfs_dir_entry_root = debugfs_create_dir("binder", NULL);
 
 	binder_for_each_debugfs_entry(db_entry)

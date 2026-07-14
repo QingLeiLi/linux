@@ -232,17 +232,40 @@ void kasan_init_hw_tags_cpu(void)
 	kasan_enable_hw_tags();
 }
 
+/*
+ * kasan_init_hw_tags - 初始化硬件内存标签（MTE）模式的 KASAN
+ *
+ * 仅在 boot CPU 上调用一次（smp_prepare_boot_cpu() 调用链）。
+ * 每个 secondary CPU 启动时调用的是 kasan_init_hw_tags_cpu()。
+ *
+ * KASAN（KernelAddressSanitizer）是内核内存错误检测工具，hw-tags 模式
+ * 利用 ARMv8.5 的 MTE（Memory Tagging Extension）硬件特性：
+ *   - 每个 16 字节内存块携带一个 4 位"颜色标签"
+ *   - 指针的高位字节（bit[59:56]）携带访问标签
+ *   - CPU 在每次内存访问时自动比较两个标签，不匹配则触发异常
+ *   - 检测堆溢出、use-after-free 等内存错误，硬件加速，开销极低
+ *
+ * 三种检测模式：
+ *   SYNC：访问时立即同步检查，错误立刻报告，精确但略慢
+ *   ASYNC：异步检查，错误报告可能延迟，速度最快，适合生产环境
+ *   ASYMM：写同步检查，读异步检查，折中方案
+ */
 /* kasan_init_hw_tags() is called once on boot CPU. */
 void __init kasan_init_hw_tags(void)
 {
-	/* If hardware doesn't support MTE, don't initialize KASAN. */
+	/* MTE 是 ARMv8.5 引入的可选硬件特性，system_supports_mte() 通过
+	 * CPU capability 检测结果判断，不支持则直接返回，不初始化 KASAN。 */
 	if (!system_supports_mte())
 		return;
 
-	/* If KASAN is disabled via command line, don't initialize it. */
+	/* kasan_arg 由命令行参数 kasan.mode=off 设置，
+	 * 允许在支持 MTE 的硬件上显式禁用 KASAN（如性能敏感场景）。 */
 	if (kasan_arg == KASAN_ARG_OFF)
 		return;
 
+	/* 根据命令行参数 kasan.mode=sync/async/asymm 设置检测模式。
+	 * DEFAULT 保持编译时指定的默认值（通常是 SYNC）。
+	 * kasan_mode 后续被 kasan_enable_hw_tags() 用于配置 MTE 控制寄存器。 */
 	switch (kasan_arg_mode) {
 	case KASAN_ARG_MODE_DEFAULT:
 		/* Default is specified by kasan_mode definition. */
@@ -258,6 +281,9 @@ void __init kasan_init_hw_tags(void)
 		break;
 	}
 
+	/* 根据命令行参数 kasan.vmalloc=off/on 控制是否对 vmalloc 区域也启用标签检测。
+	 * vmalloc 区域的标签检测会增加 vmalloc 分配的开销，默认视编译配置决定。
+	 * 使用 static_branch 实现，运行时 vmalloc 路径的判断零开销。 */
 	switch (kasan_arg_vmalloc) {
 	case KASAN_ARG_VMALLOC_DEFAULT:
 		/* Default is specified by kasan_flag_vmalloc definition. */
@@ -270,9 +296,17 @@ void __init kasan_init_hw_tags(void)
 		break;
 	}
 
+	/* 根据命令行参数 kasan.stacktrace=off/on 初始化调用栈收集配置。
+	 * 开启时从 memblock 分配 stack_ring 环形缓冲区，存储最近的分配/释放调用栈，
+	 * 用于 use-after-free 错误报告中显示"内存在哪里被释放"。 */
 	kasan_init_tags();
 
-	/* KASAN is now initialized, enable it. */
+	/* KASAN is now initialized, enable it.
+	 *
+	 * 通过 static_branch_enable(&kasan_flag_enabled) 开启全局 KASAN 标志。
+	 * 使用 static key 而不是普通变量，是因为 kasan_enabled() 在每次内存
+	 * 分配/访问路径上都会被调用，static key 保证热路径零开销。
+	 * 此调用之后，所有新分配的内存才开始被打上标签并受 MTE 保护。 */
 	kasan_enable();
 
 	pr_info("KernelAddressSanitizer initialized (hw-tags, mode=%s, vmalloc=%s, stacktrace=%s, write_only=%s)\n",

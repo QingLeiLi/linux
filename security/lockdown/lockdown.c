@@ -161,6 +161,57 @@ static int __init lockdown_secfs_init(void)
 	return PTR_ERR_OR_ZERO(dentry);
 }
 
+// 注册 LSM
+/*
+	lockdown 是内核完整性保护机制，核心目标是：防止 root 用户破坏内核自身。
+
+	---
+	背景问题
+
+	传统 Linux 中 root 权限几乎等同于内核权限：
+	- root 可以写 /dev/mem 直接改内核内存
+	- root 可以加载内核模块（任意代码进内核）
+	- root 可以用 kexec 替换运行中的内核
+	- root 可以读 /proc/kcore 窥探内核数据
+
+	这意味着：一旦攻击者获得 root，就能绕过 SELinux/AppArmor 等所有安全机制，直接篡改内核。
+
+	---
+	lockdown 的两个级别
+
+	LOCKDOWN_INTEGRITY_MAX   ← 完整性模式
+		防止内核被修改（写操作被拦截）
+		- 禁止写 /dev/mem、/dev/kmem
+		- 禁止加载未签名内核模块
+		- 禁止 kexec 加载未签名内核
+		- 禁止 hibernation（会写内核镜像到磁盘）
+		- 禁止调试器写内核内存（ptrace 部分功能）
+
+	LOCKDOWN_CONFIDENTIALITY_MAX   ← 保密模式（包含完整性模式的所有限制）
+		额外防止内核数据被读取
+		- 禁止读 /dev/mem、/proc/kcore
+		- 禁止 perf 采样内核地址
+		- 禁止某些 ACPI 表访问
+
+	---
+	与 Secure Boot 的关系
+
+	lockdown 最典型的用法是配合 UEFI Secure Boot：
+
+	Secure Boot 验证内核镜像签名
+		↓ 内核启动时检测到 Secure Boot 开启
+		↓ 自动启用 lockdown（完整性模式）
+
+	效果：从固件到内核的信任链完整
+		攻击者即使获得 root，也无法注入未签名代码破坏这条链
+
+	没有 lockdown，攻击者 root 后可以通过 /dev/mem 修改内核，完全绕过 Secure Boot 建立的信任链。
+
+	---
+	为什么要 DEFINE_EARLY_LSM
+
+	lockdown 必须在任何可能被它拦截的操作之前就绪。如果等到普通 security_init() 才初始化，早期启动阶段就有窗口期可以绕过它。放入 early_security_init() 确保它是最早生效的安全机制之一。
+*/
 #ifdef CONFIG_SECURITY_LOCKDOWN_LSM_EARLY
 DEFINE_EARLY_LSM(lockdown) = {
 #else

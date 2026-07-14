@@ -56,7 +56,32 @@ int hugetlb_max_hstate __read_mostly;
 unsigned int default_hstate_idx;
 struct hstate hstates[HUGE_MAX_HSTATE];
 
+/*
+ * hugetlb_bootmem_nodes - 启动阶段有物理内存的 NUMA 节点掩码
+ *
+ * __initdata：仅在内核初始化阶段有效，init 结束后该内存被释放。
+ *
+ * 由 hugetlb_bootmem_set_nodes() 填充，记录 memblock 中所有包含
+ * 实际物理内存的节点。用于：
+ *   1. hugetlb_cma_reserve()：决定在哪些节点上预留 CMA 区域
+ *   2. hugetlb_bootmem_alloc()：决定在哪些节点上分配 gigantic 巨页
+ *
+ * 之所以需要这个掩码而不直接用 node_online_mask，是因为此时 SMP 尚未
+ * 完全启动，node_online_mask 可能还未建立，只有 memblock 的物理内存
+ * 范围信息是可靠的。
+ */
 __initdata nodemask_t hugetlb_bootmem_nodes;
+
+/*
+ * huge_boot_pages - 启动阶段已分配的 gigantic 巨页链表（每节点一条）
+ *
+ * __initdata：仅在内核初始化阶段有效。
+ *
+ * hugetlb_bootmem_alloc() 通过 memblock 分配 gigantic 巨页后，
+ * 将每个页的描述符挂入对应节点的链表。buddy 分配器就绪后，
+ * hugetlb_init_hstates() 遍历这些链表，将页正式移交给
+ * hugetlb 子系统的 hstate 管理。
+ */
 __initdata struct list_head huge_boot_pages[MAX_NUMNODES];
 static unsigned long hstate_boot_nrinvalid[HUGE_MAX_HSTATE] __initdata;
 
@@ -4441,35 +4466,179 @@ static int __init default_hugepagesz_setup(char *s)
 }
 hugetlb_early_param("default_hugepagesz", default_hugepagesz_setup);
 
+/*
+   扫描物理内存，记录哪些 NUMA 节点上有内存，供后续巨页分配时知道"可以去哪些节点要内存"
+   内核启动极早期，想分配巨页，但面临一个问题：
+
+	▎ 我有 4 个 NUMA 节点（node 0~3），但不是每个节点都有物理内存。我怎么知道应该去哪些节点分配？
+
+	不能用 node_online_mask，因为 SMP 还没启动，那个掩码还没建好。唯一可靠的信息源是 memblock——它记录了固件报告的所有物理内存区间及其所属节点。
+
+	---
+	函数做的事
+
+	for_each_mem_pfn_range(...)   // 遍历 memblock 里每一段物理内存
+		node_set(nid, hugetlb_bootmem_nodes)  // 把有内存的节点号记下来
+
+	结果就是 hugetlb_bootmem_nodes 这个位图，比如 4 节点系统中 node 0 和 node 2 有内存：
+
+	hugetlb_bootmem_nodes = 0b0101  （node 0 和 node 2）
+
+	---
+	之后谁用这个结果
+
+	hugetlb_cma_reserve()
+		for_each_node_mask(nid, hugetlb_bootmem_nodes)
+			→ 只在 node 0 和 node 2 上预留 CMA 区域
+			→ 不会傻乎乎地去 node 1/3 预留（那里没内存，必然失败）
+
+	hugetlb_bootmem_alloc()
+		→ 同样只在这两个节点上分配 gigantic 巨页
+
+ * hugetlb_bootmem_set_nodes - 扫描 memblock 构建有物理内存的节点掩码
+ *
+ * 调用时机：memblock 可用，buddy 尚未建立，SMP 尚未启动。
+ * 可被 hugetlb_cma_reserve() 和 hugetlb_bootmem_alloc() 先后调用，
+ * 内部通过 nodes_empty() 检测保证只执行一次，重复调用是安全的。
+ *
+ * 结果写入全局变量 hugetlb_bootmem_nodes（nodemask_t），后续的
+ * CMA 预留和 gigantic 巨页分配都以此掩码为目标节点集合。
+ */
+/* memblock
+memblock 是内核启动极早期的临时内存分配器。
+
+---
+为什么需要它
+
+内核刚启动时，buddy 分配器（正式的内存管理器）还没初始化，kmalloc/vmalloc 都不能用。但内核自身的初始化代码又需要分配内存（页表、数据结构等）。
+
+memblock 就是填补这个空白的简单粗暴的临时方案。
+
+---
+memblock 的数据结构
+
+非常简单，就是两个数组：
+
+memblock.memory[]   记录所有可用物理内存区间
+    [0]: 0x40000000 ~ 0x7FFFFFFF  (node 0, 1GB)
+    [1]: 0x80000000 ~ 0xBFFFFFFF  (node 1, 1GB)
+    ...
+
+memblock.reserved[] 记录已被占用的区间
+    [0]: 0x40000000 ~ 0x40FFFFFF  (内核镜像)
+    [1]: 0x41000000 ~ 0x410FFFFF  (设备树)
+    ...
+
+---
+信息来源
+
+固件（UEFI / 设备树 / BIOS e820）在启动时告诉内核有哪些物理内存，setup_arch() 把这些信息填入 memblock.memory[]。
+
+---
+分配原理
+
+分配时从 memory[] 中找一段空闲区间（不在 reserved[] 中），然后把它加入 reserved[]：
+
+分配 1MB：
+    扫描 memory[]，找到空闲区间
+    在 reserved[] 中记录这段区间
+    返回该物理地址
+
+没有释放的概念——分配出去就不回收，因为生命周期极短。
+
+---
+生命周期
+
+固件交接
+   ↓
+setup_arch()      ← memblock 填充物理内存信息
+   ↓
+mm_core_init_early()  ← hugetlb/CMA 用 memblock 预留内存
+   ↓
+free_area_init()  ← buddy 数据结构建立
+   ↓
+memblock_free_all()   ← memblock 把所有空闲内存移交 buddy，自己退出历史舞台
+   ↓
+buddy 接管，kmalloc 可用
+
+memblock_free_all() 之后 memblock 就不再使用，其自身占用的内存也被释放。
+
+*/
 void __init hugetlb_bootmem_set_nodes(void)
 {
 	int i, nid;
 	unsigned long start_pfn, end_pfn;
 
+	/* 幂等性保证：若掩码已建立（上次调用已填充），直接返回，
+	 * 避免重复扫描 memblock。hugetlb_cma_reserve() 和
+	 * hugetlb_bootmem_alloc() 都会调用本函数，两者调用顺序
+	 * 不固定，此检测确保只扫描一次。 */
 	if (!nodes_empty(hugetlb_bootmem_nodes))
 		return;
 
+	/* for_each_mem_pfn_range：遍历 memblock 中所有物理内存区间，
+	 * 每次迭代返回一段连续 PFN 范围 [start_pfn, end_pfn) 及其所属节点 nid。
+	 * MAX_NUMNODES 作为 nid 参数表示"遍历所有节点"。
+	 *
+	 * end_pfn > start_pfn 过滤空区间（memblock 中可能存在零长度条目），
+	 * 只有真正有物理页的节点才加入掩码。 */
 	for_each_mem_pfn_range(i, MAX_NUMNODES, &start_pfn, &end_pfn, &nid) {
 		if (end_pfn > start_pfn)
+			/* 将该节点加入 hugetlb_bootmem_nodes 掩码，
+			 * 表示此节点有物理内存，可以在上面预留/分配巨页。 */
 			node_set(nid, hugetlb_bootmem_nodes);
 	}
 }
 
+/*
+ * hugetlb_bootmem_alloc - 通过 memblock 分配启动阶段的 gigantic 巨页
+ *
+ * 调用时机：hugetlb_cma_reserve() 之后，free_area_init() 之前，
+ * memblock 仍然可用，buddy 分配器尚未建立。
+ *
+ * 只处理 gigantic 页（order > MAX_PAGE_ORDER，如 x86 上的 1GiB 页）。
+ * 普通大页（2MiB/4MiB）的实际分配延迟到 hugetlb_init_hstates()，
+ * 因为普通大页可以通过 buddy 分配，不需要在此阶段抢占连续内存。
+ *
+ * 已分配的 gigantic 页挂在 huge_boot_pages[nid] 链表，
+ * 等 buddy 就绪后由 hugetlb_init_hstates() 正式移交给 hugetlb 子系统管理。
+ */
 void __init hugetlb_bootmem_alloc(void)
 {
 	struct hstate *h;
 	int i;
 
+	/* 构建 hugetlb_bootmem_nodes 掩码：扫描 memblock 找到所有有物理内存的节点。
+	 * 若已建立（hugetlb_cma_reserve 已调用过）则直接返回，避免重复扫描。 */
 	hugetlb_bootmem_set_nodes();
 
+	/* 初始化每个 NUMA 节点的 huge_boot_pages 链表。
+	 * 该链表是 __initdata，用于在 buddy 就绪前临时存放已分配的 gigantic 页描述符。
+	 * buddy 初始化完成后，这些页会被移交给 hugetlb 子系统的 hstate 管理。 */
 	for (i = 0; i < MAX_NUMNODES; i++)
 		INIT_LIST_HEAD(&huge_boot_pages[i]);
 
+	/* 延迟解析 hugetlb 命令行参数（hugepagesz=/hugepages=/default_hugepagesz=）。
+	 * 这些参数不能用 early_param 直接处理，因为各架构确定合法大页大小的时机不同，
+	 * 过早解析会错误拒绝合法的 hugepagesz= 值。
+	 * 内核将参数暂存在 hugetlb_params[]，此处统一消费。
+	 * 同时调用 hugetlb_cma_validate_params()：若 hugetlb_cma_size == 0
+	 * 则清除 hugetlb_cma_only 标志，防止后续错误地走 CMA 路径。 */
 	hugetlb_parse_params();
 
+	/* 遍历所有 hstate（每种大页尺寸对应一个 hstate 结构体）。 */
 	for_each_hstate(h) {
+		/* 初始化 NUMA 轮转分配起始节点为第一个在线节点。
+		 * 后续分配时 hugetlb 子系统从此节点开始轮转，保证 NUMA 均衡。 */
 		h->next_nid_to_alloc = first_online_node;
 
+		/* 仅对 gigantic 页在此阶段分配物理内存。
+		 * hugetlb_hstate_alloc_pages() 内部：
+		 *   - 若 CMA 已预留（hugetlb_cma_total_size() > 0）且该 hstate
+		 *     使用 CMA 路径，则跳过（实际分配由 CMA 在需要时完成）；
+		 *   - 否则调用 hugetlb_gigantic_pages_alloc_boot()，循环通过
+		 *     alloc_bootmem_huge_page() 从 memblock 分配指定数量的 gigantic 页，
+		 *     每个页的描述符添加到 huge_boot_pages[nid] 链表。 */
 		if (hstate_is_gigantic(h))
 			hugetlb_hstate_alloc_pages(h);
 	}

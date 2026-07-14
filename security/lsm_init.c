@@ -381,17 +381,47 @@ void __init security_add_hooks(struct security_hook_list *hooks, int count,
 
 /**
  * early_security_init - Initialize the early LSMs
+ * 在 start_kernel() 极早期初始化必须在其他子系统之前就绪的 LSM（Linux Security Module）。与后期的 security_init() 不同，这里的 LSM 不受命令行参数控制，强制启用。
  */
+/*
+	与 security_init() 的分工
+
+	early_security_init()   ← start_kernel() 极早期
+		只初始化 DEFINE_EARLY_LSM 注册的 LSM（目前仅 lockdown）
+		强制启用，不受命令行控制
+
+	security_init()         ← 稍后，setup_arch() 之后
+		初始化所有普通 LSM（SELinux、AppArmor、BPF LSM 等）
+		受 lsm=/security= 命令行参数控制顺序和启用状态
+*/
 int __init early_security_init(void)
 {
 	struct lsm_info *lsm;
 
 	/* NOTE: lsm_pr_dbg() doesn't work here as lsm_debug is not yet set */
 
+	/*
+		遍历对象：.early_lsm_info.init section
+
+		通过 DEFINE_EARLY_LSM 宏注册的 LSM 被放入专用 section：
+
+		#define DEFINE_EARLY_LSM(lsm)
+			static struct lsm_info __early_lsm_##lsm
+				__used __section(".early_lsm_info.init")
+
+		目前只有一个：lockdown LSM（security/lockdown/lockdown.c）。
+		lockdown 控制内核的完整性保护（防止 root 访问内核内存），必须在任何可能违反完整性的操作之前就绪。
+	*/
 	lsm_early_for_each_raw(lsm) {
+		// 强制标记为启用，不受命令行 lsm= 参数影响
 		lsm_enabled_set(lsm, true);
+		// 加入全局 LSM 顺序列表，来源标记为 "early"
 		lsm_order_append(lsm, "early");
+		// 累加该 LSM 需要的 blob 空间
+		// 每个 LSM 需要在内核对象（cred/inode/file/sock 等）上附加私有数据（blob），这一步把该 LSM 需要的各类 blob 大小累加到全局 blob_sizes 中。后续分配这些对象时会按总大小预留空间
 		lsm_prepare(lsm);
+		// 调用 lsm->init() 执行实际初始化
+		// 调用 LSM 自己的 init() 函数，注册 hook 回调。对 lockdown 来说，就是向安全框架注册各个 hook（如 locked_down）
 		lsm_init_single(lsm);
 		lsm_count_early++;
 	}

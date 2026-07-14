@@ -522,31 +522,112 @@ static void __jump_label_update(struct static_key *key,
 }
 #endif
 
+/*
+ * jump_label_init - 初始化静态分支（static key）机制
+ *
+ * 【背景】
+ * 内核中大量使用 static_branch_likely/unlikely() 做特性开关，例如：
+ *   if (static_branch_unlikely(&tracing_enabled)) { ... }
+ *
+ * 普通条件跳转每次都要读取变量、做分支预测。静态分支的做法是：
+ * 直接在内核代码段（.text）原地 patch 机器码：
+ *   特性关闭 → 该处是 NOP 指令，CPU 直接跳过，零分支预测开销
+ *   特性开启 → 该处被 patch 成 B（跳转）指令，直接跳到特性代码
+ *
+ * 编译器在每个 static_branch_xxx() 调用处生成一个 struct jump_entry，
+ * 收集到内核镜像的 __jump_table section（__start___jump_table ~
+ * __stop___jump_table），记录三个信息：
+ *   code   - 需要被 patch 的指令地址（相对偏移）
+ *   target - 若开启跳转，跳到哪里（相对偏移）
+ *   key    - 对应哪个 static_key（相对偏移）
+ *
+ * 本函数在内核启动早期（start_kernel）调用，完成 patch 表的三项初始化工作：
+ *   1. 对 __jump_table 按 key 地址排序
+ *   2. 将初始状态为 NOP 的条目原地写入 NOP 机器码（修正编译器的默认生成值）
+ *   3. 建立 static_key → jump_entry 链表，供后续 enable/disable 时快速找到
+ *      所有需要 patch 的位置
+ *
+ * 调用时机：极早期，SMP 尚未启动，但需要在任何 static_key 被使用之前完成。
+ */
+/*
+jump_entry
+需要编译器支持，结合开发者的特定写法，普通 if 永远不会生成 jump_entry。
+核心是 JUMP_TABLE_ENTRY 这个宏，调用了汇编向 __jump_table section 写入了当前
+*/
 void __init jump_label_init(void)
 {
+	// __start___jump_table 和 __stop___jump_table 是链接器自动生成的首尾符号
 	struct jump_entry *iter_start = __start___jump_table;
 	struct jump_entry *iter_stop = __stop___jump_table;
 	struct static_key *key = NULL;
 	struct jump_entry *iter;
 
+	/* 幂等性保护：若已初始化则直接返回。
+	 * 防止某些架构在极早期调用过一次后又重复调用。 */
 	if (static_key_initialized)
 		return;
 
+	/* cpus_read_lock()：防止 CPU 热插拔在初始化期间改变 CPU 集合。
+	 * 虽然此时 SMP 尚未启动，但保持与运行期 patch 路径一致的锁序，
+	 * 避免将来引入热插拔支持时出现死锁。 */
 	cpus_read_lock();
+
+	/* jump_label_lock()：持有全局互斥锁，防止并发 patch 操作。
+	 * 初始化阶段是单 CPU，此锁实际不会竞争，但语义上必须持有，
+	 * 因为后续所有修改 jump_table 的路径都需要此锁。 */
 	jump_label_lock();
+
+	/* 对 __jump_table 按 key 地址升序排序。
+	 * 目的：让同一个 static_key 的所有 jump_entry 在表中连续排列。
+	 * 这样建立 key→entries 链表时只需线性扫描，遇到新 key 才更新指针，
+	 * 而不需要每次全表搜索。排序也使后续 enable/disable 遍历更高效。
+	 * 注意：CONFIG_HAVE_ARCH_JUMP_LABEL_RELATIVE 时 entry 使用相对偏移，
+	 * 排序前需要先将偏移转换为绝对地址（sort 时会临时调整）。 */
 	jump_label_sort_entries(iter_start, iter_stop);
 
 	for (iter = iter_start; iter < iter_stop; iter++) {
 		struct static_key *iterk;
 		bool in_init;
 
-		/* rewrite NOPs */
+		/* rewrite NOPs
+		 *
+		 * 编译器生成 jump_entry 时，该位置的机器码可能是跳转指令（JMP），
+		 * 也可能是 NOP，取决于编译器的默认选择。
+		 * jump_label_type() 根据对应 static_key 的初始值（enabled 字段）
+		 * 和 entry 的方向（branch/fallthrough）计算出"该位置应该是什么"：
+		 *   结果为 JUMP_LABEL_NOP → 此处应是 NOP（特性默认关闭）
+		 *   结果为 JUMP_LABEL_JMP → 此处应是 JMP（特性默认开启）
+		 *
+		 * 这里只处理 NOP 情况，原因：
+		 *   - NOP 表示特性默认关闭，编译器有时会生成跳转指令，需要改写成 NOP
+		 *   - JMP 情况编译器生成是正确的，不需要修正
+		 *
+		 * arch_jump_label_transform_static() 与运行期的
+		 * arch_jump_label_transform() 的区别：
+		 *   _static 版本：初始化阶段用，不需要 IPI 同步其他 CPU（此时单 CPU）
+		 *   普通版本：运行期 enable/disable 时用，需要 kick_all_cpus_sync()
+		 *             确保所有 CPU 的指令缓存看到新指令 */
 		if (jump_label_type(iter) == JUMP_LABEL_NOP)
 			arch_jump_label_transform_static(iter, JUMP_LABEL_NOP);
 
+		/* 检测该 patch 点（jump_entry.code 指向的指令）是否位于 __init section。
+		 * __init section 的代码在内核初始化完成后会被释放（内存归还给 buddy）。
+		 * 标记 in_init 的目的：init 代码释放后，禁止再对这些地址做 patch，
+		 * 否则会写入已释放的内存，引发崩溃。
+		 * 运行期 enable/disable 时，jump_label_can_update() 会检查此标志。 */
 		in_init = init_section_contains((void *)jump_entry_code(iter), 1);
 		jump_entry_set_init(iter, in_init);
 
+		/* 建立 static_key → jump_entry 链表。
+		 * 因为已按 key 地址排序，相同 key 的 entry 连续排列，
+		 * 只有遇到新的 key 时才需要更新 key->entries 指针。
+		 *
+		 * static_key_set_entries(key, iter) 将 key->entries 指向
+		 * 该 key 的第一个 jump_entry，后续 entry 在数组中连续存放，
+		 * 通过 jump_entry_key(entry) == key 判断是否属于同一个 key。
+		 *
+		 * 这样 static_branch_enable(key) 时，只需从 key->entries 开始
+		 * 线性扫描直到 key 不匹配，找到所有需要 patch 的位置。 */
 		iterk = jump_entry_key(iter);
 		if (iterk == key)
 			continue;
@@ -554,6 +635,10 @@ void __init jump_label_init(void)
 		key = iterk;
 		static_key_set_entries(key, iter);
 	}
+
+	/* 设置全局标志，表示 jump_table 初始化完成，static_key 可以安全使用。
+	 * STATIC_KEY_CHECK_USE() 宏会在每次 static_key 操作前检查此标志，
+	 * 若在 jump_label_init() 之前就使用 static_key，会触发 WARN。 */
 	static_key_initialized = true;
 	jump_label_unlock();
 	cpus_read_unlock();

@@ -847,8 +847,20 @@ static int random_pm_notification(struct notifier_block *nb, unsigned long actio
 static struct notifier_block pm_notifier = { .notifier_call = random_pm_notification };
 
 /*
- * This is called extremely early, before time keeping functionality is
- * available, but arch randomness is. Interrupts are not yet enabled.
+ * random_init_early - RNG 最早期初始化（时钟子系统就绪前）
+ *
+ * 调用时机：start_kernel() 极早期，时钟计数器不可用，中断尚未使能。
+ * 此阶段能获取的熵源非常有限，主要依赖：
+ *   1. 编译时潜在熵（LATENT_ENTROPY_PLUGIN）
+ *   2. CPU 硬件随机数生成器（RDRAND/RDSEED 或 ARM64 的 mrs rndrrs）
+ *   3. 内核版本信息（utsname）和命令行参数
+ *
+ * 整个 RNG 子系统的状态机：
+ *   CRNG_EMPTY  (0) → 几乎没有熵，/dev/urandom 会发出警告
+ *   CRNG_EARLY  (1) → 积累了 POOL_EARLY_BITS（=128 bits），可用于早期加密
+ *   CRNG_READY  (2) → 积累了 POOL_READY_BITS（=256 bits），完全初始化
+ *
+ * 所有熵数据都通过 _mix_pool_bytes() 混入 input_pool（一个 BLAKE2s 哈希状态）。
  */
 void __init random_init_early(const char *command_line)
 {
@@ -856,10 +868,25 @@ void __init random_init_early(const char *command_line)
 	size_t i, longs, arch_bits;
 
 #if defined(LATENT_ENTROPY_PLUGIN)
+	/* GCC 插件 LATENT_ENTROPY_PLUGIN 在编译时用随机字节填充 compiletime_seed，
+	 * 每次编译生成不同的值，使不同编译版本的内核初始熵池状态不同。
+	 * __latent_entropy 标记告诉插件在此处注入随机数据，
+	 * __initconst 确保数据在 init 完成后被释放。 */
 	static const u8 compiletime_seed[BLAKE2S_BLOCK_SIZE] __initconst __latent_entropy;
 	_mix_pool_bytes(compiletime_seed, sizeof(compiletime_seed));
 #endif
 
+	/* 尽量从 CPU 硬件随机数获取熵，填满 entropy[] 数组（一个 BLAKE2s 块大小）。
+	 * arch_bits 追踪成功从硬件获取的位数，失败的槽位不计入熵贡献。
+	 *
+	 * 优先使用 arch_get_random_seed_longs()（对应 x86 RDSEED / arm64 RNDRRS）：
+	 *   从真实物理熵源（热噪声等）获取，质量最高，但可能暂时不可用（返回 0）。
+	 *
+	 * 退而使用 arch_get_random_longs()（对应 x86 RDRAND / arm64 RNDR）：
+	 *   从 DRBG（确定性随机位生成器）获取，基于硬件种子，质量略低于 RDSEED。
+	 *
+	 * 若两者都返回 0（硬件不支持或暂时不可用），该槽位跳过，arch_bits 减少，
+	 * 不将全零数据当作熵（避免熵池被低质量数据污染）。 */
 	for (i = 0, arch_bits = sizeof(entropy) * 8; i < ARRAY_SIZE(entropy);) {
 		longs = arch_get_random_seed_longs(entropy, ARRAY_SIZE(entropy) - i);
 		if (longs) {
@@ -873,14 +900,30 @@ void __init random_init_early(const char *command_line)
 			i += longs;
 			continue;
 		}
+		/* 此槽位无法从硬件获取，不计入熵贡献。 */
 		arch_bits -= sizeof(*entropy) * 8;
 		++i;
 	}
 
+	/* 混入内核版本信息（uts_namespace：hostname/sysname/release/version/machine）。
+	 * 不同系统的 utsname 不同，防止不同机器的熵池初始状态相同。 */
 	_mix_pool_bytes(init_utsname(), sizeof(*(init_utsname())));
+
+	/* 混入内核命令行参数（如 root=、console=、KASLR 偏移等）。
+	 * 命令行在不同启动中可能不同，提供额外的区分度。 */
 	_mix_pool_bytes(command_line, strlen(command_line));
 
-	/* Reseed if already seeded by earlier phases. */
+	/* Reseed if already seeded by earlier phases.
+	 *
+	 * 某些架构（如 EFI stub）在更早阶段已向熵池注入了足够的熵，
+	 * 若此时 crng 已就绪，立即重新播种以利用新混入的数据。
+	 *
+	 * 否则，若配置信任 CPU 硬件随机数（trust_cpu=true，默认开启），
+	 * 将本轮从硬件获取的 arch_bits 位计入熵池，
+	 * 若累积到 POOL_READY_BITS（256位）则触发 crng_ready 状态转换。
+	 *
+	 * trust_cpu 可通过命令行 random.trust_cpu=0 禁用，
+	 * 适用于不信任 CPU 硬件随机数实现的安全敏感场景。 */
 	if (crng_ready())
 		crng_reseed(NULL);
 	else if (trust_cpu)
@@ -888,31 +931,65 @@ void __init random_init_early(const char *command_line)
 }
 
 /*
- * This is called a little bit after the prior function, and now there is
- * access to timestamps counters. Interrupts are not yet enabled.
+ * random_init - RNG 第二阶段初始化（时钟子系统就绪后）
+ *
+ * 调用时机：time_init() 之后，中断使能之前。
+ * 此时时钟计数器可用，可以获取高精度时间戳作为额外熵源。
+ *
+ * 与 random_init_early() 的分工：
+ *   early：依赖 CPU 硬件随机数，在时钟不可用时运行
+ *   本函数：依赖时间戳熵，补充 early 阶段可能遗漏的熵
  */
 void __init random_init(void)
 {
+	/* random_get_entropy()：读取 CPU 周期计数器（如 x86 TSC、arm64 CNTVCT_EL0）
+	 * 作为熵源。时钟计数器值在每次启动时不同，提供时间相关的随机性。
+	 * 若无时钟计数器（某些嵌入式 CPU），返回 0，后面有 WARN 提示。 */
 	unsigned long entropy = random_get_entropy();
+
+	/* ktime_get_real()：读取当前墙钟时间（UTC 时间戳）。
+	 * 与 random_get_entropy() 的 CPU 周期计数不同，这是人类可读的时间，
+	 * 两者结合提供更多维度的时间随机性。 */
 	ktime_t now = ktime_get_real();
 
+	/* 将时间戳混入熵池，增加初始状态的不可预测性。 */
 	_mix_pool_bytes(&now, sizeof(now));
 	_mix_pool_bytes(&entropy, sizeof(entropy));
+
+	/* add_latent_entropy()：若启用了 LATENT_ENTROPY_PLUGIN，将编译时注入到
+	 * latent_entropy 全局变量中的随机值混入熵池（与 random_init_early 中
+	 * compiletime_seed 不同，这个值在内核运行期间会被各处代码路径修改）。
+	 * 未启用插件时此调用为空操作。 */
 	add_latent_entropy();
 
 	/*
 	 * If we were initialized by the cpu or bootloader before workqueues
 	 * are initialized, then we should enable the static branch here.
+	 *
+	 * workqueue 初始化之前，_credit_init_bits() 无法通过 queue_work() 调度
+	 * crng_set_ready 工作项来开启 crng_is_ready 静态分支。
+	 * 现在 workqueue 已就绪，若 crng_init 已达到 CRNG_READY 但静态分支
+	 * 尚未开启（crng_is_ready 仍为 false），在此补充开启。
+	 * crng_is_ready 静态分支开启后，crng_ready() 查询变为单条 NOP，零开销。
 	 */
 	if (!static_branch_likely(&crng_is_ready) && crng_init >= CRNG_READY)
 		crng_set_ready(NULL);
 
-	/* Reseed if already seeded by earlier phases. */
+	/* Reseed if already seeded by earlier phases.
+	 * 若 early 阶段已完成初始化，利用新混入的时间戳熵立即重新播种，
+	 * 刷新 crng（ChaCha20 流密码密钥），进一步增强随机数质量。 */
 	if (crng_ready())
 		crng_reseed(NULL);
 
+	/* 注册电源管理通知回调 random_pm_notification：
+	 * 系统 suspend/resume 时将休眠时长、恢复时间戳混入熵池，
+	 * 防止 resume 后 RNG 状态与 suspend 前相同（时间流逝是额外熵源）。
+	 * resume 后若 crng 已就绪，还会主动重新播种以刷新密钥。 */
 	WARN_ON(register_pm_notifier(&pm_notifier));
 
+	/* 若 entropy=0，说明既没有 CPU 周期计数器也没有备用定时器，
+	 * 系统将严重缺乏时序熵，RNG 质量会受到影响，发出内核警告。
+	 * 某些极简嵌入式系统可能遇到此情况。 */
 	WARN(!entropy, "Missing cycle counter and fallback timer; RNG "
 		       "entropy collection will consequently suffer.");
 }

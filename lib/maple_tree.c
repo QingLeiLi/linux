@@ -5634,6 +5634,22 @@ void __init maple_tree_init(void)
 		.sheaf_capacity = 32,
 	};
 
+	// 创建一个 slab 缓存 maple_node_cache，专门用于分配 struct maple_node 对象
+	/*
+		为什么要专用 slab 缓存
+
+		maple tree 是内核 5.15 引入的数据结构，用来替代 VMA（虚拟内存区域）管理中的红黑树，每个进程的地址空间用一棵 maple tree 管理所有 VMA。
+
+		系统运行时会有大量 struct maple_node 的分配和释放：
+
+		进程 fork → 复制 VMA → 大量分配 maple_node
+		mmap/munmap → 插入/删除节点 → 频繁分配释放
+
+		用专用 slab 缓存的好处：
+		- 同类型对象聚集在一起，减少内存碎片
+		- slab 分配器针对固定大小对象做了优化，比通用 kmalloc 快
+		- SLAB_PANIC 表示分配失败直接 panic，因为没有 maple tree 内核无法管理 VMA
+	*/
 	maple_node_cache = kmem_cache_create("maple_node",
 			sizeof(struct maple_node), &args,
 			SLAB_PANIC);

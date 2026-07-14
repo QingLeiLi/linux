@@ -24,7 +24,22 @@
  */
 static struct lock_class_key irq_desc_lock_class;
 
+/*
+ * irq_default_affinity - 中断默认 CPU 亲和性掩码
+ *
+ * 决定新注册的中断默认可以在哪些 CPU 上被投递和处理。
+ * 可通过内核命令行参数 irqaffinity=<cpulist> 设置，
+ * 例如 irqaffinity=0-3 表示所有中断默认只在 CPU 0~3 上处理。
+ * 若未指定，默认为所有 CPU（cpumask_setall）。
+ */
 #if defined(CONFIG_SMP)
+/*
+ * irq_affinity_setup - 解析 irqaffinity= 命令行参数
+ *
+ * 在极早期（__setup 阶段）解析用户指定的 CPU 列表，写入 irq_default_affinity。
+ * 同时强制将 boot CPU 加入掩码：防止用户指定了不含任何在线 CPU 的掩码，
+ * 导致无法投递中断（至少保证 boot CPU 始终可以接收中断）。
+ */
 static int __init irq_affinity_setup(char *str)
 {
 	alloc_bootmem_cpumask_var(&irq_default_affinity);
@@ -38,14 +53,25 @@ static int __init irq_affinity_setup(char *str)
 }
 __setup("irqaffinity=", irq_affinity_setup);
 
+/*
+ * init_irq_default_affinity - 初始化中断默认 CPU 亲和性掩码（SMP 版本）
+ *
+ * 若用户未通过 irqaffinity= 参数指定（irq_default_affinity 尚未分配），
+ * 分配并初始化为全 CPU 掩码（所有 CPU 都可处理中断）。
+ * 若已通过命令行分配但为空（解析结果为空集），同样重置为全 CPU 掩码，
+ * 防止系统启动后没有任何 CPU 能接收中断。
+ */
 static void __init init_irq_default_affinity(void)
 {
+	/* irq_affinity_setup() 已在命令行阶段分配并填写，此处跳过。 */
 	if (!cpumask_available(irq_default_affinity))
 		zalloc_cpumask_var(&irq_default_affinity, GFP_NOWAIT);
+	/* 兜底：若掩码为空，回退到允许所有 CPU。 */
 	if (cpumask_empty(irq_default_affinity))
 		cpumask_setall(irq_default_affinity);
 }
 #else
+/* UP（单 CPU）系统不需要亲和性掩码，空实现。 */
 static void __init init_irq_default_affinity(void)
 {
 }
@@ -189,6 +215,15 @@ struct irq_desc *irq_find_desc_at_or_after(unsigned int offset)
 	return mt_find(&sparse_irqs, &index, total_nr_irqs);
 }
 
+/*
+ * irq_insert_desc - 将 irq_desc 插入全局 sparse_irqs maple tree
+ * @irq:  中断号（作为 maple tree 的键）
+ * @desc: 要插入的 irq_desc 指针
+ *
+ * sparse_irqs 是一棵以中断号为键的 maple tree，用于在中断号空间稀疏
+ * （不连续）时高效存取 irq_desc，避免为所有可能的中断号分配连续数组。
+ * MA_STATE 宏创建 maple tree 操作状态，指定在 irq 这个键的位置存储 desc。
+ */
 static void irq_insert_desc(unsigned int irq, struct irq_desc *desc)
 {
 	MA_STATE(mas, &sparse_irqs, irq, irq);
@@ -205,28 +240,64 @@ static void delete_irq_desc(unsigned int irq)
 static const struct kobj_type irq_kobj_type;
 #endif
 
+/*
+ * init_desc - 初始化一个 irq_desc 结构体的所有字段
+ * @desc:     已分配但未初始化的 irq_desc 指针
+ * @irq:      中断号
+ * @node:     NUMA 节点（用于内存分配亲和性）
+ * @flags:    初始 irq_data 标志位
+ * @affinity: 初始 CPU 亲和性掩码，NULL 表示使用 irq_default_affinity
+ * @owner:    拥有该中断的内核模块（通常为 NULL）
+ *
+ * 分配 per-cpu 统计结构、CPU 亲和性掩码，初始化锁、互斥量、等待队列，
+ * 并通过 desc_set_defaults() 设置默认处理函数和 irq_data 字段。
+ */
 static int init_desc(struct irq_desc *desc, int irq, int node,
 		     unsigned int flags,
 		     const struct cpumask *affinity,
 		     struct module *owner)
 {
+	/* 分配 per-cpu 中断统计计数器（irqstat），记录每个 CPU 上该中断的触发次数，
+	 * 用于 /proc/interrupts 和 perf 统计。 */
 	desc->kstat_irqs = alloc_percpu(struct irqstat);
 	if (!desc->kstat_irqs)
 		return -ENOMEM;
 
+	/* 分配 SMP 亲和性掩码（affinity、effective_affinity、pending_mask），
+	 * 指定该中断可以/实际在哪些 CPU 上处理。UP 系统此函数为空。 */
 	if (alloc_masks(desc, node)) {
 		free_percpu(desc->kstat_irqs);
 		return -ENOMEM;
 	}
 
+	/* 初始化 irq_desc 的主锁，所有对 desc 的修改操作都需持此锁。
+	 * 所有 irq_desc 共用同一个 lockdep 锁类（irq_desc_lock_class），
+	 * 使 lockdep 把它们视为同一种锁，避免误报死锁。 */
 	raw_spin_lock_init(&desc->lock);
 	lockdep_set_class(&desc->lock, &irq_desc_lock_class);
+
+	/* 保护 request_irq/free_irq 不并发执行的互斥锁。 */
 	mutex_init(&desc->request_mutex);
+
+	/* 等待中断线程（threaded IRQ）退出的等待队列，
+	 * free_irq() 需要等待所有 IRQ 线程完成后才能释放 desc。 */
 	init_waitqueue_head(&desc->wait_for_threads);
+
+	/* 设置默认处理函数（handle_bad_irq）、irq_data（硬件 irq 号、domain 等）
+	 * 和 CPU 亲和性掩码（使用传入的 affinity 或 irq_default_affinity）。 */
 	desc_set_defaults(irq, desc, node, affinity, owner);
+
+	/* 将初始标志位写入 irq_data.state_use_accessors，
+	 * 例如 IRQ_NOAUTOEN（注册后不自动使能）等标志。 */
 	irqd_set(&desc->irq_data, flags);
+
+	/* 初始化中断重发（resend）机制：某些中断控制器在边沿触发模式下，
+	 * 若中断到来时被屏蔽，需要软件模拟重发以防止中断丢失。 */
 	irq_resend_init(desc);
+
 #ifdef CONFIG_SPARSE_IRQ
+	/* 初始化 sysfs kobject（对应 /sys/kernel/irq/N/ 目录）和 RCU head，
+	 * RCU head 用于延迟释放 desc（free_irq 后通过 RCU 安全释放）。 */
 	kobject_init(&desc->kobj, &irq_kobj_type);
 	init_rcu_head(&desc->rcu);
 #endif
@@ -427,6 +498,17 @@ void irq_unlock_sparse(void)
 	mutex_unlock(&sparse_irq_lock);
 }
 
+/*
+ * alloc_desc - 分配并初始化一个 irq_desc 结构体
+ * @irq:      中断号
+ * @node:     NUMA 节点，内存从该节点分配（减少跨节点访问延迟）
+ * @flags:    初始 irq_data 标志位（如 IRQ_NOAUTOEN）
+ * @affinity: 初始 CPU 亲和性掩码，NULL 表示使用默认掩码
+ * @owner:    拥有该中断的内核模块
+ *
+ * kzalloc_node 在指定 NUMA 节点分配并清零内存，然后调用 init_desc 完成
+ * 所有字段的初始化。分配失败或初始化失败时返回 NULL。
+ */
 static struct irq_desc *alloc_desc(int irq, int node, unsigned int flags,
 				   const struct cpumask *affinity,
 				   struct module *owner)
@@ -434,10 +516,14 @@ static struct irq_desc *alloc_desc(int irq, int node, unsigned int flags,
 	struct irq_desc *desc;
 	int ret;
 
+	/* 在 NUMA 节点 node 上分配 irq_desc，并清零所有字段。
+	 * NUMA 亲和分配使中断处理路径上的数据访问尽量在本地内存节点完成。 */
 	desc = kzalloc_node(sizeof(*desc), GFP_KERNEL, node);
 	if (!desc)
 		return NULL;
 
+	/* 初始化所有子字段（per-cpu 统计、亲和性掩码、锁、默认处理函数等），
+	 * 失败时释放已分配的 desc 内存并返回 NULL。 */
 	ret = init_desc(desc, irq, node, flags, affinity, owner);
 	if (unlikely(ret)) {
 		kfree(desc);
@@ -549,66 +635,125 @@ static bool irq_expand_nr_irqs(unsigned int nr)
 	return true;
 }
 
+/*
+ * early_irq_init - 中断子系统最早期初始化（CONFIG_SPARSE_IRQ 版本）
+ *
+ * 调用时机：start_kernel() 极早期，内存分配器就绪后，中断控制器驱动初始化前。
+ * 此时只需建立 irq_desc 的基础框架，实际硬件中断号由后续 irqchip_init() 确定。
+ *
+ * SPARSE_IRQ 模式：中断号空间可能很稀疏（不连续，如 0~1023 中只有少数几个使用），
+ * 用 maple tree（sparse_irqs）动态存储 irq_desc，按需分配，避免为所有可能的
+ * 中断号预分配大量 irq_desc 浪费内存。
+ *
+ * 初始化完成后 IRQ 框架可接受中断注册（request_irq），但中断控制器尚未启动，
+ * 实际中断还不会触发。
+ */
 int __init early_irq_init(void)
 {
 	int i, initcnt, node = first_online_node;
 	struct irq_desc *desc;
 
+	/* 初始化中断默认 CPU 亲和性掩码，确保新注册的中断有合法的投递目标 CPU。 */
 	init_irq_default_affinity();
 
-	/* Let arch update nr_irqs and return the nr of preallocated irqs */
+	/* Let arch update nr_irqs and return the nr of preallocated irqs
+	 *
+	 * 询问架构需要预分配多少个 irq_desc：
+	 *   - x86：根据 IOAPIC 数量和 MSI 配置计算，需要提前确定
+	 *   - arm64：返回 NR_IRQS_LEGACY（通常 16），真正的 GIC 中断号
+	 *     在 irqchip_init() → gic_init() 时才从设备树动态发现
+	 *
+	 * total_nr_irqs 是运行时总中断号上限，NR_IRQS 是编译时上限。 */
 	initcnt = arch_probe_nr_irqs();
 	printk(KERN_INFO "NR_IRQS: %d, nr_irqs: %d, preallocated irqs: %d\n",
 	       NR_IRQS, total_nr_irqs, initcnt);
 
+	/* 防御性检查：总数和预分配数均不得超过 sparse irq 的硬上限。 */
 	if (WARN_ON(total_nr_irqs > MAX_SPARSE_IRQS))
 		total_nr_irqs = MAX_SPARSE_IRQS;
 
 	if (WARN_ON(initcnt > MAX_SPARSE_IRQS))
 		initcnt = MAX_SPARSE_IRQS;
 
+	/* 若预分配数超过当前总数，扩大总数上限以容纳预分配的条目。 */
 	if (initcnt > total_nr_irqs)
 		total_nr_irqs = initcnt;
 
+	/* 预分配 initcnt 个 irq_desc 并插入 sparse_irqs maple tree。
+	 * 这些是"保留"中断号（如旧式 ISA 中断 0~15），后续驱动无需再动态分配。
+	 * 在 first_online_node 上分配，减少跨 NUMA 节点的内存访问延迟。 */
 	for (i = 0; i < initcnt; i++) {
 		desc = alloc_desc(i, node, 0, NULL, NULL);
 		irq_insert_desc(i, desc);
 	}
+
+	/* 根据 total_nr_irqs 计算 /proc/interrupts 输出的数字列宽（对齐宽度），
+	 * 例如 total_nr_irqs=1000 时列宽为 4（"%4d"）。 */
 	irq_proc_calc_prec();
+
+	/* 调用架构钩子做架构相关的早期中断初始化。
+	 * arm64 使用弱符号默认实现（return 0），什么都不做；
+	 * x86 等架构可能在此设置 APIC 相关的早期状态。 */
+	/*
+		为什么 arm64 不需要覆盖这两个函数
+
+		arm64 使用 GICv3/v4 中断控制器，中断号是动态发现的（从设备树或 ACPI MADT 解析），不需要在启动极早期就确定总数。
+		真正的 GIC 初始化发生在后续的 irqchip_init() 里，通过设备树驱动框架探测 GIC 并调用 gic_init()，那时才确定支持多少个硬件中断号。
+		相比之下，x86 的 arch_probe_nr_irqs 需要覆盖，因为它要根据 IOAPIC 数量和 MSI 配置提前计算中断号总量，在极早期就确定 irq_desc 数组大小。
+	*/
 	return arch_early_irq_init();
 }
 
 #else /* !CONFIG_SPARSE_IRQ */
 
+/*
+ * 非 SPARSE_IRQ 模式（CONFIG_SPARSE_IRQ 未开启）：
+ * 中断号空间连续且数量固定（NR_IRQS），使用静态数组 irq_desc[] 存储。
+ * 编译时已分配好内存（__cacheline_aligned_in_smp 保证 cache line 对齐），
+ * 适合中断号数量确定、不需要动态扩展的嵌入式/小型系统。
+ */
 struct irq_desc irq_desc[NR_IRQS] __cacheline_aligned_in_smp = {
 	[0 ... NR_IRQS-1] = {
-		.handle_irq	= handle_bad_irq,
-		.depth		= 1,
+		.handle_irq	= handle_bad_irq,  /* 默认处理函数：打印警告，中断未注册 */
+		.depth		= 1,               /* depth=1 表示初始处于屏蔽状态 */
 		.lock		= __RAW_SPIN_LOCK_UNLOCKED(irq_desc->lock),
 	}
 };
 
+/*
+ * early_irq_init - 中断子系统最早期初始化（非 SPARSE_IRQ 版本）
+ *
+ * 静态数组已在编译时分配，此处只需对每个 irq_desc 调用 init_desc()
+ * 完成动态字段的初始化（per-cpu 统计、亲和性掩码、锁等）。
+ * 任何一个 init_desc 失败则回滚已初始化的条目并返回错误。
+ */
 int __init early_irq_init(void)
 {
 	int count, i, node = first_online_node;
 	int ret;
 
+	/* 初始化中断默认 CPU 亲和性掩码。 */
 	init_irq_default_affinity();
 
 	pr_info("NR_IRQS: %d\n", NR_IRQS);
 
 	count = ARRAY_SIZE(irq_desc);
 
+	/* 逐个初始化静态数组中的每个 irq_desc。
+	 * 主要工作：分配 per-cpu 统计计数器、亲和性掩码，初始化锁和等待队列。 */
 	for (i = 0; i < count; i++) {
 		ret = init_desc(irq_desc + i, i, node, 0, NULL, NULL);
 		if (unlikely(ret))
 			goto __free_desc_res;
 	}
 
+	/* 计算 /proc/interrupts 输出列宽。 */
 	irq_proc_calc_prec();
 	return arch_early_irq_init();
 
 __free_desc_res:
+	/* 回滚：释放已初始化的 desc 的动态分配资源（亲和性掩码和 per-cpu 统计）。
+	 * 静态数组本身不需要 kfree，只需释放其中动态分配的字段。 */
 	while (--i >= 0) {
 		free_masks(irq_desc + i);
 		free_percpu(irq_desc[i].kstat_irqs);

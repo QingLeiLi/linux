@@ -173,18 +173,44 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 	return -EIO;
 }
 
+/*
+ * init_gic_priority_masking - 为当前 CPU 初始化 GIC PMR 优先级屏蔽模式
+ *
+ * 在启用 CONFIG_ARM64_PSEUDO_NMI 时，内核用 GIC PMR 寄存器（ICC_PMR_EL1）
+ * 代替 DAIF.I 位来控制中断开关，从而保留高优先级 FIQ 作为伪 NMI 穿透。
+ * 本函数对当前 CPU 完成该模式的硬件初始化，在 boot CPU 和每个 secondary
+ * CPU 启动时各调用一次。
+ *
+ * boot CPU 路径：smp_prepare_boot_cpu() → init_gic_priority_masking()
+ * secondary CPU 路径：secondary_start_kernel() → init_gic_priority_masking()
+ */
 static void init_gic_priority_masking(void)
 {
 	u32 cpuflags;
 
+	/* gic_enable_sre()：使能 GICv3 系统寄存器接口（SRE，System Register Enable）。
+	 * GICv3 的 CPU 接口可以通过内存映射或系统寄存器两种方式访问，
+	 * SRE 必须开启后才能用 MSR/MRS 指令直接读写 ICC_PMR_EL1 等寄存器。
+	 * 返回 false 说明 GIC 不支持 SRE，PMR 路径无法使用，发出警告并退出。 */
 	if (WARN_ON(!gic_enable_sre()))
 		return;
 
+	/* 读出当前 DAIF 值，断言 IRQ（PSR_I_BIT）和 FIQ（PSR_F_BIT）均已屏蔽。
+	 * 初始化 PMR 时必须处于关中断状态，防止在 PMR 尚未就绪时就有中断投递进来。
+	 * 若这两个断言触发，说明调用时序有误。 */
 	cpuflags = read_sysreg(daif);
-
 	WARN_ON(!(cpuflags & PSR_I_BIT));
 	WARN_ON(!(cpuflags & PSR_F_BIT));
 
+	/* 将 ICC_PMR_EL1 初始化为 GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET：
+	 *   GIC_PRIO_IRQON：将 PMR 阈值设置为"开中断"状态的值，
+	 *                   表示 GIC 侧允许投递普通中断；
+	 *   GIC_PRIO_PSR_I_SET：同时设置一个特殊标志位，告知内核此时
+	 *                        DAIF.I 仍然置位（中断实际被 DAIF 屏蔽），
+	 *                        保证 PMR 和 DAIF 的状态视图一致。
+	 * 之后内核通过写 PMR（而非 daifset/daifclr）来开关中断，
+	 * 中断是否实际到达 CPU 由 PMR 阈值决定，DAIF.F 保持清零以允许
+	 * 高优先级 FIQ（伪 NMI）穿透。 */
 	gic_write_pmr(GIC_PRIO_IRQON | GIC_PRIO_PSR_I_SET);
 }
 
@@ -444,24 +470,122 @@ void __init smp_cpus_done(unsigned int max_cpus)
 	mark_linear_text_alias_ro();
 }
 
+/*
+ * smp_prepare_boot_cpu - 完成 boot CPU（CPU 0）的 SMP 前置准备工作
+ *
+ * 调用时机：setup_per_cpu_areas() 之后，smp_init()（唤醒其他 CPU）之前。
+ * 此时只有 boot CPU 在运行，其他 CPU 尚未启动。
+ *
+ * 本函数完成四项工作：
+ *   1. 切换到运行时 per-cpu 区域
+ *   2. 读取并存储 boot CPU 的硬件信息
+ *   3. 检测 boot CPU 的硬件 capability
+ *   4. 初始化中断屏蔽和内存安全检测机制
+ */
 void __init smp_prepare_boot_cpu(void)
 {
 	/*
 	 * The runtime per-cpu areas have been allocated by
 	 * setup_per_cpu_areas(), and CPU0's boot time per-cpu area will be
 	 * freed shortly, so we must move over to the runtime per-cpu area.
+	 *
+	 * per-cpu 变量的访问依赖一个存储在寄存器中的"当前 CPU 的 per-cpu 区域基地址
+	 * 偏移"。arm64 用 tpidr_el1（或虚拟化时 tpidr_el2）寄存器存放这个偏移。
+	 *
+	 * 内核启动极早期使用的是编译进镜像的"boot time per-cpu 区域"（静态分配），
+	 * setup_per_cpu_areas() 已为每个 CPU 分配了正式的运行时区域并复制了初始值。
+	 * 此处调用 set_my_cpu_offset() 将 tpidr_el1 更新为 boot CPU 的运行时区域
+	 * 偏移，使后续所有 per-cpu 访问都指向运行时区域。
+	 * 旧的 boot time 区域稍后会被释放，若不切换则访问已释放内存。
 	 */
 	set_my_cpu_offset(per_cpu_offset(smp_processor_id()));
 
+	/* 读取 boot CPU 的 CPU ID 寄存器（MIDR、REVIDR、ID_AA64* 等系统寄存器），
+	 * 存入 per_cpu(cpu_data, 0) 和全局 boot_cpu_data，
+	 * 并调用 init_cpu_features() 根据这些寄存器值初始化 CPU feature 框架的
+	 * 基准线（后续 secondary CPU 的特性只能是 boot CPU 特性的子集）。 */
+	/*
+		features（特性）CPU 硬件有什么
+
+		CPU 硬件支持的功能，来自 CPU ID 寄存器（ID_AA64ISAR*、ID_AA64MMFR*、MIDR 等），直接反映硬件能力：
+
+		CPU 的 features（部分）：
+			MTE（内存标签扩展）
+			SVE（可扩展向量扩展）
+			BTI（分支目标识别）
+			PAC（指针认证）
+			LSE（大系统扩展，原子指令）
+			...
+
+		读出来是原始的寄存器字段值，描述"这颗 CPU 有什么硬件"。
+		cpuinfo_store_boot_cpu() 读取并存储的就是这些原始 feature 寄存器值。
+	*/
 	cpuinfo_store_boot_cpu();
+
+	/* 在 boot CPU 的硬件信息已存储的基础上：
+	 *   1. init_cpucap_indirect_list()：初始化 CPU capability 间接指针数组，
+	 *      为后续按 capability ID 快速查找做准备。
+	 *   2. detect_system_supports_pseudo_nmi()：检测 GIC 是否支持优先级屏蔽，
+	 *      决定是否可以启用伪 NMI，必须在 setup_boot_cpu_capabilities() 之前
+	 *      调用，因为后者依赖此检测结果。
+	 *   3. setup_boot_cpu_capabilities()：遍历所有 capability 定义，
+	 *      检测 boot CPU 支持哪些特性，写入 system_cpucaps 位图，
+	 *      并应用对应的 alternative patch（如将 NOP 替换为优化指令序列）。 */
+	/*
+		capability（能力）内核决定用什么
+
+		内核对 feature 的加工和决策结果——综合考虑硬件支持、内核配置、安全策略等因素，最终判断"内核是否启用这个功能"：
+
+		capability = feature + 内核决策
+
+		例：
+			硬件支持 MTE（feature 存在）
+			+ CONFIG_KASAN_HW_TAGS=y（内核编译开启）
+			+ 命令行没有 kasan.mode=off（运行时未禁用）
+			——→ ARM64_MTE capability 成立
+	*/
+	/*
+		features 和 capability 的关系
+
+		feature（硬件原始值）
+			↓ 经过 capability 定义中的 matches() 函数判断
+		capability（内核启用决策）
+			↓ 成立后
+		alternative patch（替换机器码中的 NOP 为优化指令）
+		system_uses_irq_prio_masking() 等查询函数返回 true
+
+		一个 capability 可能依赖多个 feature，也可能依赖其他 capability：
+
+		// ARM64_HAS_GIC_PRIO_MASKING 的成立条件：
+		//   1. GIC 支持优先级屏蔽（硬件 feature）
+		//   2. ARM64_HAS_GICV3_CPUIF capability 已成立
+		//   3. CONFIG_ARM64_PSEUDO_NMI=y（编译配置）
+		//   4. 命令行包含 irqchip.gicv3_pseudo_nmi=1
+	*/
 	setup_boot_cpu_features();
 
-	/* Conditionally switch to GIC PMR for interrupt masking */
+	/* Conditionally switch to GIC PMR for interrupt masking
+	 *
+	 * 若系统启用了 CONFIG_ARM64_PSEUDO_NMI 且 GIC 支持优先级屏蔽，
+	 * 切换到用 ICC_PMR_EL1 控制中断开关的模式（而非 DAIF.I 位），
+	 * 以支持高优先级 FIQ 作为伪 NMI 穿透关中断临界区。
+	 * system_uses_irq_prio_masking() 使用静态分支，运行时零开销。 */
 	if (system_uses_irq_prio_masking())
 		init_gic_priority_masking();
 
+	/* 初始化硬件内存标签（MTE，Memory Tagging Extension）用于 KASAN。
+	 * MTE 是 ARMv8.5 引入的硬件特性，可在内存访问时自动检查地址标签，
+	 * 用于检测堆溢出、use-after-free 等内存错误。
+	 * 若硬件不支持 MTE 或 KASAN 被命令行禁用，此函数直接返回。 */
 	kasan_init_hw_tags();
-	/* Init percpu seeds for random tags after cpus are set up. */
+
+	/* Init percpu seeds for random tags after cpus are set up.
+	 *
+	 * 初始化软件内存标签（sw-tags KASAN）的每 CPU 随机数种子。
+	 * sw-tags KASAN 在每次分配内存时生成随机标签写入指针高位，
+	 * 并在访问时验证，用于不支持 MTE 硬件的系统上检测内存错误。
+	 * 用 get_cycles()（CPU 时钟计数器）作为种子，确保各 CPU 种子不同。
+	 * 必须在 per-cpu 区域切换完成后调用，因为种子存储在 per-cpu 变量中。 */
 	kasan_init_sw_tags();
 }
 

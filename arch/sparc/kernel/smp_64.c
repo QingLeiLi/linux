@@ -1528,6 +1528,20 @@ static int __init pcpu_cpu_to_node(int cpu)
 	return cpu_to_node(cpu);
 }
 
+/*
+	编译时，所有 DEFINE_PER_CPU 变量被收集到内核镜像的 .data..percpu section，这是一份"模板"。
+
+	setup_per_cpu_areas 在运行时：
+
+	1. 根据实际 CPU 数量，为每个 CPU 分配一块内存区域
+	（大小 = .data..percpu section 的大小）
+
+	2. 把模板内容复制到每个 CPU 的区域（初始化变量的默认值）
+
+	3. 记录每个 CPU 区域的基地址偏移
+	访问 per_cpu(var, cpu) 时：
+	基地址偏移[cpu] + var在模板中的偏移 = 该CPU该变量的地址
+*/
 void __init setup_per_cpu_areas(void)
 {
 	unsigned long delta;

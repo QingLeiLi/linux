@@ -12,6 +12,39 @@
  * management can be a bitch. See 'mm/memory.c': 'copy_page_range()'
  */
 
+/*
+ * 【Android 安全研究注释】
+ *
+ * fork.c 是 Linux 内核进程创建的核心模块，负责实现所有进程/线程的创建逻辑。
+ * 每次 fork()、vfork()、clone() 系统调用最终都会走到这个文件中的函数。
+ *
+ * 与 Android 的关系：
+ *   Android 的进程模型以 Zygote 为核心。系统启动时，Zygote 进程预加载 ART
+ *   虚拟机和常用类库，之后每当启动一个 App，ActivityManagerService 通过
+ *   socket 通知 Zygote 调用 fork()，由此克隆出新的 App 进程。这个 fork()
+ *   最终就是由本文件的函数实现的。fork 比重新创建进程快得多，因为 COW
+ *   写时复制机制让父子进程初始共享内存页。
+ *
+ * 核心函数调用链：
+ *   用户态 fork()/clone()/clone3() 系统调用
+ *     → kernel_clone()       — 统一入口，解析 clone_flags
+ *       → copy_process()     — 核心：完成进程描述符复制、资源复制、安全设置
+ *         → dup_task_struct()     — 分配新 task_struct 和内核栈
+ *         → copy_creds()          — 复制/继承凭证（uid/gid/capabilities）
+ *         → security_task_alloc() — LSM 分配安全标签（SELinux domain）
+ *         → copy_mm()             — 复制内存空间（COW 或共享）
+ *         → copy_namespaces()     — 复制/共享命名空间（隔离边界）
+ *         → copy_thread()         — 复制 CPU 寄存器状态
+ *         → alloc_pid()           — 分配新 PID
+ *
+ * 安全边界说明：
+ *   - copy_creds()：决定子进程继承哪些权限，是权限隔离的关键点
+ *   - copy_namespaces()：决定子进程看到哪个 PID/网络/文件系统视图，
+ *     容器（Docker/Android 沙箱）隔离的基础
+ *   - security_task_alloc()：SELinux 在此为子进程打上安全标签，
+ *     Android 中每个 App 有独立的 SELinux domain
+ */
+
 #include <linux/anon_inodes.h>
 #include <linux/slab.h>
 #include <linux/sched/autogroup.h>
@@ -851,6 +884,24 @@ static void __init task_struct_whitelist(unsigned long *offset, unsigned long *s
 		*offset += offsetof(struct task_struct, thread);
 }
 
+/*
+ * 【fork_init】系统启动时的进程子系统初始化
+ *
+ * 由 start_kernel() 在系统引导阶段调用，完成以下初始化工作：
+ *
+ * 1. 创建 task_struct 的 slab 缓存（task_struct_cachep）：
+ *    task_struct 是进程描述符，每创建一个进程都需要从该缓存分配，
+ *    slab 缓存比直接 kmalloc 更高效，且支持 usercopy 白名单以防止
+ *    信息泄漏（只允许复制结构体中明确标记为安全的字段）。
+ *
+ * 2. 设置系统最大线程数（max_threads）：
+ *    根据系统内存大小计算上限，默认为内存页数 / 8（每个线程需要内核栈等）。
+ *    同时设置 init 进程的 RLIMIT_NPROC 为 max_threads/2。
+ *
+ * 3. 初始化每用户命名空间的资源计数上限（ucount_max）：
+ *    控制每个用户能创建的进程数，防止 fork bomb。
+ *    Android 中 AID_APP 用户受此限制约束。
+ */
 void __init fork_init(void)
 {
 	int i;
@@ -911,6 +962,31 @@ void set_task_stack_end_magic(struct task_struct *tsk)
 	*stackend = STACK_END_MAGIC;	/* for overflow detection */
 }
 
+/*
+ * 【dup_task_struct】为新进程分配并初始化 task_struct 和内核栈
+ *
+ * 这是 copy_process() 调用的第一步，为子进程准备最基本的数据结构。
+ *
+ * 主要工作：
+ * 1. 从 task_struct_cachep slab 缓存分配新的 task_struct（进程描述符），
+ *    并调用 arch_dup_task_struct() 将父进程的 task_struct 内容拷贝过来。
+ *
+ * 2. 分配新的内核栈（alloc_thread_stack_node）：
+ *    内核栈布局（以 ARM64 为例，栈向低地址增长）：
+ *      高地址：栈顶（初始 sp 指向此处）
+ *        ...   内核函数调用帧
+ *      低地址：thread_info（嵌入在 task_struct 中，或位于栈底）
+ *    set_task_stack_end_magic() 在栈底写入 STACK_END_MAGIC 魔数，
+ *    用于运行时检测内核栈溢出（内核栈溢出是严重的安全漏洞）。
+ *
+ * 3. 设置 stack canary（tsk->stack_canary）：
+ *    CONFIG_STACKPROTECTOR 启用时，每个进程的内核栈有独立的随机 canary 值，
+ *    GCC/Clang 的栈保护插桩会在函数返回前校验，防止栈缓冲区溢出攻击。
+ *
+ * 4. 将 seccomp.filter 置 NULL：
+ *    seccomp 过滤器在 copy_process() 后续步骤中正式继承，
+ *    这里先清零防止错误引用父进程的过滤器链。
+ */
 static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 {
 	struct task_struct *tsk;
@@ -1986,6 +2062,43 @@ static bool need_futex_hash_allocate_default(u64 clone_flags)
  * parts of the process environment (as per the clone
  * flags). The actual kick-off is left to the caller.
  */
+
+/*
+ * 【copy_process】进程创建的核心函数 —— 所有创建工作都在这里完成
+ *
+ * 无论是 fork()、vfork()、clone() 还是 clone3()，最终都通过 kernel_clone()
+ * 调用本函数。函数接收 clone_flags 标志位，决定哪些资源被复制、哪些被共享。
+ *
+ * 整体流程分为以下几个阶段：
+ *
+ * 【阶段一：标志位合法性检查】
+ *   检查 clone_flags 的标志组合是否合法，例如：
+ *   - CLONE_NEWNS 与 CLONE_FS 不能同时设置（新挂载命名空间时不能共享根目录）
+ *   - CLONE_THREAD 必须同时设置 CLONE_SIGHAND（线程必须共享信号处理器）
+ *
+ * 【阶段二：分配进程描述符】
+ *   dup_task_struct() 分配 task_struct 和内核栈，这是进程存在的物理基础。
+ *
+ * 【阶段三：凭证与安全检查】
+ *   copy_creds() 复制父进程凭证，security_task_alloc() 分配 LSM 安全标签。
+ *
+ * 【阶段四：资源复制】
+ *   依次复制文件描述符表、文件系统信息、信号处理器、内存空间、命名空间等。
+ *   根据 clone_flags，各资源可能是独立复制或与父进程共享。
+ *
+ * 【阶段五：进程标识与调度】
+ *   copy_thread() 复制 CPU 寄存器状态，alloc_pid() 分配新 PID，
+ *   sched_fork() 设置调度参数。
+ *
+ * 【阶段六：加入进程树】
+ *   将新进程挂入父进程的子进程链表，加入全局进程哈希表，完成创建。
+ *
+ * 安全关注点（Android 场景）：
+ *   - Zygote fork App 进程时，clone_flags 不含 CLONE_VM（地址空间独立），
+ *     不含 CLONE_NEWPID（共享 PID 命名空间），也不含 CLONE_NEWNET（共享网络）。
+ *   - App 进程的隔离主要依赖 SELinux domain 转换（execve 后由 init 触发），
+ *     而非 fork 时的命名空间隔离。
+ */
 __latent_entropy struct task_struct *copy_process(
 					struct pid *pid,
 					int trace,
@@ -2145,6 +2258,21 @@ __latent_entropy struct task_struct *copy_process(
 #ifdef CONFIG_PROVE_LOCKING
 	DEBUG_LOCKS_WARN_ON(!p->softirqs_enabled);
 #endif
+	/*
+	 * 【安全边界：复制进程凭证】
+	 * copy_creds() 复制父进程的 struct cred（包含 uid/gid/euid/egid/
+	 * fsuid/fsgid 以及 capabilities 能力集）到子进程。
+	 *
+	 * fork 语义：子进程完全继承父进程的凭证，不做任何降权处理。
+	 * 这意味着 Zygote（以 root uid=0 或特殊 uid 运行）fork 出的子进程
+	 * 初始时也拥有同等权限，App 进程的降权（setuid 到 AID_APP_xxx）
+	 * 发生在 fork 之后、execve 之前（由 zygote 的 Java 层调用
+	 * Os.setuid/setgid 完成）。
+	 *
+	 * 安全隐患：如果 fork 后降权步骤被绕过，子进程将以高权限运行。
+	 * CLONE_NEWUSER 标志会触发新用户命名空间的创建，此时 uid 映射
+	 * 需要显式配置（/proc/<pid>/uid_map），是容器逃逸研究的重点。
+	 */
 	retval = copy_creds(p, clone_flags);
 	if (retval < 0)
 		goto bad_fork_free;
@@ -2259,6 +2387,7 @@ __latent_entropy struct task_struct *copy_process(
 	if (retval)
 		goto bad_fork_cleanup_policy;
 
+	/* 继承父进程的性能监控事件（perf_event）设置 */
 	retval = perf_event_init_task(p, clone_flags);
 	if (retval)
 		goto bad_fork_sched_cancel_fork;
@@ -2267,33 +2396,128 @@ __latent_entropy struct task_struct *copy_process(
 		goto bad_fork_cleanup_perf;
 	/* copy all the process information */
 	shm_init_task(p);
+	/*
+	 * 【安全标签分配：LSM/SELinux】
+	 * security_task_alloc() 调用所有已注册的 LSM（Linux Security Module）
+	 * 钩子为新进程分配安全上下文（security blob）。
+	 *
+	 * 对于 SELinux：新进程初始继承父进程的 SELinux domain（类型）。
+	 * 真正的 domain transition（域转换）发生在 execve() 时，由 SELinux
+	 * 策略中的 type_transition 规则触发。
+	 *
+	 * Android 中每个 App 有独立的 SELinux domain（如 untrusted_app、
+	 * isolated_app），这是 Android 沙箱的核心机制之一，限制 App
+	 * 能访问的文件、设备、系统调用等。
+	 */
 	retval = security_task_alloc(p, clone_flags);
 	if (retval)
 		goto bad_fork_cleanup_audit;
 	retval = copy_semundo(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_security;
+	/*
+	 * 【资源复制：文件描述符表】
+	 * copy_files() 处理进程的文件描述符表（files_struct）：
+	 * - 若设置 CLONE_FILES（线程创建时）：共享同一个 files_struct（引用计数+1）
+	 * - 否则（普通 fork）：深拷贝一份独立的文件描述符表
+	 *
+	 * 安全意义：fork 后子进程拥有父进程所有已打开文件的副本。
+	 * Zygote fork App 进程后，App 进程会继承 Zygote 打开的文件描述符，
+	 * 如果 Zygote 持有敏感 fd（如 /dev/ashmem、socket），子进程也能访问。
+	 * 这是 Android 安全审计中需要关注的 fd 泄漏场景。
+	 */
 	retval = copy_files(clone_flags, p, args->no_files);
 	if (retval)
 		goto bad_fork_cleanup_semundo;
+	/*
+	 * 【资源复制：文件系统信息】
+	 * copy_fs() 处理进程的文件系统上下文（fs_struct），包含：
+	 * - 进程的根目录（root）：chroot 隔离的基础
+	 * - 进程的当前工作目录（pwd）
+	 * - umask（文件创建掩码）
+	 *
+	 * - CLONE_FS：共享同一个 fs_struct（线程模型）
+	 * - 否则：独立复制一份
+	 *
+	 * CLONE_NEWNS（挂载命名空间）与此独立，由 copy_namespaces() 处理。
+	 */
 	retval = copy_fs(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_files;
+	/*
+	 * 【资源复制：信号处理器】
+	 * copy_sighand() 处理进程的信号处理器表（sighand_struct）：
+	 * - CLONE_SIGHAND：共享信号处理器（必须同时设置 CLONE_VM，即线程）
+	 * - 否则：深拷贝，子进程有独立的信号处理器
+	 *
+	 * 注意：信号的 pending 队列由 copy_signal() 单独处理。
+	 */
 	retval = copy_sighand(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_fs;
 	retval = copy_signal(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_sighand;
+	/*
+	 * 【资源复制：内存地址空间】
+	 * copy_mm() 是 fork 性能的关键路径，处理进程的虚拟内存空间（mm_struct）：
+	 *
+	 * - CLONE_VM（线程）：共享同一个 mm_struct，线程间共享地址空间，
+	 *   引用计数加一，无需复制页表。
+	 *
+	 * - 普通 fork（无 CLONE_VM）：使用 COW（写时复制）机制：
+	 *   1. 复制父进程的页表结构（dup_mmap）
+	 *   2. 将父子进程所有可写页面的 PTE 都标记为只读
+	 *   3. 任何一方尝试写入时，触发缺页异常（page fault），
+	 *      内核此时才真正分配新物理页并复制内容
+	 *   COW 使 fork 极快，Zygote 的效率来源于此。
+	 *
+	 * 安全意义：COW 期间父进程的物理内存被子进程"可见"（只读），
+	 * 这是 Dirty COW（CVE-2016-5195）漏洞的基础场景。
+	 */
 	retval = copy_mm(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_signal;
+	/*
+	 * 【资源复制：命名空间 —— 隔离边界的核心】
+	 * copy_namespaces() 处理进程的命名空间（nsproxy），这是 Linux
+	 * 容器技术和 Android 沙箱隔离的基础机制。
+	 *
+	 * 支持的命名空间类型（通过 CLONE_NEW* 标志创建新命名空间）：
+	 * - CLONE_NEWNS   (mnt)：挂载命名空间，子进程看到独立的文件系统挂载树
+	 * - CLONE_NEWUTS  (uts)：UTS 命名空间，独立的 hostname/domainname
+	 * - CLONE_NEWIPC  (ipc)：IPC 命名空间，独立的 System V IPC、POSIX 消息队列
+	 * - CLONE_NEWPID  (pid)：PID 命名空间，子进程在新空间中 PID=1（容器 init）
+	 * - CLONE_NEWNET  (net)：网络命名空间，独立的网络接口、路由表、iptables
+	 * - CLONE_NEWUSER (user)：用户命名空间，独立的 uid/gid 映射
+	 * - CLONE_NEWTIME (time)：时间命名空间，独立的系统时钟偏移
+	 *
+	 * 若不设置任何 CLONE_NEW* 标志，子进程与父进程共享同一套命名空间
+	 * （nsproxy 引用计数加一）。Zygote fork App 进程时不隔离网络和PID
+	 * 命名空间，Android 的隔离主要依赖 uid 隔离 + SELinux，而非命名空间。
+	 */
 	retval = copy_namespaces(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_mm;
 	retval = copy_io(clone_flags, p);
 	if (retval)
 		goto bad_fork_cleanup_namespaces;
+	/*
+	 * 【CPU 状态复制：子进程从哪里开始执行】
+	 * copy_thread() 是体系结构相关的函数（见 arch/arm64/kernel/process.c
+	 * 或 arch/x86/kernel/process.c），负责复制父进程的 CPU 寄存器状态
+	 * 到子进程的内核栈帧（struct pt_regs），使子进程"看起来"像是刚从
+	 * 系统调用返回。
+	 *
+	 * fork 返回值为 0 的原理：
+	 *   copy_thread() 将子进程的返回值寄存器（x86: eax/rax，ARM64: x0）
+	 *   设置为 0，而父进程的 copy_process() 返回子进程的 PID。
+	 *   因此同一套代码 fork() 后，父进程得到子 PID，子进程得到 0。
+	 *
+	 * 内核线程（kernel_thread）：
+	 *   copy_thread() 同样处理内核线程的创建，此时 pt_regs 为空，
+	 *   子进程从指定的函数指针开始执行。
+	 */
 	retval = copy_thread(p, args);
 	if (retval)
 		goto bad_fork_cleanup_io;
@@ -2301,6 +2525,13 @@ __latent_entropy struct task_struct *copy_process(
 	stackleak_task_init(p);
 
 	if (pid != &init_struct_pid) {
+		/*
+		 * 【PID 分配】
+		 * alloc_pid() 在目标 PID 命名空间中分配一个新的 PID 号。
+		 * 若进程位于嵌套的 PID 命名空间，它在每层命名空间都有一个
+		 * 不同的 PID 号（struct pid 中保存所有层级的 PID）。
+		 * 最内层命名空间中的 PID 即进程自身看到的 PID（getpid() 返回值）。
+		 */
 		pid = alloc_pid(p->nsproxy->pid_ns_for_children, args->set_tid,
 				args->set_tid_size);
 		if (IS_ERR(pid)) {
@@ -2689,6 +2920,47 @@ struct task_struct *create_io_thread(int (*fn)(void *), void *arg, int node)
  *
  * It copies the process, and if successful kick-starts
  * it and waits for it to finish using the VM if required.
+ */
+
+/*
+ * 【kernel_clone】fork/vfork/clone/clone3 系统调用的统一内核入口
+ *
+ * 所有创建进程/线程的系统调用最终都汇聚到这里：
+ *   sys_fork()   → kernel_clone(flags=SIGCHLD)
+ *   sys_vfork()  → kernel_clone(flags=CLONE_VFORK|CLONE_VM|SIGCHLD)
+ *   sys_clone()  → kernel_clone(用户指定 flags)
+ *   sys_clone3() → kernel_clone(通过 struct clone_args 传入)
+ *
+ * clone_flags 关键标志位说明：
+ *
+ * 进程/线程行为类：
+ *   CLONE_VM        — 共享父进程的虚拟内存空间（线程的核心标志）
+ *   CLONE_FS        — 共享文件系统信息（根目录、当前目录、umask）
+ *   CLONE_FILES     — 共享文件描述符表
+ *   CLONE_SIGHAND   — 共享信号处理器，必须与 CLONE_VM 同时使用
+ *   CLONE_THREAD    — 加入父进程的线程组（共享 TGID），POSIX 线程语义
+ *   CLONE_VFORK     — vfork 语义：父进程挂起，直到子进程 execve 或退出
+ *
+ * 命名空间隔离类（容器/沙箱基础）：
+ *   CLONE_NEWNS     — 创建新的挂载命名空间（mnt ns）
+ *   CLONE_NEWUTS    — 创建新的 UTS 命名空间（hostname 隔离）
+ *   CLONE_NEWIPC    — 创建新的 IPC 命名空间
+ *   CLONE_NEWPID    — 创建新的 PID 命名空间（子进程成为新空间的 PID 1）
+ *   CLONE_NEWNET    — 创建新的网络命名空间（独立网络栈）
+ *   CLONE_NEWUSER   — 创建新的用户命名空间（uid/gid 重映射）
+ *   CLONE_NEWTIME   — 创建新的时间命名空间
+ *
+ * 其他：
+ *   CLONE_PIDFD     — 在 parent_tid 指向的地址返回 pidfd（进程文件描述符）
+ *   CLONE_PARENT_SETTID — fork 后将子进程 PID 写入父进程的指定地址
+ *   CLONE_CHILD_CLEARTID — 子进程退出时清零并 futex 唤醒指定地址（POSIX 线程退出通知）
+ *
+ * 函数流程：
+ *   1. 参数合法性检查（CLONE_PIDFD 与 CLONE_PARENT_SETTID 互斥等）
+ *   2. 确定 ptrace 事件类型（PTRACE_EVENT_FORK/CLONE/VFORK）
+ *   3. 调用 copy_process() 完成实际的进程复制
+ *   4. 唤醒新进程进入调度队列（wake_up_new_task）
+ *   5. 若 CLONE_VFORK，等待子进程释放 vfork_done 完成量
  */
 pid_t kernel_clone(struct kernel_clone_args *args)
 {

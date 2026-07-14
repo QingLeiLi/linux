@@ -34,16 +34,52 @@
 #include "kasan.h"
 #include "../slab.h"
 
+/*
+ * prng_state - 软件标签模式下每 CPU 的伪随机数生成器状态
+ *
+ * sw-tags KASAN 在每次内存分配时生成一个随机标签（1 字节，0x01~0xFF），
+ * 写入指针的高位字节，并在 shadow 内存中记录该标签。
+ * 访问时将指针标签与 shadow 中记录的标签比较，不匹配则报错。
+ *
+ * 每个 CPU 维护独立的 PRNG 状态，避免多核并发时的竞争。
+ * 使用廉价的 PRNG（非加密级别），因为标签是概率性检测工具，
+ * 不需要密码学强度，只需足够随机以使相邻对象标签不同。
+ */
 static DEFINE_PER_CPU(u32, prng_state);
 
+/*
+ * kasan_init_sw_tags - 初始化软件标签（sw-tags）模式的 KASAN
+ *
+ * 在 smp_prepare_boot_cpu() 中调用，per-cpu 区域切换完成后执行。
+ *
+ * sw-tags 是 KASAN 的软件实现版本，不依赖 MTE 硬件，适用于所有架构：
+ *   - 分配内存时生成随机标签，存入指针高位（top byte）和 shadow 内存
+ *   - 访问内存时比较指针标签与 shadow 中存储的标签
+ *   - 标签不匹配说明访问了错误的内存（越界、use-after-free 等）
+ *
+ * 与 hw-tags 相比，sw-tags 开销更高（每次访问需要读 shadow 内存），
+ * 但兼容性更好，不依赖特定硬件。
+ *
+ * 必须在 per-cpu 区域初始化完成后调用，因为 prng_state 存储在 per-cpu 变量中。
+ */
 void __init kasan_init_sw_tags(void)
 {
 	int cpu;
 
+	/* 用 get_cycles()（CPU 时钟周期计数器）为每个 CPU 的 PRNG 设置初始种子。
+	 * get_cycles() 读取 CNTVCT_EL0（arm64）等硬件计数器，在不同时间点
+	 * 调用会得到不同值，保证各 CPU 的种子不同，产生独立的随机标签序列。
+	 * 此时 random 子系统尚未完全初始化，无法使用 get_random_u32()，
+	 * 用硬件计数器是可用的最好方案。 */
 	for_each_possible_cpu(cpu)
 		per_cpu(prng_state, cpu) = (u32)get_cycles();
 
+	/* 根据命令行参数初始化调用栈收集配置，与 hw-tags 共用同一实现。
+	 * 若开启 stacktrace，从 memblock 分配 stack_ring 缓冲区存储调用栈。 */
 	kasan_init_tags();
+
+	/* 通过 static_branch_enable(&kasan_flag_enabled) 开启全局 KASAN 标志。
+	 * 此调用之后，slab/slub 分配器开始为每次分配生成随机标签并写入 shadow。 */
 	kasan_enable();
 
 	pr_info("KernelAddressSanitizer initialized (sw-tags, stacktrace=%s)\n",

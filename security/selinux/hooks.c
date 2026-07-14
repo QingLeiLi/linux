@@ -21,6 +21,67 @@
  *  Copyright (C) 2016 Mellanox Technologies
  */
 
+/*
+ * ============================================================
+ * SELinux 核心钩子实现 —— Android 安全模型基础
+ * ============================================================
+ *
+ * 一、SELinux 是什么
+ * ------------------
+ * SELinux（Security-Enhanced Linux）是一种强制访问控制（MAC，Mandatory Access
+ * Control）机制，由 NSA 发起，后合并进主线内核。它与传统的自主访问控制（DAC，
+ * Discretionary Access Control，即 Unix 的 owner/group/rwx 权限）共存，但优先
+ * 级更高——即使某个文件对所有人可读（DAC 允许），SELinux 策略仍可以拒绝访问。
+ *
+ * MAC vs DAC：
+ *   DAC：文件所有者自主决定谁能访问（chmod/chown），root 可以绕过。
+ *   MAC：由集中策略决定，即使是 root（UID=0）也受 SELinux 约束。
+ *
+ * 二、Android 如何使用 SELinux
+ * ----------------------------
+ * Android 4.3 起引入 SELinux，5.0 起强制开启 enforcing 模式。Android 的安全
+ * 模型建立在"每个进程/文件都有安全上下文标签（security context）"之上：
+ *
+ *   进程标签示例：u:r:untrusted_app:s0:c512,c768
+ *   文件标签示例：u:object_r:system_file:s0
+ *   格式：user:role:type:sensitivity[:categories]
+ *
+ * 其中 type 是最重要的部分（也称为 domain，针对进程）。策略以 type 为单位
+ * 定义权限：allow <源type> <目标type>:<类别> { <权限列表> };
+ *
+ * 三、访问控制决策模型
+ * --------------------
+ * 每次访问请求可以表示为三元组：
+ *   主体（subject）：发起操作的进程（及其 domain type）
+ *   操作（operation）：要执行的动作（read/write/execute/ioctl/...）
+ *   客体（object）：被操作的资源（文件、socket、binder 等）及其 type
+ *
+ * SELinux 的决策流程：
+ *   1. 查询 AVC（Access Vector Cache）缓存，命中则直接返回结果
+ *   2. 缓存未命中，查询策略数据库（policy database）
+ *   3. 记录审计日志（avc: denied / avc: granted）
+ *   4. 根据 enforcing/permissive 模式决定是否真正阻断
+ *
+ * 四、Android 的 neverallow 规则
+ * --------------------------------
+ * Android 在 sepolicy 中大量使用 neverallow 规则，这些规则在编译期由
+ * checkpolicy 工具验证，确保策略中不会出现危险的 allow 语句：
+ *   neverallow untrusted_app domain:process ptrace;
+ *   neverallow { all_untrusted_apps } su:process *;
+ * neverallow 是构建时检查，不是运行时钩子，但它决定了哪些 allow 规则
+ * 永远不会出现在最终策略中，从而在源头杜绝危险权限。
+ *
+ * 五、LSM 钩子机制
+ * ----------------
+ * Linux Security Module（LSM）框架在内核关键路径上预留了"安全钩子"插槽。
+ * SELinux 将自己的检查函数注册到这些插槽（见文件末尾的 selinux_hooks[] 数组
+ * 和 DEFINE_LSM 宏）。当内核执行文件打开、进程创建、网络连接等操作时，会自动
+ * 回调对应的 SELinux 钩子函数，完成 MAC 检查后再继续（或拒绝）操作。
+ *
+ * 本文件包含所有 SELinux 钩子函数的具体实现，是 Android 安全沙箱的核心。
+ * ============================================================
+ */
+
 #include <linux/init.h>
 #include <linux/kd.h>
 #include <linux/kernel.h>
@@ -2067,12 +2128,56 @@ static inline u32 open_file_to_av(struct file *file)
 
 /* Hook functions begin here. */
 
+/*
+ * ============================================================
+ * Binder IPC 安全钩子（Android 独有扩展）
+ * ============================================================
+ * Binder 是 Android 最核心的 IPC（进程间通信）机制，几乎所有的系统服务调用
+ * （ActivityManager、PackageManager、AudioFlinger 等）都通过 Binder 完成。
+ * 标准 Linux 内核没有 Binder 相关的 SELinux 类别，这四个钩子是 Android 专门
+ * 为 Binder 添加的 SELinux 扩展，对应策略中的 binder { call transfer ... } 权限。
+ *
+ * 整体访问控制思路：
+ *   即使 Binder 驱动层面的连接已经建立（ServiceManager 找到了目标服务），
+ *   SELinux 仍然可以在每次 transaction 时独立拒绝——权限控制在 IPC 内容层面，
+ *   而不仅仅是连接层面，这是 Android "纵深防御"的关键体现。
+ */
+
+/*
+ * selinux_binder_set_context_mgr - 检查进程能否注册为 Binder 上下文管理器
+ *
+ * Binder 上下文管理器（context manager）即 servicemanager 进程，它是整个
+ * Android 服务注册/查询的中枢。只有被策略授权了 binder:set_context_mgr 权限
+ * 的 domain（通常是 servicemanager type）才能担任此角色。
+ *
+ * 策略示例：allow servicemanager servicemanager:binder set_context_mgr;
+ */
 static int selinux_binder_set_context_mgr(const struct cred *mgr)
 {
 	return avc_has_perm(current_sid(), cred_sid(mgr), SECCLASS_BINDER,
 			    BINDER__SET_CONTEXT_MGR, NULL);
 }
 
+/*
+ * selinux_binder_transaction - 检查 Binder 事务（IPC 调用）权限
+ *
+ * 这是 Android IPC 权限控制的核心钩子。每当进程 A 通过 Binder 向进程 B 发起
+ * 调用时触发，执行两层检查：
+ *
+ *   1. 身份冒充检查（impersonate）：如果实际调用者（mysid）和事务声明的发起者
+ *      （fromsid）不同，则需要 binder:impersonate 权限。这防止恶意进程伪装成
+ *      其他进程发起调用。
+ *
+ *   2. 调用权限检查（call）：发起方 domain（fromsid）必须拥有对目标方 domain
+ *      （tosid）的 binder:call 权限。
+ *
+ * 策略示例：
+ *   allow untrusted_app system_server:binder call;
+ *   allow system_server untrusted_app:binder call;
+ *
+ * Android 安全意义：即使 App 拿到了某个系统服务的 Binder 引用，如果策略里
+ * 没有对应的 allow 规则，调用仍会被此处拒绝，实现细粒度的 IPC 访问控制。
+ */
 static int selinux_binder_transaction(const struct cred *from,
 				      const struct cred *to)
 {
@@ -2092,6 +2197,13 @@ static int selinux_binder_transaction(const struct cred *from,
 			    SECCLASS_BINDER, BINDER__CALL, NULL);
 }
 
+/*
+ * selinux_binder_transfer_binder - 检查能否通过 Binder 传递对象引用
+ *
+ * 当进程 A 把一个 Binder 对象的引用传递给进程 B 时触发（例如 App 把回调
+ * 对象传给系统服务）。需要 from domain 对 to domain 拥有 binder:transfer 权限。
+ * 这防止低权限进程将自己持有的 Binder 引用"扩散"给不应拥有它的进程。
+ */
 static int selinux_binder_transfer_binder(const struct cred *from,
 					  const struct cred *to)
 {
@@ -2100,6 +2212,17 @@ static int selinux_binder_transfer_binder(const struct cred *from,
 			    NULL);
 }
 
+/*
+ * selinux_binder_transfer_file - 检查能否通过 Binder 传递文件描述符
+ *
+ * Android 允许通过 Binder 传递 fd（文件描述符），例如传递 Ashmem/memfd 共享
+ * 内存、管道、socket 等。此钩子对传递的 fd 执行多重检查：
+ *   1. 如果接收方 domain 与 fd 的安全标签不同，需要 fd:use 权限
+ *   2. 如果是 BPF 相关 fd，执行额外的 BPF 安全检查
+ *   3. 对底层 inode 检查接收方是否具有对应文件类型的访问权限
+ *
+ * 这确保进程不能通过"绕道 Binder 传 fd"的方式获得它本来无权访问的资源。
+ */
 static int selinux_binder_transfer_file(const struct cred *from,
 					const struct cred *to,
 					const struct file *file)
@@ -2137,6 +2260,26 @@ static int selinux_binder_transfer_file(const struct cred *from,
 			    &ad);
 }
 
+/*
+ * selinux_ptrace_access_check - 控制进程调试（ptrace）权限
+ *
+ * ptrace 是 Linux 的进程调试/跟踪系统调用，GDB、strace 以及几乎所有动态分析
+ * 工具都依赖它。此钩子决定调试者（tracer）能否 attach 到目标进程（tracee）。
+ *
+ * 检查分两种模式：
+ *   PTRACE_MODE_READ（只读模式，如 /proc/pid/mem 读取）：
+ *     检查调试者对目标进程 inode 的 file:read 权限
+ *   写入/控制模式（PTRACE_ATTACH、PTRACE_SEIZE 等）：
+ *     检查调试者对目标进程的 process:ptrace 权限
+ *
+ * Android 安全意义：
+ *   - 非 debuggable 的 App（release 版本）其 domain 不会被策略授予 process:ptrace
+ *     权限，因此无法被外部进程 attach，有效阻止动态逆向分析
+ *   - debuggable App 在开发者模式下运行于特殊 domain，策略会有限度地开放此权限
+ *   - 即使攻击者获得了 shell，如果 shell 的 domain 没有对目标 App domain 的
+ *     ptrace 权限，attach 操作仍会被此处拒绝
+ *   - 这是 Android 防止运行时动态分析/内存 dump/代码注入的重要防线
+ */
 static int selinux_ptrace_access_check(struct task_struct *child,
 				       unsigned int mode)
 {
@@ -2802,6 +2945,25 @@ static int selinux_sb_statfs(struct dentry *dentry)
 	return superblock_has_perm(cred, dentry->d_sb, FILESYSTEM__GETATTR, &ad);
 }
 
+/*
+ * selinux_mount - 文件系统挂载权限检查
+ *
+ * 当进程执行 mount(2) 系统调用时触发。Android 的分区安全模型很大程度上依赖
+ * 挂载时的 SELinux 标签设置：
+ *
+ *   - 重新挂载（MS_REMOUNT）：检查调用者对已挂载超级块的 filesystem:remount 权限。
+ *     Android 的 system 分区以只读方式挂载，防止被重新挂载为可写是重要安全边界。
+ *
+ *   - 新挂载：检查调用者对挂载点路径的 file:mounton 权限。
+ *     只有 init、vold（存储管理守护进程）等特权 domain 才被允许在关键目录上挂载。
+ *
+ * Android 文件系统标签机制：
+ *   文件/目录的 SELinux 标签在挂载时通过两种方式确定：
+ *   1. xattr（扩展属性）：ext4/f2fs 等文件系统，标签存储在 security.selinux xattr 中
+ *   2. genfscon 规则：proc、sysfs、tmpfs 等伪文件系统，标签由策略中的
+ *      genfscon 规则按路径模式分配
+ *   这两种机制共同确保了 Android 中每个文件从创建起就有确定的安全标签。
+ */
 static int selinux_mount(const char *dev_name,
 			 const struct path *path,
 			 const char *type,
@@ -3240,6 +3402,37 @@ static inline void task_avdcache_update(struct task_security_struct *tsec,
  * Check if the current task is allowed to access @inode according to
  * @requested.  Returns 0 if allowed, negative values otherwise.
  */
+/*
+ * selinux_inode_permission - 文件 inode 访问权限检查（最高频钩子之一）
+ *
+ * 每次进程对文件/目录执行读、写、执行、追加操作前均会调用此函数，是整个
+ * SELinux 中调用频率最高的钩子之一，因此性能优化至关重要。
+ *
+ * 检查流程：
+ *   1. 快速路径：若请求操作不涉及 read/write/exec/append（如纯粹的存在性检测），
+ *      直接返回 0（允许），跳过 SELinux 检查。
+ *
+ *   2. 任务级缓存（task AVD cache）：每个进程的 task_security_struct 中维护了
+ *      一个小型的 per-task AV 决策缓存（avdcache）。命中时直接从缓存读取决策，
+ *      无需查询全局 AVC，进一步降低热路径开销。
+ *
+ *   3. AVC（Access Vector Cache）查询：
+ *      AVC 是 SELinux 的全局权限决策缓存，以 <sid_src, sid_dst, class> 为键，
+ *      存储已做出的 av_decision（允许向量/拒绝向量）。
+ *      - 缓存命中（cache hit）：直接用缓存的 avd 判断是否拒绝，避免策略数据库查询
+ *      - 缓存未命中（cache miss）：调用 avc_has_perm_noaudit 查询策略数据库，
+ *        将结果更新到 task-level 缓存
+ *
+ *   4. 审计：如果需要记录审计日志（被拒绝或配置了 auditallow），调用
+ *      audit_inode_permission 写入内核审计子系统（对应 Android 日志中的
+ *      "avc: denied" 或 "avc: granted" 消息）。
+ *
+ * Android 场景：
+ *   - App（untrusted_app domain）尝试读取 /data/data/其他App/ 时，在此被拒绝
+ *   - system_server 读取 /proc/pid/status 时，在此验证 process:getattr 权限
+ *   - 执行权限（MAY_EXEC）检查确保只有具有 file:execute 权限的 domain 才能
+ *     运行可执行文件，防止在 /data/local/tmp 等目录执行恶意二进制
+ */
 static int selinux_inode_permission(struct inode *inode, int requested)
 {
 	int mask;
@@ -3269,14 +3462,14 @@ static int selinux_inode_permission(struct inode *inode, int requested)
 
 	rc = task_avdcache_search(tsec, isec, &avdc);
 	if (likely(!rc)) {
-		/* Cache hit. */
+		/* 缓存命中：直接用缓存中的访问向量决策，判断是否拒绝 */
 		avdp = &avdc->avd;
 		denied = perms & ~avdp->allowed;
 		if (unlikely(denied) && enforcing_enabled() &&
 			!(avdp->flags & AVD_FLAGS_PERMISSIVE))
 			rc = -EACCES;
 	} else {
-		/* Cache miss. */
+		/* 缓存未命中：查询策略数据库，并将结果写入 task-level 缓存 */
 		rc = avc_has_perm_noaudit(sid, isec->sid, isec->sclass,
 					  perms, 0, avdp);
 		task_avdcache_update(tsec, isec, avdp);
@@ -4274,6 +4467,28 @@ static int selinux_file_open(struct file *file)
 
 /* task security operations */
 
+/*
+ * selinux_task_alloc - 进程（任务）创建时分配并初始化安全标签
+ *
+ * 在 fork()/clone() 创建新进程时调用，负责两件事：
+ *
+ *   1. 安全上下文继承：将父进程的 task_security_struct 完整复制给子进程（*new_tsec = *old_tsec）。
+ *      默认情况下子进程与父进程运行在相同的 SELinux domain 中。
+ *
+ *   2. fork 权限检查：验证当前进程的 domain 是否拥有 process:fork 权限
+ *      （检查的是 sid -> sid，即自身对自身的 fork 权限）。
+ *
+ * 关于 Type Transition（类型转换）：
+ *   selinux_task_alloc 仅处理 fork 阶段。真正的 domain 切换发生在 exec() 时，
+ *   由 selinux_bprm_creds_for_exec 钩子处理：
+ *     - 策略中的 type_transition 规则指定：当 domain A 的进程执行文件 label B 时，
+ *       新进程自动切换到 domain C
+ *     - 典型 Android 例子：zygote（zygote domain）fork 出 App 进程后，
+ *       App 进程 exec 时根据 type_transition 规则切换到 untrusted_app 或
+ *       platform_app 等对应的 domain
+ *   这种机制确保每个 Android App 进程都在严格隔离的 SELinux 沙箱中运行，
+ *   即使它们都由同一个 zygote 进程 fork 而来。
+ */
 static int selinux_task_alloc(struct task_struct *task,
 			      u64 clone_flags)
 {
@@ -7526,6 +7741,32 @@ struct lsm_blob_sizes selinux_blob_sizes __ro_after_init = {
  *
  * Please follow block comment delimiters in the list to keep this order.
  */
+/*
+ * selinux_hooks[] - SELinux 钩子注册表（LSM 框架接入点）
+ *
+ * 这是 SELinux 与 Linux Security Module（LSM）框架的接口定义表。数组中的每个
+ * 条目通过 LSM_HOOK_INIT(hook_name, handler) 宏将 SELinux 的具体实现函数绑定
+ * 到对应的 LSM 钩子插槽上。
+ *
+ * 工作原理：
+ *   - 内核在每个安全敏感操作（文件访问、进程创建、网络连接等）前后预留了
+ *     LSM 钩子插槽（定义在 include/linux/lsm_hooks.h）
+ *   - 本数组在 selinux_init() 中通过 security_add_hooks() 一次性注册到框架
+ *   - __ro_after_init 属性确保数组在初始化后变为只读，防止被篡改（内核安全加固）
+ *   - 运行时内核执行 security_file_open() 等包装函数时，框架自动遍历并调用
+ *     所有已注册 LSM 的对应钩子（若有多个 LSM 叠加，如 SELinux + Landlock）
+ *
+ * Android 相关条目解读：
+ *   - binder_*：Android 特有的 Binder IPC 权限控制（4 个钩子，标准 Linux 无）
+ *   - ptrace_access_check：防止调试非 debuggable App
+ *   - bprm_creds_for_exec：exec 时执行 domain 切换（type transition），
+ *     是 App 沙箱隔离的关键机制
+ *   - sb_mount / sb_kern_mount：挂载时设置文件系统安全标签
+ *   - inode_permission：最高频的文件访问权限检查
+ *   - task_alloc：进程 fork 时的安全上下文初始化
+ *   - socket_*：网络 socket 的创建、连接、绑定权限控制
+ *   - key_*：Android Keystore 密钥访问控制
+ */
 static struct security_hook_list selinux_hooks[] __ro_after_init = {
 	LSM_HOOK_INIT(binder_set_context_mgr, selinux_binder_set_context_mgr),
 	LSM_HOOK_INIT(binder_transaction, selinux_binder_transaction),
@@ -7818,6 +8059,34 @@ static struct security_hook_list selinux_hooks[] __ro_after_init = {
 #endif
 };
 
+/*
+ * selinux_init - SELinux 子系统早期初始化入口
+ *
+ * 由 DEFINE_LSM 宏注册，在内核启动极早期（early_initcall 阶段）被调用，
+ * 早于绝大多数驱动和文件系统初始化，确保从系统启动第一刻起所有进程和
+ * 对象都在 SELinux 监管下创建。
+ *
+ * 初始化步骤：
+ *   1. 初始化全局 selinux_state，设置 enforcing/permissive 启动模式
+ *      （由内核命令行参数 enforcing=0/1 或编译选项决定）
+ *   2. 初始化 AVC（Access Vector Cache）——SELinux 权限决策缓存
+ *   3. 为 init 进程（PID 1）设置初始安全上下文（kernel_t domain）
+ *   4. 初始化策略相关的缓存结构（avtab、ebitmap、hashtab）
+ *   5. 调用 security_add_hooks() 将 selinux_hooks[] 注册到 LSM 框架
+ *   6. 注册 AVC 回调：策略重新加载时刷新网络缓存、LSM notifier、审计规则
+ *
+ * 策略加载时机（注意：此处不加载策略）：
+ *   SELinux 策略文件（/sys/fs/selinux/load）在 Android init 进程启动后由
+ *   init 程序加载，通常在 early-init 阶段完成。策略加载前 SELinux 以
+ *   "无策略"状态运行（所有访问都通过），加载后立即生效并强制执行。
+ *   selinux_complete_init() 在策略加载后被调用，补充为已挂载文件系统
+ *   设置安全标签（针对策略加载前就已挂载的文件系统）。
+ *
+ * Android 启动序列中的 SELinux：
+ *   kernel init -> SELinux early init（本函数）-> 挂载 tmpfs/proc/sys ->
+ *   第一个用户态进程 /init -> 加载 SELinux 策略 -> selinux_complete_init ->
+ *   进入 enforcing 模式 -> 启动各系统服务（每个服务都在其 domain 中运行）
+ */
 static __init int selinux_init(void)
 {
 	vma_flags_t data_default_flags = VMA_DATA_DEFAULT_FLAGS;
@@ -7887,8 +8156,25 @@ void selinux_complete_init(void)
 	iterate_supers(delayed_superblock_init, NULL);
 }
 
-/* SELinux requires early initialization in order to label
-   all processes and objects when they are created. */
+/*
+ * SELinux requires early initialization in order to label
+ * all processes and objects when they are created.
+ *
+ * DEFINE_LSM(selinux) - 将 SELinux 注册为 LSM 框架的安全模块
+ *
+ * 此宏将 SELinux 的元数据和初始化函数打包成一个 struct lsm_info 描述符，
+ * 存放在内核的 .lsm_info.init 段。内核启动时自动遍历该段注册所有 LSM 模块。
+ *
+ * 关键字段说明：
+ *   .flags = LSM_FLAG_LEGACY_MAJOR | LSM_FLAG_EXCLUSIVE：
+ *     SELinux 是"重量级"主 LSM，与其他独占型 LSM（如 AppArmor）互斥，
+ *     但可与非独占型 LSM（如 Landlock、BPF LSM）共存
+ *   .blobs = &selinux_blob_sizes：
+ *     声明 SELinux 需要在各内核对象（task、inode、file、sock 等）中
+ *     附加的安全数据结构大小，LSM 框架统一分配这些"安全 blob"内存
+ *   .init = selinux_init：
+ *     内核启动时调用的初始化函数（见上方 selinux_init 注释）
+ */
 DEFINE_LSM(selinux) = {
 	.id = &selinux_lsmid,
 	.flags = LSM_FLAG_LEGACY_MAJOR | LSM_FLAG_EXCLUSIVE,

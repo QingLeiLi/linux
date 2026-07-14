@@ -169,11 +169,20 @@ void __init housekeeping_init(void)
 	if (!housekeeping.flags)
 		return;
 
+	// 开启静态分支
+	// 通知内核"housekeeping 模式已激活"。后续 housekeeping_cpu() 等函数通过这个 static key 判断是否需要做 CPU 过滤，未激活时直接返回 true（所有 CPU 均可）。
 	static_branch_enable(&housekeeping_overridden);
 
+	// 初始化 tick offload（若启用 nohz_full）
+	// nohz_full CPU 上关闭了周期性 tick，调度时钟的职责需要 offload 到 housekeeping CPU 上代为处理。
 	if (housekeeping.flags & HK_FLAG_KERNEL_NOISE)
 		sched_tick_offload_init();
 	/*
+	将 cpumask 从 memblock 迁移到 slab
+	 	每种隔离类型（调度域、中断、内核噪声等）都有一张 housekeeping CPU 的 cpumask。
+		这些 cpumask 在早期由 memblock_alloc 分配（slab 还未就绪）。
+		此时 slab 已可用，将它们迁移到 kmalloc 分配的内存，
+		使后续 kfree 可以直接释放旧版本（内核动态更新 cpumask 时需要 kfree 旧的）
 	 * Realloc with a proper allocator so that any cpumask update
 	 * can indifferently free the old version with kfree().
 	 */

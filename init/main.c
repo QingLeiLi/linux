@@ -4,12 +4,19 @@
  *
  *  Copyright (C) 1991, 1992  Linus Torvalds
  *
- *  GK 2/5/95  -  Changed to support mounting root fs via NFS
- *  Added initrd & change_root: Werner Almesberger & Hans Lermen, Feb '96
- *  Moan early if gcc is old, avoiding bogus kernels - Paul Gortmaker, May '96
- *  Simplified starting of init:  Michael A. Griffith <grif@acm.org>
+ * 这是 Linux 内核启动的核心 C 文件。
+ * head.S 完成硬件初始化（MMU/页表）后，最终跳转到本文件的 start_kernel()。
+ * 整个内核的 C 世界从这里开始。
+ *
+ * 文件结构：
+ *   1. 全局变量和命令行参数处理
+ *   2. start_kernel()：内核主初始化函数
+ *   3. rest_init()：创建 PID 1 和 PID 2，自身变成 idle
+ *   4. kernel_init()：PID 1 的执行体，最终 exec 用户态 init
+ *   5. do_initcalls()：驱动和子系统的批量初始化机制
  */
 
+/* 启用 initcall_debug，允许通过内核参数开启初始化调试输出 */
 #define DEBUG		/* Enable initcall_debug */
 
 #include <linux/types.h>
@@ -119,39 +126,57 @@
 
 #include <kunit/test.h>
 
+/* kernel_init 是 PID 1 的执行体，在 rest_init() 中创建，这里前向声明 */
 static int kernel_init(void *);
 
 /*
- * Debug helper: via this flag we know that we are in 'early bootup code'
- * where only the boot processor is running with IRQ disabled.  This means
- * two things - IRQ must not be enabled before the flag is cleared and some
- * operations which are not allowed with IRQ disabled are allowed while the
- * flag is set.
+ * 早期启动 IRQ 禁用标志。
+ * 此标志为 true 时表示系统处于早期启动阶段：
+ *   - 只有 boot CPU 在运行
+ *   - IRQ 处于禁用状态
+ * 作用：让某些通常不允许在 IRQ 关闭时执行的操作可以在早期启动时执行，
+ * 同时防止意外开启 IRQ（开启前必须先清除此标志）。
+ * __read_mostly：提示编译器把这个变量放在 Cache 友好的位置，
+ * 因为它会被频繁读取但很少写入。
  */
 bool early_boot_irqs_disabled __read_mostly;
 
+/*
+ * 系统当前状态，供各子系统判断启动阶段。
+ * 状态枚举：SYSTEM_BOOTING → SYSTEM_SCHEDULING → SYSTEM_RUNNING 等。
+ * EXPORT_SYMBOL 使驱动模块可以读取这个变量。
+ */
 enum system_states system_state __read_mostly;
 EXPORT_SYMBOL(system_state);
 
 /*
- * Boot command-line arguments
+ * Boot 命令行参数。
+ * Boot loader（ABL）把内核命令行字符串放在特定内存地址，
+ * setup_arch() 解析设备树后把它复制到 boot_command_line。
+ * 示例命令行：console=ttyMSM0 androidboot.hardware=walleye
  */
 #define MAX_INIT_ARGS CONFIG_INIT_ENV_ARG_LIMIT
 #define MAX_INIT_ENVS CONFIG_INIT_ENV_ARG_LIMIT
 
-/* Default late time init is NULL. archs can override this later. */
+/*
+ * 晚期时间初始化函数指针，默认为 NULL。
+ * 某些架构需要在大部分系统初始化完成后才能初始化时钟，
+ * 在 start_kernel() 末尾调用。
+ * __initdata：此变量只在初始化阶段使用，初始化完成后内存会被释放。
+ */
 void (*__initdata late_time_init)(void);
 
-/* Untouched command line saved by arch-specific code. */
+/* boot_command_line：arch 代码保存的原始命令行，不会被修改，供 /proc/cmdline 使用 */
 char __initdata boot_command_line[COMMAND_LINE_SIZE];
-/* Untouched saved command line (eg. for /proc) */
+/* saved_command_line：最终保存的完整命令行（可能包含 bootconfig 追加的内容） */
+/* __ro_after_init：初始化完成后变为只读，防止运行时被意外修改 */
 char *saved_command_line __ro_after_init;
 unsigned int saved_command_line_len __ro_after_init;
-/* Command line for parameter parsing */
+/* static_command_line：用于参数解析的副本，解析过程会就地修改字符串 */
 static char *static_command_line;
-/* Untouched extra command line */
+/* extra_command_line：来自 bootconfig 的额外内核参数 */
 static char *extra_command_line;
-/* Extra init arguments */
+/* extra_init_args：来自 bootconfig 的额外 init 参数（"init." 前缀的键） */
 static char *extra_init_args;
 
 #ifdef CONFIG_BOOT_CONFIG
@@ -163,7 +188,16 @@ static size_t initargs_offs;
 # define initargs_offs 0
 #endif
 
+/*
+ * execute_command：通过 init= 命令行参数指定的 init 程序路径。
+ * 例如：init=/sbin/init 或 init=/bin/bash（单用户恢复模式）。
+ */
 static char *execute_command;
+/*
+ * ramdisk_execute_command：从 ramdisk 运行的 init 程序，默认 "/init"。
+ * 可通过 rdinit= 命令行参数覆盖。
+ * Android 的 /init 就是通过这个路径启动的。
+ */
 static char *ramdisk_execute_command = "/init";
 static bool __initdata ramdisk_execute_command_set;
 
@@ -668,52 +702,90 @@ static void __init setup_command_line(char *command_line)
 
 static __initdata DECLARE_COMPLETION(kthreadd_done);
 
+/*
+ * rest_init()：start_kernel() 的最后一步，创建内核进程并让自身变成 idle。
+ *
+ * noinline：禁止内联，防止 start_kernel 被 free_initmem 释放前 rest_init 还在栈上。
+ * __ref：标记此函数可以在初始化阶段调用 __init 代码。
+ * __noreturn：此函数永远不返回（最终进入 idle 循环）。
+ *
+ * 执行完后系统状态：
+ *   PID 0：当前执行流变成 idle 进程（cpu_startup_entry）
+ *   PID 1：kernel_init（等待 kthreadd 就绪后执行用户态 init）
+ *   PID 2：kthreadd（所有内核线程的父进程）
+ */
 static noinline void __ref __noreturn rest_init(void)
 {
 	struct task_struct *tsk;
 	int pid;
 
+	/* 通知 RCU 调度器即将启动，从此 RCU 进入正常工作模式 */
 	rcu_scheduler_starting();
+
 	/*
-	 * We need to spawn init first so that it obtains pid 1, however
-	 * the init task will end up wanting to create kthreads, which, if
-	 * we schedule it before we create kthreadd, will OOPS.
+	 * 必须先创建 init（PID 1），再创建 kthreadd（PID 2），
+	 * 这样 PID 编号才正确。
+	 * 但 init 会尝试创建内核线程，如果 kthreadd 还不存在就调度 init，
+	 * 会触发 OOPS。
+	 * 解决方案：先创建 init 但让它阻塞在 kthreadd_done 完成量上，
+	 * 等 kthreadd 创建完再释放它。
+	 *
+	 * user_mode_thread()：创建一个将来会进入用户态的内核线程。
+	 * 与 kernel_thread() 的区别：会设置用户态相关的初始状态。
 	 */
 	pid = user_mode_thread(kernel_init, NULL, CLONE_FS);
+
 	/*
-	 * Pin init on the boot CPU. Task migration is not properly working
-	 * until sched_init_smp() has been run. It will set the allowed
-	 * CPUs for init to the non isolated CPUs.
+	 * 把 init 固定在 boot CPU 上运行。
+	 * 原因：sched_init_smp() 还没运行，任务迁移功能未就绪，
+	 * 如果 init 跑到其他 CPU 上可能出问题。
+	 * sched_init_smp() 之后会解除限制，允许 init 在所有非隔离 CPU 上运行。
 	 */
 	rcu_read_lock();
 	tsk = find_task_by_pid_ns(pid, &init_pid_ns);
-	tsk->flags |= PF_NO_SETAFFINITY;
+	tsk->flags |= PF_NO_SETAFFINITY; /* 禁止外部修改 CPU 亲和性 */
 	set_cpus_allowed_ptr(tsk, cpumask_of(smp_processor_id()));
 	rcu_read_unlock();
 
+	/* 恢复默认 NUMA 内存策略（允许从任意 NUMA 节点分配内存） */
 	numa_default_policy();
+
+	/*
+	 * 创建 kthreadd（PID 2）。
+	 * kthreadd 是所有内核线程的守护进程，负责代替内核线程创建其他内核线程。
+	 * 内核代码调用 kthread_create() 实际上是向 kthreadd 发送请求。
+	 * CLONE_FS | CLONE_FILES：共享文件系统和文件描述符。
+	 */
 	pid = kernel_thread(kthreadd, NULL, NULL, CLONE_FS | CLONE_FILES);
 	rcu_read_lock();
 	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
 	rcu_read_unlock();
 
 	/*
-	 * Enable might_sleep() and smp_processor_id() checks.
-	 * They cannot be enabled earlier because with CONFIG_PREEMPTION=y
-	 * kernel_thread() would trigger might_sleep() splats. With
-	 * CONFIG_PREEMPT_VOLUNTARY=y the init task might have scheduled
-	 * already, but it's stuck on the kthreadd_done completion.
+	 * 现在可以开启 might_sleep() 和 smp_processor_id() 检查了。
+	 * 之前不能开启是因为 CONFIG_PREEMPTION=y 时 kernel_thread()
+	 * 会触发 might_sleep() 警告。
 	 */
 	system_state = SYSTEM_SCHEDULING;
 
+	/*
+	 * 发出 kthreadd_done 完成量信号，解除 kernel_init 的阻塞。
+	 * 从此 PID 1 可以开始真正的初始化工作。
+	 */
 	complete(&kthreadd_done);
 
 	/*
-	 * The boot idle thread must execute schedule()
-	 * at least once to get things moving:
+	 * boot idle 线程（当前执行流）必须至少调用一次 schedule()，
+	 * 让调度器开始工作，把 CPU 交给其他线程。
 	 */
 	schedule_preempt_disabled();
-	/* Call into cpu_idle with preempt disabled */
+
+	/*
+	 * 进入 cpu_idle 循环，当前执行流正式成为 idle 进程（PID 0）。
+	 * idle 进程在没有其他任务时执行 WFI（Wait For Interrupt）指令，
+	 * 让 CPU 进入低功耗状态。
+	 * 此函数永不返回。
+	 */
 	cpu_startup_entry(CPUHP_ONLINE);
 }
 
@@ -756,6 +828,23 @@ void __init parse_early_param(void)
 
 void __init __weak arch_post_acpi_subsys_init(void) { }
 
+// 空函数体——适用于不需要显式设置 CPU ID 的架构
+// 各架构按需提供强符号实现，链接时自动替换弱符号
+/*
+┌─────────┬─────────────────────────────────┬─────────────────────────────────────────────────────────┐
+│  架构    │            实现位置              │                        主要工作                          │
+├─────────┼─────────────────────────────────┼─────────────────────────────────────────────────────────┤
+│ arm64   │ arch/arm64/kernel/setup.c:153   │ 读取 MPIDR_EL1 寄存器，建立逻辑 CPU 0 到物理 CPU 的映射      │
+├─────────┼─────────────────────────────────┼─────────────────────────────────────────────────────────┤
+│ arm     │ arch/arm/kernel/setup.c:596     │ 读取 MPIDR 寄存器，初始化 cpu_logical_map                  │
+├─────────┼─────────────────────────────────┼─────────────────────────────────────────────────────────┤
+│ s390    │ arch/s390/kernel/smp.c:974      │ 读取 CPU 地址，初始化 cpu_number                           │
+├─────────┼─────────────────────────────────┼─────────────────────────────────────────────────────────┤
+│ riscv   │ arch/riscv/kernel/smp.c:59      │ 读取 hart ID，初始化逻辑/物理 CPU 映射                      │
+├─────────┼─────────────────────────────────┼─────────────────────────────────────────────────────────┤
+│ sparc64 │ arch/sparc/kernel/smp_64.c:1206 │ 类似工作                                                  │
+└─────────┴─────────────────────────────────┴─────────────────────────────────────────────────────────┘
+*/
 void __init __weak smp_setup_processor_id(void)
 {
 }
@@ -862,12 +951,27 @@ static void __init print_unknown_bootoptions(void)
 
 static void __init early_numa_node_init(void)
 {
+// 不开启 CONFIG_USE_PERCPU_NUMA_NODE_ID 时：整个函数体为空，cpu_to_node 由架构自己的方式实现（如查静态表）
 #ifdef CONFIG_USE_PERCPU_NUMA_NODE_ID
+// 架构已定义 cpu_to_node 宏时：也跳过，说明架构有更高效的实现
 #ifndef cpu_to_node
 	int cpu;
 
 	/* The early_cpu_to_node() should be ready here. */
 	for_each_possible_cpu(cpu)
+		// 将每个 CPU 所属的 NUMA 节点号，写入该 CPU 的 per-cpu 变量 numa_node
+		/*
+			写完之后，cpu_to_node(cpu) 和 numa_node_id() 才能正常工作：
+
+			// 这两个函数内部直接读 per-cpu(numa_node)
+			cpu_to_node(cpu)   // 查某个 CPU 属于哪个节点
+			numa_node_id()     // 查当前 CPU 属于哪个节点（最快路径）
+
+			调度器、内存分配器等大量依赖这两个函数来做 NUMA 亲和性决策：
+
+			分配内存时：优先从 numa_node_id() 返回的节点分配
+			进程迁移时：尽量让进程跑在离其内存近的 CPU 上
+		*/
 		set_cpu_numa_node(cpu, early_cpu_to_node(cpu));
 #endif
 #endif
@@ -968,162 +1072,783 @@ static void __init print_kernel_cmdline(const char *cmdline)
 		pr_notice("%s%s\n", KERNEL_CMDLINE_PREFIX, cmdline);
 }
 
+/*
+ * start_kernel()：内核 C 代码的真正起点。
+ *
+ * 由 head.S 中的 __primary_switched() 调用，此时：
+ *   - MMU 已开启，虚拟地址空间就绪
+ *   - 只有 boot CPU（CPU0）在运行
+ *   - 中断处于禁用状态
+ *   - 只有最基本的内存可用（memblock）
+ *
+ * 函数修饰符说明：
+ *   asmlinkage：使用 C 调用约定，参数通过栈传递（供汇编调用）
+ *   __visible：禁止编译器把此符号优化为内部符号，确保调试器可见
+ *   __init：代码在初始化完成后可以被释放
+ *   __no_sanitize_address：禁用 KASAN 检测（初始化阶段内存状态特殊）
+ *   __noreturn：此函数永不返回（最终调用 rest_init() 进入 idle）
+ *   __no_stack_protector：禁用栈保护（初始化阶段栈 canary 尚未就绪）
+ */
 asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
 void start_kernel(void)
 {
 	char *command_line;
 	char *after_dashes;
 
+	/*
+	 * ── 第一批：最早期初始化（无任何子系统可用）──────────────────
+	 */
+
+	/* 在 init_task（PID 0 的 task_struct）栈末尾写入魔数
+	 * 用于运行时检测栈溢出（如果魔数被覆盖则触发 panic） */
+	// task_struct 是静态编译到内核镜像中的（不是动态分配的），此时处于 start_kernel() 最早期，内存分配器尚未就绪，所以只能操作这个静态的 init_task，而不是动态分配的进程
 	set_task_stack_end_magic(&init_task);
+
+	/* 设置 CPU ID（某些架构需要在最早期识别自己的 CPU 编号） */
 	smp_setup_processor_id();
+
+	/* 初始化调试对象跟踪系统（检测对象生命周期错误） */
 	debug_objects_early_init();
+
+	/* 记录内核编译 ID（用于崩溃报告中唯一标识内核版本） */
 	init_vmlinux_build_id();
 
+	/* cgroup 早期初始化（在内存分配器就绪前做最小化设置） */
 	cgroup_init_early();
 
+	/* 显式关闭中断，确保后续初始化不被打断 */
 	local_irq_disable();
 	early_boot_irqs_disabled = true;
 
 	/*
-	 * Interrupts are still disabled. Do necessary setups, then
-	 * enable them.
+	 * ── 第二批：中断仍禁用，完成必要设置 ──────────────────────────
 	 */
+
+	/* 标记 boot CPU 为在线状态，初始化 CPU 位图 */
 	boot_cpu_init();
+
+	/* 初始化高端内存（highmem）的页地址哈希表（32位系统需要） */
+	/*
+		背景：highmem 问题
+
+		32 位系统的内核虚拟地址空间只有 1GB（通常），无法把所有物理内存永久映射进来。超出这个范围的物理内存叫 highmem，内核需要用时临时映射（kmap），用完再解除。
+
+		这就带来一个问题：给定一个 highmem 的 struct page *，怎么快速查到它当前被临时映射到哪个虚拟地址？
+
+		---
+		page_address_init 做的事
+
+		初始化一张哈希表 page_address_htable，结构：
+
+		page_address_htable[hash(page)] → 链表 → {page*, 虚拟地址} → ...
+
+		page_address_init 只是把这张表的每个槽初始化：
+
+		for (i = 0; i < ARRAY_SIZE(page_address_htable); i++) {
+			INIT_LIST_HEAD(&page_address_htable[i].lh);   /
+			spin_lock_init(&page_address_htable[i].lock); // 初始化自旋锁
+		}
+
+		之后 kmap() 建立临时映射时向表中插入记录，page_addrunmap() 解除映射时从表中删除。
+	*/
+	/*
+		是什么限制了1G
+
+		32 位地址线本身，总共只有 2³² = 4GB 可寻址空间，内核和用户进程必须共享这 4GB 虚拟地址空间。
+
+		---
+		经典的 3G/1G 分割
+
+		Linux 在 32 位上默认这样划分：
+
+		0x00000000 ~ 0xBFFFFFFF   3GB   用户空间
+		0xC0000000 ~ 0xFFFFFFFF   1GB   内核空间
+
+		这个分割点由 PAGE_OFFSET（通常 0xC0000000）决定，可以编译时调整（有 2G/2G、1G/3G 等变体），但总和永远是 4GB。
+
+		---
+		为什么内核要和用户共享同一个 4GB
+
+		因为 32 位 CPU 的 MMU 只有 32 根地址线，任何时刻能寻址的虚拟地址范围就是 0 ~ 4GB，没有更多了。
+
+		内核和用户进程运行在同一个 CPU 上，切换时为了避免刷 TLB（代价极高），Linux 选择让内核页表常驻在每个进程的地址空间高端，两者共用一张页表，系统调用进入内核时不需要切换 CR3。
+
+		---
+		1GB 内核空间放不下所有物理内存时
+
+		假设物理内存有 2GB：
+
+		内核直接映射区：0xC0000000 ~ 0xFFFFFFFF = 1GB
+						只能永久映射 1GB 物理内存
+
+		超出的物理内存 → highmem
+						需要 kmap() 临时映射，用完再释放
+						page_address_htable 就是为了追踪这些临时映射
+
+		---
+		64 位为何没有这个问题
+
+		64 位地址线有 48 位可用（实际寻址 256TB），内核和用户各自拥有 128TB，物理内存再大也能全部直接映射进内核空间，highmem 机制完全消失。这也是为什么现代 64 位 Linux 上 page_address_htable 实际上永远空着。
+	 */
 	page_address_init();
+
+	/* 打印内核版本横幅（就是 dmesg 开头那行 "Linux version ..."） */
 	pr_notice("%s", linux_banner);
+
+	/*
+	 * 架构相关的核心初始化，ARM64 在这里做：
+	 *   - 解析设备树（DTB），识别内存范围、CPU 数量
+	 *   - 初始化 memblock（早期内存分配器）
+	 *   - 建立完整内核页表（替换 head.S 的临时页表）
+	 *   - 解析命令行到 command_line
+	 * 这是 start_kernel 中最重要的单个调用。
+	 */
 	setup_arch(&command_line);
+
+	/* 内存管理核心早期初始化（页分配器就绪前的准备工作） */
 	mm_core_init_early();
-	/* Static keys and static calls are needed by LSMs */
+
+	/* 初始化 static key（一种高效的运行时开关，用汇编 NOP/JMP 实现） */
+	/*
+		静态分支
+
+		内核中大量存在这样的代码：
+
+		if (static_branch_unlikely(&some_feature))
+			do_something();
+
+		这个 if 在运行时极少改变（如某功能默认关闭），普通条件跳转会浪费 CPU 分支预测资源。
+
+		静态分支的解决方案：直接在机器码层面打补丁：
+		- 功能关闭时：该位置是一条 NOP（什么都不做，直接往下执行）
+		- 功能开启时：该位置被 patch 成 JMP（跳转到功能代码）
+
+		CPU 执行到这里时，看到的就是一条固定指令，完全没有分支预测的开销。
+	*/
 	jump_label_init();
+
+	/* 初始化 static call（比函数指针更快的间接调用机制） */
+	/* static call
+		static call 是静态分支机制的"函数指针版本"。
+
+		---
+		问题背景
+
+		普通函数指针调用：
+
+		void (*func_ptr)(void) = default_func;
+
+		func_ptr();   // 每次都要：读指针变量 → 间接跳转
+					// 间接跳转 CPU 无法预测目标，流水线代价大
+					// 还破坏了 CFI（控制流完整性）安全机制
+
+		这与静态分支面对的问题类似——调用目标在运行时极少改变，但每次调用都承担间接跳转的开销。
+
+		---
+		static call 的解决方案
+
+		和静态分支一样，直接在代码段原地 patch 机器码：
+
+		DEFINE_STATIC_CALL(my_func, default_func);
+
+		static_call(my_func)();   // 编译后是一条直接 CALL 指令
+								// call default_func  ← 直接调用，CPU 可预测
+
+		切换目标时：
+
+		static_call_update(my_func, new_func);
+		// 找到所有 call 指令的位置
+		// 把 call default_func 改写成 call new_func
+
+		---
+		与静态分支的对比
+
+		┌──────────────┬──────────────────────────┬─────────────────────────────────┐
+		│              │  static key（静态分支）    │           static call           │
+		├──────────────┼──────────────────────────┼─────────────────────────────────┤
+		│ 解决的问题     │ if (flag) 的条件判断开销   │ 函数指针间接调用开销               │
+		├──────────────┼──────────────────────────┼─────────────────────────────────┤
+		│ patch 的内容  │ NOP ↔ JMP                │ CALL target 的目标地址            │
+		├──────────────┼──────────────────────────┼─────────────────────────────────┤
+		│ 典型场景      │ 特性开关                   │ 可替换的函数实现（如 paravirt）    │
+		└──────────────┴──────────────────────────┴─────────────────────────────────┘
+
+		---
+		典型使用场景
+
+		内核里大量的虚拟化钩子（paravirt ops）、tracepoint 调用、调度器钩子都用 static call：
+
+		// 虚拟化：裸机用 native_xxx，虚拟机用 xen_xxx / kvm_xxx
+		DEFINE_STATIC_CALL(pv_tlb_flush, native_flush_tlb);
+
+		// 启动时检测到运行在 Xen 上：
+		static_call_update(pv_tlb_flush, xen_flush_tlb);
+		// 之后每次 tlb flush 都是直接 call xen_flush_tlb，零间接跳转开销
+
+		start_kernel() 里调用 static_call_init() 就是建立类似 __jump_table 的索引表，为后续 static_call_update() 能快速找到所有需要 patch 的 call 指令做准备。
+	*/
 	static_call_init();
+
+	/* LSM（Linux 安全模块，如 SELinux）早期初始化 */
+	// 初始化 lockdown，进行内核完整性保护
 	early_security_init();
+
+	/* 解析 bootconfig（附加在 initramfs 末尾的扩展配置格式） */
 	setup_boot_config();
+
+	/* 整理命令行：合并 bootconfig 参数，保存多份副本 */
 	setup_command_line(command_line);
+
+	/* 确定系统实际 CPU 数量（从设备树读取） */
+	// nr 是 number of 的缩写，是 Linux 内核代码里极常见的前缀，表示"数量"
+	// 将 CPU 数量收紧到实际值，之后所有循环用此作上界，避免遍历大量空槽位浪费时间
 	setup_nr_cpu_ids();
+
+	/*
+	 * 为每个 CPU 分配 per-cpu 变量区域。
+	 * per-cpu 变量：每个 CPU 有独立副本，无需加锁，性能极高。
+	 * 例如：运行队列、中断计数器都是 per-cpu 变量。
+	 */
+	/* per-cpu 变量
+		内核里用 DEFINE_PER_CPU 声明的变量，每个 CPU 有自己独立的一份：
+
+		DEFINE_PER_CPU(int, cpu_number);          // 每个 CPU 有自己的 cpu_number
+		DEFINE_PER_CPU(struct runqueue, runqueues); // 每个 CPU 有自己的运行队列
+
+		访问时用专用宏：
+
+		per_cpu(cpu_number, 0)   // 访问 CPU 0 的副本
+		this_cpu_read(cpu_number) // 访问当前 CPU 的副本（最快）
+
+		---
+		为什么需要 per-cpu 变量
+
+		普通全局变量：
+			所有 CPU 共享 → 需要加锁 → 锁竞争 → 性能差
+
+		per-cpu 变量：
+			每个 CPU 独占自己的副本 → 不需要加锁 → 零竞争 → 极快
+			还避免了 cache bouncing（多核争抢同一 cache line）
+	*/
 	setup_per_cpu_areas();
+
+	/* arch 特定的 boot CPU 钩子（ARM64 这里初始化一些 CPU 特性标志） */
 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
+
+	/* 初始化每个 CPU 的 NUMA 节点 ID（NUMA = 非统一内存访问架构） */
+	// 将每个 CPU 所属的 NUMA 节点号，写入该 CPU 的 per-cpu 变量 numa_node
 	early_numa_node_init();
+
+	// 将 CPU 状态设置为 CPUHP_ONLINE 状态，表示已完全上线
+	// 这里只是补记状态，因为热插拔的状态机还没建立，boot cpu 跳过了整个过程，直接运行的
 	boot_cpu_hotplug_init();
 
+	/* 打印完整的内核命令行到 dmesg */
 	print_kernel_cmdline(saved_command_line);
-	/* parameters may set static keys */
+
+	/*
+	 * 解析 early_param 参数（console=、loglevel= 等需要最早处理的参数）。
+	 * early_param 注册的处理函数在这里调用，早于普通的 __setup 参数。
+	 */
 	parse_early_param();
+
+	/*
+	 * 解析剩余的内核参数。
+	 * __start___param / __stop___param：链接器生成的内核参数表边界。
+	 * 通过 module_param() 或 __setup() 注册的参数在这里处理。
+	 * '--' 之后的参数会传给 init 进程，after_dashes 指向这部分。
+	 */
 	after_dashes = parse_args("Booting kernel",
 				  static_command_line, __start___param,
 				  __stop___param - __start___param,
 				  -1, -1, NULL, &unknown_bootoption);
 	print_unknown_bootoptions();
 	if (!IS_ERR_OR_NULL(after_dashes))
+		/* '--' 后面的参数作为 init 进程的命令行参数 */
 		parse_args("Setting init args", after_dashes, NULL, 0, -1, -1,
 			   NULL, set_init_arg);
 	if (extra_init_args)
+		/* bootconfig 中 "init." 前缀的参数也传给 init */
 		parse_args("Setting extra init args", extra_init_args,
 			   NULL, 0, -1, -1, NULL, set_init_arg);
 
-	/* Architectural and non-timekeeping rng init, before allocator init */
+	/* 早期随机数初始化（在内存分配器就绪前，用命令行作为熵源） */
 	random_init_early(command_line);
 
 	/*
-	 * These use large bootmem allocations and must precede
-	 * initalization of page allocator
+	 * ── 第三批：内存管理初始化 ────────────────────────────────────
+	 * 以下调用需要大块 memblock 分配，必须在 page allocator 初始化前完成。
 	 */
+
+	/* 分配内核日志缓冲区（dmesg 的存储区域） */
 	setup_log_buf(0);
+
+	/* VFS 缓存早期初始化（dcache/inode cache 的哈希表，需要大量内存） */
 	vfs_caches_init_early();
+
+	/* 对内核异常表排序（加速异常处理时的查找） */
+	// 让后续查找时能用二分搜索（O(log n)）而不是线性扫描，提高页错误处理路径的速度
+	/* 内核异常表（extable）
+		内核软件层面的一张查找表，专门服务于一种特定 trap 的处理流程——页错误（page fault）中的用户地址访问失败场景
+		内核访问用户态内存时（copy_from_user、get_user 等），可能因用户指针无效而触发页错误。但内核不能像用户进程那样直接被 SIGSEGV 杀死，需要一种"出错了能安全继续执行"的机制。
+
+		解决方案：对每个可能出错的访问指令，预先记录一条"修复记录"：
+
+		struct exception_table_entry {
+			int insn;    // 可能出错的指令地址（相对偏移）
+			int fixup;   // 出错后跳转到哪里继续执行（相对偏移）
+			int data;    // 额外数据（如错误处理类型）
+		};
+
+		---
+		编译时写入的方式
+
+		与 jump_entry 类似，通过内联汇编写入特殊 section：
+
+		// copy_from_user 的某条 load 指令旁边
+		asm volatile(
+			"1: ldrb %w0, [%1]\n"          // 可能出错的指令，标记为 "1:"
+			".pushsection __ex_table\n"    // 切换到异常表 section
+			".long 1b - .\n"               // 记录：出错指令在哪
+			".long 2f - .\n"               // 记录：出错后跳到哪（fixup 代码）
+			".popsection\n"
+			...
+			"2: mov %w0, #-EFAULT\n"       // fixup：返回错误码
+		);
+
+		链接后所有条目合并为 __start___ex_table ~ __stop___ex_table 数组。
+
+		运行时如何使用
+
+		用户地址访问触发页错误
+			↓
+		CPU 执行指令 → MMU 检测到问题 → CPU 触发 trap（硬件）
+                                        ↓
+                              跳入异常向量表入口
+                                        ↓
+                              do_page_fault()（软件）
+                                        ↓
+                         search_exception_tables(fault_addr)
+                                        ↓
+                    ┌───────────────────┴───────────────────┐
+                  找到                                    找不到
+                    ↓                                        ↓
+             跳到 fixup 代码                         真正的内核 bug
+             返回 -EFAULT                            oops / panic
+	*/
+	/*
+		extable 只是 trap 处理程序内部的一个工具
+
+		do_page_fault() 不是只用 extable，它的完整决策树是：
+
+		do_page_fault()
+			↓
+		是缺页（valid address，页还没加载）？→ 分配物理页，映射，返回
+			↓
+		是写时复制（COW）？→ 复制页，映射，返回
+			↓
+		是内核访问用户地址失败？→ search_exception_tables() → fixup 或 oops
+			↓
+		是用户态非法访问？→ 发 SIGSEGV 给进程
+
+		extable 只处理其中"内核访问用户地址失败"这一个分支，其他分支有各自的处理逻辑，互不干扰。
+	*/
 	sort_main_extable();
+
+	/* 初始化异常向量，将异常向量的内存地址写入指定寄存器，之后 CPU 发生任何异常都会自动找到正确的处理入口 */
+	/*
+		trap（陷阱/异常）
+
+		CPU 硬件层面的概念，指令执行时触发的同步异常，ARM64 叫 exception，x86 叫 trap/fault：
+
+		除零、非法指令、页错误、系统调用、断点...
+
+		触发后 CPU 自动跳转到异常向量表（vectors），由内核的异常处理程序接管。这是硬件机制，由 CPU 架构定义。
+	*/
+	/*
+		arm64 不需要在这里初始化异常向量
+		arm64 的异常向量表（vectors）在更早的阶段就已设置好了——在汇编启动代码 head.S 里
+		// arch/arm64/kernel/head.S
+		adr_l   x0, vectors     // vectors 是 entry.S 中定义的异常向量表
+		msr     vbar_el1, x0    // 写入 VBAR_EL1 寄存器，CPU 从这里取异常入口
+
+		VBAR_EL1（Vector Base Address Register）在进入 start_kernel() 之前就已经指向正确的向量表了，不需要在 trap_init() 里再做任何事。
+	*/
 	trap_init();
+
+	/*
+	 * 内存管理核心初始化：
+	 *   - 把 memblock 管理的内存移交给 buddy system（正式的页分配器）
+	 *   - 初始化 slab/slub 分配器（kmalloc 的基础）
+	 *   - 建立内存 zone（DMA/Normal/HighMem）
+	 * 完成后 kmalloc() 可以使用。
+	 */
+	/*
+		buddy system（伙伴系统）—— 物理页分配器
+
+		管理物理内存，分配单位是页（4KB），只能分配 2 的幂次个连续页：
+
+		free_area[0]  → 1页  (4KB)  的空闲链表
+		free_area[1]  → 2页  (8KB)  的空闲链表
+		free_area[2]  → 4页  (16KB) 的空闲链表
+		...
+		free_area[10] → 1024页(4MB) 的空闲链表
+
+		名字来自"伙伴"机制：分配出去的块释放时，若相邻的"伙伴块"也空闲，两者合并成更大的块，防止碎片化。
+
+		局限：最小分配单位是 4KB，申请 100 字节也给你 4KB，浪费严重。
+	*/
+	/*
+		slab/slub —— 小对象分配器
+
+		建立在 buddy system 之上，解决小对象分配问题：
+
+		buddy system 分配几页大块内存
+			↓
+		slab/slub 把大块切成固定大小的小对象
+			↓
+		内核代码 kmalloc(64) → 从对应大小的 slab 缓存取一个对象
+
+		slab 是原始实现（复杂），slub 是简化重写版（现代系统默认用 slub）。两者接口相同，实现不同。
+
+		每种常用对象都有专用缓存（如 struct task_struct、struct inode），分配时从缓存取，释放时还回缓存，不真正归还给 buddy，下次直接复用，极快。
+	*/
 	mm_core_init();
+
+	/* 初始化 maple tree（内核的 B-tree 实现，用于 VMA（虚拟内存区域） 管理） */
 	maple_tree_init();
+
+	/* 初始化代码修补机制（用于 ftrace、kprobes 等运行时代码插桩） */
 	poking_init();
+
+	/* 初始化 ftrace（内核函数跟踪框架） */
 	ftrace_init();
 
-	/* trace_printk can be enabled here */
+	/* 初始化早期跟踪（trace_printk 从此可用） */
 	early_trace_init();
 
 	/*
-	 * Set up the scheduler prior starting any interrupts (such as the
-	 * timer interrupt). Full topology setup happens at smp_init()
-	 * time - but meanwhile we still have a functioning scheduler.
+	 * ── 第四批：调度器初始化 ──────────────────────────────────────
+	 * 必须在任何中断（包括时钟中断）启动前初始化调度器。
+	 * SMP 完整拓扑在 smp_init() 时才建立，但此时调度器已可工作。
 	 */
 	sched_init();
 
+	/* 健康检查：如果中断在这里是开启的，说明之前某处错误地开启了 */
 	if (WARN(!irqs_disabled(),
 		 "Interrupts were enabled *very* early, fixing it\n"))
 		local_irq_disable();
+
+	/* 初始化 radix tree（内核的基数树，page cache 等数据结构的基础） */
+	/*
+		Radix tree（基数树）是一种用整数键做快速索引的树形结构。
+
+		---
+		基本原理
+
+		将键（通常是页号或偏移量）按固定位数分层，每层是一个数组索引：
+
+		键值 = 0xABCDEF（24位，每层8位）
+
+		根节点[0xAB] → 中间节点[0xCD] → 叶节点[0xEF] → 值
+
+		查找复杂度 O(k)，k 是键的层数，与存储的条目数量无关。
+
+		---
+		内核里的主要用途
+
+		页缓存（Page Cache）
+
+		这是 radix tree 最核心的用途——每个文件的 address_space 用一棵 radix tree 管理所有已缓存的页：
+
+		文件偏移（页号）→ struct page *
+
+		read(file, offset):
+			页号 = offset / PAGE_SIZE
+			page = radix_tree_lookup(&mapping->page_tree, 页号)
+			若命中 → 直接读缓存
+			若未命中 → 从磁盘读入，插入树中
+
+		文件可能有数十亿个页，radix tree 能在 O(log n) 时间内按页号精确查找，比链表快得多。
+
+		IDR（ID 分配器）
+
+		进程 PID、文件描述符编号等整数 ID 的分配和查找，底层也用 radix tree（IDR 是 radix tree 的封装）。
+
+		---
+		与 maple tree 的关系
+
+		内核正在逐步用 XArray（radix tree 的现代封装）和 maple tree 替代旧的 radix tree：
+
+		旧：page cache 用 radix_tree
+		新：page cache 用 XArray（内部还是类 radix tree 结构）
+
+		旧：VMA 管理用红黑树
+		新：VMA 管理用 maple tree
+
+		radix_tree_init 仍然存在是因为 XArray 底层共享了 radix tree 的节点和 slab 缓存，两者并非完全独立。
+
+	*/
 	radix_tree_init();
 
+	/* 初始化 housekeeping CPU（隔离实时任务和普通任务的机制） */
 	/*
-	 * Set up housekeeping before setting up workqueues to allow the unbound
-	 * workqueue to take non-housekeeping into account.
-	 */
+		背景：CPU 隔离（isolcpus / nohz_full）
+
+		通过内核命令行参数可以隔离部分 CPU，让它们专跑实时任务或高性能计算，避免内核噪声：
+
+		isolcpus=2,3       # CPU 2,3 不参与调度域，不跑内核后台任务
+		nohz_full=2,3      # CPU 2,3 关闭周期性时钟中断（tick）
+
+		"housekeeping CPU"就是剩余的非隔离 CPU，负责承担所有内核杂务：
+		定时器处理、RCU 回调、工作队列、内核线程、中断亲和等。
+	*/
 	housekeeping_init();
 
 	/*
-	 * Allow workqueue creation and work item queueing/cancelling
-	 * early.  Work item execution depends on kthreads and starts after
-	 * workqueue_init().
+	 * 初始化工作队列（workqueue）早期框架。
+	 * 此时只能创建队列和排队工作项，实际执行要等 workqueue_init()。
+	 * workqueue 是内核的异步执行机制，大量驱动依赖它。
 	 */
+	/*
+		workqueue 是内核内部的延迟执行机制，用于把工作推迟到稍后执行：
+
+		// 驱动、子系统等内核代码提交工作
+		INIT_WORK(&my_work, my_handler);
+		queue_work(system_wq, &my_work);
+		// → 稍后由 worker kthread 在合适时机执行 my_handler()
+
+		典型使用场景：
+		- 中断处理程序把耗时工作推迟到进程上下文（可以睡眠）
+		- 驱动的异步初始化、热插拔事件处理
+		- 网络子系统的报文处理
+		- 文件系统的后台刷盘
+
+		与 进程调度 完全独立
+
+		用户进程和内核线程的调度由**调度器（scheduler）**管理，与 workqueue 无关：
+
+		进程调度体系：
+			struct task_struct（每个进程/线程）
+			→ CFS/RT/DL 调度器
+			→ 运行队列（runqueue）
+			→ CPU 执行
+
+		workqueue 体系：
+			struct work_struct（一个工作项）
+			→ worker_pool（工作池）
+			→ worker kthread（工作线程，本质上也是 task_struct）
+			→ CPU 执行
+
+		worker kthread 本身也是一个普通的内核线程，受调度器管理，但它只是 workqueue 机制的载体，调度器并不知道"这是 workqueue 的线程"。
+
+	*/
 	workqueue_init_early();
 
+	/*
+	 * 初始化 RCU（Read-Copy-Update）。
+	 * RCU 是内核最重要的无锁同步机制：
+	 *   读者：无锁，极快
+	 *   写者：复制-修改-替换，等待读者完成后释放旧版本
+	 * 几乎所有内核子系统都依赖 RCU。
+	 */
+	/*
+		RCU（Read-Copy-Update）是内核的一种无锁并发读取机制。
+
+		---
+		解决的问题
+
+		多个 CPU 同时读取一个数据结构，偶尔有写者修改它。用普通锁：
+
+		// 读者也要加锁，即使只是读
+		read_lock(&lock);
+		p = list_head->next;
+		read_unlock(&lock);
+
+		高并发场景下读锁竞争严重，性能差。
+
+		---
+		RCU 的核心思想
+
+		读者完全不加锁，写者遵循"复制-修改-替换"的规则：
+
+		// 写者：不修改原数据，而是复制一份新的
+		new_node = kmalloc(...);
+		*new_node = *old_node;      // 复制
+		new_node->value = new_val;  // 修改副本
+		rcu_assign_pointer(p, new_node);  // 原子替换指针
+
+		// 等所有正在读旧数据的 CPU 读完（宽限期）
+		synchronize_rcu();
+
+		// 释放旧数据
+		kfree(old_node);
+
+		读者：
+
+		rcu_read_lock();            // 不加真正的锁，只是标记"我在读"
+		p = rcu_dereference(ptr);  // 读指针
+		use(p->value);
+		rcu_read_unlock();          // 标记读完
+
+		---
+		宽限期（Grace Period）
+
+		写者替换指针后不能立即释放旧数据——可能有 CPU 还在读旧数据。
+
+		RCU 等待所有 CPU 都经历了一次上下文切换（或执行了 RCU 静止点），此时可以确认没有任何 CPU 还持有旧数据的引用，才安全释放：
+
+		CPU 0：读旧数据 ────────────────────┐ 上下文切换
+		CPU 1：          读旧数据 ──────────┘ 上下文切换
+		CPU 2：                    写者替换指针，等待宽限期结束
+													↓
+												kfree(旧数据)
+
+		---
+		两种实现
+
+		┌────────┬───────────────────────────────┬───────────────────────────────┐
+		│        │ tiny RCU（kernel/rcu/tiny.c）  │ tree RCU（kernel/rcu/tree.c） │
+		├────────┼───────────────────────────────┼───────────────────────────────┤
+		│ 适用    │ 单 CPU（UP）系统                │ SMP 多 CPU 系统               │
+		├────────┼───────────────────────────────┼───────────────────────────────┤
+		│ 复杂度  │ 极简，几百行                    │ 复杂，处理多 CPU 宽限期协调       │
+		├────────┼───────────────────────────────┼───────────────────────────────┤
+		│ 宽限期  │ 简单等待                        │ 分层树形结构跟踪各 CPU 状态      │
+		└────────┴───────────────────────────────┴───────────────────────────────┘
+
+		---
+		典型使用场景
+
+		网络路由表     → 查路由极频繁，RCU 读，路由更新时写
+		进程列表       → 频繁遍历，任务退出时写
+		文件系统 dentry缓存 → 频繁查找，目录变化时写
+		设备驱动注册表 → 频繁查设备，注册/注销时写
+
+		总结：RCU 用读者零开销换取写者的复杂性，适合读多写少的共享数据结构。
+	*/
 	rcu_init();
+
+	/* 初始化 kvfree_rcu（延迟释放内存的 RCU 版本） */
+	/*
+		kfree_rcu() / kvfree_rcu() 的批处理加速机制，是建立在 RCU 之上的一个优化层。
+
+		背景：kfree_rcu() 的问题
+
+		kfree_rcu(ptr, rcu_head);
+		// 等待当前 GP 结束后调用 kfree(ptr)
+
+		每个 kfree_rcu() 调用都向 RCU 注册一个回调，大量调用时（如网络包处理）会产生海量回调，消耗大量 CPU 时间来处理回调链表。
+
+		解决方案：把多个待释放指针攒成批次，GP 结束后一次性批量释放，减少回调注册次数。
+	*/
 	kvfree_rcu_init();
 
-	/* Trace events are available after this */
+	/* 初始化内核跟踪框架（trace events 从此可用） */
 	trace_init();
 
 	if (initcall_debug)
+		/* 开启 initcall 调试：每个初始化函数的耗时都会打印到 dmesg */
 		initcall_debug_enable();
 
+	/* 初始化上下文跟踪（用于 NOHZ 模式，精确跟踪用户/内核态切换） */
 	context_tracking_init();
-	/* init some links before init_ISA_irqs() */
+
+	/*
+	 * ── 第五批：中断系统初始化 ────────────────────────────────────
+	 */
+
+	/* 早期 IRQ 初始化（建立 IRQ 描述符数组） */
+	// 实现在 kernel/irq/irqdesc.c
 	early_irq_init();
+
+	/*
+	 * 初始化中断控制器（ARM64 上是 GIC - Generic Interrupt Controller）。
+	 * 之后硬件中断可以被接收（但 CPU 中断还是关闭的）。
+	 */
 	init_IRQ();
+
+	/* 初始化时钟事件框架（tick = 内核的基本时间单位） */
 	tick_init();
+
+	/* 初始化 RCU 的 NOHZ（无滴答）模式 */
 	rcu_init_nohz();
+
+	/* 初始化定时器（timer wheel，低精度定时器） */
 	timers_init();
+
+	/* 初始化 SRCU（Sleepable RCU，允许读者睡眠的 RCU 变体） */
 	srcu_init();
+
+	/* 初始化高精度定时器（hrtimer，纳秒级精度） */
 	hrtimers_init();
+
+	/* 初始化软中断（softirq）系统（网络、块设备等用软中断处理延迟工作） */
 	softirq_init();
+
+	/* 初始化 VDSO 数据页（Virtual Dynamic Shared Object，gettimeofday 加速） */
 	vdso_setup_data_pages();
+
+	/* 初始化时间保持系统（wall clock，单调时钟等） */
 	timekeeping_init();
+
+	/*
+	 * 架构相关的时钟初始化（ARM64 上初始化 arch timer，即 Generic Timer）。
+	 * 之后时钟中断可以正常工作，jiffies 开始计时。
+	 */
 	time_init();
 
-	/* This must be after timekeeping is initialized */
+	/* 完整的随机数初始化（依赖时钟，时钟就绪后才能做） */
 	random_init();
 
-	/* These make use of the fully initialized rng */
+	/* 初始化 KFENCE（内核内存安全性检测，采样式检测堆越界） */
 	kfence_init();
+
+	/* 初始化栈 canary（每个进程栈的保护值，检测栈溢出） */
 	boot_init_stack_canary();
 
+	/* 初始化性能事件框架（perf，硬件性能计数器接口） */
 	perf_event_init();
+
+	/* 初始化性能分析框架（profile，用于 oprofile 等工具） */
 	profile_init();
+
+	/* 初始化跨 CPU 函数调用机制（smp_call_function 的基础） */
 	call_function_init();
+
 	WARN(!irqs_disabled(), "Interrupts were enabled early\n");
 
+	/*
+	 * ── 关键时刻：开启中断 ────────────────────────────────────────
+	 * 从这里开始系统可以响应外部中断（时钟、设备等）。
+	 * 在此之前所有工作都在关中断状态下完成。
+	 */
 	early_boot_irqs_disabled = false;
 	local_irq_enable();
 
+	/* 完成 slab 分配器的后期初始化（中断开启后才能完成的部分） */
 	kmem_cache_init_late();
 
 	/*
-	 * HACK ALERT! This is early. We're enabling the console before
-	 * we've done PCI setups etc, and console_init() must be aware of
-	 * this. But we do want output early, in case something goes wrong.
+	 * 初始化控制台（串口、framebuffer 等输出设备）。
+	 * 注意：此时 PCI 等总线还没初始化完成，console_init() 必须能处理这种情况。
+	 * 尽管如此，我们需要尽早有输出，方便调试启动问题。
 	 */
 	console_init();
+
+	/* 如果命令行参数太多，这里会 panic（之前只是记录，现在才真正报错） */
 	if (panic_later)
 		panic("Too many boot %s vars at `%s'", panic_later,
 		      panic_param);
 
+	/* 初始化 lockdep（运行时死锁检测，仅 debug 内核） */
 	lockdep_init();
 
-	/*
-	 * Need to run this when irqs are enabled, because it wants
-	 * to self-test [hard/soft]-irqs on/off lock inversion bugs
-	 * too:
-	 */
+	/* 锁机制自测（需要中断开启，因为要测试中断上下文的锁行为） */
 	locking_selftest();
 
 #ifdef CONFIG_BLK_DEV_INITRD
+	/* 检查 initrd 是否被内存布局覆盖，如果是则禁用 initrd */
 	if (initrd_start && !initrd_below_start_ok &&
 	    page_to_pfn(virt_to_page((void *)initrd_start)) < min_low_pfn) {
 		pr_crit("initrd overwritten (0x%08lx < 0x%08lx) - disabling it.\n",
@@ -1132,46 +1857,127 @@ void start_kernel(void)
 		initrd_start = 0;
 	}
 #endif
+
+	/*
+	 * ── 第六批：各子系统完整初始化 ───────────────────────────────
+	 */
+
+	/* 为每个 CPU 分配页集合（用于加速页分配，减少全局锁争用） */
 	setup_per_cpu_pageset();
+
+	/* 初始化 NUMA 内存策略（控制内存从哪个 NUMA 节点分配） */
 	numa_policy_init();
+
+	/* ACPI 早期初始化（解析 ACPI 表，发现设备拓扑） */
 	acpi_early_init();
+
+	/* 晚期时间初始化（某些平台的时钟需要在这里初始化） */
 	if (late_time_init)
 		late_time_init();
+
+	/* 初始化调度时钟（sched_clock，用于调度器的时间戳） */
 	sched_clock_init();
+
+	/*
+	 * 计算 BogoMIPS（Bogus MIPS，一个粗略的 CPU 速度指标）。
+	 * 通过测量空循环延迟来估算 CPU 频率，用于 udelay() 的校准。
+	 * dmesg 中会看到 "Calibrating delay loop... 1234.56 BogoMIPS"。
+	 */
 	calibrate_delay();
 
+	/* CPU 最终初始化（处理器特性检测、漏洞缓解措施最终确认） */
 	arch_cpu_finalize_init();
 
+	/* 初始化 PID 的 IDR（整数 ID 分配器，用于分配进程 ID） */
 	pid_idr_init();
+
+	/* 初始化匿名 VMA（Virtual Memory Area）的 rmap 机制 */
 	anon_vma_init();
+
+	/* 初始化线程栈的 slab 缓存（加速线程创建） */
 	thread_stack_cache_init();
+
+	/* 初始化进程凭证（credentials）系统（uid/gid/capabilities） */
 	cred_init();
+
+	/*
+	 * 初始化 fork 机制。
+	 * fork 是创建新进程的基础，Zygote fork App 就用这个。
+	 * 建立 task_struct 的 slab 缓存等。
+	 */
 	fork_init();
+
+	/* 初始化 /proc 文件系统的各种 slab 缓存 */
 	proc_caches_init();
+
+	/* 初始化 UTS 命名空间（主机名、域名的隔离，容器技术基础） */
 	uts_ns_init();
+
+	/* 初始化时间命名空间（容器内独立时钟偏移） */
 	time_ns_init();
+
+	/* 初始化内核密钥系统（存储加密密钥、凭证等） */
 	key_init();
+
+	/* 安全框架完整初始化（SELinux 策略在这里加载） */
 	security_init();
+
+	/* 调试相关的晚期初始化 */
 	dbg_late_init();
+
+	/* 初始化网络命名空间（network namespace，容器网络隔离的基础） */
 	net_ns_init();
+
+	/* VFS 缓存完整初始化（dcache/inode cache 正式建立） */
 	vfs_caches_init();
+
+	/* 初始化页缓存（文件内容的内存缓存） */
 	pagecache_init();
+
+	/* 初始化信号机制（kill/signal 的基础数据结构） */
 	signals_init();
+
+	/* 初始化 seq_file（/proc 文件的顺序读取接口） */
 	seq_file_init();
+
+	/* 初始化 /proc 根目录 */
 	proc_root_init();
+
+	/* 初始化命名空间文件系统（/proc/*/ns/ 目录） */
 	nsfs_init();
+
+	/* 初始化 PID 文件系统（通过文件描述符引用进程，防止 PID 复用竞争） */
 	pidfs_init();
+
+	/* 初始化 cpuset（CPU 和内存节点的分组管理，cgroup 的一部分） */
 	cpuset_init();
+
+	/* 初始化 memory cgroup（内存使用量限制和统计） */
 	mem_cgroup_init();
+
+	/* 完整初始化 cgroup（控制组，容器技术的核心机制） */
 	cgroup_init();
+
+	/* 初始化任务统计接口（进程资源使用统计，供 /proc 使用） */
 	taskstats_init_early();
+
+	/* 初始化延迟记账（记录进程等待调度、IO 等的时间） */
 	delayacct_init();
 
+	/* ACPI 子系统完整初始化 */
 	acpi_subsystem_init();
+
+	/* 架构在 ACPI 初始化后的钩子（ARM64 这里处理 ACPI 平台设备） */
 	arch_post_acpi_subsys_init();
+
+	/* 初始化 KCSAN（内核并发安全分析，检测数据竞争） */
 	kcsan_init();
 
-	/* Do the rest non-__init'ed, we're now alive */
+	/*
+	 * ── 最后一步 ──────────────────────────────────────────────────
+	 * 进入 rest_init()：创建 PID 1 和 PID 2，自身变成 idle 进程。
+	 * 注释"we're now alive"：内核现在完全活着了，后续工作交给内核线程。
+	 */
 	rest_init();
 
 	/*
@@ -1334,49 +2140,81 @@ static inline void do_trace_initcall_level(const char *level)
 }
 #endif /* !TRACEPOINTS_ENABLED */
 
+/*
+ * do_one_initcall()：执行单个 initcall 函数，并做健康检查。
+ *
+ * 每个 initcall 函数执行后，检查：
+ *   1. 抢占计数是否平衡（如果不平衡说明驱动有锁泄露）
+ *   2. 中断是否意外被关闭（如果是说明驱动忘记 local_irq_enable）
+ * 发现问题时打印警告但继续启动（不 panic），尽量让系统跑起来。
+ */
 int __init_or_module do_one_initcall(initcall_t fn)
 {
-	int count = preempt_count();
+	int count = preempt_count(); /* 记录执行前的抢占计数，用于检测泄露 */
 	char msgbuf[64];
 	int ret;
 
+	/* 检查黑名单（可通过 initcall_blacklist= 参数跳过特定初始化函数） */
 	if (initcall_blacklisted(fn))
 		return -EPERM;
 
 	do_trace_initcall_start(fn);
-	ret = fn();
+	ret = fn(); /* 执行 initcall 函数 */
 	do_trace_initcall_finish(fn, ret);
 
 	msgbuf[0] = 0;
 
+	/* 检查抢占计数是否平衡（spin_lock/unlock 必须成对） */
 	if (preempt_count() != count) {
 		sprintf(msgbuf, "preemption imbalance ");
-		preempt_count_set(count);
+		preempt_count_set(count); /* 强制修复，避免后续代码崩溃 */
 	}
+	/* 检查中断状态（驱动不应该在 initcall 结束时关着中断） */
 	if (irqs_disabled()) {
 		strlcat(msgbuf, "disabled interrupts ", sizeof(msgbuf));
-		local_irq_enable();
+		local_irq_enable(); /* 强制修复 */
 	}
 	WARN(msgbuf[0], "initcall %pS returned with %s\n", fn, msgbuf);
 
+	/* 向随机数熵池添加一点隐含的随机性（利用执行时间的不确定性） */
 	add_latent_entropy();
 	return ret;
 }
 
 
+/*
+ * initcall 机制说明：
+ *
+ * 内核中的驱动和子系统通过宏注册自己的初始化函数：
+ *   pure_initcall(fn)      → level 0，最先运行
+ *   core_initcall(fn)      → level 1
+ *   postcore_initcall(fn)  → level 2
+ *   arch_initcall(fn)      → level 3
+ *   subsys_initcall(fn)    → level 4
+ *   fs_initcall(fn)        → level 5
+ *   device_initcall(fn)    → level 6  （module_init() 默认用这个）
+ *   late_initcall(fn)      → level 7，最后运行
+ *
+ * 这些宏展开后把函数指针放入特殊的 ELF 段（如 .initcall1.init）。
+ * 链接脚本把同一 level 的所有函数指针连续排列，
+ * __initcallN_start 指向每段的起始地址。
+ * do_initcalls() 按 level 顺序遍历这些指针并逐个调用。
+ *
+ * 好处：添加驱动只需加一行宏，不需要修改任何初始化流程代码。
+ */
 static initcall_entry_t *initcall_levels[] __initdata = {
-	__initcall0_start,
-	__initcall1_start,
-	__initcall2_start,
-	__initcall3_start,
-	__initcall4_start,
-	__initcall5_start,
-	__initcall6_start,
-	__initcall7_start,
+	__initcall0_start,  /* pure */
+	__initcall1_start,  /* core */
+	__initcall2_start,  /* postcore */
+	__initcall3_start,  /* arch */
+	__initcall4_start,  /* subsys */
+	__initcall5_start,  /* fs */
+	__initcall6_start,  /* device（驱动的默认 level） */
+	__initcall7_start,  /* late */
 	__initcall_end,
 };
 
-/* Keep these in sync with initcalls in include/linux/init.h */
+/* 与 include/linux/init.h 中的 initcall 宏保持同步 */
 static const char *initcall_level_names[] __initdata = {
 	"pure",
 	"core",
@@ -1536,53 +2374,95 @@ void __weak free_initmem(void)
 	free_initmem_default(POISON_FREE_INITMEM);
 }
 
+/*
+ * kernel_init()：PID 1 的执行体。
+ *
+ * 由 rest_init() 通过 user_mode_thread() 创建，
+ * 最终通过 kernel_execve() 变成用户态的 init 进程。
+ * 执行成功后此函数不再存在（被 exec 替换），
+ * 失败则 panic（没有 init 进程内核无法继续运行）。
+ *
+ * 这是内核线程变成用户进程的关键转变点。
+ */
 static int __ref kernel_init(void *unused)
 {
 	int ret;
 
 	/*
-	 * Wait until kthreadd is all set-up.
+	 * 等待 kthreadd（PID 2）完全建立。
+	 * 原因：kernel_init 可能会创建内核线程，
+	 * 必须等 kthreadd 就绪才能安全地创建内核线程。
+	 * rest_init() 在创建完 kthreadd 后会调用 complete(&kthreadd_done)。
 	 */
 	wait_for_completion(&kthreadd_done);
 
+	/*
+	 * kernel_init_freeable()：完成剩余的初始化工作。
+	 *   - 启动其他 CPU（SMP 初始化）
+	 *   - 运行所有 do_initcalls（驱动初始化）
+	 *   - 挂载根文件系统
+	 * 这些工作放在单独的函数里是为了避免栈 canary 问题（见函数注释）。
+	 */
 	kernel_init_freeable();
-	/* need to finish all async __init code before freeing the memory */
+
+	/* 等待所有异步 __init 代码完成，再释放 init 内存 */
 	async_synchronize_full();
 
+	/*
+	 * 释放 __init 段内存。
+	 * 所有标记了 __init 的函数和数据（包括 start_kernel 本身）
+	 * 在这里被释放，通常能释放数百 KB 内存。
+	 * dmesg 中会看到 "Freeing unused kernel image memory: XXXK freed"。
+	 */
 	system_state = SYSTEM_FREEING_INITMEM;
-	kprobe_free_init_mem();
-	ftrace_free_init_mem();
-	kgdb_free_init_mem();
-	exit_boot_config();
-	free_initmem();
+	kprobe_free_init_mem();  /* 清理 kprobe 在 init 段的数据 */
+	ftrace_free_init_mem();  /* 清理 ftrace 在 init 段的数据 */
+	kgdb_free_init_mem();    /* 清理 kgdb 在 init 段的数据 */
+	exit_boot_config();      /* 释放 bootconfig 内存 */
+	free_initmem();          /* 释放 __init 段 */
+
+	/*
+	 * 把内核代码/数据段标记为只读（W^X 保护）。
+	 * 之前因为 __init 段在同一映射中需要先释放再标记，
+	 * 现在 __init 内存已释放，可以安全地设置只读保护了。
+	 * 这防止了对内核代码段的运行时修改（安全加固）。
+	 */
 	mark_readonly();
 
 	/*
-	 * Kernel mappings are now finalized - update the userspace page-table
-	 * to finalize PTI.
+	 * 内核映射已最终确定，更新用户空间页表以完成 PTI（Page Table Isolation）。
+	 * PTI 是 Meltdown 漏洞的缓解措施：用户态和内核态使用不同页表，
+	 * 防止用户态推测执行读取内核内存。
 	 */
 	pti_finalize();
 
+	/* 系统正式进入运行状态 */
 	system_state = SYSTEM_RUNNING;
 	numa_default_policy();
 
+	/* 通知 RCU 内核启动阶段结束 */
 	rcu_end_inkernel_boot();
 
+	/* 处理通过 sysctl 命令行参数传入的 sysctl 设置 */
 	do_sysctl_args();
 
+	/*
+	 * 尝试运行 init 进程，按优先级顺序：
+	 *
+	 * 1. ramdisk 中的 init（Android 的 /init 就是这个）
+	 *    通过 rdinit= 参数指定，默认是 "/init"
+	 */
 	if (ramdisk_execute_command) {
 		ret = run_init_process(ramdisk_execute_command);
 		if (!ret)
-			return 0;
+			return 0; /* exec 成功，此函数不再存在 */
 		pr_err("Failed to execute %s (error %d)\n",
 		       ramdisk_execute_command, ret);
 	}
 
 	/*
-	 * We try each of these until one succeeds.
-	 *
-	 * The Bourne shell can be used instead of init if we are
-	 * trying to recover a really broken machine.
+	 * 2. 通过 init= 参数指定的 init
+	 *    如果指定了但执行失败则直接 panic（用户明确指定了就不再尝试其他）
 	 */
 	if (execute_command) {
 		ret = run_init_process(execute_command);
@@ -1592,6 +2472,7 @@ static int __ref kernel_init(void *unused)
 		      execute_command, ret);
 	}
 
+	/* 3. Kconfig 中指定的默认 init（CONFIG_DEFAULT_INIT） */
 	if (CONFIG_DEFAULT_INIT[0] != '\0') {
 		ret = run_init_process(CONFIG_DEFAULT_INIT);
 		if (ret)
@@ -1601,12 +2482,17 @@ static int __ref kernel_init(void *unused)
 			return 0;
 	}
 
+	/*
+	 * 4. 按传统路径逐个尝试。
+	 *    /bin/sh 作为最后手段，让管理员可以修复严重故障的系统。
+	 */
 	if (!try_to_run_init_process("/sbin/init") ||
 	    !try_to_run_init_process("/etc/init") ||
 	    !try_to_run_init_process("/bin/init") ||
 	    !try_to_run_init_process("/bin/sh"))
 		return 0;
 
+	/* 所有尝试都失败，内核无法继续运行，panic */
 	panic("No working init found.  Try passing init= option to kernel. "
 	      "See Linux Documentation/admin-guide/init.rst for guidance.");
 }
@@ -1626,45 +2512,108 @@ void __init console_on_rootfs(void)
 	fput(file);
 }
 
+/*
+ * kernel_init_freeable()：kernel_init() 中可释放部分的初始化工作。
+ *
+ * 单独拆分为此函数的原因：
+ *   防止 start_kernel() 和 boot_init_stack_canary() 的调用者
+ *   在 free_initmem() 之前被 GCC-10 及更早版本尾调用优化掉。
+ *   noinline 确保栈帧独立存在。
+ *
+ * 执行顺序：
+ *   1. SMP 初始化（启动其他 CPU）
+ *   2. do_initcalls（所有驱动和子系统的批量初始化）
+ *   3. 挂载根文件系统
+ */
 static noinline void __init kernel_init_freeable(void)
 {
-	/* Now the scheduler is fully set up and can do blocking allocations */
+	/*
+	 * 现在调度器完全就绪，可以进行阻塞分配了。
+	 * __GFP_BITS_MASK 开启所有 GFP 标志，包括允许睡眠等待内存。
+	 * 之前只允许非阻塞分配（避免在调度器就绪前睡眠）。
+	 */
 	gfp_allowed_mask = __GFP_BITS_MASK;
 
-	/*
-	 * init can allocate pages on any node
-	 */
+	/* init 进程可以从任意 NUMA 节点分配内存 */
 	set_mems_allowed(node_states[N_MEMORY]);
 
+	/* 记录 init 进程的 PID（用于 Ctrl+Alt+Del 重启信号发送目标） */
 	cad_pid = get_pid(task_pid(current));
 
+	/* 为所有 CPU 做启动前的准备工作（分配每 CPU 数据结构等） */
 	smp_prepare_cpus(setup_max_cpus);
 
+	/*
+	 * 完成工作队列初始化（启动 kworker 内核线程）。
+	 * 之前 workqueue_init_early() 只建立了框架，
+	 * 现在才真正启动工作线程来执行队列中的工作项。
+	 */
 	workqueue_init();
 
+	/* 内存管理内部数据结构的后期初始化 */
 	init_mm_internals();
 
+	/*
+	 * 运行 SMP 启动前的 initcalls（level 0，"pure" 级别）。
+	 * 这些是必须在其他 CPU 启动前完成的初始化。
+	 */
 	do_pre_smp_initcalls();
+
+	/* 初始化 CPU 死锁检测（watchdog/NMI），监控 CPU 是否卡死 */
 	lockup_detector_init();
 
+	/*
+	 * 启动所有其他 CPU（SMP 初始化）。
+	 * 从这里开始系统变成真正的多核系统。
+	 * 每个 CPU 执行 secondary_startup → secondary_start_kernel。
+	 */
 	smp_init();
+
+	/* 初始化 SMP 调度（建立完整的 CPU 拓扑，迁移任务到各 CPU） */
 	sched_init_smp();
 
+	/* 根据 CPU 拓扑（NUMA/缓存层次）优化工作队列的 CPU 绑定策略 */
 	workqueue_init_topology();
+
+	/* 初始化异步函数调用框架（async_schedule 等） */
 	async_init();
+
+	/* 初始化并行数据处理框架（加密、校验等并行计算） */
 	padata_init();
+
+	/* 页分配器的晚期初始化（处理内存热插拔等） */
 	page_alloc_init_late();
 
+	/*
+	 * do_basic_setup()：运行所有 initcalls（level 1-7）。
+	 * 这是驱动初始化的核心，包括：
+	 *   - 总线驱动（PCI/USB/I2C 等）
+	 *   - 存储驱动（eMMC/UFS/SATA 等）
+	 *   - 网络驱动
+	 *   - 文件系统注册
+	 *   - Android 相关驱动（Binder/ion 等）
+	 * 执行完后所有内置驱动都已初始化。
+	 */
 	do_basic_setup();
 
+	/* 运行所有 KUnit 测试（内核单元测试框架，调试内核时使用） */
 	kunit_run_all_tests();
 
+	/* 等待 initramfs 完全加载到内存 */
 	wait_for_initramfs();
+
+	/*
+	 * 打开 /dev/console，绑定到 stdin/stdout/stderr（fd 0/1/2）。
+	 * init 进程需要有控制台才能输出信息。
+	 */
 	console_on_rootfs();
 
 	/*
-	 * check if there is an early userspace init.  If yes, let it do all
-	 * the work
+	 * 检查 ramdisk 中是否存在 init 程序。
+	 * 如果 ramdisk_execute_command（默认 "/init"）可访问，
+	 * 就用它作为 init（Android 就走这条路）。
+	 * 如果不可访问，则调用 prepare_namespace() 挂载真正的根文件系统，
+	 * 再从磁盘上找 init。
 	 */
 	int ramdisk_command_access;
 	ramdisk_command_access = init_eaccess(ramdisk_execute_command);
@@ -1673,17 +2622,17 @@ static noinline void __init kernel_init_freeable(void)
 			pr_warn("check access for rdinit=%s failed: %i, ignoring\n",
 				ramdisk_execute_command, ramdisk_command_access);
 		ramdisk_execute_command = NULL;
+		/* 没有 ramdisk init，挂载真实根文件系统 */
 		prepare_namespace();
 	}
 
 	/*
-	 * Ok, we have completed the initial bootup, and
-	 * we're essentially up and running. Get rid of the
-	 * initmem segments and start the user-mode stuff..
+	 * 初始启动完成，系统基本运行起来了。
+	 * 释放 initmem 段，启动用户态...
 	 *
-	 * rootfs is available now, try loading the public keys
-	 * and default modules
+	 * 根文件系统现在可用，加载公钥和默认模块。
 	 */
 
+	/* 加载完整性验证公钥（IMA/EVM 等安全特性使用） */
 	integrity_load_keys();
 }
