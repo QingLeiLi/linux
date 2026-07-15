@@ -1639,12 +1639,32 @@ static struct workqueue_struct *sync_wq;
 static atomic_long_t rcu_sr_normal_count;
 static int rcu_sr_normal_latched; /* 0/1 */
 
+/*
+ * 宽限期结束后，由 GP kthread/worker 对队列中的每个请求调用此函数，
+ * 唤醒阻塞在 synchronize_rcu_normal() 里的调用者。
+ *
+ * 执行顺序的约束：
+ *   complete() 必须在 dec 之前执行。
+ *   如果先 dec 再 complete()：另一个线程可能看到 nr==0 并清除 latch，
+ *   而此时 complete() 还没执行，唤醒丢失。先 complete() 再 dec 保证
+ *   等待者被唤醒后，计数才减少，latch 清除时机正确。
+ *
+ * latch 清除时机：
+ *   当 nr 降到 0（队列完全排空）且 latch 曾被置 1 时，将其清零，
+ *   恢复 synchronize_rcu_normal() 走快路径。
+ *   用 cmpxchg_relaxed 而非直接写 0，是为了避免在 latch 本就为 0 时
+ *   产生不必要的写操作（保持 cacheline 干净）。
+ */
 static void rcu_sr_normal_complete(struct llist_node *node)
 {
 	struct rcu_synchronize *rs = container_of(
 		(struct rcu_head *) node, struct rcu_synchronize, head);
 	long nr;
 
+	/*
+	 * 仅 CONFIG_PROVE_RCU：验证从提交请求到现在确实经历了完整宽限期。
+	 * 用入队前抓取的 oldstate 快照做检查，防止 GP kthread 提前唤醒等待者。
+	 */
 	WARN_ONCE(IS_ENABLED(CONFIG_PROVE_RCU) &&
 		!poll_state_synchronize_rcu_full(&rs->oldstate),
 		"A full grace period is not passed yet!\n");
@@ -1803,6 +1823,28 @@ static bool rcu_sr_normal_gp_init(void)
 	return start_new_poll;
 }
 
+/*
+
+ * 将一个 synchronize_rcu() 请求加入全局待处理队列（srs_next llist），
+ * 并在并发量超过阈值时设置 latch 标志切换到慢路径。
+ *
+ * 为什么要先递增计数再入队（而不是先入队再递增）？
+ *   rcu_sr_normal_complete() 在回调中会递减计数，当计数降到 0 时清除 latch。
+ *   如果先入队再递增：GP kthread 有可能在递增之前就看到节点并调用 complete()，
+ *   导致计数先减到 -1 再加回 0，触发 WARN_ON_ONCE(nr < 0)，同时 latch 清除时机
+ *   也会错乱。先递增再入队确保 complete() 永远在 inc 之后执行，计数始终 >= 0。
+ *
+ * latch 机制（rcu_sr_normal_latched）的作用：
+ *   当并发请求数 == RCU_SR_NORMAL_LATCH_THR（64）时，将 latch 从 0 置 1。
+ *   之后新来的 synchronize_rcu_normal() 看到 latch == 1 就走慢路径，
+ *   避免队列继续膨胀加剧延迟。latch 在队列完全排空（nr 降到 0）时由
+ *   rcu_sr_normal_complete() 自动清除，恢复快路径。
+ *
+ *   用精确匹配（nr == 阈值）而非 >= 阈值，是为了让 cmpxchg 只在一个上下文
+ *   中触发，避免多个并发调用者同时竞争写 latch 带来不必要的 cacheline 争抢。
+ *   latch 是 best-effort 的：并发的 set/clear 可能短暂丢失，但无关正确性，
+ *   只影响快/慢路径的选择。
+ */
 static void rcu_sr_normal_add_req(struct rcu_synchronize *rs)
 {
 	/*
@@ -1823,6 +1865,7 @@ static void rcu_sr_normal_add_req(struct rcu_synchronize *rs)
 		(void)cmpxchg_relaxed(&rcu_sr_normal_latched, 0, 1);
 
 	/* Publish for the GP kthread/worker. */
+	/* 发布到 GP kthread/worker 可见的全局链表。 */
 	llist_add((struct llist_node *) &rs->head, &rcu_state.srs_next);
 }
 
@@ -3289,6 +3332,19 @@ EXPORT_SYMBOL_GPL(call_rcu);
  * is not a common case.  Furthermore, this optimization would cause
  * the rcu_gp_oldstate structure to expand by 50%, so this potential
  * grace-period optimization is ignored once the scheduler is running.
+ * 判断当前上下文是否天然构成一个完整的宽限期，从而允许 synchronize_rcu()
+ * 绕过真正的宽限期流程直接返回。
+ *
+ * 为什么早期启动阶段"阻塞即宽限期"？
+ *   RCU 宽限期的本质是"等待所有已开始的 RCU 读临界区结束"。在调度器启动
+ *   之前（INACTIVE 阶段），系统只有一个执行流，不存在任何并发读者，因此
+ *   调用者一旦能执行到 synchronize_rcu()，就意味着不可能有任何读临界区还
+ *   在进行中——宽限期条件已经天然满足，无需等待。
+ *
+ * 为什么 SMP+PREEMPTION 单 CPU 的情况不做同样优化？
+ *   理论上单 CPU 运行时也满足上述条件，但实现这个优化需要在
+ *   rcu_gp_oldstate 结构中多存一个状态位，导致结构体膨胀 50%。
+ *   这是个极少出现的场景，性价比不高，所以故意忽略。
  */
 static int rcu_blocking_is_gp(void)
 {
@@ -3301,6 +3357,24 @@ static int rcu_blocking_is_gp(void)
 
 /*
  * Helper function for the synchronize_rcu() API.
+ * synchronize_rcu() 在非 expedited 模式下的真正实现。
+ *
+ * 整体流程：把当前调用者挂在 GP kthread 的完成队列里，等 GP kthread 跑完
+ * 一轮宽限期后唤醒所有等待者。这样多个并发的 synchronize_rcu() 调用可以
+ * 共享同一个宽限期，而不是每人各自跑一轮，大幅降低开销。
+ *
+ * 快慢路径选择（rcu_normal_wake_from_gp / rcu_sr_normal_latched）：
+ *   正常情况（快路径）：通过 llist + completion 批量排队，GP kthread 跑完后
+ *   统一唤醒所有等待者，吞吐量高。
+ *
+ *   两种情况退回慢路径（wait_rcu_gp(call_rcu_hurry)）：
+ *   1. rcu_normal_wake_from_gp < 1：功能被管理员/模块参数显式关闭。
+ *   2. rcu_sr_normal_latched == 1：在飞途径中的请求数已超过阈值
+ *      RCU_SR_NORMAL_LATCH_THR（64），说明系统正处于宽限期高压状态，
+ *      快路径队列已经拥堵。退回慢路径可以独立提交一个 call_rcu 回调，
+ *      避免新请求继续堆积导致延迟恶化。
+ *   慢路径通过 call_rcu 提交一个回调，回调触发时意味着宽限期已过，
+ *   再通过栈上的 completion 唤醒调用者。
  */
 static void synchronize_rcu_normal(void)
 {
@@ -3320,16 +3394,27 @@ static void synchronize_rcu_normal(void)
 	/*
 	 * This code might be preempted, therefore take a GP
 	 * snapshot before adding a request.
+	 * 在加入队列之前先抓一次 GP 快照（仅 CONFIG_PROVE_RCU）。
+	 * 此处可能被抢占，如果在快照和入队之间发生了 GP 推进，
+	 * 后续 rcu_sr_normal_complete() 中的 poll_state_synchronize_rcu_full()
+	 * 会用这个快照验证"返回时确实经历了完整宽限期"，而不是误判为已完成。
 	 */
 	if (IS_ENABLED(CONFIG_PROVE_RCU))
 		get_state_synchronize_rcu_full(&rs.oldstate);
 
+	/* 将本次请求加入全局 llist，GP kthread 在宽限期结束时批量唤醒。 */
 	rcu_sr_normal_add_req(&rs);
 
 	/* Kick a GP and start waiting. */
+	/*
+	 * 踢一脚 GP kthread，确保它知道有新请求在等待。
+	 * 如果 GP 已经在跑，这次调用是幂等的（GP kthread 会在本轮结束后
+	 * 再处理队列里的新请求）。
+	 */
 	(void) start_poll_synchronize_rcu();
 
 	/* Now we can wait. */
+	/* 挂起，等 rcu_sr_normal_complete() 通过 complete() 唤醒我们。 */
 	wait_for_completion(&rs.completion);
 
 trace_complete_out:
@@ -3374,6 +3459,40 @@ trace_complete_out:
  *
  * Implementation of these memory-ordering guarantees is described here:
  * Documentation/RCU/Design/Memory-Ordering/Tree-RCU-Memory-Ordering.rst.
+ *
+ * synchronize_rcu - 等待一个完整的 RCU 宽限期结束后返回。
+ *
+ * 【作用】
+ * 阻塞调用者，直到所有在本次调用开始之前已经开始的 RCU 读临界区全部结束。
+ * 返回后，调用者可以安全地释放/修改被 RCU 保护的旧数据，因为不再有读者
+ * 持有指向它的引用。注意：返回时可能已有新的读临界区开始，但它们看到的
+ * 是更新后的数据，无需关心。
+ *
+ * 【典型用法】
+ *   writer 侧用 RCU 替换一个指针后，调用 synchronize_rcu()，
+ *   确认所有老读者离场，然后才能 kfree() 老对象。
+ *   如果不想阻塞，可以用 call_rcu() 注册一个回调代替。
+ *
+ * 【什么算 RCU 读临界区】
+ *   - rcu_read_lock() / rcu_read_unlock() 之间的代码（可嵌套）
+ *   - v5.0 起：关中断、关抢占、关软中断的代码段也算（包括硬中断、
+ *     软中断、NMI 处理函数）
+ *
+ * 【内存序保证（SMP）】
+ * 返回时，每个 CPU 保证已在其"调用 synchronize_rcu() 之前最后一个读
+ * 临界区结束后"执行过完整内存屏障；跨越返回点的读临界区则保证在
+ * synchronize_rcu() 开始后、该临界区开始前执行过完整内存屏障。
+ * 这些保证对离线、idle、用户态 CPU 同样成立。
+ * 若调用发生在 CPU A、返回到 CPU B，则 A 和 B 都保证在执行期间各自
+ * 经历过完整内存屏障（即使 A==B，但前提是系统有多于一个 CPU）。
+ *
+ * 【实现路径选择】
+ *   INACTIVE 阶段（早期启动）：直接记账，无需真正等待（无并发读者）
+ *   INIT/RUNNING + expedited：IPI 强制各 CPU 快速通过静止状态，延迟低
+ *   INIT/RUNNING + normal：批量排队共享宽限期，吞吐高
+ *
+ * 内存序实现细节见：
+ *   Documentation/RCU/Design/Memory-Ordering/Tree-RCU-Memory-Ordering.rst
  */
 void synchronize_rcu(void)
 {
@@ -3385,6 +3504,12 @@ void synchronize_rcu(void)
 			 lock_is_held(&rcu_sched_lock_map),
 			 "Illegal synchronize_rcu() in RCU read-side critical section");
 	if (!rcu_blocking_is_gp()) {
+		/*
+		 * 正常路径（调度器已启动）：根据当前是否处于 expedited 模式
+		 * 选择实现。expedited 通过 IPI 强制所有 CPU 快速通过静止状态，
+		 * 延迟低但对系统干扰大；normal 则批量排队共享宽限期，吞吐高。
+		 * 启动阶段及 sysctl rcu_expedited=1 时走 expedited 路径。
+		 */
 		if (rcu_gp_is_expedited())
 			synchronize_rcu_expedited();
 		else
@@ -3398,6 +3523,17 @@ void synchronize_rcu(void)
 	// process level.  Therefore, this normal GP overlaps with other
 	// normal GPs only by being fully nested within them, which allows
 	// reuse of ->gp_seq_polled_snap.
+	/*
+	 * 早期启动快路径（INACTIVE 阶段，!PREEMPT && !SMP）：
+	 * rcu_blocking_is_gp() 返回 true，说明当前上下文天然就是一个完整的
+	 * 宽限期（系统只有一个执行流，不存在并发读者）。
+	 * 这里不需要真正等待，只需"记账"——让 GP 序号正确推进，
+	 * 使后续的 poll_state_synchronize_rcu() 等函数能看到宽限期已完成。
+	 *
+	 * 注意：所有推进宽限期序号的代码都在进程上下文运行，因此并发的
+	 * synchronize_rcu() 只能通过完全嵌套来重叠，不会出现交叉，
+	 * 所以可以安全复用全局的 ->gp_seq_polled_snap。
+	 */
 	rcu_poll_gp_seq_start_unlocked(&rcu_state.gp_seq_polled_snap);
 	rcu_poll_gp_seq_end_unlocked(&rcu_state.gp_seq_polled_snap);
 
@@ -3405,6 +3541,12 @@ void synchronize_rcu(void)
 	// this grace period, but only those used by the boot CPU.
 	// The rcu_scheduler_starting() will take care of the rest of
 	// these counters.
+	/*
+	 * 手动推进 GP 序号以记录本次"宽限期"。
+	 * 只更新启动 CPU 用到的计数器；rcu_scheduler_starting() 稍后会把
+	 * 整棵 rcu_node 树的序号全部对齐，这里不必也不能提前做全树更新。
+	 * 关中断防止中断处理程序并发修改同一批序号。
+	 */
 	local_irq_save(flags);
 	WARN_ON_ONCE(num_online_cpus() > 1);
 	rcu_state.gp_seq += (1 << RCU_SEQ_CTR_SHIFT);
@@ -4726,23 +4868,98 @@ early_initcall(rcu_spawn_gp_kthread);
  * A later core_initcall() rcu_set_runtime_mode() will switch to full
  * runtime RCU functionality.
  */
+/*
+ * 在第一个任务（PID 1）创建之前、调度器首次运行之前调用。
+ * 将 RCU 从早期启动模式（INACTIVE）推进到 INIT 模式。
+ *
+ * 为什么需要这个状态机，而不是一开始就让 RCU 完全工作？
+ *
+ *   RCU 的宽限期机制依赖"所有 CPU 都经历过一次上下文切换"来判断没有读者
+ *   持有旧数据。但内核启动早期只有一个执行流，根本不会发生上下文切换，
+ *   宽限期永远无法推进。为此 RCU 用 rcu_scheduler_active 区分三个阶段：
+ *
+ *   INACTIVE（初始值）：
+ *     调度器尚未启动，整个系统只有一个执行流，不存在并发读者。
+ *     此时 rcu_blocking_is_gp() 返回 true，synchronize_rcu() 直接退化为
+ *     一条内存屏障（barrier()）就够了，完全不需要等待任何宽限期。
+ *     call_rcu() 提交的回调也会检测到这一状态，做特殊的早期初始化处理。
+ *
+ *   INIT（本函数设置）：
+ *     调度器即将启动，多任务即将出现，从现在起必须走完整的宽限期流程。
+ *     但 RCU 的 GP kthread 还没有被创建，所以 RCU 处于"能检测宽限期但
+ *     还没有专属线程来驱动"的过渡状态。
+ *
+ *   RUNNING（由 core_initcall(rcu_set_runtime_mode) 设置）：
+ *     RCU kthread 全部启动完毕，进入全功能模式。
+ *     kfree_rcu() 的批量回收等依赖 kthread 的功能也在此时激活。
+ */
 void rcu_scheduler_starting(void)
 {
 	unsigned long flags;
 	struct rcu_node *rnp;
 
+	/*
+	 * 时序断言：此函数必须在"只有一个 CPU 在线且从未发生过上下文切换"
+	 * 的窗口内调用，也就是 rest_init() 创建第一个任务之前。
+	 *
+	 * 如果这两个断言触发，说明启动顺序被破坏了——某处在调度器启动后才
+	 * 调用了本函数，RCU 的早期优化路径（INACTIVE 阶段的 barrier 退化）
+	 * 就已经在多任务环境下被错误地使用了，可能导致数据损坏。
+	 */
 	WARN_ON(num_online_cpus() != 1);
 	WARN_ON(nr_context_switches() > 0);
+
+	/*
+	 * 在切换状态之前，先用当前的 INACTIVE 语义跑一遍同步原语自检。
+	 * 仅在开启 CONFIG_PROVE_RCU 时生效，目的是验证 INACTIVE 阶段的
+	 * synchronize_rcu/synchronize_rcu_expedited 没有暗藏 bug，
+	 * 为后续切换到真正的宽限期检测提供一个干净的基线。
+	 */
 	rcu_test_sync_prims();
 
 	// Fix up the ->gp_seq counters.
+	/*
+	 * 对齐节点树中每个 rcu_node 的宽限期序号。
+	 *
+	 * 问题根源：rcu_init() 初始化各节点时，gp_seq/gp_seq_needed 都被设为 0，
+	 * 但全局 rcu_state.gp_seq 在启动过程中可能已经因为某些早期操作被推进。
+	 * 如果节点序号落后于全局序号，第一次真正的宽限期请求到来时，
+	 * rcu_gp_needed() 会拿节点的 gp_seq_needed 与 rcu_state.gp_seq 比较，
+	 * 发现"节点需要的宽限期序号已经满足"，从而直接跳过等待——实际上
+	 * 宽限期根本还没有走完，等待它的调用者会拿到错误的"已完成"结论。
+	 *
+	 * 修复方式：把所有节点的两个序号强制拉齐到全局值，保证第一次宽限期
+	 * 请求一定会触发一轮完整的宽限期流程。
+	 *
+	 * 为什么要关中断：此时硬件中断已经开启，中断处理程序里可能调用
+	 * call_rcu() 从而触发对 rcu_node 序号的读写，需要防止并发破坏。
+	 */
 	local_irq_save(flags);
 	rcu_for_each_node_breadth_first(rnp)
 		rnp->gp_seq_needed = rnp->gp_seq = rcu_state.gp_seq;
 	local_irq_restore(flags);
 
 	// Switch out of early boot mode.
+	/*
+	 * 切换到 INIT 模式。这一行是本函数最核心的副作用：
+	 *
+	 *   - rcu_blocking_is_gp() 从此返回 false，synchronize_rcu() 不再走
+	 *     barrier() 捷径，而是真正挂起调用者直到宽限期结束。
+	 *   - lockdep-RCU 在 INACTIVE 阶段会压制某些误报（因为早期单任务环境
+	 *     下很多锁规则还不适用），切换到 INIT 后这些检查全部恢复正常。
+	 *   - rcu_poll_gp_seq_start/end 等函数中针对 INACTIVE 的跳过路径
+	 *     也会失效，开始执行完整的锁断言和序号更新。
+	 *
+	 * 注意：此时 RCU GP kthread 尚未创建，宽限期的推进暂时依赖
+	 * rcu_check_quiescent_state() 在普通进程上下文切换时被动触发，
+	 * 直到 core_initcall(rcu_set_runtime_mode) 将状态推进到 RUNNING。
+	 */
 	rcu_scheduler_active = RCU_SCHEDULER_INIT;
+
+	/*
+	 * 切换后再跑一遍自检，验证 INIT 语义下 synchronize_rcu 走的是真正的
+	 * 宽限期路径而非退化路径，确保两次自检之间的状态切换没有引入 bug。
+	 */
 	rcu_test_sync_prims();
 }
 

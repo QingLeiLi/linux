@@ -376,28 +376,94 @@ static struct file_system_type proc_fs_type = {
 
 void __init proc_root_init(void)
 {
+	/*
+	 * 创建 procfs 专用的三个 slab 缓存（fs/proc/inode.c）：
+	 *   proc_inode_cachep    — struct proc_inode（VFS inode + proc 私有字段合体），
+	 *                          每个 /proc 文件背后都有一个，SLAB_RECLAIM_ACCOUNT
+	 *                          使其可被 shrinker 在内存压力下回收；
+	 *   pde_opener_cache     — struct pde_opener，跟踪 /proc 文件的打开实例，
+	 *                          用于在 proc_dir_entry 被移除时等待所有 reader 退出；
+	 *   proc_dir_entry_cache — struct proc_dir_entry（PDE），描述一个 /proc 节点
+	 *                          的元数据（名称、权限、ops 指针等），
+	 *                          kmem_cache_create_usercopy 标记 inline_name 字段
+	 *                          可安全复制到用户空间（HARDENED_USERCOPY 合规）。
+	 */
 	proc_init_kmemcache();
+
+	/*
+	 * 预计算 /proc/<pid>/ 和 /proc/<pid>/task/<tid>/ 目录的 nlink 数量。
+	 * nlink 等于子目录数 + 2（"." 和 ".."），而子目录数由
+	 * tgid_base_stuff / tid_base_stuff 数组中类型为目录的条目数决定。
+	 * 预计算结果存入 nlink_tgid / nlink_tid，避免每次 stat() 重新遍历数组。
+	 */
 	set_proc_pid_nlink();
+
+	/*
+	 * 为 /proc/self 预分配 inode 编号（self_inum）。
+	 * /proc/self 是指向当前进程 /proc/<pid> 的符号链接；
+	 * inode 编号固定后，readlink("/proc/self") 才能稳定返回目标路径。
+	 */
 	proc_self_init();
+
+	/*
+	 * 为 /proc/thread-self 预分配 inode 编号（thread_self_inum）。
+	 * /proc/thread-self 指向当前线程的 /proc/<pid>/task/<tid>，
+	 * 多线程程序通过它读取本线程的 stat/status 而无需知道自己的 tid。
+	 */
 	proc_thread_self_init();
+
+	/*
+	 * 创建 /proc/mounts → self/mounts 的符号链接。
+	 * 用户态工具（mount(8)、df(1) 等）通过 /proc/mounts 读取
+	 * 当前挂载表，实际内容由 /proc/<pid>/mounts 的 seq_file 生成。
+	 */
 	proc_symlink("mounts", NULL, "self/mounts");
 
+	/*
+	 * 初始化 /proc/net 目录框架。
+	 * /proc/net 是每网络命名空间独立的目录，内容随 net namespace 切换。
+	 * 这里只建立框架和 pernet_operations 注册机制；具体条目（如
+	 * /proc/net/dev、/proc/net/tcp）由各网络子系统后续注册。
+	 */
 	proc_net_init();
+
+	/* 建立 /proc/fs 目录：各文件系统注册自己的调试/统计节点的挂载点 */
 	proc_mkdir("fs", NULL);
+	/* 建立 /proc/driver 目录：驱动程序注册自己的状态节点 */
 	proc_mkdir("driver", NULL);
-	proc_create_mount_point("fs/nfsd"); /* somewhere for the nfsd filesystem to be mounted */
+	/* 为 nfsd 文件系统预留挂载点 /proc/fs/nfsd，nfsd 模块加载时在此挂载 */
+	proc_create_mount_point("fs/nfsd");
 #if defined(CONFIG_SUN_OPENPROMFS) || defined(CONFIG_SUN_OPENPROMFS_MODULE)
-	/* just give it a mountpoint */
+	/* SPARC OpenPROM 文件系统的挂载点，ARM64 上此分支不编译 */
 	proc_create_mount_point("openprom");
 #endif
+
+	/*
+	 * 初始化 /proc/tty 目录，注册 TTY 驱动信息节点：
+	 *   /proc/tty/drivers  — 已注册的 TTY 驱动列表；
+	 *   /proc/tty/ldiscs   — 已注册的线路规程（line discipline）列表。
+	 * ARM64 的串口控制台（如 ttyAMA0）依赖这里的注册信息。
+	 */
 	proc_tty_init();
+
+	/* 建立 /proc/bus 目录：USB、PCI 等总线子系统的设备枚举节点 */
 	proc_mkdir("bus", NULL);
+
+	/*
+	 * 初始化 /proc/sys 目录并调用 sysctl_init_bases()。
+	 * sysctl 是内核参数的运行时读写接口：
+	 *   /proc/sys/kernel/  — 进程、调度、崩溃等核心参数；
+	 *   /proc/sys/vm/      — 内存管理参数（swappiness、dirty_ratio 等）；
+	 *   /proc/sys/net/     — 网络栈参数（tcp_congestion_control 等）。
+	 * 此后 sysctl_register_table() 可用，驱动可注册自己的 sysctl 节点。
+	 */
 	proc_sys_init();
 
 	/*
-	 * Last things last. It is not like userspace processes eager
-	 * to open /proc files exist at this point but register last
-	 * anyway.
+	 * 最后一步：将 proc_fs_type 注册到 VFS 文件系统表。
+	 * 只有注册后，"mount -t proc proc /proc" 才能找到这个文件系统类型。
+	 * 故意放在最后：确保所有内部数据结构（缓存、目录、inode 编号）
+	 * 完全就绪后，外部才能访问 /proc，避免竞争窗口。
 	 */
 	register_filesystem(&proc_fs_type);
 }

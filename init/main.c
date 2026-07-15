@@ -716,10 +716,13 @@ static __initdata DECLARE_COMPLETION(kthreadd_done);
  */
 static noinline void __ref __noreturn rest_init(void)
 {
-	struct task_struct *tsk;
-	int pid;
+	struct task_struct *tsk; /* 用于临时持有新创建线程的 task_struct 指针 */
+	int pid;                 /* 接收 user_mode_thread/kernel_thread 返回的 PID */
 
-	/* 通知 RCU 调度器即将启动，从此 RCU 进入正常工作模式 */
+	/*
+	 * 通知 RCU 调度器即将启动，从此 RCU 进入正常工作模式。
+	 * 在此之前 RCU 处于"早期启动"阶段，不支持抢占式 RCU 读侧临界区。
+	 */
 	rcu_scheduler_starting();
 
 	/*
@@ -731,9 +734,11 @@ static noinline void __ref __noreturn rest_init(void)
 	 * 等 kthreadd 创建完再释放它。
 	 *
 	 * user_mode_thread()：创建一个将来会进入用户态的内核线程。
-	 * 与 kernel_thread() 的区别：会设置用户态相关的初始状态。
+	 * 与 kernel_thread() 的区别：会设置用户态相关的初始状态（信号、寄存器等），
+	 * 使线程可以通过 execve() 切换到用户态程序。
+	 * CLONE_FS：与父进程共享文件系统信息（根目录、当前目录、umask）。
 	 */
-	pid = user_mode_thread(kernel_init, NULL, CLONE_FS);
+	pid = user_mode_thread(kernel_init, NULL, CLONE_FS); /* 创建 PID 1（init），入口为 kernel_init() */
 
 	/*
 	 * 把 init 固定在 boot CPU 上运行。
@@ -741,50 +746,61 @@ static noinline void __ref __noreturn rest_init(void)
 	 * 如果 init 跑到其他 CPU 上可能出问题。
 	 * sched_init_smp() 之后会解除限制，允许 init 在所有非隔离 CPU 上运行。
 	 */
-	rcu_read_lock();
-	tsk = find_task_by_pid_ns(pid, &init_pid_ns);
-	tsk->flags |= PF_NO_SETAFFINITY; /* 禁止外部修改 CPU 亲和性 */
-	set_cpus_allowed_ptr(tsk, cpumask_of(smp_processor_id()));
-	rcu_read_unlock();
+	rcu_read_lock();                                          /* 进入 RCU 读侧临界区，防止 task_struct 被释放 */
+	tsk = find_task_by_pid_ns(pid, &init_pid_ns);            /* 通过 PID 在初始 PID 命名空间中找到 init 的 task_struct */
+	tsk->flags |= PF_NO_SETAFFINITY;                         /* 禁止用户态/外部代码通过 sched_setaffinity() 修改 init 的 CPU 亲和性 */
+	set_cpus_allowed_ptr(tsk, cpumask_of(smp_processor_id())); /* 将 init 限制在当前 boot CPU 上运行 */
+	rcu_read_unlock();                                        /* 退出 RCU 读侧临界区 */
 
-	/* 恢复默认 NUMA 内存策略（允许从任意 NUMA 节点分配内存） */
+	/*
+	 * 恢复默认 NUMA 内存策略（MPOL_DEFAULT：允许从任意 NUMA 节点分配内存）。
+	 * 之前可能因为 NUMA 初始化需要而临时改变了内存策略。
+	 */
 	numa_default_policy();
 
 	/*
 	 * 创建 kthreadd（PID 2）。
-	 * kthreadd 是所有内核线程的守护进程，负责代替内核线程创建其他内核线程。
-	 * 内核代码调用 kthread_create() 实际上是向 kthreadd 发送请求。
-	 * CLONE_FS | CLONE_FILES：共享文件系统和文件描述符。
+	 * kthreadd 是所有内核线程的守护进程，负责代替其他内核代码异步创建内核线程。
+	 * 内核代码调用 kthread_create() 实际上是向 kthreadd 的任务队列提交请求，
+	 * 再由 kthreadd 调用 kernel_thread() 完成实际创建，从而避免在任意上下文
+	 * 直接调用 kernel_thread() 的限制。
+	 * CLONE_FS | CLONE_FILES：与父进程共享文件系统信息和文件描述符表。
 	 */
-	pid = kernel_thread(kthreadd, NULL, NULL, CLONE_FS | CLONE_FILES);
-	rcu_read_lock();
-	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);
-	rcu_read_unlock();
+	pid = kernel_thread(kthreadd, NULL, NULL, CLONE_FS | CLONE_FILES); /* 创建 PID 2（kthreadd），入口为 kthreadd() */
+	rcu_read_lock();                                                    /* 进入 RCU 读侧临界区 */
+	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);            /* 保存 kthreadd 的 task_struct 到全局变量，供 kthread_create() 使用 */
+	rcu_read_unlock();                                                  /* 退出 RCU 读侧临界区 */
 
 	/*
-	 * 现在可以开启 might_sleep() 和 smp_processor_id() 检查了。
+	 * 将系统状态切换为 SYSTEM_SCHEDULING，表示调度器已可正常工作。
+	 * 从此可以开启 might_sleep() 和 smp_processor_id() 的运行时检查。
 	 * 之前不能开启是因为 CONFIG_PREEMPTION=y 时 kernel_thread()
-	 * 会触发 might_sleep() 警告。
+	 * 内部会触发 might_sleep() 警告（彼时调度器尚未就绪）。
 	 */
 	system_state = SYSTEM_SCHEDULING;
 
 	/*
-	 * 发出 kthreadd_done 完成量信号，解除 kernel_init 的阻塞。
-	 * 从此 PID 1 可以开始真正的初始化工作。
+	 * 发出 kthreadd_done 完成量信号，解除 kernel_init（PID 1）的阻塞。
+	 * kernel_init() 开头调用了 wait_for_completion(&kthreadd_done)，
+	 * 此处 complete() 之后 PID 1 才真正开始执行初始化工作。
+	 * 这保证了 PID 1 创建内核线程时 kthreadd（PID 2）已经就绪。
 	 */
 	complete(&kthreadd_done);
 
 	/*
-	 * boot idle 线程（当前执行流）必须至少调用一次 schedule()，
-	 * 让调度器开始工作，把 CPU 交给其他线程。
+	 * boot idle 线程（当前执行流，即 swapper/0，PID 0）必须至少调用一次
+	 * schedule()，让调度器开始工作，把 CPU 交给就绪队列中的其他线程。
+	 * 使用 schedule_preempt_disabled() 而非 schedule()，
+	 * 是因为此时抢占仍处于禁用状态（preempt_count > 0）。
 	 */
 	schedule_preempt_disabled();
 
 	/*
-	 * 进入 cpu_idle 循环，当前执行流正式成为 idle 进程（PID 0）。
-	 * idle 进程在没有其他任务时执行 WFI（Wait For Interrupt）指令，
-	 * 让 CPU 进入低功耗状态。
-	 * 此函数永不返回。
+	 * 进入 cpu_idle 循环，当前执行流正式成为 boot CPU 的 idle 进程（PID 0）。
+	 * idle 进程在没有其他可运行任务时执行 cpu_relax()/WFI 指令，
+	 * 让 CPU 进入低功耗状态直到下一次中断唤醒。
+	 * CPUHP_ONLINE 表示 CPU 处于完全在线状态。
+	 * 此函数内部是死循环，永不返回，与函数签名 __noreturn 一致。
 	 */
 	cpu_startup_entry(CPUHP_ONLINE);
 }
@@ -1866,16 +1882,392 @@ void start_kernel(void)
 	setup_per_cpu_pageset();
 
 	/* 初始化 NUMA 内存策略（控制内存从哪个 NUMA 节点分配） */
+	/* 背景
+		在进程申请内存（malloc → mmap → 缺页中断）时，决定从哪个 NUMA 节点的物理 DRAM 上分配这个物理页。
+		硬件层面的现实
+
+		┌─────────────────────────────────────────────────────┐
+		│                    主板                              │
+		│                                                     │
+		│  ┌──────────────────┐    ┌──────────────────┐       │
+		│  │   CPU Socket 0   │    │   CPU Socket 1   │       │
+		│  │  ┌────────────┐  │    │  ┌────────────┐  │       │
+		│  │  │ Core 0-15  │  │    │  │ Core 16-31 │  │       │
+		│  │  │  L1/L2/L3  │  │    │  │  L1/L2/L3  │  │       │
+		│  │  └────────────┘  │    │  └────────────┘  │       │
+		│  │  内存控制器 IMC   │    │  内存控制器 IMC  │       │
+		│  └────────┬─────────┘    └────────┬─────────┘       │
+		│           │                       │                 │
+		│      ┌────┴────┐             ┌────┴────┐            │
+		│      │ 64GB    │             │ 64GB    │            │
+		│      │ DRAM    │             │ DRAM    │            │
+		│      │ Node 0  │             │ Node 1  │            │
+		│      └─────────┘             └─────────┘            │
+		│           └──────── QPI/UPI ──────────┘             │
+		└─────────────────────────────────────────────────────┘
+
+		- L1/L2/L3 Cache：CPU 内部的硬件，内核管不了，完全由硬件自动管理
+		- DRAM：每个 Socket 有自己直连的内存，这才是 NUMA 策略控制的对象
+
+		---
+		分配时机：缺页中断
+
+		内存不是一开始就分配的，Linux 用懒分配：
+
+		malloc(1GB)
+			│
+			▼
+		mmap() ── 只建立虚拟地址空间，不分配物理页
+			│
+			▼
+		第一次访问该地址
+			│
+			▼
+		缺页中断 (page fault)
+			│
+			▼
+		__alloc_pages()  ← NUMA 策略在这里生效
+			│
+			├─ MPOL_LOCAL     → 从 CPU 当前所在节点的 DRAM 取一页
+			├─ MPOL_BIND      → 只从指定节点的 DRAM 取一页
+			└─ MPOL_INTERLEAVE → 轮流从 node0/node1 取页
+
+		---
+		关键点
+
+		┌───────────────────────┬─────────────────────────────────────────┐
+		│         问题          │                  答案                   │
+		├───────────────────────┼─────────────────────────────────────────┤
+		│ 是预分配一块区域吗？  │ 不是，每次缺页才按策略选节点            │
+		├───────────────────────┼─────────────────────────────────────────┤
+		│ 是分配 CPU Cache 吗？ │ 不是，Cache 由硬件全自动管理            │
+		├───────────────────────┼─────────────────────────────────────────┤
+		│ 控制的是什么？        │ 物理页从哪个节点的 DRAM 分配            │
+		├───────────────────────┼─────────────────────────────────────────┤
+		│ 什么时候生效？        │ 缺页中断时（第一次访问虚拟地址）        │
+		├───────────────────────┼─────────────────────────────────────────┤
+		│ 已分配的页能改变吗？  │ 能，mbind() + MPOL_MF_MOVE 可迁移已有页 │
+		└───────────────────────┴─────────────────────────────────────────┘
+
+		---
+		为什么快/慢
+
+		Core 0 访问 Node 0 的内存：
+		Core 0 → 本地 IMC → Node 0 DRAM    ~60ns ✓
+
+		Core 0 访问 Node 1 的内存：
+		Core 0 → 本地 IMC → QPI总线 → Node 1 IMC → Node 1 DRAM    ~120ns ✗
+
+		慢的原因是多了一跳 QPI/UPI 总线，而不是 Cache 问题。NUMA 策略的本质就是尽量让 Core 和它访问的 DRAM 在同一个 Socket，少走这一跳。
+
+	*/
+	/*
+		NUMA 内存策略
+
+		NUMA（Non-Uniform Memory Access） 是多处理器系统中的内存架构——不同 CPU 访问本地内存快、访问远端节点内存慢。内存策略就是控制内核从哪个 NUMA 节点分配内存的规则。
+
+		---
+		numa_policy_init 做了什么
+
+		1. 创建 slab 缓存 — policy_cache（存 mempolicy 结构体）和 sn_cache（存共享策略节点）
+		2. 为每个 NUMA 节点预建 PREFERRED 策略 — preferred_node_policy[nid]，供后续快速使用
+		3. 为系统 init 进程设置 INTERLEAVE 策略 — 内存交错分布到各节点（>= 16MB 的节点才参与；若全部太小则选最大节点）
+		4. 调用 check_numabalancing_enable() — 检查是否开启自动 NUMA 均衡
+
+		---
+		六种策略模式
+
+		┌──────────────────────────┬──────────────────────────────────────────────────┐
+		│           模式           │                       含义                       │
+		├──────────────────────────┼──────────────────────────────────────────────────┤
+		│ MPOL_DEFAULT             │ 默认，从当前进程所在节点分配                     │
+		├──────────────────────────┼──────────────────────────────────────────────────┤
+		│ MPOL_PREFERRED           │ 优先从指定节点分配，不够再用其他节点             │
+		├──────────────────────────┼──────────────────────────────────────────────────┤
+		│ MPOL_PREFERRED_MANY      │ 优先从多个指定节点分配                           │
+		├──────────────────────────┼──────────────────────────────────────────────────┤
+		│ MPOL_BIND                │ 严格绑定到指定节点集，不允许溢出                 │
+		├──────────────────────────┼──────────────────────────────────────────────────┤
+		│ MPOL_INTERLEAVE          │ 轮询交错分配到多个节点（均摊带宽，适合大数据集） │
+		├──────────────────────────┼──────────────────────────────────────────────────┤
+		│ MPOL_LOCAL               │ 强制只用本地节点（类似 PREFERRED 但不指定节点）  │
+		├──────────────────────────┼──────────────────────────────────────────────────┤
+		│ MPOL_WEIGHTED_INTERLEAVE │ 带权重的交错（按节点容量比例分配）               │
+		└──────────────────────────┴──────────────────────────────────────────────────┘
+
+		各策略的优势场景
+
+		MPOL_DEFAULT / MPOL_LOCAL — 延迟最低
+		进程在哪个 CPU 运行就从哪个节点分配，数据和计算在同一节点，不走慢速跨节点互联。适合单线程、延迟敏感的应用。
+
+		MPOL_BIND — 隔离保证
+		强制限定只能用指定节点的内存。优势是可预测性——避免某个进程悄悄占用了其他节点的内存，适合容器/虚拟机的资源隔离。
+
+		MPOL_INTERLEAVE — 带宽最大
+		内存页轮流放在 node0/node1/node0/node1...，读写时多个节点的内存控制器并行工作，聚合带宽翻倍。适合大内存、随机访问的场景（数据库 buffer pool、科学计算）。
+
+		MPOL_PREFERRED — 折中
+		优先本地，本地不够时自动溢出到其他节点，不会因为本地内存紧张而 OOM。适合不确定内存用量的通用场景。
+
+		---
+		为什么 init 用 INTERLEAVE
+
+		内核启动时不知道未来的工作负载，INTERLEAVE 策略可以将内核数据结构均匀散布到各 NUMA 节点，避免启动时所有内存都集中在 node 0，后续用户进程根据需要再通过 set_mempolicy(2) / mbind(2) 设置自己的策略。
+	*/
 	numa_policy_init();
 
 	/* ACPI 早期初始化（解析 ACPI 表，发现设备拓扑） */
+	/*
+		ACPI（Advanced Configuration and Power Interface，高级配置与电源接口）是一个开放标准，定义了操作系统与硬件固件之间的接口，用于：
+
+		主要功能：
+		- 电源管理：控制 CPU 频率调节、睡眠/唤醒（S0-S5 状态）、设备电源开关
+		- 硬件配置：让 OS 发现和配置主板上的设备（替代早期的 PnP BIOS）
+		- 热管理：监控温度、控制风扇转速
+
+		工作原理：
+		- 固件（UEFI/BIOS）提供 ACPI 表（如 DSDT、SSDT），用 AML（ACPI Machine Language）字节码描述硬件
+		- 内核内置 AML 解释器（drivers/acpi/）解析这些表
+		- OS 通过 ACPI 接口与硬件交互，而无需为每块主板写专用驱动
+
+		在 Linux 内核中：
+		- init/main.c 中的 acpi_early_init() 在启动早期初始化 ACPI 子系统
+		- 相关代码在 drivers/acpi/ 和 include/acpi/
+
+		简单说：ACPI 是硬件告诉操作系统"我有什么、怎么控制我"的语言，是现代 x86 系统电源管理的核心机制。
+	*/
+	/*
+		ARM 平台上是有 ACPI 的，但情况比 x86 复杂：
+
+		ARM64（AArch64）上的 ACPI：
+		- 从 Linux 3.x 开始，ARM64 逐步加入 ACPI 支持
+		- 主要面向服务器场景（SBSA/SBBR 规范），如 Ampere、Kunpeng、ThunderX 等服务器 SoC
+		- 内核中有专门的 ARM64 ACPI 适配代码（arch/arm64/kernel/acpi.c）
+
+		但 ARM 嵌入式/移动设备通常用 DT（Device Tree）：
+		- 手机、嵌入式板卡（树莓派、开发板等）几乎全用 Device Tree（.dts/.dtb）描述硬件
+		- 原因：ACPI 依赖固件质量，而嵌入式厂商固件参差不齐；DT 更轻量、更灵活
+		- DT 是 ARM 嵌入式世界的事实标准
+
+		32位 ARM（arm）：
+		- 基本不用 ACPI，几乎全是 DT
+
+		总结：
+
+		┌────────────────────────┬────────────────────┐
+		│          场景          │        机制        │
+		├────────────────────────┼────────────────────┤
+		│ x86 PC/服务器          │ ACPI               │
+		├────────────────────────┼────────────────────┤
+		│ ARM64 服务器           │ ACPI（越来越普及） │
+		├────────────────────────┼────────────────────┤
+		│ ARM64/ARM 嵌入式、手机 │ Device Tree        │
+		└────────────────────────┴────────────────────┘
+
+		你在 init/main.c 里看到的 acpi_early_init() 在 ARM 嵌入式设备上通常是空操作或直接跳过，由 CONFIG_ACPI 编译选项控制。
+	*/
+	/*
+		ACPI 的职责分四大块：
+
+		1. 电源管理（最广为人知）
+		- CPU 睡眠状态（C-state）、性能档位（P-state）
+		- 系统睡眠/唤醒（S0 正常运行 → S5 关机）
+		- 设备电源开关（如关闭 USB 控制器省电）
+
+		2. 硬件发现与配置
+		- 告诉 OS 板上有哪些设备（嵌入式控制器、传感器、按钮等）
+		- 这些设备没有标准总线（不像 PCI/USB 可自动枚举），靠 ACPI 命名空间描述
+
+		3. 热管理
+		- 读取温度传感器
+		- 控制风扇转速
+		- 触发过热保护（降频或强制关机）
+
+		4. 平台事件通知
+		- 电源键按下、合盖、电池插拔、对接坞连接等事件通过 SCI 中断通知 OS
+		- OS 收到 SCI 后执行对应的 AML 方法处理事件
+
+		直观比例：
+
+		ACPI 职责
+		├── 电源管理        ████████░░  重要但不是全部
+		├── 硬件描述/发现   ██████░░░░  现代系统非常依赖
+		├── 热管理          ████░░░░░░
+		└── 事件通知        ███░░░░░░░
+
+		历史上 ACPI 是为了统一替换三样东西：APM（纯电源管理）、PnP BIOS（设备发现）、以及各厂商私有的热管理方案。所以它天生是个"大杂烩"规范，电源只是其中最显眼的部分。
+	*/
+	/*
+		ACPI 描述写在固件（BIOS/UEFI）里，不是硬件。
+
+		固件存储在主板上的一块 Flash 芯片中，DSDT/SSDT 等 AML 字节码就烧录在这里。启动时固件把这些表加载到内存，内核去读取。
+
+		---
+		有 bug 的修复方式，有三种，不需要重装系统：
+
+		1. 刷新固件（最根本）
+		厂商发布 BIOS 更新修复 AML bug，用户更新固件即可。但很多老机器厂商已停止更新。
+
+		2. 内核 override DSDT（dmi_check_system 做的事）
+		内核在编译时内置一份修正过的 DSDT，启动时检测到对应机型就用内置版本替换固件版本，固件本身不变。这是内核绕过固件 bug 的手段，不需要用户做任何操作，对用户透明。
+
+		3. 用户手动覆盖 DSDT
+		把修正后的 DSDT 编译成 .aml 文件，放到 initramfs 中，内核启动时加载用户提供的版本替换固件版本。适合固件无更新且内核也没有内置 quirk 的情况：
+
+		# 大致流程
+		iasl -d dsdt.dat          # 反编译固件 DSDT 为可读的 .dsl
+		# 手动修改 .dsl 中的 bug
+		iasl -tc dsdt.dsl         # 重新编译为 .aml
+		# 打包进 initramfs，内核通过 INITRD_DSDT 加载
+
+		---
+		总结：
+
+		┌────────────────┬────────────┬──────────────────┐
+		│    修复方式    │   谁来做   │    需要重装？    │
+		├────────────────┼────────────┼──────────────────┤
+		│ 刷固件         │ 用户/厂商  │ 否               │
+		├────────────────┼────────────┼──────────────────┤
+		│ 内核内置 quirk │ 内核开发者 │ 否，升级内核即可 │
+		├────────────────┼────────────┼──────────────────┤
+		│ 用户覆盖 DSDT  │ 用户       │ 否               │
+		└────────────────┴────────────┴──────────────────┘
+
+		三种方式都不需要重装系统，固件 bug 属于"硬件厂商欠的债"，内核长期维护着大量这类 workaround。
+	*/
+	/*
+		是谁将其从flash芯片读到内存的
+
+		是固件自己（UEFI/BIOS）完成的，内核看到的时候表已经在内存里了。
+
+		完整流程：
+
+		上电
+		│
+		▼
+		CPU 从 Flash 芯片固定地址开始执行固件代码
+		│
+		▼
+		固件初始化内存控制器（此前连 RAM 都不可用）
+		│
+		▼
+		固件将 ACPI 表（DSDT/SSDT/FADT 等）从 Flash 复制到 RAM
+		并在特定内存区域写入 RSDP（入口指针）
+		│
+		▼
+		固件把控制权交给 bootloader（GRUB 等）
+		│
+		▼
+		bootloader 加载内核
+		│
+		▼
+		内核通过 RSDP 找到根表，再顺着指针找到所有 ACPI 表
+		内核只是"读客"，表已经在内存里等着了
+
+		内核侧的入口就是你现在打开的 tbxface.c 里的 acpi_find_root_pointer()——它负责在内存中搜索 RSDP 签名（"RSD PTR "），找到后整个 ACPI 表树就可以顺着指针遍历了。
+
+		acpi_reallocate_root_table()（acpi_early_init 里调用的那个）做的事情是把固件放在 EfiBootServices 内存里的表再拷贝一份到内核自己管理的内存，因为 EfiBootServices 那块内存后面会被释放掉。
+	*/
+	/*
+		acpi描述的内存地址是如何传递的
+
+		这是一个地址链，每一级指向下一级：
+
+		UEFI 启动路径（现代）：
+
+		固件构建 EFI System Table（放在内存某处）
+		│  包含 ConfigurationTable[] 数组，其中一项是 RSDP 地址
+		│
+		▼
+		bootloader/EFI stub 把 EFI System Table 地址
+		写入 boot_params（x86 启动协议的结构体）
+		│
+		▼
+		内核从 boot_params.efi_info 拿到 EFI System Table 地址
+		→ 遍历 ConfigurationTable[] 找 ACPI RSDP 条目
+		│
+		▼
+		RSDP 内含 XSDT 物理地址
+		XSDT 内含所有其他表的物理地址数组（FADT、MADT、SSDT…）
+		FADT 内含 DSDT 物理地址
+
+		Legacy BIOS 路径（老机器）：
+
+		固件把 RSDP 写入约定的内存区域
+		├── EBDA（Extended BIOS Data Area）：低 1MB 内 0xE0000-0xFFFFF
+		└── 或 BIOS ROM 区域
+		│
+		▼
+		内核直接扫描这段物理内存，找 "RSD PTR " 签名（8字节）
+
+		找到 RSDP 之后的地址链：
+
+		RSDP
+		└─→ XSDT（64位）或 RSDT（32位）
+			└─→ [ FADT地址, MADT地址, SSDT地址, ... ]
+					│
+					▼
+					FADT
+					└─→ DSDT地址（主 AML 表）
+						└─→ 可引用多个 SSDT（补充 AML 表）
+
+		关键点：
+		- 整个链条都是物理地址，内核读取前需要用 ioremap 映射到虚拟地址
+		- acpi_reallocate_root_table() 就是在把这些物理地址对应的内容拷贝到内核自己的内存，然后更新内部指针指向新位置
+		- 地址本身不是"传递"的，而是固件按规范写在约定位置，内核按规范去找——是一种约定寻址，不是函数调用
+	*/
 	acpi_early_init();
 
-	/* 晚期时间初始化（某些平台的时钟需要在这里初始化） */
+	/*
+	* 晚期时间初始化（late_time_init）：
+	*
+	* 设计动机：某些架构的时钟硬件依赖 ioremap（将物理地址映射到内核虚拟地址）
+	* 才能访问，而 ioremap 本身需要内存管理子系统就绪。因此这些架构在早期的
+	* time_init() 中只是把真正的初始化函数赋给 late_time_init 函数指针，
+	* 留到这里——内存/ACPI 都已就绪之后——再执行。
+	*
+	* 以 x86 为例（arch/x86/kernel/time.c: x86_late_time_init）：
+	*   1. intr_mode_select()  — 选择中断投递模式（PIC / APIC / x2APIC）；
+	*      决定 PIT 是否需要初始化，必须在 timer_init() 之前完成。
+	*   2. timer_init()        — 初始化传统定时器：优先启用 HPET，若不可用
+	*      则退回 8254 PIT；同时注册 IRQ0 定时器中断处理函数。
+	*   3. intr_mode_init()    — 完成中断模式的最终切换（Legacy PIC → APIC）。
+	*   4. tsc_init()          — 初始化 TSC（Time Stamp Counter）时钟源，
+	*      校准 TSC 频率，并决定是否将其注册为高精度 clocksource。
+	*      若 CPU 支持 WAITPKG，还会启用 tpause 指令优化 udelay。
+	*
+	* 其他架构的实现：
+	*   - ARM  : twd_timer_setup()     — 初始化 per-CPU 的 TWD 本地定时器
+	*   - MIPS : ocelot_late_init()    — 初始化 Ocelot SoC 的时钟
+	*   - SH   : sh_late_time_init()   — SuperH 平台定时器
+	*   - UML  : um_timer_init()       — User Mode Linux 虚拟定时器
+	*
+	* 若架构无此需求，指针保持 NULL，if 判断直接跳过，零开销。
+	*/
 	if (late_time_init)
 		late_time_init();
 
-	/* 初始化调度时钟（sched_clock，用于调度器的时间戳） */
+	/*
+	 * 初始化调度时钟（sched_clock）。
+	 *
+	 * 目的：
+	 *   为调度器建立一个每 CPU 的纳秒级单调时钟。调度器用它测量任务的运行
+	 *   时间（vruntime）、计算调度延迟、以及 perf/ftrace 的时间戳。
+	 *
+	 * 调用后的影响：
+	 *   - sched_clock_cpu(cpu)、local_clock()、cpu_clock(cpu) 开始返回
+	 *     有意义的纳秒时间戳；
+	 *   - 若架构配置了 CONFIG_HAVE_UNSTABLE_SCHED_CLOCK，还会计算好
+	 *     __gtod_offset，使后续每个 tick 中断里的 sched_clock_tick()
+	 *     能从当前时刻无缝衔接，不产生跳变；
+	 *   - 将 sched_clock_running 引用计数从 0 增到 1，激活
+	 *     sched_clock_cpu() 的 per-CPU 快路径。
+	 *
+	 * 为何在此处调用：
+	 *   必须在 late_time_init()（TSC/HPET 初始化）之后，才能读到
+	 *   有效的硬件时间源；同时必须在 calibrate_delay()（依赖时间测量）
+	 *   之前，保证后续一切时间相关操作都有可用的时钟基础。
+	 */
 	sched_clock_init();
 
 	/*
@@ -1891,7 +2283,27 @@ void start_kernel(void)
 	/* 初始化 PID 的 IDR（整数 ID 分配器，用于分配进程 ID） */
 	pid_idr_init();
 
-	/* 初始化匿名 VMA（Virtual Memory Area）的 rmap 机制 */
+	/*
+	 * 初始化匿名页反向映射（rmap）的 slab 缓存。
+	 *
+	 * 目的：
+	 *   在 ARM64 上，每次 mmap 私有匿名映射或 fork 时，内核都需要分配
+	 *   anon_vma 和 anon_vma_chain 对象。此函数预先创建对应的 slab 缓存，
+	 *   使后续分配走快速的每 CPU slab 路径，而非每次 kmalloc。
+	 *
+	 * 产生的影响：
+	 *   - anon_vma_cachep 就绪：此后 anon_vma_alloc() 可用，
+	 *     do_mmap() / anon_vma_prepare() 才能为匿名 VMA 建立 rmap 链；
+	 *   - anon_vma_chain_cachep 就绪：fork 时 dup_mmap() 调用的
+	 *     anon_vma_clone() 才能分配 anon_vma_chain 节点；
+	 *   - 没有这两个缓存，第一个用户进程（init）执行任何匿名 mmap 或
+	 *     fork 都会立刻 panic（SLAB_PANIC 标志）。
+	 *
+	 * 为何在此处调用：
+	 *   必须在 slab 子系统（kmem_cache_init）就绪之后；
+	 *   必须在第一个用户进程 kernel_init 创建任何匿名映射之前。
+	 *   ARM64 无特殊硬件依赖，纯内存分配，时序窗口宽松，放在这里合适。
+	 */
 	anon_vma_init();
 
 	/* 初始化线程栈的 slab 缓存（加速线程创建） */
@@ -1928,7 +2340,31 @@ void start_kernel(void)
 	/* 初始化网络命名空间（network namespace，容器网络隔离的基础） */
 	net_ns_init();
 
-	/* VFS 缓存完整初始化（dcache/inode cache 正式建立） */
+	/*
+	 * VFS 层的完整初始化：建立路径查找、文件描述符、挂载点等全部基础设施。
+	 *
+	 * 目的：
+	 *   完成内核 VFS 层所需的全部 slab 缓存和哈希表，使后续的 open/read/
+	 *   write/mount 等系统调用拥有完整的数据结构支撑。
+	 *
+	 * 调用后的影响（7 个子步骤，详见 fs/dcache.c: vfs_caches_init）：
+	 *   1. filename_init    — 路径名 slab 缓存就绪，sys_open 可分配路径对象；
+	 *   2. dcache_init      — dentry slab + 哈希表就绪，路径查找缓存生效；
+	 *   3. inode_init       — inode slab + 哈希表就绪，文件元数据缓存生效；
+	 *   4. files_init       — struct file / backing_file slab 就绪，
+	 *                         文件描述符可分配；
+	 *   5. files_maxfiles_init — 按当前内存大小计算系统级 max_files 上限；
+	 *   6. mnt_init         — 挂载点 slab + 哈希表就绪，kernfs/sysfs 初始化，
+	 *                         rootfs 和初始挂载树建立，VFS 命名空间可用；
+	 *   7. bdev_cache_init  — 块设备 inode slab 和伪文件系统就绪，
+	 *      chrdev_init      — 字符设备映射表就绪。
+	 *
+	 * 为何在此处调用：
+	 *   依赖 slab（kmem_cache_init）、内存管理、网络命名空间（net_ns_init）
+	 *   均已就绪；mnt_init 内部的 shmem_init 依赖页缓存前置条件也已满足。
+	 *   此函数执行完后，pagecache_init 和 signals_init 才能安全运行，
+	 *   整个 VFS 栈从这一刻起对后续子系统完全可用。
+	 */
 	vfs_caches_init();
 
 	/* 初始化页缓存（文件内容的内存缓存） */
@@ -1940,7 +2376,32 @@ void start_kernel(void)
 	/* 初始化 seq_file（/proc 文件的顺序读取接口） */
 	seq_file_init();
 
-	/* 初始化 /proc 根目录 */
+	/*
+	 * 挂载并完整初始化 procfs（/proc 文件系统）。
+	 *
+	 * 目的：
+	 *   procfs 是内核向用户空间暴露运行时状态的主要接口，提供：
+	 *     /proc/<pid>/         — 每个进程的内存映射、文件描述符、状态等；
+	 *     /proc/self/          — 当前进程的符号链接快捷方式；
+	 *     /proc/sys/           — sysctl 参数的文件系统视图（可读写调参）；
+	 *     /proc/net/           — 网络栈统计（每网络命名空间独立）；
+	 *     /proc/tty/           — TTY 驱动注册信息。
+	 *
+	 * 调用后的影响：
+	 *   - proc_inode_cachep / pde_opener_cache / proc_dir_entry_cache 就绪；
+	 *   - /proc/self、/proc/thread-self 的 inode 编号预分配完成；
+	 *   - /proc/mounts（→ self/mounts）、/proc/fs、/proc/driver、
+	 *     /proc/bus、/proc/net、/proc/sys、/proc/tty 目录全部建立；
+	 *   - proc_fs_type 注册到 VFS，后续 mount procfs 时可通过名字找到；
+	 *   - sysctl_init_bases() 完成，/proc/sys/kernel、/proc/sys/vm 等
+	 *     基础 sysctl 节点可读写。
+	 *
+	 * 为何在此处调用：
+	 *   必须在 vfs_caches_init()（dentry/inode/file 缓存）和
+	 *   seq_file_init()（/proc 文件的顺序读接口）之后；
+	 *   必须在 fork_init()（创建第一个进程）之前，否则第一个进程
+	 *   的 /proc/<pid>/ 目录无法建立。
+	 */
 	proc_root_init();
 
 	/* 初始化命名空间文件系统（/proc/*/ns/ 目录） */
@@ -1978,6 +2439,58 @@ void start_kernel(void)
 	 * 进入 rest_init()：创建 PID 1 和 PID 2，自身变成 idle 进程。
 	 * 注释"we're now alive"：内核现在完全活着了，后续工作交给内核线程。
 	 */
+	/*
+		---
+		start_kernel 为何变成 idle 进程，而不是被回收？
+
+		核心问题：PID 0（swapper/idle）是一个永久存在的特殊进程，每个 CPU 各有一个，它是调度器的兜底，不能也不需要回收。
+
+		执行流变成 idle 的全过程
+
+		start_kernel()
+		└─ rest_init()                     ← 永不返回
+			├─ user_mode_thread(kernel_init) → fork 出 PID 1
+			├─ kernel_thread(kthreadd)       → fork 出 PID 2
+			├─ complete(&kthreadd_done)      → 解锁 PID 1
+			├─ schedule_preempt_disabled()   → 第一次调度，把 CPU 让出去
+			└─ cpu_startup_entry(CPUHP_ONLINE) → 进入 idle 死循环，永不返回
+
+		start_kernel 的执行流本身（CPU 上的那段寄存器 + 栈）没有消失，它"变身"为 PID 0 / swapper / idle，永远在 cpu_startup_entry 的循环里跑 WFI（Wait For Interrupt）。
+
+		---
+		为什么不回收，而是让它一直跑？
+
+		1. 调度器的兜底角色
+
+		调度器必须保证"runqueue 永远不为空"。当所有任务都在睡眠、没有可运行任务时，调度器会选择 idle 进程。如果 idle 进程不存在，调度器就无处可去，CPU 会乱跑。
+
+		2. PID 0 不在进程树里，无法被 wait() 回收
+
+		普通进程被回收的路径是：父进程调用 wait()，内核清理 task_struct。但 PID 0 没有父进程，内核也从未将它注册进可 wait 的进程树，所以标准的进程生命周期管理根本不适用于它。
+
+		3. 每个 CPU 都需要一个自己的 idle 进程
+
+		SMP 系统中，每个 CPU 都有独立的 idle 线程（swapper/0, swapper/1, …），它们的栈和 task_struct 都是静态分配的，不走 kmalloc/kfree 路径，天生就是"永久的"。
+
+		4. idle 不是"什么都不干"，而是让 CPU 省电
+
+		cpu_startup_entry 循环本质上是：
+
+		while (1) {
+			// 挑选 cpuidle 驱动提供的最深睡眠状态
+			cpuidle_idle_call();   // 内部执行 WFI / MWAIT / HLT 等指令
+		}
+
+		这是 CPU 功耗管理的核心路径。没有 idle 进程，CPU 就无法进入 C-state 节电。
+
+		---
+		为什么 rest_init 标记了 __noreturn？
+
+		因为 cpu_startup_entry 永不返回，整条调用链都不会回到 start_kernel。__noreturn 告诉编译器不用为返回路径生成代码，也方便静态分析工具验证这一不变式。
+
+		---
+		一句话总结： start_kernel 的执行流变成 idle 不是"浪费"，而是被复用为调度器兜底 + CPU 节电的必要基础设施，每个 CPU 各一个，静态存在，无需也无法回收。
+	*/
 	rest_init();
 
 	/*

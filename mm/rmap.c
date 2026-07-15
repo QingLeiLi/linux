@@ -540,20 +540,81 @@ void unlink_anon_vmas(struct vm_area_struct *vma)
 	}
 }
 
+/*
+ * anon_vma_ctor() —— slab 构造函数，每次从缓存分配一个新 anon_vma 对象时调用。
+ *
+ * slab 分配器在首次创建 slab page 时对每个对象调用一次 ctor，
+ * 后续同一对象反复分配/释放不会再调用，因此这里只初始化"结构性"字段
+ * （锁、引用计数、红黑树根），而不是每次使用前都需要重置的业务字段。
+ */
 static void anon_vma_ctor(void *data)
 {
 	struct anon_vma *anon_vma = data;
 
+	/* 初始化读写信号量：
+	 *   写锁（W）：修改 anon_vma 链表时持有（fork、unmap）；
+	 *   读锁（R）：遍历链表反向映射时持有（页面回收、迁移）。
+	 * ARM64 上 rwsem 底层是 LSE 原子指令或 LL/SC，无需关中断 */
 	init_rwsem(&anon_vma->rwsem);
+
+	/* 引用计数初始为 0；第一次通过 get_anon_vma() 获取时才增到 1。
+	 * 当引用计数降回 0 且无活跃 VMA 指向时，才真正释放对象 */
 	atomic_set(&anon_vma->refcount, 0);
+
+	/* 初始化区间红黑树根节点（RB_ROOT_CACHED 同时维护最左节点缓存，
+	 * 加速区间查找的最小值定位）。树中每个节点是一个 anon_vma_chain，
+	 * 以 VMA 的虚拟地址范围为键，支持"给定地址找到所有映射该匿名页的 VMA" */
 	anon_vma->rb_root = RB_ROOT_CACHED;
 }
 
+/*
+ * anon_vma_init() —— 为匿名页反向映射创建两个专用 slab 缓存。
+ *
+ * 反向映射（rmap）解决的核心问题：
+ *   给定一个物理页帧（struct page/folio），找出所有映射它的进程和 VMA，
+ *   以便页面回收（kswapd）、内存迁移、KSM 等能批量修改/撤销 PTE。
+ *
+ * 两个缓存对象的作用：
+ *   anon_vma       —— 匿名映射的"锚点"，每个独立的匿名映射区域有一个；
+ *                     fork 后父子进程共享同一 anon_vma 树（通过 parent 指针），
+ *                     从而让页面回收能同时找到父子两侧的 PTE。
+ *   anon_vma_chain —— 连接 VMA 和 anon_vma 的桥梁节点（多对多关系）；
+ *                     同时挂在 VMA 的 same_vma 链表和 anon_vma 的红黑树上。
+ */
 void __init anon_vma_init(void)
 {
+	/*
+	 * 创建 anon_vma 的 slab 缓存。
+	 *
+	 * SLAB_TYPESAFE_BY_RCU：
+	 *   允许在 RCU 读侧临界区内持有指向 anon_vma 的裸指针，
+	 *   保证对象在 RCU 宽限期内不会被 kfree 后立刻重用为不同类型。
+	 *   这是 page_lock_anon_vma_read()（页面回收路径）无锁快速路径的基础：
+	 *   先 rcu_read_lock() 取指针，再用 trylock 确认仍然有效，失败则回退。
+	 *
+	 * SLAB_PANIC：
+	 *   分配失败直接 panic，因为没有 anon_vma 缓存内核无法运行。
+	 *
+	 * SLAB_ACCOUNT：
+	 *   将此缓存的内存用量计入 memcg（内存控制组）统计，
+	 *   支持容器级别的内存限制（ARM64 服务器场景下 cgroup v2 常用）。
+	 *
+	 * anon_vma_ctor：slab 构造函数，见上方注释。
+	 */
 	anon_vma_cachep = kmem_cache_create("anon_vma", sizeof(struct anon_vma),
 			0, SLAB_TYPESAFE_BY_RCU|SLAB_PANIC|SLAB_ACCOUNT,
 			anon_vma_ctor);
+
+	/*
+	 * 创建 anon_vma_chain 的 slab 缓存。
+	 *
+	 * KMEM_CACHE 宏：等价于 kmem_cache_create(#type, sizeof(type), ...)，
+	 * 自动对齐到 struct anon_vma_chain 的自然对齐要求。
+	 * 无构造函数：anon_vma_chain 的所有字段在使用前都会被显式赋值，
+	 * 不需要 ctor 预初始化。
+	 *
+	 * SLAB_PANIC | SLAB_ACCOUNT：理由同上。
+	 */
 	anon_vma_chain_cachep = KMEM_CACHE(anon_vma_chain,
 			SLAB_PANIC|SLAB_ACCOUNT);
 }

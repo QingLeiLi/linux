@@ -3507,14 +3507,95 @@ void __init vfs_caches_init_early(void)
 	inode_init_early();
 }
 
+/*
+ * vfs_caches_init() —— VFS 层完整初始化，依次建立所有核心数据结构。
+ *
+ * 早期的 vfs_caches_init_early() 只初始化了 in_lookup_hashtable、
+ * dcache/inode 哈希表的静态部分（hashdist=0 时），这里完成剩余工作。
+ * 顺序有依赖：mnt_init 内部会调用 shmem_init / init_rootfs，
+ * 后者需要 dcache/inode/file 缓存已就绪，所以前四步必须先于 mnt_init。
+ */
 void __init vfs_caches_init(void)
 {
+	/*
+	 * 创建路径名（struct filename）的 slab 缓存 "names_cache"。
+	 * SLAB_HWCACHE_ALIGN：对齐到 cache line，减少伪共享。
+	 * kmem_cache_create_usercopy：标记 iname 字段可安全复制到用户空间
+	 * （CONFIG_HARDENED_USERCOPY 检查的基础），防止内核堆布局信息泄漏。
+	 * 此后 getname() / putname() 可用，路径解析（namei）才能分配路径对象。
+	 */
 	filename_init();
+
+	/*
+	 * 创建 dentry 的 slab 缓存并（若 hashdist=1）分配大哈希表。
+	 * dentry 是路径分量（目录项）的内核表示，是路径查找的核心缓存：
+	 *   命中 dcache → 无需读磁盘，直接返回 inode；
+	 *   未命中     → 调用具体文件系统的 lookup()。
+	 * SLAB_RECLAIM_ACCOUNT：可在内存压力下被 shrinker 回收（dcache shrinker）。
+	 * ARM64 上 hashdist=1（NUMA 感知），哈希表按 node 分布分配，
+	 * 大小由 dhash_entries 命令行参数或默认公式（总内存 / 512 * 2）决定。
+	 */
 	dcache_init();
+
+	/*
+	 * 创建 inode 的 slab 缓存并分配 inode 哈希表。
+	 * inode 是文件元数据（权限、大小、数据块指针）的内核表示。
+	 * 各文件系统在 inode_cachep 基础上嵌入自己的私有字段
+	 * （如 ext4_inode_info），通过 container_of 互转。
+	 * inode 哈希表以 (superblock, inode number) 为键加速查找，
+	 * 避免重复分配同一文件的 inode。
+	 */
 	inode_init();
+
+	/*
+	 * 创建 struct file（filp）和 struct backing_file（bfilp）的 slab 缓存。
+	 * struct file 是进程打开文件的描述符内核端，持有读写位置、flags、
+	 * f_op 指针等；backing_file 是 overlay/fuse 的底层文件包装。
+	 * SLAB_TYPESAFE_BY_RCU：允许在 RCU 读临界区持有裸指针，
+	 * 支持 fget_light() 的无锁快速路径（ARM64 高并发场景关键）。
+	 * freeptr_offset：slab 复用对象内部的 f_freeptr 字段存放空闲链指针，
+	 * 减少额外指针开销，同时防止释放后使用时踩到外部数据。
+	 * 同时初始化 nr_files percpu 计数器，用于 /proc/sys/fs/file-nr 统计。
+	 */
 	files_init();
+
+	/*
+	 * 根据当前可用内存动态计算 files_stat.max_files 上限。
+	 * 公式：(可用页数 * PAGE_SIZE/1024) / 10，即约 10% 内存用于文件对象。
+	 * 保证下限为 NR_FILE（通常 8192），防止小内存设备上限过低。
+	 * ARM64 服务器内存大，此值通常在数百万级别。
+	 */
 	files_maxfiles_init();
+
+	/*
+	 * 挂载点子系统完整初始化，是本函数最重量级的一步：
+	 *   1. mnt_cache slab       — struct mount（内核挂载实例）缓存；
+	 *   2. mount_hashtable      — 以 (vfsmount, dentry) 为键的哈希表，
+	 *                             加速 path_walk 中的挂载点穿越；
+	 *   3. mountpoint_hashtable — 以 dentry 为键，找出该目录上的所有挂载；
+	 *   4. kernfs_init          — kernfs 虚拟文件系统骨架（sysfs 的底层）；
+	 *   5. sysfs_init           — 注册 sysfs，/sys 的基础；
+	 *   6. shmem_init           — 基于 tmpfs 的匿名共享内存（mmap MAP_SHARED
+	 *                             的底层，Android Ashmem / memfd 的前身）；
+	 *   7. init_rootfs          — 注册 rootfs（内核内置的 tmpfs 变体）；
+	 *   8. init_mount_tree      — 建立初始 VFS 挂载树（rootfs 挂到 "/"），
+	 *                             设置 init_task 的 fs->root 和 fs->pwd，
+	 *                             从此路径解析有了根节点。
+	 */
 	mnt_init();
+
+	/*
+	 * 初始化块设备的 inode 缓存（bdev_inode = block_device + inode 合体）
+	 * 并挂载块设备伪文件系统（blockdev_superblock）。
+	 * 块设备通过该伪文件系统持有 inode，writeback 子系统通过
+	 * blockdev_superblock 找到脏页并回写，是块 I/O 路径的起点。
+	 */
 	bdev_cache_init();
+
+	/*
+	 * 初始化字符设备映射表（cdev_map），以主设备号为键的 kobj_map。
+	 * open() 遇到字符设备节点时通过此表找到对应的 file_operations，
+	 * /dev/null、/dev/zero、/dev/tty 等都依赖这张表。
+	 */
 	chrdev_init();
 }

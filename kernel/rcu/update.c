@@ -251,9 +251,24 @@ EXPORT_SYMBOL_GPL(rcu_inkernel_boot_has_ended);
 #endif /* #ifndef CONFIG_TINY_RCU */
 
 /*
- * Test each non-SRCU synchronous grace-period wait API.  This is
- * useful just after a change in mode for these primitives, and
- * during early boot.
+ * 对所有非 SRCU 的同步宽限期等待 API 做一次端到端自检。
+ * 仅在开启 CONFIG_PROVE_RCU 时编译进内核，用于在 RCU 状态机发生
+ * 模式切换的"边界点"验证新模式下的同步原语行为是否符合预期。
+ *
+ * 为什么要在模式切换前后各调用一次？
+ *   RCU 的同步原语在不同状态下语义不同：
+ *     INACTIVE 阶段：synchronize_rcu() 退化为 barrier()（无宽限期）
+ *     INIT     阶段：必须走完整宽限期，但 GP kthread 尚未启动
+ *     RUNNING  阶段：GP kthread 驱动，全功能宽限期
+ *   切换前调用可以捕捉旧语义下的 bug，切换后调用可以验证新语义是否
+ *   正常工作，两次测试夹住切换点，精确定位问题出在哪个阶段。
+ *
+ * 为什么同时测 synchronize_rcu 和 synchronize_rcu_expedited？
+ *   二者底层路径不同：expedited 版本通过 IPI 强制所有 CPU 快速通过
+ *   静止状态，不依赖调度器自然切换；非 expedited 版本依赖各 CPU 自行
+ *   上报静止状态。启动早期调度器行为受限，两条路径的正确性需分别验证。
+ *
+ * 注意：此函数在 CONFIG_PROVE_RCU=n 时是空操作，生产内核零开销。
  */
 void rcu_test_sync_prims(void)
 {
@@ -267,7 +282,31 @@ void rcu_test_sync_prims(void)
 #if !defined(CONFIG_TINY_RCU)
 
 /*
- * Switch to run-time mode once RCU has fully initialized.
+ * 将 RCU 从 INIT 模式推进到 RUNNING 模式，在所有 RCU kthread 启动完毕后
+ * 由 core_initcall 机制自动调用。
+ *
+ * 为什么需要 RUNNING 这个独立阶段，不能在 rcu_scheduler_starting() 里
+ * 一步到位直接设置 RUNNING？
+ *
+ *   rcu_scheduler_starting() 在第一个任务创建之前调用，此时 GP kthread
+ *   还不存在。若直接设为 RUNNING，依赖 kthread 的代码路径（如 kfree_rcu
+ *   的批量回收 monitor）会立即尝试唤醒一个根本不存在的线程，导致崩溃。
+ *   INIT 状态充当"多任务已启动、但 kthread 尚未就绪"的过渡缓冲区。
+ *
+ * 这里的调用顺序有严格要求：
+ *   1. rcu_test_sync_prims()         ← 验证 INIT 阶段语义基线
+ *   2. rcu_scheduler_active = RUNNING ← 原子切换到全功能模式
+ *   3. kfree_rcu_scheduler_running() ← 激活 kfree_rcu 的 monitor kthread：
+ *                                       遍历所有 CPU 的 krc 结构，若有积压
+ *                                       的待释放对象则立即调度 drain work。
+ *                                       必须在 RUNNING 之后调用，因为它依赖
+ *                                       调度器能正常唤醒 delayed work。
+ *   4. rcu_test_sync_prims()         ← 验证 RUNNING 阶段语义正确
+ *
+ * 另外，整个启动阶段（从 rcu_expedite_gp 到 rcu_end_inkernel_boot 调用
+ * rcu_unexpedite_gp 之前）所有宽限期都被强制 expedited，以加快启动速度。
+ * 切换到 RUNNING 本身不影响这一行为，expedited 的关闭由 rcu_end_inkernel_boot
+ * 在 do_initcalls 结束后完成。
  */
 static int __init rcu_set_runtime_mode(void)
 {

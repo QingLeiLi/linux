@@ -1367,20 +1367,57 @@ static int __init acpi_bus_init_irq(void)
  *
  * Doing this before switching the EFI runtime services to virtual mode allows
  * the EfiBootServices memory to be freed slightly earlier on boot.
+ *
+ * 这是 ACPI（Advanced Configuration and Power Interface，高级配置与电源接口）
+ * 子系统启动的第一阶段，在 start_kernel() 的早期被调用。
+ * 完成后 ACPI 表可读，但事件处理和全局锁尚未就绪，因此此时不能执行
+ * AML（ACPI Machine Language，ACPI 机器语言，固件用来描述硬件行为的字节码）。
+ * 第二阶段由 acpi_subsystem_init() 完成，负责真正切换到 ACPI 模式。
+ *
+ * 在 EFI（Extensible Firmware Interface，可扩展固件接口）runtime services
+ * 切换到虚拟地址模式之前完成此初始化，可以让 EfiBootServices（EFI 启动期
+ * 服务占用的内存，启动完成后应归还给 OS）内存稍早释放，减少启动时内存占用。
+ *
+ * 常见问题：
+ * - 固件 ACPI 表损坏或不合规：acpi_reallocate_root_table() 或
+ *   acpi_initialize_subsystem() 失败，整个 ACPI 子系统被禁用，
+ *   导致电源管理、热插拔等功能不可用，内核降级为遗留模式运行。
+ * - x86 上 DSDT（Differentiated System Description Table，差异化系统描述表，
+ *   描述主板设备及其控制方法的核心 AML 表）有 bug：通过 DMI（Desktop Management
+ *   Interface，桌面管理接口，存储主板厂商/型号等标识信息的固件表）匹配表将有
+ *   问题的 DSDT 替换为内核自带的修正版本（需要内核编译时包含对应的 quirk）。
+ * - SCI（System Control Interrupt，系统控制中断，ACPI 用于通知 OS 发生电源/
+ *   热管理事件的专用中断）触发方式错误：在 PIC（Programmable Interrupt
+ *   Controller，可编程中断控制器，传统 x86 中断管理芯片）模式下若固件未指定
+ *   触发类型，默认强制为电平触发（level），避免中断风暴。
  */
 void __init acpi_early_init(void)
 {
 	acpi_status status;
 
+	/* acpi=off 内核参数或固件标记禁用时直接跳过 */
 	if (acpi_disabled)
 		return;
 
 	pr_info("Core revision %08x\n", ACPI_CA_VERSION);
 
 	/* enable workarounds, unless strict ACPI spec. compliance */
+	/*
+	 * 非严格模式下开启 AML 解释器的容错（slack）模式。
+	 * 现实中大量固件的 AML 代码不完全符合 ACPI 规范，
+	 * slack 模式会对常见的轻微违规行为进行宽容处理，
+	 * 而不是直接返回错误导致设备无法使用。
+	 * acpi_strict 由内核参数 acpi=strict 控制。
+	 */
 	if (!acpi_strict)
 		acpi_gbl_enable_interpreter_slack = TRUE;
 
+	/*
+	 * 标记 ACPI 表的内存映射为永久映射，防止后续被 unmap。
+	 * 必须在任何 ACPI 表访问之前设置，否则后期 ioremap（将物理地址映射到
+	 * 内核虚拟地址空间的接口）释放后访问表内容会导致内核 oops（空指针或
+	 * 非法地址访问引发的内核错误）。
+	 */
 	acpi_permanent_mmap = true;
 
 #ifdef CONFIG_X86
@@ -1391,15 +1428,37 @@ void __init acpi_early_init(void)
 	 * would not be OK because only x86 initializes dmi early enough.
 	 * Thankfully only x86 systems need such quirks for now.
 	 */
+	/*
+	 * 对已知有缺陷的机型，将固件 DSDT 替换为内核内置的修正版本。
+	 * DMI 表中记录了这些机型的特征字符串（厂商、产品名等）。
+	 * 仅限 x86：其他架构的 DMI 初始化时机晚于此处，无法在这里调用。
+	 */
 	dmi_check_system(dsdt_dmi_table);
 #endif
 
+	/*
+	 * 将固件在物理内存中的 RSDP（Root System Description Pointer，根系统描述
+	 * 指针，ACPI 表的入口，由固件放置在特定内存区域供 OS 搜索）/
+	 * XSDT（Extended System Description Table，扩展系统描述表，64位根表）/
+	 * RSDT（Root System Description Table，根系统描述表，32位根表）等根表
+	 * 重新分配到内核可长期管理的内存区域。固件原始表所在的 EfiBootServices
+	 * 内存在 EFI 初始化完成后会被释放，若不提前拷贝则后续访问会越界。
+	 */
 	status = acpi_reallocate_root_table();
 	if (ACPI_FAILURE(status)) {
 		pr_err("Unable to reallocate ACPI tables\n");
 		goto error0;
 	}
 
+	/*
+	 * 初始化 ACPICA（ACPI Component Architecture，由 Intel 主导开发的开源
+	 * ACPI 参考实现，Linux 内核直接集成其核心层）核心子系统：
+	 * 分配内部数据结构、初始化 AML 解释器、解析 ACPI 命名空间（一棵描述
+	 * 系统中所有硬件对象及其方法的树形结构）。
+	 * 完成后可通过 acpi_get_table() 等接口访问各 ACPI 表。
+	 * 注意：此时仅完成解析，事件和操作区域（Operation Region，AML 访问
+	 * 硬件寄存器的抽象层）处理器尚未注册，不能调用 AML 方法（如 _INI、_STA）。
+	 */
 	status = acpi_initialize_subsystem();
 	if (ACPI_FAILURE(status)) {
 		pr_err("Unable to initialize the ACPI Interpreter\n");
@@ -1409,17 +1468,38 @@ void __init acpi_early_init(void)
 #ifdef CONFIG_X86
 	if (!acpi_ioapic) {
 		/* compatible (0) means level (3) */
+		/*
+		 * PIC 模式下：若 MADT（Multiple APIC Description Table，多 APIC
+		 * 描述表，描述系统中断控制器拓扑的 ACPI 表）中 SCI 中断的触发
+		 * 类型字段为 0（compatible，含义模糊），则强制设为电平触发（level）。
+		 * 边沿触发的 SCI 在 PIC 模式下容易丢中断，导致电源事件
+		 * （如按电源键、电池状态变化）无响应。
+		 */
 		if (!(acpi_sci_flags & ACPI_MADT_TRIGGER_MASK)) {
 			acpi_sci_flags &= ~ACPI_MADT_TRIGGER_MASK;
 			acpi_sci_flags |= ACPI_MADT_TRIGGER_LEVEL;
 		}
 		/* Set PIC-mode SCI trigger type */
+		/*
+		 * 将确定后的触发类型写入 PIC 的 ELCR（Edge/Level Control Register，
+		 * 边沿/电平控制寄存器，控制每个 IRQ 的触发方式）寄存器。
+		 */
 		acpi_pic_sci_set_trigger(acpi_gbl_FADT.sci_interrupt,
 					 (acpi_sci_flags & ACPI_MADT_TRIGGER_MASK) >> 2);
 	} else {
 		/*
 		 * now that acpi_gbl_FADT is initialized,
 		 * update it with result from INT_SRC_OVR parsing
+		 * IOAPIC（I/O Advanced Programmable Interrupt Controller，I/O 高级
+		 * 可编程中断控制器，SMP 系统中替代传统 PIC 的中断路由芯片）模式下：
+		 * 用 INT_SRC_OVR（Interrupt Source Override，中断源覆盖，MADT 中的
+		 * 一种表项，描述 ISA IRQ 到 GSI 的重映射关系）解析出的
+		 * GSI（Global System Interrupt，全局系统中断号，IOAPIC 体系下统一
+		 * 编号的中断标识）覆盖 FADT（Fixed ACPI Description Table，固定 ACPI
+		 * 描述表，包含电源管理寄存器地址、SCI 中断号等核心硬件参数）中的
+		 * sci_interrupt 字段。
+		 * 部分固件在 FADT 里填写的是 ISA IRQ 号而非 GSI，
+		 * INT_SRC_OVR 提供了从 ISA IRQ 到 GSI 的重映射信息。
 		 */
 		acpi_gbl_FADT.sci_interrupt = acpi_sci_override_gsi;
 	}
@@ -1427,6 +1507,7 @@ void __init acpi_early_init(void)
 	return;
 
  error0:
+	/* 任一步骤失败则完全禁用 ACPI，内核继续以无 ACPI 模式启动 */
 	disable_acpi();
 }
 

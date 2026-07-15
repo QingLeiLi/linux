@@ -58,17 +58,32 @@
 #include "sched.h"
 
 /*
- * Scheduler clock - returns current time in nanosec units.
- * This is default implementation.
- * Architectures and sub-architectures can override this.
+ * sched_clock() —— 调度时钟的底层硬件读取接口，返回纳秒时间戳。
+ *
+ * 这是 __weak 默认实现：用 jiffies 折算出纳秒，精度仅 1/HZ（约 1~10ms）。
+ * 各架构会用自己的高精度实现覆盖它：
+ *   x86  → 读 TSC（Time Stamp Counter），精度 ~1ns
+ *   ARM  → 读 arch timer 或 cycle counter，精度 ~1ns
+ *
+ * notrace：禁止 ftrace 插桩此函数，避免时钟读取本身触发 tracing 死递归。
+ * __weak：允许架构用同名强符号覆盖此实现。
  */
 notrace unsigned long long __weak sched_clock(void)
 {
+	/* (jiffies - INITIAL_JIFFIES) 得到自启动以来的 tick 数，
+	 * 乘以每 tick 的纳秒数（NSEC_PER_SEC / HZ）折算为纳秒。
+	 * 精度低但在硬件时钟就绪前作为保底实现。 */
 	return (unsigned long long)(jiffies - INITIAL_JIFFIES)
 					* (NSEC_PER_SEC / HZ);
 }
 EXPORT_SYMBOL_GPL(sched_clock);
 
+/*
+ * sched_clock_running：静态分支键，引用计数达到 2 时时钟完全就绪。
+ *   - sched_clock_init()      将其从 0 增到 1（early，硬件时钟已就绪）
+ *   - sched_clock_init_late() 将其从 1 增到 2（late，驱动可能修改稳定性后）
+ * 读侧用 static_branch_likely() 检测，零开销快路径。
+ */
 static DEFINE_STATIC_KEY_FALSE(sched_clock_running);
 
 #ifdef CONFIG_HAVE_UNSTABLE_SCHED_CLOCK
@@ -198,14 +213,41 @@ notrace void clear_sched_clock_stable(void)
 		__clear_sched_clock_stable();
 }
 
+/*
+ * __sched_clock_gtod_offset() —— 计算 sched_clock() 与 ktime（GTOD）之间的偏移。
+ *
+ * 维持不变式：
+ *   ktime_get_ns() + __gtod_offset  ==  sched_clock() + __sched_clock_offset
+ *
+ * 即让两条时间线在当前时刻对齐，后续才能用 sched_clock() 的增量来提升
+ * ktime 的分辨率，同时又保持与墙上时间的可对比性。
+ */
 notrace static void __sched_clock_gtod_offset(void)
 {
+	/* 取本 CPU 的 per-CPU sched_clock_data，存储上次 tick 的快照 */
 	struct sched_clock_data *scd = this_scd();
 
+	/* 同时采样 tick_raw（sched_clock()读值）和 tick_gtod（ktime_get_ns()读值），
+	 * 两次读取尽量靠近，缩小竞争窗口 */
 	__scd_stamp(scd);
+
+	/* 推导 __gtod_offset：
+	 *   scd->tick_raw  + __sched_clock_offset  是 sched_clock 时间线当前值
+	 *   scd->tick_gtod                          是 GTOD 时间线当前值
+	 * 两者之差即为需要加在 GTOD 上才能等于 sched_clock 时间线的偏移量 */
 	__gtod_offset = (scd->tick_raw + __sched_clock_offset) - scd->tick_gtod;
 }
 
+/*
+ * sched_clock_init() —— 早期初始化（CONFIG_HAVE_UNSTABLE_SCHED_CLOCK 路径）。
+ *
+ * 在 late_time_init()（TSC/HPET 就绪）之后立即调用，完成两件事：
+ *   1. 计算 __gtod_offset，让后续 sched_clock_tick() 从当前时刻无缝衔接；
+ *   2. 将 sched_clock_running 引用计数 +1（0→1），激活 per-CPU 快路径。
+ *
+ * 此时仍是 UP（单处理器）阶段，TSC 即使有轻微误差也不会跨 CPU 漂移，
+ * 所以直接采样是安全的。
+ */
 void __init sched_clock_init(void)
 {
 	/*
@@ -215,19 +257,30 @@ void __init sched_clock_init(void)
 	 * Even if TSC is buggered, we're still UP at this point so it
 	 * can't really be out of sync.
 	 */
+	/* 关中断保证 __scd_stamp() 里两次读取（tick_raw 和 tick_gtod）不被打断，
+	 * 否则中断处理会污染采样值，导致 __gtod_offset 计算偏差 */
 	local_irq_disable();
-	__sched_clock_gtod_offset();
+	__sched_clock_gtod_offset(); /* 计算并写入 __gtod_offset */
 	local_irq_enable();
 
+	/* 引用计数从 0 增到 1；sched_clock_cpu() 检测到 running>=1 后
+	 * 才开始走 per-CPU sched_clock_data 快路径，而非直接返回裸 sched_clock() */
 	static_branch_inc(&sched_clock_running);
 }
+
 /*
- * We run this as late_initcall() such that it runs after all built-in drivers,
- * notably: acpi_processor and intel_idle, which can mark the TSC as unstable.
+ * sched_clock_init_late() —— 晚期初始化，作为 late_initcall 运行。
+ *
+ * 必须在所有内建驱动初始化完成后执行，因为 acpi_processor、intel_idle
+ * 等驱动可能在初始化时调用 mark_tsc_unstable() 修改时钟稳定性标志。
+ * 只有等它们跑完，这里才能做最终裁决：时钟到底稳不稳定。
  */
 static int __init sched_clock_init_late(void)
 {
+	/* 引用计数从 1 增到 2，表示时钟完全就绪（驱动已有机会修改稳定性）；
+	 * sched_clock_cpu() 此后走完整的 per-CPU 稳定性判断逻辑 */
 	static_branch_inc(&sched_clock_running);
+
 	/*
 	 * Ensure that it is impossible to not do a static_key update.
 	 *
@@ -235,15 +288,23 @@ static int __init sched_clock_init_late(void)
 	 * and do the update, or we must see their __sched_clock_stable_early
 	 * and do the update, or both.
 	 */
+	/* 全内存屏障，与 set_sched_clock_stable() / clear_sched_clock_stable()
+	 * 中的 smp_mb() 配对，防止编译器/CPU 重排导致双方都错过对方的写入，
+	 * 从而漏掉一次 static_key 更新 */
 	smp_mb(); /* matches {set,clear}_sched_clock_stable() */
 
 	if (__sched_clock_stable_early)
+		/* 驱动均未标记不稳定：将 __sched_clock_stable 静态分支设为 true，
+		 * sched_clock_cpu() 走零开销快路径（直接 sched_clock() + offset） */
 		__set_sched_clock_stable();
 	else
-		disable_sched_clock_irqtime();  /* disable if clock unstable. */
+		/* 有驱动标记了 TSC 不稳定：关闭 IRQ 时间统计（irqtime），
+		 * 因为不稳定时钟会导致统计值异常跳变，不如不统计 */
+		disable_sched_clock_irqtime();
 
 	return 0;
 }
+/* late_initcall：在所有 device_initcall 之后、do_initcalls 最后一轮执行 */
 late_initcall(sched_clock_init_late);
 
 /*
@@ -477,21 +538,40 @@ notrace void sched_clock_idle_wakeup_event(void)
 }
 EXPORT_SYMBOL_GPL(sched_clock_idle_wakeup_event);
 
-#else /* !CONFIG_HAVE_UNSTABLE_SCHED_CLOCK: */
+#else /* !CONFIG_HAVE_UNSTABLE_SCHED_CLOCK: 架构提供全局同步的稳定高精度时钟 */
 
+/*
+ * sched_clock_init()（稳定时钟路径）。
+ *
+ * 当架构保证 sched_clock() 全局单调且跨 CPU 同步时（如 ARM64 的 arch timer），
+ * 无需 per-CPU 漂移补偿机制，初始化更简单：
+ *   1. 激活 sched_clock_running（引用计数 +1）；
+ *   2. 调用 generic_sched_clock_init() 完成时钟注册和 wrap 定时器设置。
+ */
 void __init sched_clock_init(void)
 {
+	/* 标记时钟就绪，后续 sched_clock_cpu() 不再返回 0 */
 	static_branch_inc(&sched_clock_running);
+	/* generic_sched_clock_init() 内部会读取并更新 epoch，需关中断保证原子性 */
 	local_irq_disable();
-	generic_sched_clock_init();
+	generic_sched_clock_init(); /* 注册底层读函数、启动 wrap 防溢出 hrtimer */
 	local_irq_enable();
 }
 
+/*
+ * sched_clock_cpu()（稳定时钟路径）。
+ *
+ * 稳定时钟下所有 CPU 共享同一时间线，无需跨 CPU 补偿，
+ * 直接返回 sched_clock() 即可。
+ */
 notrace u64 sched_clock_cpu(int cpu)
 {
+	/* 时钟未就绪（sched_clock_init 尚未执行）时返回 0，
+	 * 避免调度器在极早期拿到无意义的时间戳 */
 	if (!static_branch_likely(&sched_clock_running))
 		return 0;
 
+	/* 稳定时钟全局同步，直接读取即可，无需 per-CPU 漂移修正 */
 	return sched_clock();
 }
 
