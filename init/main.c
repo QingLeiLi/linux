@@ -768,8 +768,34 @@ static noinline void __ref __noreturn rest_init(void)
 	 */
 	pid = kernel_thread(kthreadd, NULL, NULL, CLONE_FS | CLONE_FILES); /* 创建 PID 2（kthreadd），入口为 kthreadd() */
 	rcu_read_lock();                                                    /* 进入 RCU 读侧临界区 */
-	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);            /* 保存 kthreadd 的 task_struct 到全局变量，供 kthread_create() 使用 */
-	rcu_read_unlock();                                                  /* 退出 RCU 读侧临界区 */
+	/*
+	 * 将 kthreadd 的 task_struct 指针保存到全局变量 kthreadd_task，
+	 * 供后续 kthread_create() / wake_up_process(kthreadd_task) 使用。
+	 *
+	 * 为什么需要 rcu_read_lock()：
+	 *   find_task_by_pid_ns() 内部通过 pid 哈希表查找进程，最终调用
+	 *   pid_task()，后者用 rcu_dereference_check() 遍历 pid->tasks[] hlist。
+	 *   该链表由 RCU 保护——写侧（attach_pid/detach_pid）在修改时会用
+	 *   hlist_add_head_rcu / hlist_del_rcu，因此读侧必须持有 RCU 读锁才能
+	 *   安全地取到链表中的指针，否则可能读到被并发修改中的半更新状态。
+	 *
+	 * 拿到指针后为何可以在 rcu_read_unlock() 之后直接裸用，指针不会在数据更新时变化：
+	 *   RCU 在这里保护的是"pid 哈希表 → pid->tasks[] hlist → task_struct *"
+	 *   这条查找路径上的中间结构，而不是 task_struct 对象本身。
+	 *   task_struct 遵循"地址不变"原则：内核不会用"分配新对象、RCU 替换旧
+	 *   指针"的方式更新进程描述符；调度器对 state/prio/se 等字段的修改全部
+	 *   是原地写入。因此一旦拿到指针，其指向的对象地址在进程存活期间永远
+	 *   有效，不存在"写侧换指针导致旧指针过期"的问题。
+	 *
+	 * 为何不需要 get_task_struct() 引用计数：
+	 *   kthreadd 是 PID 2，系统运行期间永不退出，task_struct 永不释放，
+	 *   持有裸指针是安全的。若保存的是普通进程的指针，则必须先
+	 *   get_task_struct() 增加引用计数，使用完毕后 put_task_struct() 释放，
+	 *   否则进程退出后指针将悬空。
+	 */
+	kthreadd_task = find_task_by_pid_ns(pid, &init_pid_ns);   /* 保存 kthreadd 的 task_struct 到全局变量，供
+kthread_create() 使用 */
+	rcu_read_unlock();                                        /* 退出 RCU 读侧临界区 */
 
 	/*
 	 * 将系统状态切换为 SYSTEM_SCHEDULING，表示调度器已可正常工作。
