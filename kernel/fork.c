@@ -263,11 +263,18 @@ static inline void free_task_struct(struct task_struct *tsk)
  *   3. 支持 per-CPU 缓存，减少频繁 vmalloc/vfree 的 TLB 刷新开销。
  * 代价是：vmalloc() 本身比 alloc_pages() 慢，且每次 vfree() 可能触发 TLB flush。
  * 因此内核在每个 CPU 上缓存最多 NR_CACHED_STACKS 个已释放的栈，供下次 fork 复用。
+ * 这个是因为 vm_stack 和 栈基址（tsk->stack） 复用内存指针，栈从高地址向低地址生成，可能会覆盖 vm_stack，会在软件层面等一系列限制
  */
 #ifdef CONFIG_VMAP_STACK
 /*
  * vmalloc() is a bit slow, and calling vfree() enough times will force a TLB
  * flush.  Try to minimize the number of calls by caching stacks.
+ * 这个数字一般都比较小：
+ * 1. 现代服务器的核数很多，如果缓存池比较大，每个核都占用对应空间，会消耗较多的服务器内存
+ * 2. fork 在内核中执行的并发并不高，CPU 核心执行 fork() 或 clone() 虽然高频，但它是一个交替进行的过程（CPU-0 销毁一个线程释放栈，过几毫秒又创建一个线程申请栈）
+ * 3. 缓存池比较小，可以很好的利用CPU 的 L1/L2 高速缓存（Cache Pollution），Cache 控制器 每次访问内存，大概率拿到的是同一片物理地址，直接在 高速缓存 里面执行读写，
+ * 而且不会立即写入内存，而是等到高速缓存容量不够了，根据 LRU 规则，如果要将一块脏缓存驱逐出 高速缓存，才会将其写入内存。而且，CPU内部使用 MESI 协议实现了片间的缓存一致性协议（Cache Coherency Protocol）
+ * 它在硬件电路上保证了：任何一个核心只要敢把数据写脏，其他所有核心都会在一瞬间“同步知情”。
  */
 #define NR_CACHED_STACKS 2  /* 每个 CPU 缓存的内核栈数量上限 */
 static DEFINE_PER_CPU(struct vm_struct *, cached_stacks[NR_CACHED_STACKS]); /* per-CPU 栈缓存数组 */
@@ -323,6 +330,10 @@ static struct vm_struct *alloc_thread_stack_node_from_cache(struct task_struct *
 			return NULL; /* 当前 CPU 不在目标 NUMA 节点，拒绝使用缓存 */
 
 		for (i = 0; i < NR_CACHED_STACKS; i++) {
+			// cached_stacks 是一个 Per-CPU 数组，存储的是缓存的内核栈指针
+			// this_cpu_xchg 在原子内完成以下两件事：
+			// 1. 尝试从当前 CPU 的第 i 个缓存槽中取出 vm_struct 指针。如果该槽位有缓存的栈（值不为 NULL），vm_area 就会成功拿到它
+			// 2. 同时，它把该槽位写入 NULL。这意味着这个缓存栈已经被当前进程“领走”了，其他并发的代码（比如中断处理程序）再来执行这行代码时，只会拿到 NULL，防止了双重分配（Double Allocation）。
 			vm_area = this_cpu_xchg(cached_stacks[i], NULL); /* 原子取出缓存槽 */
 			if (vm_area)
 				return vm_area; /* 命中缓存，直接返回 */
@@ -361,11 +372,17 @@ static bool try_release_thread_stack_to_cache(struct vm_struct *vm_area)
 	 */
 	scoped_guard(preempt) { /* 禁止抢占，保证 NUMA 节点检测与缓存操作的原子性 */
 		nid = numa_node_id(); /* 获取当前 CPU 所在 NUMA 节点 */
+		// 校验指定的 NUMA 节点（nid）在当前系统中是否“真正拥有可供分配的物理内存”（包括普通内存、高端内存或可移动内存）
+		// 无内存节点的场景：
+		// 1. CPU-Only Node（纯计算节点）：这个节点上插了 64 核 CPU，但由于主板设计或硬件热插拔，它旁边没有插任何内存条
+		// 2. Memory-Only Node（纯内存节点 / 常用于 CXL 扩展内存）：这个节点是一个通过总线外挂的内存池，它只有大容量物理内存，上面一个 CPU 核心都没有
+		// 3. 配置导致的临时无内存：在内存热插拔（Memory Hotplug）过程中，某个节点的内存被全部拔出
 		if (node_state(nid, N_MEMORY)) { /* 仅当本地节点有内存时才做 NUMA 过滤 */
 			for (i = 0; i < vm_area->nr_pages; i++) {
 				struct page *page = vm_area->pages[i];
+				// 通过读取 page->flags 里的位域标记，直接查出这块内存物理上属于哪一个 NUMA 节点（NID）
 				if (page_to_nid(page) != nid)
-					return false; /* 存在远端内存页，不缓存 */
+					return false; /* 存在远端内存页（内存申请时不是在当前 NUMA 申请的），不直接归还给 per cpu，因为跨节点访问延迟高，需要将其归还给对应的 NUMA 节点 */
 			}
 		}
 
@@ -397,6 +414,8 @@ static void thread_stack_free_rcu(struct rcu_head *rh)
 	if (try_release_thread_stack_to_cache(vm_stack->stack_vm_area))
 		return; /* 成功入缓存，延迟实际释放 */
 
+	// NUMA 不匹配，或者 per cpu 的缓存已满
+	// 将这个栈内存彻底归还给它原本所属的那个远端物理节点的全局内存池
 	vfree(vm_area->addr); /* 缓存已满，立即释放 vmap 映射和物理页 */
 }
 
@@ -409,6 +428,13 @@ static void thread_stack_free_rcu(struct rcu_head *rh)
  * 不能立即调用 vfree()。通过 call_rcu() 将真正的释放操作（thread_stack_free_rcu）
  * 延迟到所有 RCU 读者都完成之后执行。
  *
+ * 这里指的是 栈 和 vm_stack 的内存是一起申请的，tsk->stack 指向栈基址（最小地址），后面紧接着就是 vm_stack 结构体本身，栈从高地址向低地址增长，一开始的 SP 地址是通过 tsk->stack + THREAD_SIZE 计算得到（THREAD_SIZE代表内核栈的大小，是固定的）。内核栈的布局如下：
+ * 低地址 (0x1000) -----------------------------------------------------> 高地址 (0x5000)
+ * [ vm_stack 结构体 ] [  活动栈空间 (内核函数在里面运行，从右往左长)  ] [ 预留的安全区/对齐 ]
+ * ↑                  ↑                                         ↑
+ * tsk->stack         真正运行时的栈顶 (SP不断逼近左侧)             真正运行时的栈底 (起点)
+ * (最低地址)
+ * 栈顶（Stack Top）：是当前栈指针（SP 寄存器）指向的位置，随着函数调用往低地址延伸。
  * 技巧：vm_stack 结构体复用了栈内存本身（tsk->stack 指向栈底，
  * 同时也是 vm_stack 的起始地址），节省了额外的内存分配。
  */
