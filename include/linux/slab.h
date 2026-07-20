@@ -827,12 +827,28 @@ static_assert(PAGE_SHIFT <= 20);
  * Allocate an object from this cache.
  * See kmem_cache_zalloc() for a shortcut of adding __GFP_ZERO to flags.
  *
+ * 与 kmem_cache_alloc_node() 的关系：
+ *   kmem_cache_alloc(s, flags) ≡ kmem_cache_alloc_node(s, flags, NUMA_NO_NODE)
+ *   不指定 NUMA 节点，由分配器从当前 CPU 所在节点的 slab 空闲链表优先分配。
+ *
  * Return: pointer to the new object or %NULL in case of error
  */
 void *kmem_cache_alloc_noprof(struct kmem_cache *cachep,
 			      gfp_t flags) __assume_slab_alignment __malloc;
 #define kmem_cache_alloc(...)			alloc_hooks(kmem_cache_alloc_noprof(__VA_ARGS__))
 
+/**
+ * kmem_cache_alloc_lru - 从指定 slab 缓存分配对象，并将其关联到 LRU 链表
+ * @s:       目标 slab 缓存
+ * @lru:     目标 list_lru（每节点 LRU 链表，用于内存回收时追踪可回收对象）
+ * @gfpflags: GFP 分配标志
+ *
+ * 在分配对象的同时向 @lru 注册该对象所属的内存 cgroup（memcg）计费信息。
+ * 主要用于需要 LRU 回收支持的文件系统对象（如 dentry、inode），内存压力时
+ * shrinker 可通过 list_lru_walk() 遍历并回收这些对象。
+ *
+ * Return: 指向新分配对象的指针，失败返回 NULL。
+ */
 void *kmem_cache_alloc_lru_noprof(struct kmem_cache *s, struct list_lru *lru,
 			    gfp_t gfpflags) __assume_slab_alignment __malloc;
 #define kmem_cache_alloc_lru(...)	alloc_hooks(kmem_cache_alloc_lru_noprof(__VA_ARGS__))
@@ -873,14 +889,34 @@ kmem_buckets *kmem_buckets_create(const char *name, slab_flags_t flags,
 				  void (*ctor)(void *));
 
 /*
- * Bulk allocation and freeing operations. These are accelerated in an
- * allocator specific way to avoid taking locks repeatedly or building
- * metadata structures unnecessarily.
+ * 批量分配/释放接口。
  *
- * Note that interrupts must be enabled when calling these functions.
+ * 批量操作通过一次性获取/归还多个对象来分摊锁开销和 per-CPU 缓存操作代价，
+ * 在高频分配场景（如网络包、文件描述符）中比逐个调用性能更高。
+ *
+ * 注意：调用这些函数时中断必须处于开启状态（不能在关中断上下文中使用）。
+ */
+
+/**
+ * kmem_cache_free_bulk - 批量释放 slab 对象
+ * @s:    slab 缓存；传 NULL 时自动从每个对象的 slab 元数据推断所属缓存
+ * @size: 要释放的对象数量
+ * @p:    指向对象指针数组的指针，数组长度至少为 @size
  */
 void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p);
 
+/**
+ * kmem_cache_alloc_bulk - 从指定 slab 缓存批量分配对象
+ * @s:    目标 slab 缓存
+ * @flags: GFP 分配标志
+ * @size: 要分配的对象数量
+ * @p:    输出数组，长度至少为 @size，成功分配的对象指针依次写入
+ *
+ * 尽力批量分配 @size 个对象，若全部成功返回 true，否则返回 false（此时
+ * 已成功分配的对象也会被自动释放，调用方无需处理部分成功的情况）。
+ *
+ * Return: true 表示全部分配成功，false 表示失败（@p 数组内容无效）。
+ */
 bool kmem_cache_alloc_bulk_noprof(struct kmem_cache *s, gfp_t flags,
 		size_t size, void **p);
 #define kmem_cache_alloc_bulk(...) \
@@ -891,8 +927,50 @@ static __always_inline void kfree_bulk(size_t size, void **p)
 	kmem_cache_free_bulk(NULL, size, p);
 }
 
+/**
+ * kmem_cache_alloc_node_noprof - 从指定 slab 缓存在指定 NUMA 节点上分配对象（底层实现）
+ * @s:    目标 slab 缓存（由 kmem_cache_create() 创建）
+ * @flags: GFP 分配标志，控制内存分配行为（如 GFP_KERNEL、GFP_ATOMIC 等）
+ * @node: 目标 NUMA 节点编号；传入 NUMA_NO_NODE 表示不限制节点（等价于 kmem_cache_alloc）
+ *
+ * 与 kmem_cache_alloc_noprof() 的区别：尽量从 @node 指定的 NUMA 节点上的
+ * slab 空闲链表分配，以减少跨节点内存访问延迟。适用于已知数据将被某个特定
+ * NUMA 节点上的 CPU 频繁访问的场景（如 per-node 数据结构）。
+ *
+ * 函数名后缀 _noprof 表示这是"不带内存分配追踪"的原始版本，不应被外部代码
+ * 直接调用。外部代码应使用下方的 kmem_cache_alloc_node() 宏，它通过
+ * alloc_hooks() 在调用点自动插入分配标签（alloc_tag），供内存分析工具
+ * （mem_alloc_profiling）统计每个调用点的分配量。
+ *
+ * __assume_slab_alignment：告知编译器返回指针至少对齐到 ARCH_SLAB_MINALIGN，
+ * 允许编译器生成更激进的对齐假设优化代码。
+ * __malloc：声明返回的指针不与任何现有指针存在别名关系（restrict 语义），
+ * 允许编译器跳过别名分析，生成更优代码。
+ *
+ * Return: 指向新分配对象的指针，失败返回 NULL。
+ */
 void *kmem_cache_alloc_node_noprof(struct kmem_cache *s, gfp_t flags,
 				   int node) __assume_slab_alignment __malloc;
+
+/**
+ * kmem_cache_alloc_node - 从指定 slab 缓存在指定 NUMA 节点上分配对象（公开接口）
+ *
+ * 对 kmem_cache_alloc_node_noprof() 的封装，通过 alloc_hooks() 宏在调用点
+ * 自动定义并注册一个静态 alloc_tag，记录调用位置（文件/行号）和分配统计。
+ *
+ * alloc_hooks() 展开逻辑（见 include/linux/alloc_tag.h）：
+ *   1. DEFINE_ALLOC_TAG(_alloc_tag)：在调用点静态定义一个 alloc_tag，
+ *      包含源文件名、行号，以及一个 per-CPU 计数器用于累计分配字节数。
+ *   2. 若内存分配追踪已启用（mem_alloc_profiling_enabled()）：
+ *      保存旧 tag → 设置当前 tag → 执行实际分配 → 恢复旧 tag。
+ *   3. 若未启用：直接执行实际分配，零开销。
+ *
+ * 使用示例：
+ *   struct my_obj *obj = kmem_cache_alloc_node(my_cache, GFP_KERNEL, node_id);
+ *   if (!obj) { ... }  // 必须检查返回值
+ *   ...
+ *   kmem_cache_free(my_cache, obj);  // 归还到原 slab 缓存，不能用 kfree
+ */
 #define kmem_cache_alloc_node(...)	alloc_hooks(kmem_cache_alloc_node_noprof(__VA_ARGS__))
 
 struct slab_sheaf *
@@ -1162,6 +1240,35 @@ void *kmalloc_nolock(size_t size, gfp_t gfp_flags, int node);
 #define kmem_buckets_alloc_track_caller(_b, _size, _flags) \
 	kmem_buckets_alloc_node_track_caller(_b, _size, _flags, NUMA_NO_NODE)
 
+/**
+ * _kmalloc_node_noprof - kmalloc_node 的内联快速路径实现
+ * @size:  要分配的字节数
+ * @flags: GFP 分配标志
+ * @node:  目标 NUMA 节点；NUMA_NO_NODE 表示不限节点
+ * @token: 内存追踪令牌（由调用方的 __kmalloc_token() 宏在编译期生成）
+ *
+ * 与 _kmalloc_noprof() 的区别在于多了 @node 参数，分配时优先选择该节点的
+ * slab/page，从而减少跨 NUMA 节点访问。适用于已知对象将被特定节点 CPU 访问
+ * 的场景（如 NUMA 感知的调度器数据、网络设备的接收队列缓冲区等）。
+ *
+ * 编译期优化路径（size 为编译期常量时）：
+ *   1. size > KMALLOC_MAX_CACHE_SIZE（通常为 8KB 或 2 * PAGE_SIZE）：
+ *      → 调用 __kmalloc_large_node_noprof()，通过伙伴系统（buddy allocator）
+ *        直接分配整页，返回页对齐指针。
+ *   2. size 在 slab 缓存范围内：
+ *      → kmalloc_index(size) 计算出对应的 kmalloc-N 缓存槽位（如 size=200
+ *        → kmalloc-256），再通过 kmalloc_type() 根据 flags 选择缓存类型
+ *        （Normal/Reclaimable/DMA），最终调用 __kmalloc_cache_node_noprof()
+ *        从 per-node slab 空闲链表分配，性能最优。
+ *
+ * 运行期回退路径（size 为变量时）：
+ *      → 调用 __kmalloc_node_noprof()，在运行时执行上述相同逻辑，略慢。
+ *
+ * kmalloc_node 是面向外部的公开宏，通过 alloc_hooks() 附加分配追踪后
+ * 转发到 kmalloc_node_noprof，后者再注入 token 后调用本函数。
+ *
+ * 分配的内存须用 kfree() 释放（不能用 kmem_cache_free）。
+ */
 static __always_inline __alloc_size(1) void *_kmalloc_node_noprof(size_t size, gfp_t flags, int node, kmalloc_token_t token)
 {
 	if (__builtin_constant_p(size) && size) {
@@ -1178,6 +1285,7 @@ static __always_inline __alloc_size(1) void *_kmalloc_node_noprof(size_t size, g
 	return __kmalloc_node_noprof(PASS_KMALLOC_PARAMS(size, NULL, token), flags, node);
 }
 #define kmalloc_node_noprof(...)		_kmalloc_node_noprof(__VA_ARGS__, __kmalloc_token(__VA_ARGS__))
+/* kmalloc_node：附加分配追踪标签后的公开接口，用法与 kmalloc() 相同，多一个 node 参数 */
 #define kmalloc_node(...)			alloc_hooks(kmalloc_node_noprof(__VA_ARGS__))
 
 static inline __alloc_size(1, 2) void *_kmalloc_array_noprof(size_t n, size_t size, gfp_t flags, kmalloc_token_t token)

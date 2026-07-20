@@ -213,6 +213,8 @@ int nr_processes(void)
 	int total = 0;
 
 	for_each_possible_cpu(cpu)
+		// per_cpu 是一个宏，用于访问当前 CPU 上的特定变量实例
+		// 当前是访问 process_counts 这个 per-CPU 变量，获取当前 CPU 上的进程计数
 		total += per_cpu(process_counts, cpu); /* 累加每个 CPU 上的进程计数 */
 
 	return total;
