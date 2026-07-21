@@ -1,5 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
+ * TCP Echo skb 表示与 ownership 学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。struct sk_buff 是包/分段的元数据，
+ * payload 可在线性 head、page frags 或 frag_list 中。skb clone 可复制元数据而
+ * 共享 payload；所以“释放 skb”与“payload page 最后释放”由引用计数解耦。
+ * 同一 union/cb 会被不同队列和协议阶段复用，只有当前 owner 才能解释其类型。
+ */
+/*
  *	Definitions for the 'struct sk_buff' memory handlers.
  *
  *	Authors:
@@ -885,6 +893,7 @@ enum skb_tstamp_type {
 
 struct sk_buff {
 	union {
+		/* next/prev、rbnode、list/ll_node 共用存储：一个 skb 同时只能采用兼容的一种链接身份。 */
 		struct {
 			/* These two members must be first to match sk_buff_head. */
 			struct sk_buff		*next;
@@ -904,6 +913,7 @@ struct sk_buff {
 		struct llist_node	ll_node;
 	};
 
+	/* 可空的关联 socket；配合 destructor 进行收发内存记账，不等于 socket lock。 */
 	struct sock		*sk;
 
 	union {
@@ -916,6 +926,7 @@ struct sk_buff {
 	 * want to keep them across layers you have to do a skb_clone()
 	 * first. This is owned by whoever has the skb queued ATM.
 	 */
+	/* cb 没有运行时类型；TCP 交给 IP 前必须清理，跨层保留则需 clone/另存。 */
 	char			cb[48] __aligned(8);
 
 	union {
@@ -932,6 +943,7 @@ struct sk_buff {
 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)
 	unsigned long		 _nfct;
 #endif
+	/* len 是总数据长度；data_len 是非线性部分，故线性长度为 len - data_len。 */
 	unsigned int		len,
 				data_len;
 	__u16			mac_len,
@@ -940,6 +952,7 @@ struct sk_buff {
 	/* Following fields are _not_ copied in __copy_skb_header()
 	 * Note that queue_mapping is here mostly to fill a hole.
 	 */
+	/* 选定的 netdev TX/RX queue 编号；同 flow 随意变化可能制造乱序。 */
 	__u16			queue_mapping;
 
 /* if you move cloned around you also must adapt those constants */

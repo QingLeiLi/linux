@@ -1,5 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * TCP Echo 重传与存活计时器学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * TCP 不能把网卡“已接管 skb”当作可靠交付证据；只有 ACK/SACK 才能释放重传
+ * 状态。这里把 ACK 长时间缺失转成 RTO、零窗口探测、keepalive 或最终错误。
+ * 一个 socket 复用 inet_connection_sock 的 pending 事件和内核 timer：timer 回调
+ * 先取得 BH socket lock，若用户线程正拥有 socket，则只置 deferred bit 并持引用，
+ * 等 release_sock/tcp_release_cb 串行执行，避免两个上下文同时改拥塞与队列状态。
+ *
+ * 主线：tcp_reset_xmit_timer -> tcp_write_timer -> tcp_write_timer_handler
+ *       -> tcp_retransmit_timer -> tcp_retransmit_skb -> TCP/IP 输出路径。
+ * 指数退避减少黑洞上的持续流量，代价是偶发丢包后的恢复延迟逐轮增加；
+ * TCP_USER_TIMEOUT、SYN retry 和 orphan 策略为不同用户/资源语义设置终止边界。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -240,6 +256,16 @@ static bool retransmits_timed_out(struct sock *sk,
 }
 
 /* A write timeout has occurred. Process the after effects. */
+/*
+ * tcp_write_timeout - 判断本轮超时应继续重传，还是宣告连接失败。
+ *
+ * @sk 已持 socket 保护。握手按 syn_retries/线性超时次数判断；已建立连接先在
+ * retries1 阶段触发 PMTU black-hole 探测和 route negative advice，最终受
+ * retries2 或 TCP_USER_TIMEOUT 限制。orphan 没有应用可等待结果，采用更严格的
+ * 资源策略，必要时主动 reset。返回 1 表示连接已终止/错误已提交，调用者不得再
+ * 重传本轮 skb；0 表示仍可进入 loss/retransmit。它依据从 retrans_stamp 起的
+ * 实际经过时间，而非只数 timer 回调，避免调度延迟改变用户超时语义。
+ */
 static int tcp_write_timeout(struct sock *sk)
 {
 	struct inet_connection_sock *icsk = inet_csk(sk);
@@ -532,6 +558,16 @@ static bool tcp_rtx_probe0_timed_out(const struct sock *sk,
  *
  *  Returns: Nothing (void)
  */
+/*
+ * tcp_retransmit_timer - 处理一次 RTO 到期，并为下一轮建立新的恢复边界。
+ *
+ * @sk 已由 tcp_write_timer_handler 串行化且 BH 关闭；函数不接收/释放外部 skb，
+ * 只借用 tcp_rtx_queue 头。Fast Open SYN-ACK 有独立 timer 规则；普通路径要求
+ * packets_out 与重传树一致。tcp_write_timeout 先决定是否已经达到用户、协议或
+ * orphan 的终止边界；仍存活时进入 Loss，重发最老未确认 segment，并按线性或
+ * 指数退避重装 ICSK_TIME_RETRANS。局部资源不足只用较短 resource-probe interval，
+ * 不把本机暂时拥塞误报为对端死亡。函数可最终设置 sk_err、唤醒用户并关闭连接。
+ */
 void tcp_retransmit_timer(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -552,6 +588,7 @@ void tcp_retransmit_timer(struct sock *sk)
 		return;
 	}
 
+	/* ACK 可能在 timer 排队后清空在途数据；没有重传对象时回调变成 no-op。 */
 	if (!tp->packets_out)
 		return;
 
@@ -559,6 +596,10 @@ void tcp_retransmit_timer(struct sock *sk)
 	if (WARN_ON_ONCE(!skb))
 		return;
 
+	/*
+	 * 对端公告零窗口时不能把探测失败当网络拥塞超时：活 socket 持续 probe，
+	 * orphan 才受资源/时间上限。这里重发一个字节的目的主要是获取新 window。
+	 */
 	if (!tp->snd_wnd && !sock_flag(sk, SOCK_DEAD) &&
 	    !((1 << sk->sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV))) {
 		/* Receiver dastardly shrinks window. Our retransmits
@@ -625,6 +666,7 @@ void tcp_retransmit_timer(struct sock *sk)
 			__NET_INC_STATS(sock_net(sk), mib_idx);
 	}
 
+	/* RTO 说明 ACK 反馈不足以精确定位丢包，保守进入 Loss 并从最老未确认段重发。 */
 	tcp_enter_loss(sk);
 
 	tcp_update_rto_stats(sk);
@@ -681,6 +723,7 @@ out_reset_timer:
 		icsk->icsk_backoff++;
 		icsk->icsk_rto = min(icsk->icsk_rto << 1, tcp_rto_max(sk));
 	}
+	/* 无论线性还是指数策略，都把唯一 pending 事件重新武装到新绝对期限。 */
 	tcp_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
 			     tcp_clamp_rto_to_user_timeout(sk), false);
 	if (retransmits_timed_out(sk, READ_ONCE(net->ipv4.sysctl_tcp_retries1) + 1, 0))
@@ -691,6 +734,15 @@ out:;
 
 /* Called with bottom-half processing disabled.
  * Called by tcp_write_timer() and tcp_release_cb().
+ */
+/*
+ * tcp_write_timer_handler - 在 socket 已串行化后分派复用的发送侧 timer 事件。
+ *
+ * 调用者关闭 BH 并保证没有用户 owner。icsk_pending 同时编码事件类型和“是否仍
+ * 有工作”；若真实 deadline 尚未来到，仅重新设置底层 timer。RETRANS/PROBE0 在
+ * 调 handler 前用 release-store 清 pending，使处理函数重装新事件时不会被旧值
+ * 覆盖；与 timer 快速路径的 acquire-load 组成发布协议。函数无返回值，事件处理
+ * 可能重传、重设 timer、报告 socket error 或关闭连接。
  */
 void tcp_write_timer_handler(struct sock *sk)
 {
@@ -727,6 +779,15 @@ void tcp_write_timer_handler(struct sock *sk)
 	}
 }
 
+/*
+ * tcp_write_timer - 内核 timer_list 回调，把异步到期安全地串入 socket 状态机。
+ *
+ * timer_container_of 从嵌入的 tcp_retransmit_timer 成员恢复 struct sock；定时器
+ * 自身持有一个 sk 引用，所有出口以 sock_put 配对。acquire-load 先过滤已经被 ACK
+ * 取消的事件。若用户线程持 lock_sock，回调不能等待或直接修改 TCP，只设置
+ * TCP_WRITE_TIMER_DEFERRED，并在首次设置时 sock_hold；release callback 日后处理
+ * 并归还该额外引用。否则在 BH lock 下同步调用 handler。
+ */
 static void tcp_write_timer(struct timer_list *t)
 {
 	struct sock *sk = timer_container_of(sk, t, tcp_retransmit_timer);

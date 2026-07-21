@@ -1,5 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
+ * TCP Echo 每 skb 控制状态学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。本轮聚焦 tcp_skb_cb：它覆盖通用
+ * skb->cb，在 TCP 拥有 skb 期间保存 host-order 序列范围、ACK、flags 和 SACK/
+ * 重传状态；交给 IP 前该控制块会被清空复用。TCP_SKB_CB 只是强制类型转换宏，
+ * 正确性来自阶段 ownership，不来自编译器的动态类型检查。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -1105,8 +1113,16 @@ enum tcp_skb_cb_sacked_flags {
  * This is 44 bytes if IPV6 is enabled.
  * If this grows please adjust skbuff.h:skbuff->cb[xxx] size appropriately.
  */
+/*
+ * 该结构必须装进固定 48-byte cb，不能随意增加字段。seq/end_seq 使用
+ * host byte order并表示右开区间；SYN/FIN 各占一个序列号，所以 end_seq 不只是
+ * seq + payload len。内部 union 表明字段生命周期互斥：同一 skb 在发送、接收、
+ * TIME_WAIT 阶段只能按当前 owner 对应的成员解释。
+ */
 struct tcp_skb_cb {
+	/* 当前 skb 覆盖的 TCP 序列左边界。 */
 	__u32		seq;		/* Starting sequence number	*/
+	/* 右边界 = seq + payload + SYN + FIN；ACK 清理和接收排队都以它为准。 */
 	__u32		end_seq;	/* SEQ + FIN + SYN + datalen	*/
 	union {
 		/* Notes :
@@ -1115,14 +1131,17 @@ struct tcp_skb_cb {
 		 * 	  tcp_gso_segs/size are used in write queue only,
 		 *	  cf tcp_skb_pcount()/tcp_skb_mss()
 		 */
+		/* write queue 用 GSO 计数/大小，TIME_WAIT 输入路径复用为 isn，二者绝不能同时读取。 */
 		u32		tcp_tw_isn;
 		struct {
 			u16	tcp_gso_segs;
 			u16	tcp_gso_size;
 		};
 	};
+	/* host-order 的 FIN/SYN/RST/PSH/ACK... 位，构造 header 时再编码网络字节序。 */
 	__u16		tcp_flags;	/* TCP header flags (tcp[12-13])*/
 
+	/* 同一字节组合“已 SACK、已重传、判定丢失”等可靠性状态。 */
 	__u8		sacked;		/* State flags for SACK.	*/
 	__u8		ip_dsfield;	/* IPv4 tos or IPv6 dsfield	*/
 #define TSTAMP_ACK_SK	0x1
@@ -1131,6 +1150,7 @@ struct tcp_skb_cb {
 			eor:1,		/* Is skb MSG_EOR marked? */
 			has_rxtstamp:1,	/* SKB has a RX timestamp	*/
 			unused:4;
+	/* 入站 skb 的 ACK 字段；它确认反方向发送序列，与本 skb 的 seq 不同。 */
 	__u32		ack_seq;	/* Sequence number ACK'd	*/
 	union {
 		struct {
@@ -1155,6 +1175,10 @@ struct tcp_skb_cb {
 	};
 };
 
+/*
+ * 该宏只把 cb[0] 地址强制转换为 tcp_skb_cb 指针，没有运行时检查或复制。
+ * 只有 TCP 当前拥有 cb 且 BUILD/布局大小约束成立时，解引用结果才有意义。
+ */
 #define TCP_SKB_CB(__skb)	((struct tcp_skb_cb *)&((__skb)->cb[0]))
 
 extern const struct inet_connection_sock_af_ops ipv4_specific;
@@ -2312,6 +2336,14 @@ static inline void tcp_rtx_queue_unlink(struct sk_buff *skb, struct sock *sk)
 	rb_erase(&skb->rbnode, &sk->tcp_rtx_queue);
 }
 
+/*
+ * tcp_rtx_queue_unlink_and_free - 从“在途/待确认”索引中撤销 skb 并释放发送内存。
+ *
+ * 同一 skb 同时挂在 tcp_rtx_queue 红黑树和 tcp_tsorted_anchor 时间排序链表上；
+ * 只删一个索引会留下悬空节点。tcp_wmem_free_skb() 不只是 kfree：它还撤销
+ * sk_wmem_queued/内存记账，可能让阻塞在 send() 的进程重新获得写空间。因此
+ * 调用者必须已经更新 packets_out、SACK/retrans 等逻辑计数，并持有 socket lock。
+ */
 static inline void tcp_rtx_queue_unlink_and_free(struct sk_buff *skb, struct sock *sk)
 {
 	list_del(&skb->tcp_tsorted_anchor);

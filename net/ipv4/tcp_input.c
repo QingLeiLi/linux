@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * TCP Echo 接收状态机学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 本文件验证 ACK/window/options/sequence，推进发送确认状态，并把 payload 按
+ * 序列空间放入 receive queue 或 out_of_order_queue。只有从 rcv_nxt 开始连续、
+ * 位于接收窗口且内存记账成功的数据才能向应用发布；乱序数据只能暂存并用
+ * SACK/重复 ACK 反馈洞的位置。
+ *
+ * 快速路径使用 header prediction；任一异常退化到完整 RFC 状态机。发布数据后
+ * sk_data_ready 只唤醒 waiter，任务何时运行由调度器决定。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -3599,6 +3612,19 @@ static void tcp_ack_tstamp(struct sock *sk, struct sk_buff *skb,
  * is before the ack sequence we can discard it as it's confirmed to have
  * arrived at the other end.
  */
+/*
+ * tcp_clean_rtx_queue 将 snd_una/SACK 已确认的序列范围从重传 RB-tree
+ * 中回收，并生成 RTT、delivery-rate 和拥塞控制所需标志。
+ *
+ * @ack_skb 只借用来读取 ACK/timestamp；@prior_fack/@prior_snd_una 是处理本 ACK
+ * 前快照；@sack 是输入/输出的 SACK/速率采样状态；@ece_ack 表示交付伴随 ECN。
+ * 调用者持 socket lock。返回 FLAG_* 集合，不返回 errno。
+ *
+ * 完全确认的 skb：从 RB-tree unlink，修正 packets/sacked/lost/retrans 计数，释放
+ * skb/page/wmem；部分确认的 TSO skb：tcp_trim_head 只裁掉已确认前缀，剩余后缀
+ * 继续留树中重传。释放可能使 send buffer 可写，但唤醒由 socket write-space
+ * 协议在相应记账下降时完成。
+ */
 static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 			       u32 prior_fack, u32 prior_snd_una,
 			       struct tcp_sacktag_state *sack, bool ece_ack)
@@ -3619,6 +3645,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 
 	first_ackt = 0;
 
+	/* 重传树按 seq 排序，从最早未确认范围开始，遇到首个未完全覆盖节点即可停止。 */
 	for (skb = skb_rb_first(&sk->tcp_rtx_queue); skb; skb = next) {
 		struct tcp_skb_cb *scb = TCP_SKB_CB(skb);
 		const u32 start_seq = scb->seq;
@@ -3626,11 +3653,13 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		u32 acked_pcount;
 
 		/* Determine how many packets and what bytes were acked, tso and else */
+		/* 一个 GSO skb 代表多个 pcount，累计 ACK 可能只覆盖其前几个 segment。 */
 		if (after(scb->end_seq, tp->snd_una)) {
 			if (tcp_skb_pcount(skb) == 1 ||
 			    !after(tp->snd_una, scb->seq))
 				break;
 
+			/* 原地 trim 已确认前缀并返回被确认的逻辑 segment 数。 */
 			acked_pcount = tcp_tso_acked(sk, skb);
 			if (!acked_pcount)
 				break;
@@ -3640,6 +3669,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		}
 
 		if (unlikely(sacked & TCPCB_RETRANS)) {
+			/* ACK 命中重传数据，RTT/Karn 与恢复判断不能当作纯原始发送样本。 */
 			if (sacked & TCPCB_SACKED_RETRANS)
 				tp->retrans_out -= acked_pcount;
 			flag |= FLAG_RETRANS_DATA_ACKED;
@@ -3668,6 +3698,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		if (sacked & TCPCB_LOST)
 			tp->lost_out -= acked_pcount;
 
+		/* 所有发送状态计数必须与队列裁剪同批提交，否则 cwnd 可用量会错误。 */
 		tp->packets_out -= acked_pcount;
 		pkts_acked += acked_pcount;
 		tcp_rate_skb_delivered(sk, skb, sack->rate);
@@ -3679,6 +3710,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		 * connection startup slow start one packet too
 		 * quickly.  This is severely frowned upon behavior.
 		 */
+		/* SYN 占序列号和队列，但不是应用 data，不能用其 ACK 提前增长数据 cwnd。 */
 		if (likely(!(scb->tcp_flags & TCPHDR_SYN))) {
 			flag |= FLAG_DATA_ACKED;
 		} else {
@@ -3687,30 +3719,36 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		}
 
 		if (!fully_acked)
+			/* 当前 skb 保留未确认后缀，后续节点序列号更大，不可能被累计 ACK 覆盖。 */
 			break;
 
 		tcp_ack_tstamp(sk, skb, ack_skb, prior_snd_una);
 
+		/* 释放前先保存 next；unlink/free 后当前 rbnode 已失效。 */
 		next = skb_rb_next(skb);
 		if (unlikely(skb == tp->retransmit_skb_hint))
 			tp->retransmit_skb_hint = NULL;
 		tcp_highest_sack_replace(sk, skb, next);
+		/* ownership 终点：摘树、解除 socket 发送记账并最终释放 skb/shared pages。 */
 		tcp_rtx_queue_unlink_and_free(skb, sk);
 	}
 
 	if (!skb)
+		/* 树已清空，连接不再因未确认数据处于 busy chrono。 */
 		tcp_chrono_stop(sk, TCP_CHRONO_BUSY);
 
 	if (likely(between(tp->snd_up, prior_snd_una, tp->snd_una)))
 		tp->snd_up = tp->snd_una;
 
 	if (skb) {
+		/* 首个残留 skb 是新的重传队头；若它曾被 SACK，累计 ACK 回退可能表示 reneging。 */
 		tcp_ack_tstamp(sk, skb, ack_skb, prior_snd_una);
 		if (TCP_SKB_CB(skb)->sacked & TCPCB_SACKED_ACKED)
 			flag |= FLAG_SACK_RENEGING;
 	}
 
 	if (likely(first_ackt) && !(flag & FLAG_RETRANS_DATA_ACKED)) {
+		/* 只有可归因于原始发送的 ACK 才生成可靠 sequence RTT 样本，遵守 Karn 原则。 */
 		seq_rtt_us = tcp_stamp_us_delta(tp->tcp_mstamp, first_ackt);
 		ca_rtt_us = tcp_stamp_us_delta(tp->tcp_mstamp, last_ackt);
 
@@ -3729,10 +3767,12 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 		sack_rtt_us = tcp_stamp_us_delta(tp->tcp_mstamp, sack->first_sackt);
 		ca_rtt_us = tcp_stamp_us_delta(tp->tcp_mstamp, sack->last_sackt);
 	}
+	/* 综合累计 ACK 与 SACK timestamp 更新 srtt/rttvar/RTO 和 rate sample。 */
 	rtt_update = tcp_ack_update_rtt(sk, flag, seq_rtt_us, sack_rtt_us,
 					ca_rtt_us, sack->rate);
 
 	if (flag & FLAG_ACKED) {
+		/* 有新交付时重新安排 TLP/RTO，并处理 MTU probe、Reno/SACK 重排语义。 */
 		flag |= FLAG_SET_XMIT_TIMER;  /* set TLP or RTO timer */
 		if (unlikely(icsk->icsk_mtup.probe_size &&
 			     !after(tp->mtu_probe.probe_seq_end, tp->snd_una))) {
@@ -3756,6 +3796,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 				tcp_check_sack_reordering(sk, reord, 0);
 		}
 
+		/* GNU `?:` 在此选择残留队头 seq；无残留则使用 snd_una 作为右边界。 */
 		sack->delivered_bytes = (skb ?
 					 TCP_SKB_CB(skb)->seq : tp->snd_una) -
 					 prior_snd_una;
@@ -3770,6 +3811,7 @@ static int tcp_clean_rtx_queue(struct sock *sk, const struct sk_buff *ack_skb,
 	}
 
 	if (icsk->icsk_ca_ops->pkts_acked) {
+		/* 具体拥塞算法的可选回调得到本 ACK 的包数、RTT 和估算在途字节样本。 */
 		struct ack_sample sample = { .pkts_acked = pkts_acked,
 					     .rtt_us = sack->rate->rtt_us };
 
@@ -3905,6 +3947,14 @@ static void tcp_snd_sne_update(struct tcp_sock *tp, u32 ack)
 }
 
 /* If we update tp->snd_una, also update tp->bytes_acked */
+/*
+ * tcp_snd_una_update - 原子地提交“发送端又有一段字节被累计确认”。
+ *
+ * snd_una 是最老未确认序号，ack - old_snd_una 因 u32 模运算可正确处理序号
+ * 回绕；调用者在 tcp_ack() 中已经证明 ACK 合法且向前，因此这里不再校验。
+ * bytes_acked 是累计统计，不参与序号比较。先更新派生统计和 TCP-AO 的 SNE，
+ * 最后 WRITE_ONCE 发布新的 snd_una，使无锁观察者不会先看见游标而漏掉配套状态。
+ */
 static void tcp_snd_una_update(struct tcp_sock *tp, u32 ack)
 {
 	u32 delta = ack - tp->snd_una;
@@ -3933,6 +3983,14 @@ static void tcp_rcv_sne_update(struct tcp_sock *tp, u32 seq)
 }
 
 /* If we update tp->rcv_nxt, also update tp->bytes_received */
+/*
+ * tcp_rcv_nxt_update - 提交接收连续前缀的新右边界。
+ *
+ * 只有已经证明 [old_rcv_nxt, seq) 连续到达的路径才能调用它；乱序树插入不能
+ * 调用，否则 recv 会越过尚未填补的洞。bytes_received 记录新纳入连续前缀的
+ * 字节数；TCP-AO SNE 必须与 32 位序号回绕同步。WRITE_ONCE 对应其他上下文的
+ * 无锁读取，但不代替 socket lock：多字段一致性仍由调用者持锁保证。
+ */
 static void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
 {
 	u32 delta = seq - tp->rcv_nxt;
@@ -3947,6 +4005,18 @@ static void tcp_rcv_nxt_update(struct tcp_sock *tp, u32 seq)
  *
  * Window update algorithm, described in RFC793/RFC1122 (used in linux-2.2
  * and in FreeBSD. NetBSD's one is even worse.) is wrong.
+ */
+/*
+ * ACK 同时携带两个不同的信息：@ack 确认本端发出的字节，TCP 首部
+ * window 则声明对端当前还能接收多少字节。窗口值只有在 SEG.SEQ/ACK 足够新时
+ * 才能覆盖 snd_wnd，否则网络重排会让旧报文把新窗口倒退；这个新旧判定由
+ * tcp_may_update_window() 完成，snd_wl1 记住上次窗口更新所用的 SEG.SEQ。
+ *
+ * SYN 上的 window 未缩放，普通段才按握手协商的 snd_wscale 左移。窗口变化会
+ * 使预计算的快速路径条件失效，因此清 pred_flags 后重新检查；窗口扩大还可能
+ * 立即释放 write queue，并影响最大报文/MSS 推导。无论窗口是否更新，合法 ACK
+ * 都通过 tcp_snd_una_update() 推进累计确认点。返回 FLAG_WIN_UPDATE 供 tcp_ack()
+ * 的后续拥塞控制与输出决策使用。
  */
 static int tcp_ack_update_window(struct sock *sk, const struct sk_buff *skb, u32 ack,
 				 u32 ack_seq)
@@ -4243,14 +4313,37 @@ static void tcp_rack_update_reo_wnd(struct sock *sk, struct rate_sample *rs)
 }
 
 /* This routine deals with incoming acks, but not outgoing ones. */
+/*
+ * tcp_ack - 验证一个入站 ACK，并把确认结果提交到发送队列、计时器和拥塞控制。
+ *
+ * @sk 已持 socket/BH 序列化；@skb 是当前入站 segment，函数只借用，不消费；
+ * @flag 是调用者已验证出的 FLAG_* 上下文，函数会在局部继续累加。
+ * 返回 1 表示 ACK 被有效处理，0 表示可忽略的旧 ACK；负值编码 skb_drop_reason，
+ * 调用者取反后丢弃入站 skb。函数可能推进 snd_una、清理 retransmit queue、释放
+ * sk_wmem、更新 RTT/RTO/cwnd，并触发重传；因此它不是“比较一个 ack 数字”。
+ *
+ * 关键范围：
+ *
+ *   ack < snd_una：旧 ACK；过旧可能是注入攻击，challenge ACK/丢弃
+ *   ack == snd_una：未累计前进，仍可能携带 SACK/窗口/ECN，参与 dupack 恢复
+ *   snd_una < ack <= snd_nxt：确认新数据，清理已确认发送范围
+ *   ack > snd_nxt：确认了从未发送的字节，非法，challenge ACK/丢弃
+ *
+ * ACK 只证明对端 TCP 接收了字节，不证明对端应用已经 recv。
+ */
 static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 {
+	/*
+	 * prior_* 保存处理前快照，供“本 ACK 新确认/新丢失了多少”计算；sack_state
+	 * 收集 SACK tag 的副作用；rate_sample 把 delivery/loss/时间样本交给拥塞控制。
+	 */
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_sacktag_state sack_state;
 	struct rate_sample rs = { .prior_delivered = 0 };
 	u32 prior_snd_una = tp->snd_una;
 	bool is_sack_reneg = tp->is_sack_reneg;
+	/* ack_seq 是对端本次 segment 自己的 SEQ；ack 是其 ACK 字段，二者方向不同。 */
 	u32 ack_seq = TCP_SKB_CB(skb)->seq;
 	u32 ack = TCP_SKB_CB(skb)->ack_seq;
 	int num_dupack = 0;
@@ -4267,15 +4360,18 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	sack_state.delivered_bytes = 0;
 
 	/* We very likely will need to access rtx queue. */
+	/* 绝大多数有效 ACK 会访问重传树，提前预取根节点隐藏一部分 cache miss。 */
 	prefetch(sk->tcp_rtx_queue.rb_node);
 
 	/* If the ack is older than previous acks
 	 * then we can probably ignore it.
 	 */
+	/* TCP 序列号会 32-bit 回绕，必须使用 before/after，不能普通 `<`。 */
 	if (before(ack, prior_snd_una)) {
 		u32 max_window;
 
 		/* do not accept ACK for bytes we never sent. */
+		/* 只允许在历史可解释窗口内的轻微旧 ACK；更早值可能是盲注入。 */
 		max_window = min_t(u64, tp->max_window, tp->bytes_acked);
 		/* RFC 5961 5.2 [Blind Data Injection Attack].[Mitigation] */
 		if (before(ack, prior_snd_una - max_window)) {
@@ -4290,6 +4386,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	 * segment.  RFC 793 Section 3.9 and RFC 5961 Section 5.2
 	 * require us to send an ACK back in that case.
 	 */
+	/* snd_nxt 是已发送右边界，ACK 越过它不可能由合法接收产生。 */
 	if (after(ack, tp->snd_nxt)) {
 		if (!(flag & FLAG_NO_CHALLENGE_ACK))
 			tcp_send_challenge_ack(sk, false);
@@ -4297,6 +4394,10 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	}
 
 	if (after(ack, prior_snd_una)) {
+		/*
+		 * 阶段 1：确认累计前进。先标记事实并清 retransmit 次数；真正释放 skb
+		 * 在 tcp_clean_rtx_queue，避免只改 snd_una 却留下错误队列/记账。
+		 */
 		flag |= FLAG_SND_UNA_ADVANCED;
 		WRITE_ONCE(icsk->icsk_retransmits, 0);
 
@@ -4307,12 +4408,14 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 #endif
 	}
 
+	/* SACK flow 的 forward-most 已知交付边界可能领先累计 ACK。 */
 	prior_fack = tcp_is_sack(tp) ? tcp_highest_sack_seq(tp) : tp->snd_una;
 	rs.prior_in_flight = tcp_packets_in_flight(tp);
 
 	/* ts_recent update must be made after we are sure that the packet
 	 * is in window.
 	 */
+	/* 窗口/合法性确认前提交 timestamp 会让伪造包污染 PAWS 状态。 */
 	if (flag & FLAG_UPDATE_TS_RECENT)
 		flag |= tcp_replace_ts_recent(tp, TCP_SKB_CB(skb)->seq);
 
@@ -4322,12 +4425,14 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 		 * No more checks are required.
 		 * Note, we use the fact that SND.UNA>=SND.WL2.
 		 */
+		/* 纯累计前进且 window 不变时无需解析 SACK/ECN，直接更新 wl/snd_una。 */
 		tcp_update_wl(tp, ack_seq);
 		tcp_snd_una_update(tp, ack);
 		flag |= FLAG_WIN_UPDATE;
 
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPHPACKS);
 	} else {
+		/* 慢路径仍需区分 piggyback data、window update、SACK 和 ECN。 */
 		if (ack_seq != TCP_SKB_CB(skb)->end_seq)
 			flag |= FLAG_DATA;
 		else
@@ -4335,6 +4440,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 
 		flag |= tcp_ack_update_window(sk, skb, ack, ack_seq);
 
+		/* 入站 skb 控制块已保存解析出的 SACK blocks；据此标记 retransmit tree 范围。 */
 		if (TCP_SKB_CB(skb)->sacked)
 			flag |= tcp_sacktag_write_queue(sk, skb, prior_snd_una,
 							&sack_state);
@@ -4354,22 +4460,31 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	 * We accept CWR on pure ACKs to be more robust
 	 * with widely-deployed TCP implementations that do this.
 	 */
+	/* 为兼容现实协议栈，纯 ACK 上的 CWR 也被接受并更新 ECN 恢复状态。 */
 	tcp_ecn_accept_cwr(sk, skb);
 
 	/* We passed data and got it acked, remove any soft error
 	 * log. Something worked...
 	 */
+	/* 新 ACK 证明路径仍工作，旧 ICMP 等 soft error 不应继续污染后续操作。 */
 	if (READ_ONCE(sk->sk_err_soft))
 		WRITE_ONCE(sk->sk_err_soft, 0);
 	WRITE_ONCE(icsk->icsk_probes_out, 0);
 	tp->rcv_tstamp = tcp_jiffies32;
 	if (!prior_packets)
+		/* 没有在途 skb 时仍可能是 window/SACK/ECN 事件，但无需清 retransmit queue。 */
 		goto no_queue;
 
 	/* See if we can take anything off of the retransmit queue. */
+	/*
+	 * 阶段 2：核心 ownership 回收。helper 删除累计 ACK/SACK 已交付的 skb/范围，
+	 * 更新 packets_out/sacked_out/retrans_out，释放 payload/page 和 socket wmem；
+	 * 释放空间最终可经 sk_write_space 唤醒阻塞 send。
+	 */
 	flag |= tcp_clean_rtx_queue(sk, skb, prior_fack, prior_snd_una,
 				    &sack_state, flag & FLAG_ECE);
 
+	/* 用 DSACK/交付样本调整 RACK 对乱序的容忍窗口，避免把正常重排误判为丢包。 */
 	tcp_rack_update_reo_wnd(sk, &rs);
 
 	if (tcp_ecn_mode_accecn(tp))
@@ -4378,12 +4493,14 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 					       sack_state.delivered_bytes,
 					       &flag);
 
+	/* 向 congestion-control/BPF 等观察者发布本次 ACK 分类。 */
 	tcp_in_ack_event(sk, flag);
 
 	if (unlikely(tp->tlp_high_seq))
 		tcp_process_tlp_ack(sk, ack, flag);
 
 	if (tcp_ack_is_dubious(sk, flag)) {
+		/* 重复 ACK、SACK 洞或其他可疑进展进入 fast retransmit/recovery 判定。 */
 		if (!(flag & (FLAG_SND_UNA_ADVANCED |
 			      FLAG_NOT_DUP | FLAG_DSACKING_ACK))) {
 			num_dupack = 1;
@@ -4396,22 +4513,26 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 	}
 
 	/* If needed, reset TLP/RTO timer when RACK doesn't set. */
+	/* 只有 ACK 改变了最早未确认数据等条件时才重置定时器，避免无限推迟 RTO。 */
 	if (flag & FLAG_SET_XMIT_TIMER)
 		tcp_set_xmit_timer(sk);
 
 	if ((flag & FLAG_FORWARD_PROGRESS) || !(flag & FLAG_NOT_DUP))
 		sk_dst_confirm(sk);
 
+	/* 把累计 delivered 快照转换为本次 ACK 新交付量。 */
 	delivered = tcp_newly_delivered(sk, delivered, ecn_count, flag);
 
 	lost = tp->lost - lost;			/* freshly marked lost */
 	rs.is_ack_delayed = !!(flag & FLAG_ACK_MAYBE_DELAYED);
+	/* 阶段 3：生成 delivery-rate 样本，交给具体拥塞算法更新 cwnd/pacing。 */
 	tcp_rate_gen(sk, delivered, lost, is_sack_reneg, sack_state.rate);
 	tcp_cong_control(sk, ack, delivered, flag, sack_state.rate);
 	tcp_xmit_recovery(sk, rexmit);
 	return 1;
 
 no_queue:
+	/* 无在途队列的 ACK 仍可能打开 zero window、携带 DSACK/ECN 或结束 TLP。 */
 	if (tcp_ecn_mode_accecn(tp))
 		ecn_count = tcp_accecn_process(sk, skb,
 					       tp->delivered - delivered,
@@ -4438,6 +4559,7 @@ old_ack:
 	/* If data was SACKed, tag it and see if we should send more data.
 	 * If data was DSACKed, see if we can undo a cwnd reduction.
 	 */
+	/* 累计 ACK 虽旧，新的 SACK/DSACK 仍能报告洞后到达或伪重传，不能一律忽略。 */
 	if (TCP_SKB_CB(skb)->sacked) {
 		flag |= tcp_sacktag_write_queue(sk, skb, prior_snd_una,
 						&sack_state);
@@ -4893,6 +5015,20 @@ void tcp_reset(struct sock *sk, struct sk_buff *skb)
  *
  *	If we are in FINWAIT-2, a received FIN moves us to TIME-WAIT.
  */
+/*
+ * tcp_fin - 在 FIN 已按序进入接收序列空间后，提交“对端发送方向结束”。
+ *
+ * 调用者持 socket lock，且已经验证 FIN 位于 rcv_nxt 可连续交付的位置；这点很
+ * 关键：洞后的乱序 FIN 不能提前让 recv() 看见 EOF。函数不接收 skb 参数，也不
+ * 释放当前报文；可观察输出是 RCV_SHUTDOWN/SOCK_DONE、TCP 状态、ACK 调度以及
+ * waiter 唤醒。FIN 占一个序列号，但不产生用户 payload；已排队数据仍先于 EOF
+ * 被读取。
+ *
+ * 状态取舍：被动关闭 ESTABLISHED -> CLOSE_WAIT，应用仍可 send；同时关闭
+ * FIN_WAIT1 -> CLOSING；主动方收到对端 FIN 时 FIN_WAIT2 -> TIME_WAIT。重复 FIN
+ * 只需保持状态/ACK 语义，不能重复推进序列号。FIN 后的 OOO 数据无法再成为合法
+ * 连续字节，故清空乱序树和 SACK 状态。
+ */
 void tcp_fin(struct sock *sk)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -5331,6 +5467,18 @@ static bool tcp_can_ingest(const struct sock *sk, const struct sk_buff *skb)
 	return rmem <= sk->sk_rcvbuf;
 }
 
+/*
+ * tcp_try_rmem_schedule - 在接收 skb 前，为 socket 争取 @size 字节内存预算。
+ *
+ * 第一层 tcp_can_ingest() 检查该 socket 的 sk_rcvbuf 软上限；第二层
+ * sk_rmem_schedule() 同时处理 socket forward_alloc 和协议/网络命名空间的总
+ * 内存压力。任一失败时先 tcp_prune_queue() 压缩/清理可回收接收状态；随后反复
+ * 丢弃最昂贵且尚不可读的乱序队列，直到预算成功或再无可回收对象。
+ *
+ * 这种策略的取舍是：优先保留已经连续、应用马上能读的数据，以牺牲乱序数据
+ * 换取连接存活；被丢弃的字节仍可由 ACK 缺口触发发送端重传。返回 0 表示预算
+ * 已经记账，调用者可以入队；-1 表示调用者仍拥有 skb，必须走 drop 路径。
+ */
 static int tcp_try_rmem_schedule(struct sock *sk, const struct sk_buff *skb,
 				 unsigned int size)
 {
@@ -5348,6 +5496,17 @@ static int tcp_try_rmem_schedule(struct sock *sk, const struct sk_buff *skb,
 	return 0;
 }
 
+/*
+ * tcp_data_queue_ofo - 保存 rcv_nxt 之后的乱序 skb，并维护重叠、SACK 与内存。
+ *
+ * @sk 已持 socket/BH 序列化；@skb 的 seq > rcv_nxt 且 ownership 交给本函数。
+ * 成功时 skb 被插入按 seq 排序的 out_of_order_queue RB-tree，或合并进已有 skb；
+ * 重复/内存失败时在本函数释放。函数不会推进 rcv_nxt，也不会把 payload 发布给
+ * recv；未来填洞段到达后由 tcp_ofo_queue() 把连续前缀迁入 receive queue。
+ *
+ * 为什么用 RB-tree：乱序段可能插在任意序列位置，需要 O(log N) 查找；典型网络
+ * 乱序通常是“新的最大 seq”，所以 ooo_last_skb 提供 O(1) 尾插/合并快速路径。
+ */
 static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -5359,6 +5518,7 @@ static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
 	tcp_save_lrcv_flowlabel(sk, skb);
 	tcp_data_ecn_check(sk, skb);
 
+	/* 在进入树前完成 receive-memory 准入；失败后不能留下无记账节点。 */
 	if (unlikely(tcp_try_rmem_schedule(sk, skb, skb->truesize))) {
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPOFODROP);
 		READ_ONCE(sk->sk_data_ready)(sk);
@@ -5368,6 +5528,7 @@ static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
 
 	tcp_measure_rcv_mss(sk, skb);
 	/* Disable header prediction. */
+	/* 存在序列洞时 seq==rcv_nxt 的预测前提不稳定，必须走完整接收验证。 */
 	tp->pred_flags = 0;
 	inet_csk_schedule_ack(sk);
 
@@ -5376,8 +5537,10 @@ static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
 	seq = TCP_SKB_CB(skb)->seq;
 	end_seq = TCP_SKB_CB(skb)->end_seq;
 
+	/* p 是“将写入哪个 child 指针”的二级指针；parent 是该位置的父节点。 */
 	p = &tp->out_of_order_queue.rb_node;
 	if (RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
+		/* 第一段没有比较/重叠成本，直接成为根、尾指针和首个 SACK block。 */
 		/* Initial out of order segment, build 1 SACK. */
 		if (tcp_is_sack(tp)) {
 			tp->rx_opt.num_sacks = 1;
@@ -5393,9 +5556,11 @@ static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
 	/* In the typical case, we are adding an skb to the end of the list.
 	 * Use of ooo_last_skb avoids the O(Log(N)) rbtree lookup.
 	 */
+	/* 先与缓存尾段尝试 coalesce，避开 RB-tree 搜索和额外 skb 元数据。 */
 	if (tcp_ooo_try_coalesce(sk, tp->ooo_last_skb,
 				 skb, &fragstolen)) {
 coalesce_done:
+		/* fragstolen 表示 payload frags 已转移给旧 skb，只能 partial free 新元数据。 */
 		/* For non sack flows, do not grow window to force DUPACK
 		 * and trigger fast retransmit.
 		 */
@@ -5406,6 +5571,7 @@ coalesce_done:
 		goto add_sack;
 	}
 	/* Can avoid an rbtree lookup if we are adding skb after ooo_last_skb */
+	/* 新段起点不早于当前尾端，确定是最右 child，无需 O(log N) 搜索。 */
 	if (!before(seq, TCP_SKB_CB(tp->ooo_last_skb)->end_seq)) {
 		parent = &tp->ooo_last_skb->rbnode;
 		p = &parent->rb_right;
@@ -5413,6 +5579,7 @@ coalesce_done:
 	}
 
 	/* Find place to insert this segment. Handle overlaps on the way. */
+	/* 通用路径一边按 seq 查插入点，一边处理完全重复、部分重叠和同起点覆盖。 */
 	parent = NULL;
 	while (*p) {
 		parent = *p;
@@ -5424,6 +5591,7 @@ coalesce_done:
 		if (before(seq, TCP_SKB_CB(skb1)->end_seq)) {
 			if (!after(end_seq, TCP_SKB_CB(skb1)->end_seq)) {
 				/* All the bits are present. Drop. */
+				/* 新段完全被已有范围覆盖：记录 D-SACK 后释放，绝不能重复交付。 */
 				NET_INC_STATS(sock_net(sk),
 					      LINUX_MIB_TCPOFOMERGE);
 				tcp_drop_reason(sk, skb,
@@ -5439,6 +5607,7 @@ coalesce_done:
 				/* skb's seq == skb1's seq and skb covers skb1.
 				 * Replace skb1 with skb.
 				 */
+				/* 新段覆盖更多右侧字节，用新 rbnode 原位替换旧节点，再释放旧 skb。 */
 				rb_replace_node(&skb1->rbnode, &skb->rbnode,
 						&tp->out_of_order_queue);
 				tcp_dsack_extend(sk,
@@ -5458,11 +5627,13 @@ coalesce_done:
 	}
 insert:
 	/* Insert segment into RB tree. */
+	/* rb_link_node 建立父子关系，rb_insert_color 恢复红黑树平衡不变量。 */
 	rb_link_node(&skb->rbnode, parent, p);
 	rb_insert_color(&skb->rbnode, &tp->out_of_order_queue);
 
 merge_right:
 	/* Remove other segments covered by skb. */
+	/* 新段插入后向右删除被其完全覆盖的节点；部分覆盖的最后节点保留未覆盖后缀。 */
 	while ((skb1 = skb_rb_next(skb)) != NULL) {
 		if (!after(end_seq, TCP_SKB_CB(skb1)->seq))
 			break;
@@ -5482,6 +5653,7 @@ merge_right:
 		tp->ooo_last_skb = skb;
 
 add_sack:
+	/* SACK 描述已经收到的乱序范围，让发送端只重传洞；它不使数据对 recv 可见。 */
 	if (tcp_is_sack(tp))
 		tcp_sack_new_ofo_skb(sk, seq, end_seq);
 end:
@@ -5491,6 +5663,7 @@ end:
 		 */
 		if (tcp_is_sack(tp))
 			tcp_grow_window(sk, skb, false);
+		/* 压缩可回收 headroom 并把接收内存 owner/析构绑定到 sk。 */
 		skb_condense(skb);
 		skb_set_owner_r(skb, sk);
 	}
@@ -5499,17 +5672,29 @@ end:
 		tcp_rcvbuf_grow(sk, tp->rcvq_space.space);
 }
 
+/*
+ * tcp_queue_rcv - 把已经确认连续的 skb 合并或加入可读 receive queue。
+ *
+ * @sk 已持 socket/BH 序列化；@skb 的 seq 必须等于当前 rcv_nxt，ownership 暂由
+ * 调用者持有；@fragstolen 是输出，说明合并时 payload frag 是否转移给队尾。
+ * 返回 0：skb 作为独立队列节点，ownership 已转给 receive queue；返回 1：其
+ * 数据已合并，调用者必须依据 fragstolen 执行 kfree_skb_partial。
+ * 无论是否合并，成功后 rcv_nxt 都推进到 skb->end_seq，这是对 ACK/recv 的发布。
+ */
 static int __must_check tcp_queue_rcv(struct sock *sk, struct sk_buff *skb,
 				      bool *fragstolen)
 {
 	int eaten;
 	struct sk_buff *tail = skb_peek_tail(&sk->sk_receive_queue);
 
+	/* 优先与队尾合并，因为连续数据只可能追加在有序 receive queue 尾部。 */
 	eaten = (tail &&
 		 tcp_try_coalesce(sk, tail,
 				  skb, fragstolen)) ? 1 : 0;
+	/* 合并/入队决定已成功后推进连续边界；ACK 可以从此确认到新 end_seq。 */
 	tcp_rcv_nxt_update(tcp_sk(sk), TCP_SKB_CB(skb)->end_seq);
 	if (!eaten) {
+		/* 独立节点发布到 receive queue，并安装 socket 接收内存析构/owner。 */
 		tcp_add_receive_queue(sk, skb);
 		skb_set_owner_r(skb, sk);
 	}
@@ -5568,14 +5753,43 @@ err:
 
 }
 
+/*
+ * tcp_data_ready - 把“TCP 已有应用可见数据”翻译成 socket 层唤醒事件。
+ *
+ * sk_rcvlowat 是可读阈值：队列字节尚未达到它时，不必立即唤醒阻塞 reader。
+ * SOCK_DONE 覆盖阈值，使 EOF 始终可观察。sk_data_ready 是回调指针，通常为
+ * sock_def_readable；READ_ONCE 防止协议/BPF 并发替换时发生不一致的重复读取。
+ * 本函数不搬运数据；它只在 tcp_data_queue 已经提交队列状态之后发布通知。
+ */
 void tcp_data_ready(struct sock *sk)
 {
 	if (tcp_epollin_ready(sk, sk->sk_rcvlowat) || sock_flag(sk, SOCK_DONE))
 		READ_ONCE(sk->sk_data_ready)(sk);
 }
 
+/*
+ * tcp_data_queue - 按 TCP 序列空间把 payload 发布到有序或乱序接收队列。
+ *
+ * @sk 已由 socket lock/BH lock 串行化；@skb 已通过 header/ACK 基本验证，
+ * 函数接管 ownership。seq==rcv_nxt 且在窗口内的数据可进入 receive queue
+ * 并推进 rcv_nxt；洞后的数据进入 out_of_order_queue，不能供 recv 读取。
+ * 内存不足可丢包并安排 ACK/zero-window，可靠性依靠发送端重传恢复。
+ * 无返回值；可观察输出是队列、rcv_nxt、SACK/ACK 状态和 readable wakeup。
+ *
+ * 状态分支：
+ *
+ *   seq == rcv_nxt              in-order: reserve rmem -> receive queue -> advance
+ *   end_seq <= rcv_nxt          fully old duplicate: D-SACK/quick ACK -> drop
+ *   seq >= rcv_nxt + window     beyond receive window -> ACK -> drop
+ *   seq < rcv_nxt < end_seq     partially duplicate: record D-SACK, accept new suffix
+ *   seq > rcv_nxt               hole exists: out_of_order RB tree, not readable yet
+ *
+ * `eaten/fragstolen` 是 tcp_queue_rcv 返回的 ownership 结果：合并可能消费 skb
+ * 元数据，并把 frags 偷取到另一个 skb，所以调用者不能一律直接 kfree。
+ */
 static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 {
+	/* reason follows skb to drop trace/statistics; default means not yet classified. */
 	struct tcp_sock *tp = tcp_sk(sk);
 	enum skb_drop_reason reason;
 	bool fragstolen;
@@ -5584,15 +5798,18 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	/* If a subflow has been reset, the packet should not continue
 	 * to be processed, drop the packet.
 	 */
+	/* Chinese explanation: MPTCP may reject this subflow before ordinary TCP publishes payload; rejection consumes skb immediately. */
 	if (sk_is_mptcp(sk) && !mptcp_incoming_options(sk, skb)) {
 		__kfree_skb(skb);
 		return;
 	}
 
 	if (TCP_SKB_CB(skb)->seq == TCP_SKB_CB(skb)->end_seq) {
+		/* A segment with no sequence-space payload/FIN has nothing for the application queue. */
 		__kfree_skb(skb);
 		return;
 	}
+	/* Drop transmit/driver-only metadata, then pull TCP header so skb->len becomes payload length. */
 	tcp_cleanup_skb(skb);
 	__skb_pull(skb, tcp_hdr(skb)->doff * 4);
 
@@ -5603,6 +5820,8 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 	 *  Packets in sequence go to the receive queue.
 	 *  Out of sequence packets to the out_of_order_queue.
 	 */
+	/* Chinese explanation: receive queue is linear/readable; OOO queue is keyed by sequence and only becomes readable after holes are filled. */
+	/* 快速情形：报文正好填在连续前沿，没有序列号洞。 */
 	if (TCP_SKB_CB(skb)->seq == tp->rcv_nxt) {
 		if (tcp_receive_window(tp) == 0) {
 			/* Some stacks are known to send bare FIN packets
@@ -5611,6 +5830,7 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 			 * because the FIN flag will simply be merged to the
 			 * receive queue tail skb in most cases.
 			 */
+			/* Chinese explanation: bare FIN consumes no receive memory, so accepting it at zero window preserves orderly close without violating flow control. */
 			if (!skb->len &&
 			    (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN))
 				goto queue_and_out;
@@ -5622,33 +5842,44 @@ static void tcp_data_queue(struct sock *sk, struct sk_buff *skb)
 
 		/* Ok. In sequence. In window. */
 queue_and_out:
+		/*
+		 * 阶段 1：先预留 sk_rmem。只有记账成功或显式 forced schedule 后才能
+		 * 把 skb 发布到队列，否则攻击流量可突破 socket/system memory limit。
+		 */
 		if (tcp_try_rmem_schedule(sk, skb, skb->truesize)) {
 			/* TODO: maybe ratelimit these WIN 0 ACK ? */
 			inet_csk(sk)->icsk_ack.pending |=
 					(ICSK_ACK_NOMEM | ICSK_ACK_NOW);
 			inet_csk_schedule_ack(sk);
+			/* Wake the application to release memory; this wake occurs before deciding whether to drop. */
 			READ_ONCE(sk->sk_data_ready)(sk);
 
 			if (skb_queue_len(&sk->sk_receive_queue) && skb->len) {
+				/* Existing unread payload plus allocation failure: drop new data rather than exceed hard pressure. */
 				reason = SKB_DROP_REASON_PROTO_MEM;
 				NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPRCVQDROP);
 				goto drop;
 			}
+			/* Empty receive queue is allowed one forced charge so connection can make progress. */
 			sk_forced_mem_schedule(sk, skb->truesize);
 		}
 
+		/* 阶段 2：合并/入 receive queue 并推进连续接收边界 rcv_nxt。 */
 		eaten = tcp_queue_rcv(sk, skb, &fragstolen);
 		if (skb->len)
 			tcp_event_data_recv(sk, skb);
 		if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
+			/* FIN updates TCP state/RCV_SHUTDOWN after all preceding bytes became ordered. */
 			tcp_fin(sk);
 
 		if (!RB_EMPTY_ROOT(&tp->out_of_order_queue)) {
+			/* 新段可能填洞：把现在连续的 RB-tree 前缀迁入 receive queue。 */
 			tcp_ofo_queue(sk);
 
 			/* RFC5681. 4.2. SHOULD send immediate ACK, when
 			 * gap in queue is filled.
 			 */
+			/* Chinese explanation: filling the last hole changes cumulative ACK abruptly; immediate ACK accelerates sender recovery. */
 			if (RB_EMPTY_ROOT(&tp->out_of_order_queue))
 				inet_csk(sk)->icsk_ack.pending |= ICSK_ACK_NOW;
 		}
@@ -5659,6 +5890,7 @@ queue_and_out:
 		tcp_fast_path_check(sk);
 
 		if (eaten > 0)
+			/* Queue merge consumed logical skb; partial free respects frags stolen into queue tail. */
 			kfree_skb_partial(skb, fragstolen);
 		if (!sock_flag(sk, SOCK_DEAD))
 			tcp_data_ready(sk);
@@ -5666,6 +5898,7 @@ queue_and_out:
 	}
 
 	if (!after(TCP_SKB_CB(skb)->end_seq, tp->rcv_nxt)) {
+		/* Entire sequence range is already cumulatively received: duplicate, never re-deliver. */
 		tcp_rcv_spurious_retrans(sk, skb);
 		/* A retransmit, 2nd most common case.  Force an immediate ack. */
 		reason = SKB_DROP_REASON_TCP_OLD_DATA;
@@ -5681,6 +5914,7 @@ drop:
 	}
 
 	/* Out of window. F.e. zero window probe. */
+	/* A segment starting at/right of the window edge cannot consume receive memory. */
 	if (!before(TCP_SKB_CB(skb)->seq,
 		    tp->rcv_nxt + tcp_receive_window(tp))) {
 		reason = SKB_DROP_REASON_TCP_OVERWINDOW;
@@ -5690,6 +5924,7 @@ drop:
 
 	if (before(TCP_SKB_CB(skb)->seq, tp->rcv_nxt)) {
 		/* Partial packet, seq < rcv_next < end_seq */
+		/* Record duplicate prefix for D-SACK; queue helper will trim/merge only the new suffix. */
 		tcp_dsack_set(sk, TCP_SKB_CB(skb)->seq, tp->rcv_nxt);
 
 		/* If window is closed, drop tail of packet. But after
@@ -5703,6 +5938,7 @@ drop:
 		goto queue_and_out;
 	}
 
+	/* Hole remains: RB-tree insertion owns skb and prepares SACK, but does not wake recv as readable data. */
 	tcp_data_queue_ofo(sk, skb);
 }
 
@@ -6467,9 +6703,28 @@ reset:
  *	the rest is checked inline. Fast processing is turned on in
  *	tcp_data_queue when everything is OK.
  */
+/*
+ * tcp_rcv_established 处理已建立连接的 ACK 和 payload。
+ * @sk 是 ESTABLISHED TCP socket，调用者持 socket/BH 序列化；@skb ownership
+ * 转入本函数。header prediction 快速路径只接受预期 header、seq==rcv_nxt、
+ * ACK<=snd_nxt、窗口/校验/内存均正常的常见纯 ACK 或顺序数据；其他情况转
+ * slow_path 完成 options、PAWS、窗口、ACK、URG 和乱序处理。函数无返回值，
+ * 所有分支必须入队、转移或释放 skb。
+ *
+ * 快速路径包含两个子路径：
+ *
+ *   pure ACK: no payload -> tcp_ack frees/advances sender state -> free input skb;
+ *   in-order data: verify checksum/window/memory -> queue payload -> process piggyback ACK
+ *                  -> schedule ACK -> publish readable.
+ *
+ * 任一前置检查失败都跳到 slow_path/validate/step5，而不是更新一半状态。这个
+ * 顺序至关重要：checksum、PAWS 和窗口验证完成前，不能提交 timestamp、rcv_nxt
+ * 或 ACK 带来的状态变化。
+ */
 void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 {
 	enum skb_drop_reason reason = SKB_DROP_REASON_NOT_SPECIFIED;
+	/* skb->data was pulled by IPv4 and points at a contiguous TCP header. */
 	const struct tcphdr *th = (const struct tcphdr *)skb->data;
 	struct tcp_sock *tp = tcp_sk(sk);
 	unsigned int len = skb->len;
@@ -6477,6 +6732,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 	/* TCP congestion window tracking */
 	trace_tcp_probe(sk, skb);
 
+	/* Use one receive-time snapshot for RTT, ACK and pacing updates. */
 	tcp_mstamp_refresh_inline(tp);
 	if (unlikely(!rcu_access_pointer(sk->sk_rx_dst)))
 		inet_csk(sk)->icsk_af_ops->sk_rx_dst_set(sk, skb);
@@ -6494,6 +6750,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 	 *	extra cost of the net_bh soft interrupt processing...
 	 *	We do checksum and copy also but from device to kernel.
 	 */
+	/* Chinese explanation: prediction compresses common header checks into a few comparisons, but still keeps a complete RFC fallback for every uncommon legal packet. */
 
 	tp->rx_opt.saw_tstamp = 0;
 	tp->rx_opt.accecn = 0;
@@ -6506,7 +6763,9 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 	 *	 space for instance)
 	 *	PSH flag is ignored.
 	 */
+	/* Chinese explanation: pred_flags packs expected header length/flags/window; setting it to zero disables prediction while OOO/urgent/zero-window state exists. */
 
+	/* 阶段 1：用一个组合比较筛掉绝大多数异常 header，减少热路径分支。 */
 	if ((tcp_flag_word(th) & TCP_HP_BITS) == tp->pred_flags &&
 	    TCP_SKB_CB(skb)->seq == tp->rcv_nxt &&
 	    !after(TCP_SKB_CB(skb)->ack_seq, tp->snd_nxt)) {
@@ -6518,6 +6777,7 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 		 * is automatically equal to th->doff*4 due to pred_flags
 		 * match.
 		 */
+		/* Chinese explanation: combined pred_flags match already proves doff equals cached header length, so aligned timestamp parser can use fixed layout. */
 
 		/* Check timestamp */
 		if (tcp_header_len == sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED) {
@@ -6536,11 +6796,13 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 			 * in a hung connection since we will drop all
 			 * future packets due to the PAWS test.
 			 */
+			/* Chinese explanation: corrupted timestamp committed before checksum would poison PAWS and make all later valid packets look old, stalling the connection. */
 		}
 
 		if (len <= tcp_header_len) {
 			/* Bulk data transfer: sender */
 			if (len == tcp_header_len) {
+				/* Exact header length means pure ACK: it changes send-side state but publishes no receive data. */
 				/* Predicted packet is in window by definition.
 				 * seq == rcv_nxt and rcv_wup <= rcv_nxt.
 				 * Hence, check seq<=rcv_wup reduces to:
@@ -6556,7 +6818,9 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 				/* We know that such packets are checksummed
 				 * on entry.
 				 */
+				/* ACK may advance snd_una, free retransmit skb and wake a send-buffer-limited writer. */
 				tcp_ack(sk, skb, flag);
+				/* All information has been folded into socket state; input skb has no remaining owner. */
 				__kfree_skb(skb);
 				tcp_data_snd_check(sk);
 				/* When receiving pure ack in fast path, update
@@ -6574,13 +6838,16 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 			int eaten = 0;
 			bool fragstolen = false;
 
+			/* payload 快速路径仍必须在发布前完成 checksum 验证。 */
 			if (tcp_checksum_complete(skb))
 				goto csum_error;
 
+			/* Prediction only handled seq start; verify right edge still fits current advertised window. */
 			if (after(TCP_SKB_CB(skb)->end_seq,
 				  tp->rcv_nxt + tcp_receive_window(tp)))
 				goto validate;
 
+			/* Fast queueing requires precharged receive memory; otherwise step5 performs full accounting. */
 			if ((int)skb->truesize > sk->sk_forward_alloc)
 				goto step5;
 
@@ -6603,10 +6870,12 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 			__skb_pull(skb, tcp_header_len);
 			tcp_ecn_received_counters(sk, skb,
 						  len - tcp_header_len);
+			/* 顺序、窗口内数据直接进入可读队列，并推进 rcv_nxt。 */
 			eaten = tcp_queue_rcv(sk, skb, &fragstolen);
 
 			tcp_event_data_recv(sk, skb);
 
+			/* Piggyback ACK differs from current snd_una, so it may release send state. */
 			if (TCP_SKB_CB(skb)->ack_seq != tp->snd_una) {
 				/* Well, only one small jumplet in fast path... */
 				tcp_ack(sk, skb, flag | FLAG_DATA);
@@ -6621,12 +6890,17 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb)
 no_ack:
 			if (eaten)
 				kfree_skb_partial(skb, fragstolen);
+			/* 发布 readable 并唤醒 waitqueue/epoll；不保证用户任务立即运行。 */
 			tcp_data_ready(sk);
 			return;
 		}
 	}
 
 slow_path:
+	/*
+	 * 阶段 2：任何预测条件失败都走完整验证。慢路径是语义保证，不是错误路径；
+	 * 乱序、窗口变化、双向数据或少见 option 都会正常到达这里。
+	 */
 	if (len < (th->doff << 2) || tcp_checksum_complete(skb))
 		goto csum_error;
 
@@ -6639,10 +6913,12 @@ slow_path:
 	 *	Standard slow path.
 	 */
 validate:
+	/* Validate sequence/window/PAWS and handle RST/SYN anomalies; false means helper consumed skb. */
 	if (!tcp_validate_incoming(sk, skb, th, 1))
 		return;
 
 step5:
+	/* Full path performs ECN, ACK and receive-memory/queue handling omitted by prediction. */
 	tcp_ecn_received_counters_payload(sk, skb);
 
 	reason = tcp_ack(sk, skb, FLAG_SLOWPATH | FLAG_UPDATE_TS_RECENT);
@@ -6656,6 +6932,7 @@ step5:
 	tcp_urg(sk, skb, th);
 
 	/* step 7: process the segment text */
+	/* 阶段 3：ACK/URG 处理后，payload 再按连续/乱序规则取得最终 ownership。 */
 	tcp_data_queue(sk, skb);
 
 	tcp_data_snd_check(sk);
@@ -6663,12 +6940,14 @@ step5:
 	return;
 
 csum_error:
+	/* Checksum failure must not ACK or queue payload; sender will infer loss and retransmit. */
 	reason = SKB_DROP_REASON_TCP_CSUM;
 	trace_tcp_bad_csum(skb);
 	TCP_INC_STATS(sock_net(sk), TCP_MIB_CSUMERRORS);
 	TCP_INC_STATS(sock_net(sk), TCP_MIB_INERRS);
 
 discard:
+	/* tcp_drop_reason performs final skb release plus reason-specific tracing/accounting. */
 	tcp_drop_reason(sk, skb, reason);
 }
 
@@ -6700,6 +6979,16 @@ void tcp_init_transfer(struct sock *sk, int bpf_op, struct sk_buff *skb)
 	tcp_init_buffer_space(sk);
 }
 
+/*
+ * tcp_finish_connect - 发布主动连接完成后的通用传输状态。
+ *
+ * @sk 已由 SYN_SENT 接收路径持锁；@skb 是合法 SYN+ACK 的借用指针，TCP_REPAIR
+ * 可传 NULL。调用前四元组/hash、收发初始序号和协商选项已经就绪；本函数把状态
+ * 设为 ESTABLISHED，缓存 rx route/NAPI 线索，初始化拥塞控制、buffer、keepalive
+ * 与 header-prediction。它不消费 skb，也不发送第三次 ACK；调用者随后负责 ACK
+ * 及唤醒 connect waiter。状态发布后无锁 poll 可能立即观察到 ESTABLISHED，故
+ * copied_seq 等应用可见游标必须由调用者提前初始化。
+ */
 void tcp_finish_connect(struct sock *sk, struct sk_buff *skb)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -6819,6 +7108,19 @@ static void tcp_try_undo_spurious_syn(struct sock *sk)
 		tp->undo_marker = 0;
 }
 
+/*
+ * tcp_rcv_synsent_state_process - 处理主动打开方在 SYN_SENT 收到的第一个响应。
+ *
+ * @sk 持 socket/BH 锁；@skb ownership 暂由调用者持有；@th 借用 skb 中 TCP 头。
+ * 返回约定特殊：0 或正 drop reason 表示本函数已经消费/丢弃 skb，调用者直接
+ * 返回；-1 表示握手已建立但 skb 后续 URG/data 阶段仍由调用者收尾；部分异常
+ * 返回 skb_drop_reason 让外层发送 reset。读代码时不能把负值简单理解为 errno。
+ *
+ * SYN+ACK 成功路径先验证 ACK ∈ (snd_una,snd_nxt] 和 PAWS，再提交对端 ISN、
+ * window/options、copied_seq，最后通过内存屏障发布 ESTABLISHED 并唤醒 connect。
+ * 无 ACK 的 SYN 是 simultaneous open：转 SYN_RECV 并回 SYN+ACK。非法响应必须
+ * 恢复本次临时解析的 rx options，避免攻击报文污染后续合法握手。
+ */
 static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 					 const struct tcphdr *th)
 {
@@ -6905,6 +7207,7 @@ consume:
 		/* Ok.. it's good. Set up sequence numbers and
 		 * move to established.
 		 */
+		/* SYN 占一个序列号，所以第一个期望数据序号是 peer_isn + 1。 */
 		WRITE_ONCE(tp->rcv_nxt, TCP_SKB_CB(skb)->seq + 1);
 		tp->rcv_wup = TCP_SKB_CB(skb)->seq + 1;
 		tp->rcv_mwnd_seq = tp->rcv_wup + tp->rcv_wnd;
@@ -6936,10 +7239,12 @@ consume:
 		/* Remember, tcp_poll() does not lock socket!
 		 * Change state from SYN-SENT only after copied_seq
 		 * is initialized. */
+		/* 先发布 recv 起点，避免无锁 poll 看见 ESTABLISHED 后读取未初始化游标。 */
 		WRITE_ONCE(tp->copied_seq, tp->rcv_nxt);
 
 		smc_check_reset_syn(tp);
 
+		/* 与无锁状态观察者配对：所有握手字段必须先于 ESTABLISHED 可见。 */
 		smp_mb();
 
 		tcp_finish_connect(sk, skb);
@@ -7118,6 +7423,18 @@ static void tcp_rcv_synrecv_state_fastopen(struct sock *sk)
  *	address independent.
  */
 
+/*
+ * tcp_rcv_state_process - 处理除 ESTABLISHED/TIME_WAIT 外的 TCP 状态机报文。
+ *
+ * @sk 已由 IPv4/IPv6 接收入口选中并持 socket/BH 序列化；@skb 的 TCP 控制块已
+ * 填好，本函数接管 ownership。返回 0 表示已消费；非零 skb_drop_reason 通常让
+ * 调用者统一丢弃，个别负值用于要求外层发送 reset，必须结合调用点解释。
+ *
+ * 宏观阶段：先按 LISTEN/SYN_SENT 特判握手；其余状态统一验证 segment 与 ACK；
+ * 再执行状态迁移；最后处理 URG、payload 和 FIN。ACK 必须先于 FIN/data，因为
+ * FIN_WAIT1 是否能进入 FIN_WAIT2 取决于本端 FIN 是否已被累计确认。状态迁移只
+ * 发布协议事实，skb 的最终释放/入队仍由 consume/discard/tcp_data_queue 路径负责。
+ */
 enum skb_drop_reason
 tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb)
 {
@@ -7587,6 +7904,20 @@ u16 tcp_get_syncookie_mss(struct request_sock_ops *rsk_ops,
 	return mss;
 }
 
+/*
+ * tcp_conn_request - 把监听 socket 收到的合法 SYN 转成半连接或 SYN cookie 响应。
+ *
+ * @rsk_ops/@af_ops 提供地址族相关的 request 分配、route、ISN 和 SYN-ACK 操作；
+ * @sk 是持锁 LISTEN socket；@skb 只借用，外层状态机负责最终 consume。返回 0
+ * 表示本 SYN 已处理（包括策略丢弃），错误通过统计/响应体现而不直接返回 errno。
+ *
+ * 正常路径分配轻量 request_sock，保存对端 ISN、协商 option、入口接口、route
+ * 和本端 ISN，挂入 SYN hash 后发送 SYN-ACK；第三次 ACK 到来前不分配完整 tcp_sock。
+ * SYN queue 压力下可把必要状态编码进 cookie，不保留 req，节省内存但可携带的
+ * 协商状态受限。accept queue 已满时连完整 child 也无处发布，故更早拒绝。
+ * Fast Open 是例外：SYN data 需要立即建立 child，并直接加入 accept queue。
+ * drop 标签按 dst -> req 的逆序释放；skb ownership 始终留给调用者。
+ */
 int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		     const struct tcp_request_sock_ops *af_ops,
 		     struct sock *sk, struct sk_buff *skb)
@@ -7628,6 +7959,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		goto drop;
 	}
 
+	/* cookie 模式的 req 只用于本次构造响应，不进入 SYN hash；普通模式带 listener 引用。 */
 	req = inet_reqsk_alloc(rsk_ops, sk, !want_cookie);
 	if (!req)
 		goto drop;
@@ -7661,6 +7993,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 	inet_rsk(req)->ir_iif = inet_request_bound_dev_if(sk, skb);
 
 	if (want_cookie) {
+		/* cookie 把可验证状态编码进 SYN-ACK ISN，第三次 ACK 时再无状态重建。 */
 		isn = cookie_init_sequence(af_ops, skb, &req->mss);
 		/* Use the cookie as txhash so the SYN-ACK and the later full
 		 * socket make the same egress choice (IPv6 ECMP path; IPv4 TX queue).
@@ -7734,6 +8067,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		fastopen_sk = tcp_try_fastopen(sk, skb, req, &foc, dst);
 	}
 	if (fastopen_sk) {
+		/* TFO 已有 full child；发送 SYN-ACK 后直接发布到 accept queue 并唤醒 accept。 */
 		af_ops->send_synack(fastopen_sk, dst, &fl, req,
 				    &foc, TCP_SYNACK_FASTOPEN, skb);
 		/* Add the child socket directly into the accept queue */
@@ -7747,6 +8081,7 @@ int tcp_conn_request(struct request_sock_ops *rsk_ops,
 		sock_put(fastopen_sk);
 	} else {
 		tcp_rsk(req)->tfo_listener = false;
+		/* 普通 req 先进入可按四元组查找的 SYN hash，随后 SYN-ACK 才可安全发出。 */
 		if (!want_cookie &&
 		    unlikely(!inet_csk_reqsk_queue_hash_add(sk, req))) {
 			reqsk_free(req);

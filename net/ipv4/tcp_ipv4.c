@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * TCP Echo 的 TCP/IPv4 绑定层学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 本文件用 IPv4 四元组和 namespace/设备约束查找 established、listen、request
+ * 或 timewait socket，完成 IPv4 policy/filter 后把 skb 交给通用 TCP 输入状态机。
+ * 查找必须同时解决并发 close：hash 可见性、RCU 读侧和 sock 引用共同保证命中
+ * 对象在处理期间有效；它们不替代 socket 状态锁。
+ *
+ * 主线：tcp_v4_rcv -> __inet_lookup_skb -> tcp_v4_do_rcv
+ *       -> tcp_rcv_established；用户 owner 冲突时改入 sk_backlog。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -218,6 +231,13 @@ static int tcp_v4_pre_connect(struct sock *sk, struct sockaddr_unsized *uaddr,
 }
 
 /* This will initiate an outgoing connection. */
+/*
+ * tcp_v4_connect 为主动 IPv4 TCP 连接建立四元组和首个 SYN。
+ * @sk 由调用者 lock_sock 且初始为 TCP_CLOSE；@uaddr 是内核 sockaddr_in；
+ * @addr_len 必须覆盖完整结构。成功返回 0 时 socket 已进入 SYN_SENT、占用本地
+ * 端口并进入 hash，SYN 已提交或 Fast Open 延迟策略已建立；握手尚不一定完成。
+ * 失败路径必须撤销 state/hash/port/source/route capability，不留下半发布四元组。
+ */
 int tcp_v4_connect(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len)
 {
 	struct sockaddr_in *usin = (struct sockaddr_in *)uaddr;
@@ -250,6 +270,7 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len
 	orig_sport = inet->inet_sport;
 	orig_dport = usin->sin_port;
 	fl4 = &inet->cork.fl.u.ip4;
+	/* 阶段 1：先用候选四元组查询 route/source；此时尚未发布 socket identity。 */
 	rt = ip_route_connect(fl4, nexthop, inet->inet_saddr,
 			      sk->sk_bound_dev_if, IPPROTO_TCP, orig_sport,
 			      orig_dport, sk);
@@ -270,6 +291,7 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len
 
 	tcp_death_row = &sock_net(sk)->ipv4.tcp_death_row;
 
+	/* route 选出的源地址写入 bind hash 关系，防止后续四元组与 source 不一致。 */
 	if (!inet->inet_saddr) {
 		err = inet_bhash2_update_saddr(sk,  &fl4->saddr, AF_INET);
 		if (err) {
@@ -302,6 +324,10 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len
 	 * lock select source port, enter ourselves into the hash tables and
 	 * complete initialization after this.
 	 */
+	/*
+	 * 阶段 2（发布边界）：持 socket lock 先设 SYN_SENT，再选择临时端口并插入
+	 * established hash。这样收包查找不会看到仍标为 TCP_CLOSE 的半初始化对象。
+	 */
 	tcp_set_state(sk, TCP_SYN_SENT);
 	err = inet_hash_connect(tcp_death_row, sk);
 	if (err)
@@ -309,6 +335,7 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len
 
 	sk_set_txhash(sk);
 
+	/* autobind 可能改变源端口，带最终端口重新验证/更新 route cache。 */
 	rt = ip_route_newports(fl4, rt, orig_sport, orig_dport,
 			       inet->inet_sport, inet->inet_dport, sk);
 	if (IS_ERR(rt)) {
@@ -342,6 +369,7 @@ int tcp_v4_connect(struct sock *sk, struct sockaddr_unsized *uaddr, int addr_len
 	if (err)
 		goto failure;
 
+	/* 阶段 3：初始化发送序列/定时器并构造 SYN，进入普通 TCP 输出路径。 */
 	err = tcp_connect(sk);
 
 	if (err)
@@ -353,6 +381,10 @@ failure:
 	/*
 	 * This unhashes the socket and releases the local port,
 	 * if necessary.
+	 */
+	/*
+	 * 逆序回滚发布状态：tcp_set_state(CLOSE) 会 unhash/按条件释放端口，再清
+	 * source/route/dport。返回后调用者仍拥有 sk，但它可重新 connect。
 	 */
 	tcp_set_state(sk, TCP_CLOSE);
 	inet_bhash2_reset_saddr(sk);
@@ -1649,6 +1681,13 @@ const struct tcp_request_sock_ops tcp_request_sock_ipv4_ops = {
 	.send_synack	=	tcp_v4_send_synack,
 };
 
+/*
+ * tcp_v4_conn_request - IPv4 LISTEN socket 的 SYN 请求入口。
+ *
+ * @sk 为监听 socket，@skb 为已验证 SYN 且 ownership 仍归外层。广播/组播目的
+ * 地址不能建立一对一 TCP 连接，也不能回复 SYN-ACK 放大流量，故直接记 listen
+ * drop；单播请求把 IPv4 request 操作表交给通用 tcp_conn_request()。
+ */
 int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 {
 	/* Never answer to SYNs send to broadcast or multicast */
@@ -1667,6 +1706,19 @@ drop:
 /*
  * The three way handshake has completed - we got a valid synack -
  * now create the new socket.
+ */
+/*
+ * tcp_v4_syn_recv_sock - 用 request_sock 和第三次握手 ACK 构造完整 IPv4 child。
+ *
+ * @sk 是 listener；@skb/@req 借用第三次 ACK 和半连接；@dst 可由 cookie 路径传入；
+ * @req_unhash 指定需从 ehash 替换的 request；@own_req 输出本 CPU 是否赢得 request
+ * 所有权；@opt_child_init 是 IPv4/IPv6 复用 hook，可空。成功返回已加锁且带引用的
+ * child，已复制地址、option、拥塞与 route 状态并插入 established hash；accept
+ * queue 发布由 tcp_check_req 的 hashdance 随后完成。失败返回 NULL，并按已取得
+ * 资源逆序释放 route/newsk；调用者仍负责 skb 和 req 的外层引用。
+ *
+ * ehash 插入是并发仲裁点：重传的第三次 ACK 可在不同 CPU 同时尝试建 child，只有
+ * `own_req=true` 的对象继承 req 状态；失败候选必须销毁，不能产生两个同四元组连接。
  */
 struct sock *tcp_v4_syn_recv_sock(const struct sock *sk, struct sk_buff *skb,
 				  struct request_sock *req,
@@ -1691,6 +1743,7 @@ struct sock *tcp_v4_syn_recv_sock(const struct sock *sk, struct sk_buff *skb,
 	if (sk_acceptq_is_full(sk))
 		goto exit_overflow;
 
+	/* 先分配/初始化尚未全局可发现的 full sock，失败不会动 listener 的 req。 */
 	newsk = tcp_create_openreq_child(sk, req, skb);
 	if (!newsk)
 		goto exit_nonewsk;
@@ -1755,6 +1808,7 @@ struct sock *tcp_v4_syn_recv_sock(const struct sock *sk, struct sk_buff *skb,
 
 	if (__inet_inherit_port(sk, newsk) < 0)
 		goto put_and_exit;
+	/* 原子替换 ehash 中的 request；返回值决定当前候选是否赢得半连接 ownership。 */
 	*own_req = inet_ehash_nolisten(newsk, req_to_sk(req_unhash),
 				       &found_dup_sk);
 	if (likely(*own_req)) {
@@ -1824,6 +1878,14 @@ INDIRECT_CALLABLE_DECLARE(struct dst_entry *ipv4_dst_check(struct dst_entry *,
  * This is because we cannot sleep with the original spinlock
  * held.
  */
+/*
+ * tcp_v4_do_rcv - 在已选定 IPv4 TCP socket 上运行对应状态的接收状态机。
+ *
+ * @sk 是查找命中的 full/listen socket；调用者必须持其 BH socket lock（LISTEN
+ * 特例由监听协议保证）；@skb 已通过 IPv4 分派，函数接管 ownership。
+ * ESTABLISHED 快速交给 tcp_rcv_established；LISTEN/其他状态执行握手、校验和和
+ * 完整状态机。返回 0 或接收处理状态；drop/reset 路径在本函数释放 skb。
+ */
 int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 {
 	enum skb_drop_reason reason;
@@ -1833,6 +1895,10 @@ int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)
 		goto err_discard;
 
 	if (sk->sk_state == TCP_ESTABLISHED) { /* Fast path */
+		/*
+		 * 已建立连接可跳过通用状态 switch。缓存 rx dst 仅在接口和 dst check
+		 * 仍有效时保留；失效先摘指针再 dst_release，避免后续读者借用旧 route。
+		 */
 		struct dst_entry *dst;
 
 		dst = rcu_dereference_protected(sk->sk_rx_dst,
@@ -1895,6 +1961,20 @@ err_discard:
 	goto discard;
 }
 
+/*
+ * tcp_add_backlog - TCP 专用的“不能立刻处理”接收入口。
+ *
+ * tcp_v4_rcv() 查到 socket 后若发现 sock_owned_by_user(sk)，软中断不能与
+ * recv/send 并发推进 TCP 状态机，于是持 bh_lock_sock 把 skb 交给本函数。
+ * 它先校验 checksum，并尽量与 backlog 尾包合并；合并能减少 skb 元数据和以后
+ * 状态机遍历次数，即使接近内存上限也值得先尝试。不能合并时才用扩展后的 limit
+ * 调 sk_add_backlog()。用户线程释放 socket 时，__release_sock() 会逐包回放到
+ * tcp_v4_do_rcv()，因此报文顺序不丢失。
+ *
+ * ownership：返回 SKB_NOT_DROPPED_YET 表示 skb 已入队或已被尾包合并消费；其他
+ * drop reason 表示本函数已解除 bh 锁但未接管 skb，由 tcp_v4_rcv() 的统一 drop
+ * 路径释放。这里主动 bh_unlock_sock() 是与调用点的成功/失败分支协议的一部分。
+ */
 enum skb_drop_reason tcp_add_backlog(struct sock *sk, struct sk_buff *skb)
 {
 	u32 tail_gso_size, tail_gso_segs;
@@ -2064,8 +2144,29 @@ static void tcp_v4_fill_cb(struct sk_buff *skb, const struct iphdr *iph,
  *	From tcp_input.c
  */
 
+/*
+ * tcp_v4_rcv - IPv4 protocol table 分派到 TCP 的总入口。
+ *
+ * @skb->data 已指向 TCP header，network header 仍可定位 IPv4 header；ownership
+ * 已交给 TCP。函数在接收 softirq/RCU 相关上下文运行，不能睡眠。它验证最小
+ * header/checksum，按四元组查找 established/request/listen/timewait 对象，执行
+ * policy/filter，再以 socket BH lock 串行状态机。所有返回路径都消费 skb 或把
+ * 它转入 socket backlog；refcounted=true 时必须在退出前 sock_put。
+ *
+ * 查找结果分叉：
+ *
+ *   established full sock -> policy/filter -> BH lock -> TCP state machine
+ *   TCP_NEW_SYN_RECV req   -> 第三次握手检查，可能创建/命中 child sock
+ *   LISTEN sock            -> SYN/request 处理
+ *   TIME_WAIT              -> 检查旧连接报文，ACK/RST 或复用判断
+ *   NULL                   -> 无端点，按报文类型丢弃或回复 RST
+ *
+ * `refcounted` 不是“查找成功”布尔值，而是退出路径的 ownership 账本：只有
+ * lookup 明确交给本函数一个 sk 引用时才能 sock_put；多 put 会 UAF，少 put 泄漏。
+ */
 int tcp_v4_rcv(struct sk_buff *skb)
 {
+	/* dif/sdif 把输入设备和 VRF/从属设备约束纳入 socket lookup，避免跨域误命中。 */
 	struct net *net = dev_net_rcu(skb->dev);
 	enum skb_drop_reason drop_reason;
 	enum tcp_tw_status tw_status;
@@ -2078,13 +2179,16 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	int ret;
 	u32 isn;
 
+	/* 阶段 1：在 socket lookup 前验证线上 header 足以安全读取四元组。 */
 	drop_reason = SKB_DROP_REASON_NOT_SPECIFIED;
+	/* TCP 只处理发给本机 host 的报文；其他 L2 packet type 不应进入连接状态机。 */
 	if (skb->pkt_type != PACKET_HOST)
 		goto discard_it;
 
 	/* Count it even if it's bad */
 	__TCP_INC_STATS(net, TCP_MIB_INSEGS);
 
+	/* 非线性 skb 的 header 可能在 frag；may_pull 确保最小 TCP header 连续可读。 */
 	if (!pskb_may_pull(skb, sizeof(struct tcphdr)))
 		goto discard_it;
 
@@ -2102,21 +2206,28 @@ int tcp_v4_rcv(struct sk_buff *skb)
 	 * provided case of th->doff==0 is eliminated.
 	 * So, we defer the checks. */
 
+	/* 结合 NIC checksum 状态初始化验证；失败前不能相信端口/seq 之外的 header。 */
 	if (skb_checksum_init(skb, IPPROTO_TCP, inet_compute_pseudo))
 		goto csum_error;
 
 	th = (const struct tcphdr *)skb->data;
 	iph = ip_hdr(skb);
 lookup:
+	/*
+	 * 阶段 2：查找结果可能是 full sock、request_sock 或 timewait。refcounted
+	 * 告诉退出路径是否拥有显式 sock 引用；RCU 查找与引用生命周期不能混用。
+	 */
 	sk = __inet_lookup_skb(skb, __tcp_hdrlen(th), th->source,
 			       th->dest, sdif, &refcounted);
 	if (!sk)
 		goto no_tcp_socket;
 
 	if (sk->sk_state == TCP_TIME_WAIT)
+		/* timewait 是缩小对象，不可按 full tcp_sock 解引用，必须走专用分支。 */
 		goto do_time_wait;
 
 	if (sk->sk_state == TCP_NEW_SYN_RECV) {
+		/* request_sock 只保存握手所需最小状态；第三次 ACK 后才升级 full child。 */
 		struct request_sock *req = inet_reqsk(sk);
 		bool req_stolen = false;
 		struct sock *nsk;
@@ -2137,6 +2248,7 @@ lookup:
 			reqsk_put(req);
 			goto csum_error;
 		}
+		/* listener 可并发关闭/迁移 reuseport，状态变化时重新选择合法 listener。 */
 		if (unlikely(sk->sk_state != TCP_LISTEN)) {
 			nsk = reuseport_migrate_sock(sk, req_to_sk(req), skb);
 			if (!nsk) {
@@ -2151,9 +2263,11 @@ lookup:
 			/* We own a reference on the listener, increase it again
 			 * as we might lose it too soon.
 			 */
+			/* 后续 req/child 操作可能释放原有查找引用，因此额外 hold 保证 listener 穿过整个分支。 */
 			sock_hold(sk);
 		}
 		refcounted = true;
+		/* nsk 是输出 child；NULL 表示握手未完成/失败，等于 sk 可表示仍用 listener。 */
 		nsk = NULL;
 		drop_reason = tcp_filter(sk, skb);
 		if (!drop_reason) {
@@ -2166,6 +2280,7 @@ lookup:
 		if (!nsk) {
 			reqsk_put(req);
 			if (req_stolen) {
+				/* 另一 CPU 已把同一 req 升级为 child；恢复 cb 并重新 lookup 新对象。 */
 				/* Another cpu got exclusive access to req
 				 * and created a full blown socket.
 				 * Try to feed this packet to this socket
@@ -2213,6 +2328,7 @@ process:
 		goto discard_and_relse;
 	}
 
+	/* 入站 hash/策略可依据连接配置拒绝；必须在修改 TCP seq/queue 前完成。 */
 	drop_reason = tcp_inbound_hash(sk, NULL, skb, &iph->saddr, &iph->daddr,
 				       AF_INET, dif, sdif);
 	if (drop_reason)
@@ -2220,15 +2336,18 @@ process:
 
 	nf_reset_ct(skb);
 
+	/* classic/BPF socket filter 可 drop；通过后重新取 th/iph，因为 filter 可能线性化/改 skb。 */
 	drop_reason = tcp_filter(sk, skb);
 	if (drop_reason)
 		goto discard_and_relse;
 
 	th = (const struct tcphdr *)skb->data;
 	iph = ip_hdr(skb);
+	/* 把 IPv4 控制块转换为 TCP 控制块，并缓存 host-order seq/end_seq/flags。 */
 	tcp_v4_fill_cb(skb, iph, th);
 	TCP_SKB_CB(skb)->tcp_tw_isn = isn;
 
+	/* socket 接收阶段不再由 ingress net_device 拥有 skb，清除可复用/易误读字段。 */
 	skb->dev = NULL;
 
 	if (sk->sk_state == TCP_LISTEN) {
@@ -2238,12 +2357,22 @@ process:
 
 	sk_incoming_cpu_update(sk);
 
+	/*
+	 * 阶段 3：BH spinlock 只保护短检查/入队。它不能等待进程上下文的可睡眠
+	 * lock_sock owner，因此下面必须检查 sock_owned_by_user。
+	 */
 	bh_lock_sock_nested(sk);
+	/* 到此 socket 已确定，按 GRO pcount 记入该连接，而非简单 skb 个数。 */
 	tcp_segs_in(tcp_sk(sk), skb);
 	ret = 0;
 	if (!sock_owned_by_user(sk)) {
+		/* 无用户 owner，可在 softirq 立即推进 rcv_nxt/ACK/receive queue。 */
 		ret = tcp_v4_do_rcv(sk, skb);
 	} else {
+		/*
+		 * 用户正在 recv/send/close 修改同一连接。只把“尚未做 TCP 状态机”的
+		 * skb 加入 backlog；release_sock 后串行处理，避免软中断睡眠或竞态。
+		 */
 		drop_reason = tcp_add_backlog(sk, skb);
 		if (drop_reason)
 			goto discard_and_relse;
@@ -2252,6 +2381,7 @@ process:
 
 put_and_return:
 	if (refcounted)
+		/* 与 lookup 给出的显式引用严格配对；backlog/receive queue 有自己的 skb/sk 生命周期。 */
 		sock_put(sk);
 
 	return ret;

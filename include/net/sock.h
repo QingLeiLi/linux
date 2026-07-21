@@ -1,5 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
+ * TCP Echo 通用 socket 对象学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。本轮只注释收发主路径涉及字段。
+ * struct sock 保存协议无关队列、锁、等待回调、内存记账和函数表；TCP 在其外层
+ * 嵌入扩展。cacheline group 将不同读写方向的热字段分开，减少 RX/TX 多 CPU
+ * 触碰同一 cacheline，但使结构布局看起来不像按功能顺序排列。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -409,6 +417,7 @@ struct sock {
 	__s32			sk_peek_off;
 	struct sk_buff_head	sk_error_queue;
 	struct sk_buff_head	sk_receive_queue;
+	/* receive_queue 已通过协议验证且连续，tcp_recvmsg 可直接按 copied_seq 消费。 */
 	/*
 	 * The backlog queue is special, it is always used with
 	 * the per-socket spinlock held and requires low latency
@@ -423,6 +432,7 @@ struct sock {
 		struct sk_buff	*head;
 		struct sk_buff	*tail;
 	} sk_backlog;
+	/* backlog 是“尚未运行 TCP 状态机”的软中断延期队列，不是 TCP 乱序队列。 */
 #define sk_rmem_alloc sk_backlog.rmem_alloc
 
 	__cacheline_group_end(sock_write_rx);
@@ -450,6 +460,7 @@ struct sock {
 		/* public: */
 	};
 
+	/* 协议发布可读数据/EOF 后调用；默认唤醒 recv/poll/epoll，不保证任务立即运行。 */
 	void			(*sk_data_ready)(struct sock *sk);
 	long			sk_rcvtimeo;
 	int			sk_rcvlowat;
@@ -470,6 +481,7 @@ struct sock {
 	__cacheline_group_end(sock_read_rxtx);
 
 	__cacheline_group_begin(sock_write_rxtx);
+	/* 进程 lock_sock ownership 与 BH spinlock/backlog 组合，串行一个 socket 状态机。 */
 	socket_lock_t		sk_lock;
 	u32			sk_reserved_mem;
 	int			sk_forward_alloc;
@@ -481,13 +493,17 @@ struct sock {
 	atomic_t		sk_omem_alloc;
 	int			sk_err_soft;
 
+	/* TCP 队列逻辑占用；ACK 清理 write/rtx 状态时下降。 */
 	int			sk_wmem_queued;
+	/* 低层 clone/qdisc/driver 仍持有的发送内存引用；设备 completion 时下降。 */
 	refcount_t		sk_wmem_alloc;
 	unsigned long		sk_tsq_flags;
 	union {
 		struct sk_buff	*sk_send_head;
+		/* 已发送且需可靠性跟踪的 skb，ACK/SACK 按序列范围裁剪。 */
 		struct rb_root	tcp_rtx_queue;
 	};
+	/* 应用已提交给 TCP 的 headerless skb；send_head 划分尚未发送与已发送部分。 */
 	struct sk_buff_head	sk_write_queue;
 	struct page_frag	sk_frag;
 	union {
@@ -1131,6 +1147,12 @@ static inline void sk_forward_alloc_add(struct sock *sk, int val)
 void sk_stream_write_space(struct sock *sk);
 
 /* OOB backlog add */
+/*
+ * 这是不做容量与 pfmemalloc 策略检查的链表原语。skb 将离开当前 RCU 读侧
+ * 临界区并延后到 socket owner 解锁时处理，所以先 skb_dst_force()
+ * 把可能“不持引用”的 dst 转成真实引用。成功后 ownership 属于 sk_backlog；
+ * head 用 WRITE_ONCE 发布给可能的并发观察者，tail/next 仍由 socket 自旋锁保护。
+ */
 static inline void __sk_add_backlog(struct sock *sk, struct sk_buff *skb)
 {
 	/* dont let skb dst not refcounted, we are going to leave rcu lock */
@@ -1158,6 +1180,16 @@ static inline bool sk_rcvqueues_full(const struct sock *sk, unsigned int limit)
 }
 
 /* The per-socket spinlock must be held here. */
+/*
+ * sk_add_backlog - socket 正被用户上下文占有时，暂存一个软中断收到的 skb。
+ *
+ * 调用者持 per-socket spinlock，但不能直接运行协议状态机，因为用户线程持有
+ * owned 锁并可能正修改同一 TCP 状态。这里仅检查“receive queue + backlog”的
+ * 内存上限和 pfmemalloc 隔离，然后把 skb 所有权转交 backlog；稍后
+ * __release_sock() 按序调用 sk_backlog_rcv()。返回 0 后调用者不得再释放 skb；
+ * -ENOBUFS/-ENOMEM 时未入队，ownership 仍在调用者。注意 limit 刻意不计当前
+ * skb，使单个大包仍有一次进入机会。
+ */
 static inline __must_check int sk_add_backlog(struct sock *sk, struct sk_buff *skb,
 					      unsigned int limit)
 {

@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * TCP Echo 主路径学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * PF_INET 层把通用 socket 操作分派给 IPv4 传输协议。socket->ops 指向
+ * inet_stream_ops，sk->sk_prot 再指向 tcp_prot；两级函数表使 syscall 层无需
+ * 硬编码 TCP。配套注释覆盖 create/connect/sendmsg/recvmsg 的分派边界，TCP
+ * 字节队列和可靠性由 tcp.c/tcp_input.c/tcp_output.c 负责。
+ *
+ * 并发重点：进程上下文可用 lock_sock() 睡眠串行化一个 socket；函数表读取
+ * 使用 READ_ONCE，因为配置路径可能更换协议实现，读者不能把普通指针读取
+ * 当作永久常量。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -628,6 +642,15 @@ static long inet_wait_for_connect(struct sock *sk, long timeo, int writebias)
  *	Connect to a remote host. There is regrettably still a little
  *	TCP 'magic' in here.
  */
+/*
+ * __inet_stream_connect - 驱动 stream socket 从未连接状态进入协议连接状态。
+ *
+ * @sock 同时有用户可见 SS_* 状态和 @sock->sk 的 TCP_* 状态；@uaddr/@addr_len
+ * 是已复制到内核的地址（Fast Open 延迟连接特例可空）；@flags 含 O_NONBLOCK；
+ * @is_sendmsg 区分显式 connect 与 Fast Open send 触发。调用者持 lock_sock。
+ * 阻塞调用会在 SYN_SENT/SYN_RECV 释放 socket、睡眠并被握手/错误唤醒；非阻塞
+ * 返回 -EINPROGRESS。成功同时建立 SS_CONNECTED 与 TCP established 语义。
+ */
 int __inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
 			  int addr_len, int flags, int is_sendmsg)
 {
@@ -656,6 +679,7 @@ int __inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
 		}
 	}
 
+	/* 阶段 1：先验证 socket API 状态，不能用 TCP 内部状态替代这一层检查。 */
 	switch (sock->state) {
 	default:
 		err = -EINVAL;
@@ -681,6 +705,7 @@ int __inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
 				goto out;
 		}
 
+		/* TCP/IPv4 落到 tcp_v4_connect：选择四元组、hash 并发送 SYN。 */
 		err = sk->sk_prot->connect(sk, uaddr, addr_len);
 		if (err < 0)
 			goto out;
@@ -700,6 +725,7 @@ int __inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
 
 	timeo = sock_sndtimeo(sk, flags & O_NONBLOCK);
 
+	/* 阶段 2：握手未完成；阻塞 fd 等状态变化，非阻塞 fd 保留 EINPROGRESS。 */
 	if ((1 << sk->sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
 		int writebias = (sk->sk_protocol == IPPROTO_TCP) &&
 				tcp_sk(sk)->fastopen_req &&
@@ -731,6 +757,7 @@ int __inet_stream_connect(struct socket *sock, struct sockaddr_unsized *uaddr,
 	 * Hence, it is handled normally after connect() return successfully.
 	 */
 
+	/* 阶段 3：只有协议未回到 TCP_CLOSE 才发布 socket API 的已连接状态。 */
 	sock->state = SS_CONNECTED;
 	err = 0;
 out:
@@ -843,6 +870,7 @@ EXPORT_SYMBOL(inet_getname);
 
 int inet_send_prepare(struct sock *sk)
 {
+	/* 记录 flow 的 CPU，RFS 可据此把反向报文导向更有缓存局部性的 CPU。 */
 	sock_rps_record_flow(sk);
 
 	/* We may need to bind the socket. */
@@ -858,9 +886,11 @@ int inet_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	struct sock *sk = sock->sk;
 	const struct proto *prot;
 
+	/* 未显式 bind 的协议可首次发送时 autobind；TCP 通过 no_autobind 排除此路径。 */
 	if (unlikely(inet_send_prepare(sk)))
 		return -EAGAIN;
 
+	/* 本案例第二级分派为 tcp_prot.sendmsg=tcp_sendmsg。 */
 	prot = READ_ONCE(sk->sk_prot);
 	return INDIRECT_CALL_2(prot->sendmsg, tcp_sendmsg, udp_sendmsg,
 			       sk, msg, size);
@@ -887,9 +917,11 @@ int inet_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 	struct sock *sk = sock->sk;
 	const struct proto *prot;
 
+	/* 普通数据接收记录 flow CPU；错误队列不是 payload flow，不参与该提示。 */
 	if (likely(!(flags & MSG_ERRQUEUE)))
 		sock_rps_record_flow(sk);
 
+	/* 本案例落到 tcp_recvmsg；结果以字节/EOF/errno 表达，而不是 skb 数。 */
 	prot = READ_ONCE(sk->sk_prot);
 	return INDIRECT_CALL_2(prot->recvmsg, tcp_recvmsg, udp_recvmsg,
 			       sk, msg, size, flags);

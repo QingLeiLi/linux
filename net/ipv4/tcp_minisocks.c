@@ -1,5 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * TCP 半连接与 TIME_WAIT 轻量对象学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 完整 tcp_sock 很大，但 SYN_RECV 和 TIME_WAIT 只需保存少量序列号、时间戳、
+ * 四元组和定时器。request_sock 让监听端在第三次握手前降低每个 SYN 的内存成本；
+ * inet_timewait_sock 让关闭连接仍能处理重发 FIN/隔离旧报文而不保留完整队列。
+ * 代价是接收 lookup 可能返回多种对象类型，调用者必须按状态选择布局与引用规则。
+ *
+ * 本次主线：SYN hash 中的 request -> tcp_check_req -> syn_recv_sock 创建 child
+ *           -> established hash 仲裁 -> accept queue -> accept() 取得 full socket。
+ * request、child 和 listener 有独立引用；hash 可见、队列可接受、状态 ESTABLISHED
+ * 是三个不同发布点，不能用一个布尔值替代整个生命周期。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -684,6 +699,21 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
  *       Otherwise, this is from BH context.
  */
 
+/*
+ * tcp_check_req - 验证命中 request_sock 的报文，并在第三次 ACK 上升级为 child。
+ *
+ * @sk 通常是 listener，TFO 时可为 child；@skb ownership 仍在调用者；@req 是查找
+ * 命中的半连接借用引用；@fastopen 改变锁上下文与 ACK 校验来源；@req_stolen 输出
+ * request 是否已被另一并发路径取得；@drop_reason 输出精确丢弃原因。返回 listener
+ * 表示 ACK 非法、外层应回复 reset；返回 child 表示升级成功；NULL 表示已响应、
+ * defer-accept、overflow、重传 SYN 或丢弃。返回值不是 ERR_PTR。
+ *
+ * 所有 ACK/PAWS/window/RST 检查必须发生在创建 full socket 前，否则攻击或重传包
+ * 可迫使服务器做昂贵分配。合法第三次 ACK 调地址族 syn_recv_sock 构造并尝试插入
+ * established hash；inet_csk_complete_hashdance 再从 SYN queue 摘 req、把 child
+ * 发布到 accept queue。`own_req` 解决不同 CPU 同时处理重传 ACK 的竞态，失败候选
+ * 会被解锁并 put，只有胜者能成为 accept() 可见连接。
+ */
 struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 			   struct request_sock *req,
 			   bool fastopen, bool *req_stolen,
@@ -921,6 +951,7 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 	 * ESTABLISHED STATE. If it will be dropped after
 	 * socket is created, wait for troubles.
 	 */
+	/* 分配 full child 并竞争 established hash；此刻尚未进入 listener accept queue。 */
 	child = inet_csk(sk)->icsk_af_ops->syn_recv_sock(sk, skb, req, NULL,
 							 req, &own_req, NULL);
 	if (!child)
@@ -939,6 +970,7 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
 	sock_rps_save_rxhash(child, skb);
 	tcp_synack_rtt_meas(child, req);
 	*req_stolen = !own_req;
+	/* 完成 SYN hash -> accept queue 的所有权迁移；失败会销毁当前候选 child。 */
 	return inet_csk_complete_hashdance(sk, child, req, own_req);
 
 listen_overflow:

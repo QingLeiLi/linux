@@ -1,5 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * TCP Echo 主路径学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。新增中文仅解释当前版本源码，
+ * 不属于上游署名，也不改变代码语义。
+ *
+ * 本文件位于 VFS fd 与协议栈之间：把 fd 解析为 file/socket，把用户地址和
+ * iovec 安全转换为内核表示，经过 LSM 后调用 socket->ops。本文配套注释覆盖
+ * send/recv/connect 的 TCP Echo 主路径；本文件还包含其他协议和 ioctl，它们
+ * 不在此次范围内。此层只负责分派，不负责 TCP 序列号、路由或设备发送。
+ *
+ * 主线：send -> __sys_sendto -> __sock_sendmsg -> inet_sendmsg。
+ * ownership：fdget 临时固定 file；用户指针先转为 iterator/内核地址；协议层
+ * 只在调用期间借用 socket，返回值表达已消费字节或负 errno。
+ */
+/*
  * NET		An implementation of the SOCKET network access protocol.
  *
  * Version:	@(#)socket.c	1.1.93	18/02/95
@@ -772,6 +787,11 @@ static noinline void call_trace_sock_send_length(struct sock *sk, int ret,
 
 static inline int sock_sendmsg_nosec(struct socket *sock, struct msghdr *msg)
 {
+	/*
+	 * socket->ops 是 fd/socket 层的协议分派表。READ_ONCE 保证只取一次完整
+	 * 指针；INDIRECT_CALL_INET 只优化常见 IPv4/IPv6 目标，不改变函数指针
+	 * 语义。msg_data_left() 是 iterator 剩余字节，不是网络包长度。
+	 */
 	int ret = INDIRECT_CALL_INET(READ_ONCE(sock->ops)->sendmsg, inet6_sendmsg,
 				     inet_sendmsg, sock, msg,
 				     msg_data_left(msg));
@@ -784,6 +804,7 @@ static inline int sock_sendmsg_nosec(struct socket *sock, struct msghdr *msg)
 
 static int __sock_sendmsg(struct socket *sock, struct msghdr *msg)
 {
+	/* LSM 在协议改变任何状态前获得拒绝机会；拒绝时 TCP 尚未消费用户数据。 */
 	int err = security_socket_sendmsg(sock, msg,
 					  msg_data_left(msg));
 
@@ -798,6 +819,13 @@ static int __sock_sendmsg(struct socket *sock, struct msghdr *msg)
  *	Sends @msg through @sock, passing through LSM.
  *	Returns the number of bytes sent, or an error code.
  */
+/*
+ * @sock 在调用期间由 file/调用者固定；@msg 的 iterator 是输入源，
+ * 协议可推进它。函数在进程上下文运行并可能睡眠，但 TCP 锁由协议实现取得。
+ * 非负返回值是协议实际接受的字节数，可能短写；负值是 errno。这里不接管
+ * socket/msg。msg_name 复制到栈上，是为了不让协议保存或改写调用者地址对象；
+ * 返回前恢复原指针。成功仍不承诺 NIC、ACK 或对端 recv 已完成。
+ */
 int sock_sendmsg(struct socket *sock, struct msghdr *msg)
 {
 	struct sockaddr_storage *save_addr = (struct sockaddr_storage *)msg->msg_name;
@@ -806,6 +834,7 @@ int sock_sendmsg(struct socket *sock, struct msghdr *msg)
 	int ret;
 
 	if (msg->msg_name) {
+		/* 栈副本仅在同步 sendmsg 调用期间有效，协议不得在返回后继续引用它。 */
 		memcpy(&address, msg->msg_name, msg->msg_namelen);
 		msg->msg_name = &address;
 	}
@@ -2214,6 +2243,13 @@ SYSCALL_DEFINE3(getpeername, int, fd, struct sockaddr __user *, usockaddr,
  *	space and check the user space data area is readable before invoking
  *	the protocol.
  */
+/*
+ * __sys_sendto - 将用户 send/sendto 参数转换为内核消息并进入协议栈。
+ *
+ * @fd 必须引用 socket file；@buff/@len 是只读用户字节区；@addr 可空，已连接
+ * TCP 的 send 通常为空；@flags 的内核私有位会被清除。系统调用上下文允许
+ * 缺页和睡眠。返回协议接受字节数、短写或负 errno；不表示可靠交付完成。
+ */
 int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
 		 struct sockaddr __user *addr,  int addr_len)
 {
@@ -2222,10 +2258,12 @@ int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
 	int err;
 	struct msghdr msg;
 
+	/* iterator 只描述用户源；实际 copy/pin 在协议消费时发生。 */
 	err = import_ubuf(ITER_SOURCE, buff, len, &msg.msg_iter);
 	if (unlikely(err))
 		return err;
 
+	/* cleanup class 把 fdget/fdput 配成作用域，任意提前 return 都不会泄漏引用。 */
 	CLASS(fd, f)(fd);
 	if (fd_empty(f))
 		return -EBADF;
@@ -2239,12 +2277,14 @@ int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
 	msg.msg_namelen = 0;
 	msg.msg_ubuf = NULL;
 	if (addr) {
+		/* 先复制进内核，关闭校验后用户并发修改地址的 TOCTOU 窗口。 */
 		err = move_addr_to_kernel(addr, addr_len, &address);
 		if (err < 0)
 			return err;
 		msg.msg_name = (struct sockaddr *)&address;
 		msg.msg_namelen = addr_len;
 	}
+	/* 用户不得伪造只供内核内部 sendmsg 调用链使用的控制位。 */
 	flags &= ~MSG_INTERNAL_SENDMSG_FLAGS;
 	if (sock->file->f_flags & O_NONBLOCK)
 		flags |= MSG_DONTWAIT;
@@ -2274,6 +2314,13 @@ SYSCALL_DEFINE4(send, int, fd, void __user *, buff, size_t, len,
  *	sender. We verify the buffers are writable and if needed move the
  *	sender address from kernel to user space.
  */
+/*
+ * __sys_recvfrom - 从 socket 接收数据并写入用户目标 iterator。
+ *
+ * @ubuf/@size 是可写目标；@addr/@addr_len 可空。非阻塞 file 强制加入
+ * MSG_DONTWAIT。非负返回值是实际复制字节数，0 对 TCP 可表示有序 EOF；请求
+ * 更大也允许短读。来源地址在协议返回后再复制，协议从不直接写用户地址对象。
+ */
 int __sys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags,
 		   struct sockaddr __user *addr, int __user *addr_len)
 {
@@ -2285,6 +2332,7 @@ int __sys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags,
 	struct socket *sock;
 	int err, err2;
 
+	/* ITER_DEST 明确数据方向，copy helper 将按用户目标执行 fault 检查。 */
 	err = import_ubuf(ITER_DEST, ubuf, size, &msg.msg_iter);
 	if (unlikely(err))
 		return err;

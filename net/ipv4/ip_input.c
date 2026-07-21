@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * TCP Echo IPv4 接收学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 本文件验证 IPv4 header，执行 PRE_ROUTING，查询输入路由，并把本机报文经
+ * LOCAL_IN 分派给 TCP；转发报文则由 dst input 选择另一条路径。TCP 不负责
+ * 判断“目标地址是否属于本机”。分片必须在交给 TCP 前重组，否则传输层无法
+ * 对一个完整 TCP header/segment 做校验和序列号处理。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -186,6 +196,16 @@ bool ip_call_ra_chain(struct sk_buff *skb)
 
 INDIRECT_CALLABLE_DECLARE(int udp_rcv(struct sk_buff *));
 INDIRECT_CALLABLE_DECLARE(int tcp_v4_rcv(struct sk_buff *));
+/*
+ * ip_protocol_deliver_rcu - 按 IPv4 protocol 字段把本机 skb 分派给 TCP/UDP/raw。
+ *
+ * 调用者持 rcu_read_lock；@skb->data 已指向传输层头，network header 仍能访问。
+ * raw socket 可先获得 clone/引用，inet_protos[] 再选择注册 handler；普通 TCP
+ * 落到 tcp_v4_rcv()，它接管原 skb。XFRM 入站策略必须在协议状态机前通过。
+ * handler 返回负 protocol 表示请求按另一个协议号重新分派（隧道/封装语义）；
+ * 没有 handler 且 raw 未消费时发送 protocol-unreachable 并释放 skb。
+ * 本函数无返回值，因为每条路径都已经消费或转移 skb ownership。
+ */
 void ip_protocol_deliver_rcu(struct net *net, struct sk_buff *skb, int protocol)
 {
 	const struct net_protocol *ipprot;
@@ -226,8 +246,18 @@ resubmit:
 	}
 }
 
+/*
+ * ip_local_deliver_finish - LOCAL_IN 接受后的最后一跳，暴露 L4 头并协议分派。
+ *
+ * @skb 已重组且由本函数接管；@sk 通常为空，仅为 Netfilter continuation 统一签名。
+ * skb_orphan_frags_rx() 把不适合接收侧长期持有的外部 frag 引用安全化，可能以
+ * GFP_ATOMIC 分配而失败。随后 __skb_pull 只移动 data 游标、不丢失 network header
+ * offset；RCU 保护 inet_protos[] handler。返回 0 不代表 TCP 接受字节，只表示
+ * continuation 已经消费 skb。
+ */
 static int ip_local_deliver_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
+	/* frag 对 skb 的外部页引用必须转成接收侧可安全持有的形式，失败则本层消费。 */
 	if (unlikely(skb_orphan_frags_rx(skb, GFP_ATOMIC))) {
 		__IP_INC_STATS(net, IPSTATS_MIB_INDISCARDS);
 		kfree_skb_reason(skb, SKB_DROP_REASON_NOMEM);
@@ -235,6 +265,7 @@ static int ip_local_deliver_finish(struct net *net, struct sock *sk, struct sk_b
 	}
 
 	skb_clear_delivery_time(skb);
+	/* 移过 IPv4 header，使 skb->data 指向 TCP header；header offset 仍保留定位。 */
 	__skb_pull(skb, skb_network_header_len(skb));
 
 	rcu_read_lock();
@@ -247,6 +278,13 @@ static int ip_local_deliver_finish(struct net *net, struct sock *sk, struct sk_b
 /*
  * 	Deliver IP Packets to the higher protocol layers.
  */
+/*
+ * ip_local_deliver - 对输入路由判定为本机的 IPv4 skb 执行重组和 LOCAL_IN 分派。
+ *
+ * @skb ownership 已从通用接收层转入 IPv4；函数无论排队重组、丢弃还是交给 TCP
+ * 都会消费它，调用者不得复用。运行于接收 softirq/兼容上下文，不能随意睡眠。
+ * 返回值是 Netfilter/协议处理状态，不是传给用户的字节数。
+ */
 int ip_local_deliver(struct sk_buff *skb)
 {
 	/*
@@ -255,6 +293,7 @@ int ip_local_deliver(struct sk_buff *skb)
 	struct net *net = dev_net(skb->dev);
 
 	if (ip_is_fragment(ip_hdr(skb))) {
+		/* 未收齐时 skb 留在重组队列并返回；收齐后才可验证完整传输层报文。 */
 		if (ip_defrag(net, skb, IP_DEFRAG_LOCAL_DELIVER))
 			return 0;
 	}
@@ -358,6 +397,15 @@ static int tcp_v4_early_demux(struct sk_buff *skb)
 	return 0;
 }
 
+/*
+ * ip_rcv_finish_core - 为已验证 IPv4 skb 建立输入 route 和可选 early-demux 缓存。
+ *
+ * @skb/@dev 是当前报文和入口设备；@hint 可借用同 flow 前包的 route。函数仍拥有
+ * skb，成功返回 NET_RX_SUCCESS 并保证 skb_dst 有效；失败已释放 skb 并返回 DROP。
+ * early demux 可先关联 established socket/rx dst，减少后续 TCP hash/route 工作，
+ * 但不代替正式 policy 和 socket 状态检查。没有可复用 dst 时
+ * ip_route_input_noref() 查询 FIB，其结果的 dst->input 决定本机交付还是转发。
+ */
 static int ip_rcv_finish_core(struct net *net,
 			      struct sk_buff *skb, struct net_device *dev,
 			      const struct sk_buff *hint)
@@ -475,6 +523,14 @@ drop_error:
 	goto drop;
 }
 
+/*
+ * ip_rcv_finish - PRE_ROUTING 接受后的 continuation，完成 route 并执行 dst input。
+ *
+ * L3 master/VRF 可先接管或改写 skb；仍存在时 ip_rcv_finish_core 建立有效 dst。
+ * dst_input 是 route 多态分派：RTN_LOCAL 通常进入 ip_local_deliver，转发 route
+ * 进入 ip_forward，禁止/黑洞 route 则丢弃。因此本函数正是“目标 IP 是否本机”
+ * 的决策落地点，而 TCP 完全不参与这项判断。所有返回路径均消费 skb。
+ */
 static int ip_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	struct net_device *dev = skb->dev;
@@ -495,6 +551,15 @@ static int ip_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
 
 /*
  * 	Main IP Receive routine.
+ */
+/*
+ * ip_rcv_core - 在任何 hook、route 或传输层访问前验证并规范化 IPv4 数据报。
+ *
+ * @skb 来自 L2 分派，@net 由入口设备确定；函数拥有 skb。成功返回同一对象或
+ * 经过 unshare/trim 的替代对象，并保证 version=4、IHL/total length 合法、IPv4
+ * header checksum 正确，skb 长度已裁到 tot_len，IPCB 已清零。失败返回 NULL
+ * 且已按具体 drop reason 释放。pskb_may_pull 可能移动 skb->head，因此每次之后
+ * 都必须重新取得 iph，不能保留旧指针。这里只验证 IP framing，不验证 TCP checksum。
  */
 static struct sk_buff *ip_rcv_core(struct sk_buff *skb, struct net *net)
 {
@@ -600,15 +665,24 @@ out:
 /*
  * IP receive entry point
  */
+/*
+ * ip_rcv - Ethernet packet_type 分派到 IPv4 后的入口。
+ *
+ * @skb 由设备接收路径转移 ownership；@dev/@orig_dev 是当前/原始入口设备，
+ * @pt 是命中的 IPv4 packet_type。ip_rcv_core 验证版本、IHL、长度和 checksum；
+ * 成功后 PRE_ROUTING 与输入路由决定本机交付或转发。所有出口都消费 skb。
+ */
 int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
 	   struct net_device *orig_dev)
 {
 	struct net *net = dev_net(dev);
 
+	/* 阶段 1：在任何路由/TCP 状态变化前拒绝畸形 IPv4 header。 */
 	skb = ip_rcv_core(skb, net);
 	if (skb == NULL)
 		return NET_RX_DROP;
 
+	/* 阶段 2：hook 可丢弃/改写；接受后 ip_rcv_finish 查询 route 并调用 dst_input。 */
 	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
 		       net, NULL, skb, dev, NULL,
 		       ip_rcv_finish);

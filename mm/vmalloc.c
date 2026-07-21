@@ -1,5 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * vmalloc/vmap 子系统学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。此标识仅说明新增中文注释的来源，
+ * 不属于 Linux 上游源码署名，便于与其他模型生成的注释版本交叉比较。
+ *
+ * kmalloc 和伙伴系统擅长提供物理连续内存，但大块物理连续内存会受碎片影响。
+ * vmalloc 的核心思路是把若干离散物理页映射到一段连续内核虚拟地址：调用者
+ * 得到连续指针，页表负责把连续 VA 翻译到离散 PFN。
+ *
+ * 这带来三类额外工作：
+ *
+ *  1. 管理 VMALLOC_START..VMALLOC_END 中互不重叠的虚拟地址区间；
+ *  2. 在 init_mm 中建立、拆除内核页表，并处理 cache/TLB 可见性；
+ *  3. 分别管理 VA、页表、物理页和调试元数据的生命周期及失败回滚。
+ *
+ * 主要分配链路：
+ *
+ *   vmalloc/vzalloc
+ *     -> __vmalloc_node_range_noprof   选择地址范围、页阶、NUMA/KASAN 策略
+ *       -> __get_vm_area_node          预留 VA，创建 vmap_area/vm_struct
+ *       -> __vmalloc_area_node         分配 backing pages 并建立页表
+ *       -> clear_vm_uninitialized_flag 发布完整对象
+ *
+ * 主要释放链路：
+ *
+ *   vfree
+ *     -> remove_vm_area                从 busy 索引取消发布并拆页表
+ *     -> lazy purge                    批量 TLB flush 后才允许复用 VA
+ *     -> vm_area_free_pages            归还 vmalloc 自己拥有的物理页
+ *
+ * 当前设计用增强红黑树降低空闲区间搜索成本，用有序链表快速合并邻居，用
+ * vmap-node/per-CPU block 降低全局锁竞争，并用 lazy purge 摊薄跨 CPU TLB
+ * shootdown。收益是扩展性和吞吐；代价是数据结构、并发状态和回收时序更复杂。
+ */
+/*
  *  Copyright (C) 1993  Linus Torvalds
  *  Support of BIGMEM added by Gerhard Wichert, Siemens AG, July 1999
  *  SMP-safe vmalloc/vfree/ioremap, Tigran Aivazian <tigran@veritas.com>, May 2000
@@ -51,8 +86,15 @@
 #include "pgalloc-track.h"
 
 #ifdef CONFIG_HAVE_ARCH_HUGE_VMAP
+/*
+ * ioremap 可以在架构允许时用 PMD/PUD 等大页表项映射连续设备物理地址，以减少
+ * 页表和 TLB 压力。该变量是“允许尝试的最大页阶”，并不保证最终一定使用大页。
+ * 启动参数 nohugeiomap 把上限降到 PAGE_SHIFT，常用于架构规避或问题诊断。
+ * __ro_after_init 防止系统启动完成后再改变全局映射策略。
+ */
 static unsigned int __ro_after_init ioremap_max_page_shift = BITS_PER_LONG - 1;
 
+/* 启动早期把 ioremap 候选粒度锁定为基本页；参数只改变性能策略，不改变映射属性。 */
 static int __init set_nohugeiomap(char *str)
 {
 	ioremap_max_page_shift = PAGE_SHIFT;
@@ -64,8 +106,14 @@ static const unsigned int ioremap_max_page_shift = PAGE_SHIFT;
 #endif	/* CONFIG_HAVE_ARCH_HUGE_VMAP */
 
 #ifdef CONFIG_HAVE_ARCH_HUGE_VMALLOC
+/*
+ * 普通 RAM 的 huge-vmap 策略与设备 ioremap 分开控制，因为二者对 struct page、
+ * 物理连续性和调用者兼容性的要求不同。关闭 huge-vmalloc 只禁用优化，后续代码
+ * 仍必须能够使用 PAGE_SIZE 页表项完成相同分配。
+ */
 static bool __ro_after_init vmap_allow_huge = true;
 
+/* 关闭普通 RAM 的 huge-vmap 尝试，便于定位大页映射相关的架构或驱动兼容问题。 */
 static int __init set_nohugevmalloc(char *str)
 {
 	vmap_allow_huge = false;
@@ -76,6 +124,12 @@ early_param("nohugevmalloc", set_nohugevmalloc);
 static const bool vmap_allow_huge = false;
 #endif	/* CONFIG_HAVE_ARCH_HUGE_VMALLOC */
 
+/*
+ * 判断一个数值地址是否属于 vmalloc 虚拟地址窗口。
+ *
+ * 这只是地址分类，不证明该位置当前存在映射。KASAN 硬件 tag 不属于地址区间，
+ * 因此比较前必须去掉 tag；半开区间保证 VMALLOC_END 不会被误判为有效地址。
+ */
 bool is_vmalloc_addr(const void *x)
 {
 	unsigned long addr = (unsigned long)kasan_reset_tag(x);
@@ -84,6 +138,11 @@ bool is_vmalloc_addr(const void *x)
 }
 EXPORT_SYMBOL(is_vmalloc_addr);
 
+/*
+ * 中断等原子上下文不能直接完成 vfree：拆映射、TLB 回收和释放页的路径可能睡眠。
+ * 每个 CPU 先把请求加入无锁 llist，再由 workqueue 切换到可睡眠上下文完成回收。
+ * 这里把“快速提交释放请求”和“真正释放资源”分成两个阶段。
+ */
 struct vfree_deferred {
 	struct llist_head list;
 	struct work_struct wq;
@@ -91,6 +150,24 @@ struct vfree_deferred {
 static DEFINE_PER_CPU(struct vfree_deferred, vfree_deferred);
 
 /*** Page table manipulation functions ***/
+/*
+ * 页表操作层只负责 VA -> PFN/page 的硬件映射，不负责选择 VA，也不拥有物理页。
+ * 上层必须已经保证 [addr, end) 没有与其他 vmap_area 重叠。本层修改 init_mm，
+ * 即所有进程共享的内核地址空间；发现目标页表项已有映射说明软件 VA 索引和
+ * 硬件页表不一致，属于内核不变量破坏，而不是普通的“地址忙”。
+ *
+ * Linux 保留 PGD -> P4D -> PUD -> PMD -> PTE 的统一五级接口。实际架构可以
+ * 折叠某些层级，通用代码仍按同一调用链工作。每层先尝试安装 huge leaf，条件
+ * 不满足就下降一级；huge 失败属于优化回退，不应改变映射能否成功的语义。
+ */
+
+/*
+ * 在一个 PMD 覆盖范围内安装最终 PTE 映射。
+ *
+ * phys_addr 可能来自设备内存，不一定存在 struct page，所以主路径使用 PFN；
+ * struct page 只在诊断重复映射且 PFN 有效时使用。函数可能分配 PTE 页，失败时
+ * 返回 -ENOMEM；成功后 mask 告诉顶层 PTE 层发生修改，需要架构同步。
+ */
 static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift, pgtbl_mod_mask *mask)
@@ -103,14 +180,22 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 	if (WARN_ON_ONCE(!PAGE_ALIGNED(end - addr)))
 		return -EINVAL;
 
+	/* 把物理字节地址转换为本段起始 PFN，后续每安装一页就同步推进。 */
 	pfn = phys_addr >> PAGE_SHIFT;
+
+	/* 必要时创建下级 PTE 页；track 版本同时记录新建过哪些页表层级。 */
 	pte = pte_alloc_kernel_track(pmd, addr, mask);
 	if (!pte)
 		return -ENOMEM;
 
+	/* 某些架构/虚拟化后端可批量提交连续页表写入，降低逐项更新开销。 */
 	lazy_mmu_mode_enable();
 
 	do {
+		/*
+		 * 目标 PTE 必须为空。覆盖旧 entry 会让未知映射失去管理关系，因此有效
+		 * 普通 RAM 先打印 page 诊断信息，然后用 BUG 阻止继续破坏页表。
+		 */
 		if (unlikely(!pte_none(ptep_get(pte)))) {
 			if (pfn_valid(pfn)) {
 				page = pfn_to_page(pfn);
@@ -120,6 +205,10 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 		}
 
 #ifdef CONFIG_HUGETLB_PAGE
+		/*
+		 * 部分架构可以在 PTE 层编码大于 PAGE_SIZE 的 hugetlb entry。架构 helper
+		 * 综合剩余长度、地址/PFN 对齐和策略上限选择本轮大小；不能用时返回一页。
+		 */
 		size = arch_vmap_pte_range_map_size(addr, end, pfn, max_page_shift);
 		if (size != PAGE_SIZE) {
 			pte_t entry = pfn_pte(pfn, prot);
@@ -132,6 +221,10 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 #endif
 		set_pte_at(&init_mm, addr, pte, pfn_pte(pfn, prot));
 		pfn++;
+	/*
+	 * 按本轮实际映射大小推进 PTE 游标和 VA。size 可能是一页，也可能是特殊
+	 * huge-PTE 范围；二者同步推进后，下一轮始终从第一个未映射地址继续。
+	 */
 	} while (pte += PFN_DOWN(size), addr += size, addr != end);
 
 	lazy_mmu_mode_disable();
@@ -139,6 +232,13 @@ static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 	return 0;
 }
 
+/*
+ * 尝试用一个 PMD leaf 覆盖完整 PMD_SIZE 区间。
+ *
+ * 策略上限、架构能力、区间长度、VA 对齐和 PA 对齐缺一不可。若下级 PTE 页
+ * 已存在，只能在它为空且可安全释放时替换为 PMD leaf。返回 0 表示“回退普通
+ * PTE”，不是错误；只有 pmd_set_huge 成功才让调用者跳过下级页表。
+ */
 static int vmap_try_huge_pmd(pmd_t *pmd, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift)
@@ -164,6 +264,12 @@ static int vmap_try_huge_pmd(pmd_t *pmd, unsigned long addr, unsigned long end,
 	return pmd_set_huge(pmd, phys_addr, prot);
 }
 
+/*
+ * 遍历 PUD 下的 PMD 区间：每段先尝试 PMD huge leaf，失败再调用 PTE 层。
+ *
+ * pmd_addr_end 把本轮限制在一个 PMD entry 内。每轮结束时 VA 和 PA 按相同长度
+ * 推进，维持整个映射的偏移关系；任一层失败就停止，由顶层统一处理已建前缀。
+ */
 static int vmap_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift, pgtbl_mod_mask *mask)
@@ -191,6 +297,13 @@ static int vmap_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
 	return err;
 }
 
+/*
+ * 尝试在 PUD 层安装更大粒度的 leaf 映射。
+ *
+ * 逻辑与 PMD 版本相同，但覆盖范围和对齐要求提升到 PUD_SIZE。保留独立函数而
+ * 不是用宏强行合并，是因为各架构对 PUD/PMD leaf、下级页表释放和 entry 构造
+ * 的支持并不完全对称。失败仍只表示继续下降到 PMD/PTE。
+ */
 static int vmap_try_huge_pud(pud_t *pud, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift)
@@ -216,6 +329,12 @@ static int vmap_try_huge_pud(pud_t *pud, unsigned long addr, unsigned long end,
 	return pud_set_huge(pud, phys_addr, prot);
 }
 
+/*
+ * 遍历 P4D 下的 PUD 区间。
+ *
+ * pud_alloc_track 在未折叠 PUD 的架构上可能创建页表页；折叠架构则退化成地址
+ * 转换。每个子区间先尝试 PUD leaf，无法使用时交给 PMD 层，错误立即向上传播。
+ */
 static int vmap_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift, pgtbl_mod_mask *mask)
@@ -243,6 +362,10 @@ static int vmap_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
 	return err;
 }
 
+/*
+ * 尝试 P4D 级 huge leaf。只有真正支持五级页表并提供 P4D leaf 的架构才可能
+ * 成功；四级页表通常折叠该层。保留统一层级让通用代码不必散布条件编译。
+ */
 static int vmap_try_huge_p4d(p4d_t *p4d, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift)
@@ -268,6 +391,10 @@ static int vmap_try_huge_p4d(p4d_t *p4d, unsigned long addr, unsigned long end,
 	return p4d_set_huge(p4d, phys_addr, prot);
 }
 
+/*
+ * PGD 下的最高公共递归层。mask 贯穿调用链，汇总哪些页表层发生结构变化，
+ * 顶层据此一次性执行架构同步，避免每下降一级就重复做昂贵工作。
+ */
 static int vmap_p4d_range(pgd_t *pgd, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift, pgtbl_mod_mask *mask)
@@ -295,6 +422,12 @@ static int vmap_p4d_range(pgd_t *pgd, unsigned long addr, unsigned long end,
 	return err;
 }
 
+/*
+ * 建立物理连续地址到内核 VA 的页表，但不负责最终 cache flush。
+ *
+ * 这是 PGD 级调度器：验证调用上下文，逐 PGD entry 调用下级递归。页表分配
+ * 可能睡眠；noflush 设计让批量调用者把 cache/TLB 处理合并到更高层。
+ */
 static int vmap_range_noflush(unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift)
@@ -316,6 +449,7 @@ static int vmap_range_noflush(unsigned long addr, unsigned long end,
 	start = addr;
 	pgd = pgd_offset_k(addr);
 	do {
+		/* 当前批次限制在一个 PGD entry 内，避免下级递归跨越顶层边界。 */
 		next = pgd_addr_end(addr, end);
 		err = vmap_p4d_range(pgd, addr, next, phys_addr, prot,
 					max_page_shift, &mask);
@@ -323,12 +457,17 @@ static int vmap_range_noflush(unsigned long addr, unsigned long end,
 			break;
 	} while (pgd++, phys_addr += (next - addr), addr = next, addr != end);
 
+	/* 只有架构关心的页表层发生变化时，才同步共享内核映射。 */
 	if (mask & ARCH_PAGE_TABLE_SYNC_MASK)
 		arch_sync_kernel_mappings(start, end);
 
 	return err;
 }
 
+/*
+ * 同步的物理连续映射入口。页表建立后刷新新 VA 别名的 cache 状态，并让 KMSAN
+ * 建立对应元数据。pgprot_nx 默认移除执行权限，避免普通数据映射意外可执行。
+ */
 int vmap_page_range(unsigned long addr, unsigned long end,
 		    phys_addr_t phys_addr, pgprot_t prot)
 {
@@ -343,6 +482,10 @@ int vmap_page_range(unsigned long addr, unsigned long end,
 	return err;
 }
 
+/*
+ * ioremap 的受检包装。调用者必须先用 VM_IOREMAP 预留完整 vm_struct；传入范围
+ * 还必须与预留范围完全一致，使 vm_struct、页表和后续释放始终描述同一对象。
+ */
 int ioremap_page_range(unsigned long addr, unsigned long end,
 		phys_addr_t phys_addr, pgprot_t prot)
 {
@@ -363,6 +506,13 @@ int ioremap_page_range(unsigned long addr, unsigned long end,
 	return vmap_page_range(addr, end, phys_addr, prot);
 }
 
+/*
+ * 清除一个 PMD 下的叶子 PTE。
+ *
+ * 某些架构在 PTE 层也能编码多页 hugetlb entry，因此每轮先询问实际覆盖大小，
+ * 再原子取出并清除旧 entry。函数只拆页表，不释放 backing page；最终 TLB flush
+ * 由更高层统一完成，避免每个小范围都触发跨 CPU shootdown。
+ */
 static void vunmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 			     pgtbl_mod_mask *mask)
 {
@@ -394,6 +544,11 @@ static void vunmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 	*mask |= PGTBL_PTE_MODIFIED;
 }
 
+/*
+ * 拆除一个 PUD 下的 PMD 范围。先尝试把 PMD 当作 huge leaf 清除；若不是 leaf，
+ * 才把它解释为 PTE 页并继续下降。坏 entry 会被清除并跳过，绝不能作为页表指针
+ * 解引用。大范围处理期间 cond_resched，避免 vmalloc 释放长时间独占 CPU。
+ */
 static void vunmap_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
 			     pgtbl_mod_mask *mask)
 {
@@ -421,6 +576,10 @@ static void vunmap_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
 	} while (pmd++, addr = next, addr != end);
 }
 
+/*
+ * PUD 级拆映射与 PMD 级保持相同状态机：leaf 整项清除，table 继续下降，none/bad
+ * 直接跳过。mask 记录本层是否改变，供最终架构同步使用。
+ */
 static void vunmap_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
 			     pgtbl_mod_mask *mask)
 {
@@ -446,6 +605,10 @@ static void vunmap_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
 	} while (pud++, addr = next, addr != end);
 }
 
+/*
+ * P4D 级拆映射。折叠 P4D 的架构会由 helper 保持正确退化；通用代码仍按完整
+ * 层级向下遍历，因此建立和拆除路径具有镜像结构。
+ */
 static void vunmap_p4d_range(pgd_t *pgd, unsigned long addr, unsigned long end,
 			     pgtbl_mod_mask *mask)
 {
@@ -485,6 +648,7 @@ void __vunmap_range_noflush(unsigned long start, unsigned long end)
 	unsigned long addr = start;
 	pgtbl_mod_mask mask = 0;
 
+	/* 空区间表示上层范围计算错误；继续清页表可能伤及相邻内核映射。 */
 	BUG_ON(addr >= end);
 	pgd = pgd_offset_k(addr);
 	do {
@@ -502,6 +666,7 @@ void __vunmap_range_noflush(unsigned long start, unsigned long end)
 
 void vunmap_range_noflush(unsigned long start, unsigned long end)
 {
+	/* KMSAN 元数据必须与真实页表同步失效，避免后续复用 VA 时继承旧状态。 */
 	kmsan_vunmap_range_noflush(start, end);
 	__vunmap_range_noflush(start, end);
 }
@@ -517,11 +682,22 @@ void vunmap_range_noflush(unsigned long start, unsigned long end)
  */
 void vunmap_range(unsigned long addr, unsigned long end)
 {
+	/*
+	 * 完整顺序是：先处理旧虚拟别名的 cache 状态，再清页表，最后 shootdown TLB。
+	 * 返回后 VA 已不可访问，但 VA 描述符和物理页仍由上层释放路径负责。
+	 */
 	flush_cache_vunmap(addr, end);
 	vunmap_range_noflush(addr, end);
 	flush_tlb_kernel_range(addr, end);
 }
 
+/*
+ * 把 struct page 指针数组逐项安装到 PTE。
+ *
+ * 与连续 phys_addr 路径不同，物理来源由 pages[nr] 决定；nr 是整个递归共享的
+ * 消费进度。NULL page、无效普通 PFN 或已有 PTE 都表示调用契约/状态异常，函数
+ * 停在已映射前缀并把错误交给上层统一回滚。
+ */
 static int vmap_pages_pte_range(pmd_t *pmd, unsigned long addr,
 		unsigned long end, pgprot_t prot, struct page **pages, int *nr,
 		pgtbl_mod_mask *mask)
@@ -566,6 +742,10 @@ static int vmap_pages_pte_range(pmd_t *pmd, unsigned long addr,
 	return err;
 }
 
+/*
+ * page 数组路径的 PMD/PUD/P4D helper 只负责按页表边界切段，并把同一个 nr
+ * 游标传到底层。它们不重新计算数组下标，从而保证跨页表边界时 page 顺序连续。
+ */
 static int vmap_pages_pmd_range(pud_t *pud, unsigned long addr,
 		unsigned long end, pgprot_t prot, struct page **pages, int *nr,
 		pgtbl_mod_mask *mask)
@@ -620,6 +800,11 @@ static int vmap_pages_p4d_range(pgd_t *pgd, unsigned long addr,
 	return 0;
 }
 
+/*
+ * 普通 PAGE_SIZE 映射的可靠基线。它禁止 huge leaf，逐页消费离散 pages 数组；
+ * huge-vmap 不可用或调用者本来只有 order-0 页时都走这里。成功只表示页表完成，
+ * cache 可见性仍由同步包装处理。
+ */
 static int vmap_small_pages_range_noflush(unsigned long addr, unsigned long end,
 		pgprot_t prot, struct page **pages)
 {
@@ -663,10 +848,12 @@ int __vmap_pages_range_noflush(unsigned long addr, unsigned long end,
 
 	WARN_ON(page_shift < PAGE_SHIFT);
 
+	/* 没有架构支持或调用者只要求 base page 时，直接使用逐 PTE 基线路径。 */
 	if (!IS_ENABLED(CONFIG_HAVE_ARCH_HUGE_VMALLOC) ||
 			page_shift == PAGE_SHIFT)
 		return vmap_small_pages_range_noflush(addr, end, prot, pages);
 
+	/* 每轮处理一个 page_shift 大小的物理连续块，并同步推进 VA。 */
 	for (i = 0; i < nr; i += 1U << (page_shift - PAGE_SHIFT)) {
 		int err;
 
@@ -686,6 +873,7 @@ int vmap_pages_range_noflush(unsigned long addr, unsigned long end,
 		pgprot_t prot, struct page **pages, unsigned int page_shift,
 		gfp_t gfp_mask)
 {
+	/* KMSAN 先准备影子/origin 映射；失败时不能继续发布真实页表。 */
 	int ret = kmsan_vmap_pages_range_noflush(addr, end, prot, pages,
 						page_shift, gfp_mask);
 
@@ -694,6 +882,10 @@ int vmap_pages_range_noflush(unsigned long addr, unsigned long end,
 	return __vmap_pages_range_noflush(addr, end, prot, pages, page_shift);
 }
 
+/*
+ * 同步包装在页表建立后刷新整个目标范围的 cache。即使深层只完成部分前缀后
+ * 失败，统一 flush 仍安全；具体清理责任留给掌握完整范围和资源所有权的调用者。
+ */
 static int __vmap_pages_range(unsigned long addr, unsigned long end,
 		pgprot_t prot, struct page **pages, unsigned int page_shift,
 		gfp_t gfp_mask)
@@ -720,9 +912,17 @@ static int __vmap_pages_range(unsigned long addr, unsigned long end,
 int vmap_pages_range(unsigned long addr, unsigned long end,
 		pgprot_t prot, struct page **pages, unsigned int page_shift)
 {
+	/* 公共入口使用 GFP_KERNEL，允许页表和检测元数据分配进入正常睡眠回收。 */
 	return __vmap_pages_range(addr, end, prot, pages, page_shift, GFP_KERNEL);
 }
 
+/*
+ * 校验 sparse vm_area 的局部 map/unmap 请求。
+ *
+ * VM_SPARSE 表示区域只预留 VA，页表由调用者分段填充；普通 vmalloc 区域不能
+ * 使用该接口，否则其统一 pages/lifecycle 会被破坏。这里同时拒绝权限重置、
+ * 无 guard、超物理页总量及越过预留范围的请求。
+ */
 static int check_sparse_vm_area(struct vm_struct *area, unsigned long start,
 				unsigned long end)
 {
@@ -751,6 +951,7 @@ static int check_sparse_vm_area(struct vm_struct *area, unsigned long start,
 int vm_area_map_pages(struct vm_struct *area, unsigned long start,
 		      unsigned long end, struct page **pages)
 {
+	/* 校验通过后，本次只建立 [start,end) 子范围；page 所有权仍属于调用者。 */
 	int err;
 
 	err = check_sparse_vm_area(area, start, end);
@@ -769,12 +970,17 @@ int vm_area_map_pages(struct vm_struct *area, unsigned long start,
 void vm_area_unmap_pages(struct vm_struct *area, unsigned long start,
 			 unsigned long end)
 {
+	/* 同步拆除子范围，保证函数返回后调用者可以安全替换或释放对应 pages。 */
 	if (check_sparse_vm_area(area, start, end))
 		return;
 
 	vunmap_range(start, end);
 }
 
+/*
+ * 模块文本在部分架构拥有独立于 VMALLOC_START..END 的地址窗口，其他架构则直接
+ * 使用 vmalloc 区。该 helper 统一两种布局，但仍只做地址分类，不证明映射存活。
+ */
 int is_vmalloc_or_module_addr(const void *x)
 {
 	/*
@@ -795,6 +1001,13 @@ EXPORT_SYMBOL_GPL(is_vmalloc_or_module_addr);
  * Walk a vmap address to the struct page it maps. Huge vmap mappings will
  * return the tail page that corresponds to the base page address, which
  * matches small vmap mappings.
+ */
+/*
+ * 软件遍历 init_mm 页表，把 vmalloc/module VA 解析为 struct page。
+ *
+ * direct-map 地址可用 virt_to_page 做算术换算，vmalloc VA 与 PFN 没有这种关系，
+ * 必须逐层读取页表。遇到 P4D/PUD/PMD huge leaf 时，返回与 VA 偏移对应的 tail
+ * page，使结果与普通 PTE 映射一致。函数不加引用，调用者必须保证映射生命周期。
  */
 struct page *vmalloc_to_page(const void *vmalloc_addr)
 {
@@ -823,6 +1036,7 @@ struct page *vmalloc_to_page(const void *vmalloc_addr)
 	if (p4d_none(*p4d))
 		return NULL;
 	if (p4d_leaf(*p4d))
+		/* leaf 首页加上区间内 base-page 偏移，得到当前 VA 对应的 page。 */
 		return p4d_page(*p4d) + ((addr & ~P4D_MASK) >> PAGE_SHIFT);
 	if (WARN_ON_ONCE(p4d_bad(*p4d)))
 		return NULL;
@@ -857,12 +1071,24 @@ EXPORT_SYMBOL(vmalloc_to_page);
  */
 unsigned long vmalloc_to_pfn(const void *vmalloc_addr)
 {
+	/* 继承 vmalloc_to_page 的生命周期前置条件；设备 PFN 映射不一定有 struct page。 */
 	return page_to_pfn(vmalloc_to_page(vmalloc_addr));
 }
 EXPORT_SYMBOL(vmalloc_to_pfn);
 
 
 /*** Global kva allocator ***/
+
+/*
+ * 全局 KVA 分配器管理的是虚拟地址，不是物理页。空闲 vmap_area 同时进入增强
+ * 红黑树和地址有序链表：树按 subtree_max_size 剪枝寻找最低可用洞，链表 O(1)
+ * 取得左右邻居用于合并。两者是同一逻辑索引，必须在 free_vmap_area_lock 下
+ * 原子更新；只更新一边会导致重复分配或永久碎片。
+ *
+ * busy/lazy 区域再按虚拟地址分散到多个 vmap_node，降低全局锁竞争。这里的 node
+ * 是软件锁分片，不是 NUMA node。小型完整空闲区间还可进入精确尺寸 pool，省去
+ * 树搜索；压力路径会衰减 pool，把地址重新交回全局合并树。
+ */
 
 #define DEBUG_AUGMENT_PROPAGATE_CHECK 0
 #define DEBUG_AUGMENT_LOWEST_MATCH_CHECK 0
@@ -878,6 +1104,8 @@ static bool vmap_initialized __read_mostly;
  * free block.
  */
 static struct kmem_cache *vmap_area_cachep;
+
+/* 描述符使用专用 slab cache；中间切割空闲块时可预取第二个描述符，避免锁内睡眠。 */
 
 /*
  * This linked list is used in pair with free_vmap_area_root.
@@ -916,6 +1144,8 @@ struct rb_list {
 	spinlock_t lock;
 };
 
+/* rb_list 把红黑树、同序链表和保护锁封装成一个不可分割的区间索引。 */
+
 /*
  * A fast size storage contains VAs up to 1M size. A pool consists
  * of linked between each other ready to go VAs of certain sizes.
@@ -952,6 +1182,11 @@ static struct vmap_node {
 } single;
 
 /*
+ * 启动早期只有 single node，避免初始化分配器本身时产生循环依赖；正式初始化后
+ * 再按机器规模扩展分片。性能随初始化阶段变化，但地址分配语义保持不变。
+ */
+
+/*
  * Initial setup consists of one single node, i.e. a balancing
  * is fully disabled. Later on, after vmap is initialized these
  * parameters are updated based on a system capacity.
@@ -968,6 +1203,7 @@ static __read_mostly unsigned int vmap_zone_size = 1;
 static inline unsigned int
 addr_to_node_id(unsigned long addr)
 {
+	/* 地址按固定 zone 条带化，再轮转到 node；相邻 zone 因此落到不同锁分片。 */
 	return (addr / vmap_zone_size) % nr_vmap_nodes;
 }
 
@@ -1006,6 +1242,7 @@ node_to_id(struct vmap_node *node)
 static unsigned int
 encode_vn_id(unsigned int node_id)
 {
+	/* 低字节保存 VMAP 类型；node id 加一后放高位，编码 0 保留为“无来源”。 */
 	/* Can store U8_MAX [0:254] nodes. */
 	if (node_id < nr_vmap_nodes)
 		return (node_id + 1) << BITS_PER_BYTE;
@@ -1023,6 +1260,7 @@ encode_vn_id(unsigned int node_id)
 static unsigned int
 decode_vn_id(unsigned int val)
 {
+	/* 编码 0 减一后自然成为 UINT_MAX，最终由有效性检查转换成无效 node 哨兵。 */
 	unsigned int node_id = (val >> BITS_PER_BYTE) - 1;
 
 	/* Can store U8_MAX [0:254] nodes. */
@@ -1070,6 +1308,10 @@ static DECLARE_WORK(drain_vmap_work, drain_vmap_area_work);
 
 static __cacheline_aligned_in_smp atomic_long_t vmap_lazy_nr;
 
+/*
+ * 在按 va_start 排序的树中查找“包含 addr”的区间。返回指针不自动获得引用，
+ * 内部调用者通常必须持有对应 node 锁，避免 vfree 并发摘除并释放描述符。
+ */
 static struct vmap_area *__find_vmap_area(unsigned long addr, struct rb_root *root)
 {
 	struct rb_node *n = root->rb_node;
@@ -1127,6 +1369,11 @@ __find_vmap_area_exceed_addr(unsigned long addr, struct rb_root *root)
 static struct vmap_node *
 find_vmap_area_exceed_addr_lock(unsigned long addr, struct vmap_area **va)
 {
+	/*
+	 * vread 需要找到所有分片中第一个 end 超过 addr 的区间。第一轮逐 node 只记录
+	 * 最低候选地址并释放锁，第二轮重新锁定候选所属 node 并验证；若候选并发消失
+	 * 就重搜。成功返回时锁保持持有，把查找与消费之间的 TOCTOU 窗口关闭。
+	 */
 	unsigned long va_start_lowest;
 	struct vmap_node *vn;
 
@@ -1177,6 +1424,11 @@ find_va_links(struct vmap_area *va,
 	struct rb_root *root, struct rb_node *from,
 	struct rb_node **parent)
 {
+	/*
+	 * 一次搜索同时确定 parent/左右 child 槽并检查区间重叠。返回 rb_node ** 让
+	 * rb_link_node 可直接写入目标槽；NULL 表示发现 overlap，这是内部索引损坏，
+	 * 不是普通的空间不足。
+	 */
 	struct vmap_area *tmp_va;
 	struct rb_node **link;
 
@@ -1222,6 +1474,7 @@ find_va_links(struct vmap_area *va,
 static __always_inline struct list_head *
 get_va_next_sibling(struct rb_node *parent, struct rb_node **link)
 {
+	/* 根据待插入的 child 槽推导地址有序链表中的后继，供合并同时检查左右邻居。 */
 	struct list_head *list;
 
 	if (unlikely(!parent))
@@ -1242,6 +1495,11 @@ __link_va(struct vmap_area *va, struct rb_root *root,
 	struct rb_node *parent, struct rb_node **link,
 	struct list_head *head, bool augment)
 {
+	/*
+	 * parent/link 不仅决定树位置，也能推导地址有序链表的前驱。先连接并平衡树，
+	 * 再把同一对象插入链表；整个过程由调用者持锁，读者不会看到半更新索引。
+	 * free tree 使用 augmented 插入，busy/lazy tree 使用普通红黑树插入。
+	 */
 	/*
 	 * VA is still not in the list, but we can
 	 * identify its future previous list_head node.
@@ -1282,6 +1540,7 @@ link_va(struct vmap_area *va, struct rb_root *root,
 	struct rb_node *parent, struct rb_node **link,
 	struct list_head *head)
 {
+	/* busy/lazy tree 不按空洞容量搜索，无需维护 subtree_max_size。 */
 	__link_va(va, root, parent, link, head, false);
 }
 
@@ -1290,12 +1549,17 @@ link_va_augment(struct vmap_area *va, struct rb_root *root,
 	struct rb_node *parent, struct rb_node **link,
 	struct list_head *head)
 {
+	/* free tree 插入必须走增强回调，否则 first-fit 可能错误剪掉可用子树。 */
 	__link_va(va, root, parent, link, head, true);
 }
 
 static __always_inline void
 __unlink_va(struct vmap_area *va, struct rb_root *root, bool augment)
 {
+	/*
+	 * 删除必须与插入类型配对：free tree 的旋转需要同步修复最大空洞，普通树则不
+	 * 维护增强值。最后清除 rb_node 链接状态，可检测同一描述符被重复删除。
+	 */
 	if (WARN_ON(RB_EMPTY_NODE(&va->rb_node)))
 		return;
 
@@ -1312,12 +1576,14 @@ __unlink_va(struct vmap_area *va, struct rb_root *root, bool augment)
 static __always_inline void
 unlink_va(struct vmap_area *va, struct rb_root *root)
 {
+	/* 普通索引删除只维护红黑树平衡与地址链表。 */
 	__unlink_va(va, root, false);
 }
 
 static __always_inline void
 unlink_va_augment(struct vmap_area *va, struct rb_root *root)
 {
+	/* 空闲索引删除额外维护祖先最大洞信息。 */
 	__unlink_va(va, root, true);
 }
 
@@ -1328,6 +1594,7 @@ unlink_va_augment(struct vmap_area *va, struct rb_root *root)
 static __always_inline unsigned long
 compute_subtree_max_size(struct vmap_area *va)
 {
+	/* 调试构建从节点自身及两个子树独立重算真值，用来校验增量维护结果。 */
 	return max3(va_size(va),
 		get_subtree_max_size(va->rb_node.rb_left),
 		get_subtree_max_size(va->rb_node.rb_right));
@@ -1336,6 +1603,7 @@ compute_subtree_max_size(struct vmap_area *va)
 static void
 augment_tree_propagate_check(void)
 {
+	/* 地址链表覆盖所有 free 节点，适合低频调试时做全树不变量审计。 */
 	struct vmap_area *va;
 	unsigned long computed_size;
 
@@ -1379,6 +1647,10 @@ static __always_inline void
 augment_tree_propagate_from(struct vmap_area *va)
 {
 	/*
+	 * 区间 start/end 改变后，节点到根路径上的 subtree_max_size 可能失效。回调
+	 * 自底向上重算，遇到值未变化即可提前停止，避免每次都扫描整棵树。
+	 */
+	/*
 	 * Populate the tree from bottom towards the root until
 	 * the calculated maximum available size of checked node
 	 * is equal to its current one.
@@ -1394,6 +1666,7 @@ static void
 insert_vmap_area(struct vmap_area *va,
 	struct rb_root *root, struct list_head *head)
 {
+	/* 查找唯一不重叠插槽并原子更新普通树/链表；重叠时 find_va_links 已报警。 */
 	struct rb_node **link;
 	struct rb_node *parent;
 
@@ -1407,6 +1680,7 @@ insert_vmap_area_augment(struct vmap_area *va,
 	struct rb_node *from, struct rb_root *root,
 	struct list_head *head)
 {
+	/* from 可把分裂后的新余块从已知邻近节点开始定位，避免重新从根搜索。 */
 	struct rb_node **link;
 	struct rb_node *parent;
 
@@ -1436,6 +1710,11 @@ static __always_inline struct vmap_area *
 __merge_or_add_vmap_area(struct vmap_area *va,
 	struct rb_root *root, struct list_head *head, bool augment)
 {
+	/*
+	 * 释放区间必须与左右相邻空闲块尽可能合并，维持“空闲区间互不相邻”的规范
+	 * 形式。若先与 next 合并、随后还要与 prev 合并，必须先把 next 从树中摘除，
+	 * 再扩展 prev；否则增强值传播可能基于一个已改变身份的树节点。
+	 */
 	struct vmap_area *sibling;
 	struct list_head *next;
 	struct rb_node **link;
@@ -1520,6 +1799,7 @@ static __always_inline struct vmap_area *
 merge_or_add_vmap_area(struct vmap_area *va,
 	struct rb_root *root, struct list_head *head)
 {
+	/* 普通树版本用于不依赖空洞容量的索引。 */
 	return __merge_or_add_vmap_area(va, root, head, false);
 }
 
@@ -1527,6 +1807,7 @@ static __always_inline struct vmap_area *
 merge_or_add_vmap_area_augment(struct vmap_area *va,
 	struct rb_root *root, struct list_head *head)
 {
+	/* free tree 合并后以最终存活节点为起点修复祖先增强值。 */
 	va = __merge_or_add_vmap_area(va, root, head, true);
 	if (va)
 		augment_tree_propagate_from(va);
@@ -1538,6 +1819,7 @@ static __always_inline bool
 is_within_this_va(struct vmap_area *va, unsigned long size,
 	unsigned long align, unsigned long vstart)
 {
+	/* 把请求起点推进到 max(洞起点,vstart) 后对齐，并显式防范加法回绕。 */
 	unsigned long nva_start_addr;
 
 	if (va->va_start > vstart)
@@ -1564,6 +1846,11 @@ static __always_inline struct vmap_area *
 find_vmap_lowest_match(struct rb_root *root, unsigned long size,
 	unsigned long align, unsigned long vstart, bool adjust_search_size)
 {
+	/*
+	 * 搜索目标是地址最低的合法 first-fit。subtree_max_size 能排除容量不足的整棵
+	 * 子树；对齐和 vstart 又可能使“容量够”的节点实际不可用，因此算法必要时
+	 * 回溯祖先并进入尚未检查的右子树。size+align-1 是对齐损耗的保守上界。
+	 */
 	struct vmap_area *va;
 	struct rb_node *node;
 	unsigned long length;
@@ -1675,6 +1962,7 @@ static __always_inline enum fit_type
 classify_va_fit_type(struct vmap_area *va,
 	unsigned long nva_start_addr, unsigned long size)
 {
+	/* 分类决定裁剪需要零、一个还是两个余块；NOTHING_FIT 表示搜索不变量已破坏。 */
 	enum fit_type type;
 
 	/* Check if it is within VA. */
@@ -1702,6 +1990,11 @@ va_clip(struct rb_root *root, struct list_head *head,
 		struct vmap_area *va, unsigned long nva_start_addr,
 		unsigned long size)
 {
+	/*
+	 * 从命中的空闲区间扣除请求范围。完整命中删除节点；贴左/右边只缩一个边界；
+	 * 从中间切割会产生两个余块，需要额外 vmap_area。成功后所有余块仍在树/链表
+	 * 中有序且增强值正确，所请求范围则完全从 free 索引消失。
+	 */
 	struct vmap_area *lva = NULL;
 	enum fit_type type = classify_va_fit_type(va, nva_start_addr, size);
 
@@ -1803,6 +2096,7 @@ va_alloc(struct vmap_area *va,
 		unsigned long size, unsigned long align,
 		unsigned long vstart, unsigned long vend)
 {
+	/* 将候选洞转换为已对齐地址，并在裁剪 free tree 前最后验证调用者 vend 上界。 */
 	unsigned long nva_start_addr;
 	int ret;
 
@@ -1832,6 +2126,10 @@ __alloc_vmap_area(struct rb_root *root, struct list_head *head,
 	unsigned long size, unsigned long align,
 	unsigned long vstart, unsigned long vend)
 {
+	/*
+	 * 增强树搜索先得到最低候选洞，va_alloc 再执行不可逆裁剪。短且精确限定的窗口
+	 * 不能用 align-1 扩大搜索长度，否则本来恰好可容纳的洞会被错误剪枝。
+	 */
 	bool adjust_search_size = true;
 	unsigned long nva_start_addr;
 	struct vmap_area *va;
@@ -1867,6 +2165,10 @@ __alloc_vmap_area(struct rb_root *root, struct list_head *head,
  */
 static void free_vmap_area(struct vmap_area *va)
 {
+	/*
+	 * 用于尚不需要 lazy TLB 协议的回滚/纯地址释放：先从所属 busy 分片摘除，再在
+	 * 全局 free 锁下合并。调用者必须保证页表已不存在或从未建立。
+	 */
 	struct vmap_node *vn = addr_to_node(va->va_start);
 
 	/*
@@ -1887,6 +2189,10 @@ static void free_vmap_area(struct vmap_area *va)
 static inline void
 preload_this_cpu_lock(spinlock_t *lock, gfp_t gfp_mask, int node)
 {
+	/*
+	 * 中间裁剪需要额外描述符，但 free-tree 自旋锁内不能睡眠分配。先在锁外预取，
+	 * 再持锁以 cmpxchg 放入 per-CPU 单槽；竞争输掉的临时对象立即释放。
+	 */
 	struct vmap_area *va = NULL, *tmp;
 
 	/*
@@ -1911,6 +2217,7 @@ preload_this_cpu_lock(spinlock_t *lock, gfp_t gfp_mask, int node)
 static struct vmap_pool *
 size_to_va_pool(struct vmap_node *vn, unsigned long size)
 {
+	/* 小区间按精确页数分桶；超过上限不缓存，直接回全局 free tree 以利合并。 */
 	unsigned int idx = (size - 1) / PAGE_SIZE;
 
 	if (idx < MAX_VA_SIZE_PAGES)
@@ -1922,6 +2229,7 @@ size_to_va_pool(struct vmap_node *vn, unsigned long size)
 static bool
 node_pool_add_va(struct vmap_node *n, struct vmap_area *va)
 {
+	/* pool 保存已完成必要 flush、可立即复用的完整 VA；len 供无锁 shrinker 估算。 */
 	struct vmap_pool *vp;
 
 	vp = size_to_va_pool(n, va_size(va));
@@ -1941,6 +2249,10 @@ node_pool_del_va(struct vmap_node *vn, unsigned long size,
 		unsigned long align, unsigned long vstart,
 		unsigned long vend)
 {
+	/*
+	 * 只查精确尺寸桶以保持 O(1)。首项若不满足本次更强对齐，就轮转到尾部而不扫描
+	 * 整桶，控制热路径延迟；范围校验失败意味着 pool 污染，报警且不返回该对象。
+	 */
 	struct vmap_area *va = NULL;
 	struct vmap_pool *vp;
 	int err = 0;
@@ -1983,6 +2295,10 @@ node_alloc(unsigned long size, unsigned long align,
 		unsigned long vstart, unsigned long vend,
 		unsigned long *addr, unsigned int *vn_id)
 {
+	/*
+	 * 节点 pool 只服务完整标准 vmalloc 窗口，特殊窗口仍需全局树精确搜索。CPU id
+	 * 选择回收亲和节点，编码后的 vn_id 随 allocation 传递，未来释放可回到同一 pool。
+	 */
 	struct vmap_area *va;
 
 	*vn_id = 0;
@@ -2009,6 +2325,7 @@ node_alloc(unsigned long size, unsigned long align,
 static inline void setup_vmalloc_vm(struct vm_struct *vm,
 	struct vmap_area *va, unsigned long flags, const void *caller)
 {
+	/* 将底层 VA 与高层 vm_struct 双向关联；调用者随后再填 pages/nr_pages 等资源字段。 */
 	vm->flags = flags;
 	vm->addr = (void *)va->va_start;
 	vm->size = vm->requested_size = va_size(va);
@@ -2026,6 +2343,11 @@ static struct vmap_area *alloc_vmap_area(unsigned long size,
 				int node, gfp_t gfp_mask,
 				unsigned long va_flags, struct vm_struct *vm)
 {
+	/*
+	 * 完整 VA 分配策略：先尝试 node 精确尺寸 pool，miss 后分配描述符并搜索全局
+	 * free tree；允许睡眠时，地址耗尽会先 purge lazy VA，再通知外部缓存释放空间。
+	 * 成功区间最终进入 busy tree 并建立 KASAN shadow；失败不留下可发现对象。
+	 */
 	struct vmap_node *vn;
 	struct vmap_area *va;
 	unsigned long freed;
@@ -2068,6 +2390,7 @@ static struct vmap_area *alloc_vmap_area(unsigned long size,
 	}
 
 retry:
+	/* 只有尚无可用地址时才持全局锁搜索；pool 命中直接跳过这一慢路径。 */
 	if (IS_ERR_VALUE(addr)) {
 		preload_this_cpu_lock(&free_vmap_area_lock, gfp_mask, node);
 		addr = __alloc_vmap_area(&free_vmap_area_root, &free_vmap_area_list,
@@ -2099,6 +2422,7 @@ retry:
 		goto out_free_va;
 	}
 
+	/* 地址确定后初始化描述符，并把来源 node 编入 flags，供释放后优先回填 pool。 */
 	va->va_start = addr;
 	va->va_end = addr + size;
 	va->vm = NULL;
@@ -2112,6 +2436,7 @@ retry:
 
 	vn = addr_to_node(va->va_start);
 
+	/* 插入 busy tree 是软件发布点：此后地址查询和诊断接口可以发现该区域。 */
 	spin_lock(&vn->busy.lock);
 	insert_vmap_area(va, &vn->busy.root, &vn->busy.head);
 	spin_unlock(&vn->busy.lock);
@@ -2122,6 +2447,7 @@ retry:
 
 	ret = kasan_populate_vmalloc(addr, size, gfp_mask);
 	if (ret) {
+		/* shadow 创建失败时区域尚未交给调用者，可同步从 busy 撤销并归还 free tree。 */
 		free_vmap_area(va);
 		return ERR_PTR(ret);
 	}
@@ -2129,6 +2455,10 @@ retry:
 	return va;
 
 overflow:
+	/*
+	 * 到这里仅持有未发布描述符，没有 VA、页表或物理页。回收只尝试有限阶段：
+	 * purge 一次，再调用 notifier；只有确实释放了地址才重试，避免无限回收循环。
+	 */
 	if (!purged) {
 		reclaim_and_purge_vmap_areas();
 		purged = 1;
@@ -2182,6 +2512,10 @@ EXPORT_SYMBOL_GPL(unregister_vmap_purge_notifier);
  */
 static unsigned long lazy_max_pages(void)
 {
+	/*
+	 * lazy 阈值按在线 CPU 数的对数增长。更大的批次可减少全局 TLB shootdown，
+	 * 但会更久占住不可复用 VA；对数而非线性扩张限制超大机器的回收延迟尖峰。
+	 */
 	unsigned int log;
 
 	log = fls(num_online_cpus());
@@ -2217,6 +2551,10 @@ reclaim_list_global(struct list_head *head)
 static void
 decay_va_pool_node(struct vmap_node *vn, bool full_decay)
 {
+	/*
+	 * 普通回收从每个尺寸 pool 抽走约四分之一，保留热缓存；地址耗尽时 full_decay
+	 * 全部抽走。整条链表先在锁下交换到本地，再在锁外合并，避免长时间持锁。
+	 */
 	LIST_HEAD(decay_list);
 	struct rb_root decay_root = RB_ROOT;
 	struct vmap_area *va, *nva;
@@ -2335,6 +2673,11 @@ static void purge_vmap_node(struct work_struct *work)
 static bool __purge_vmap_area_lazy(unsigned long start, unsigned long end,
 		bool full_pool_decay)
 {
+	/*
+	 * 先把各 node 的 lazy tree 原子摘到私有 purge_list，计算覆盖范围并执行一次
+	 * 全局 TLB flush，之后才把 VA 放回 pool/free tree。顺序不能交换：若先复用
+	 * VA，其他 CPU 的旧 TLB 项可能访问新对象或已经释放的物理页。
+	 */
 	unsigned long nr_purged_areas = 0;
 	unsigned int nr_purge_helpers;
 	static cpumask_t purge_nodes;
@@ -2438,6 +2781,11 @@ static void drain_vmap_area_work(struct work_struct *work)
  */
 static void free_vmap_area_noflush(struct vmap_area *va)
 {
+	/*
+	 * 页表已拆但 TLB 尚未 flush，VA 只能进入 lazy tree，不能立即回 free tree。
+	 * 全局计数达到阈值时只调度后台 drain，释放热路径不直接承担跨 CPU shootdown。
+	 * flags 中保存的来源 node 让 purge 后的小区间优先回原 size pool。
+	 */
 	unsigned long nr_lazy_max = lazy_max_pages();
 	unsigned long va_start = va->va_start;
 	unsigned int vn_id = decode_vn_id(va->flags);
@@ -2473,6 +2821,10 @@ static void free_vmap_area_noflush(struct vmap_area *va)
  */
 static void free_unmap_vmap_area(struct vmap_area *va)
 {
+	/*
+	 * 正常释放的映射阶段依次为：处理旧 cache 别名、清页表、进入 lazy VA 回收。
+	 * backing pages 此时仍存在，随后由 vfree 的所有权路径释放；vunmap 则不拥有页。
+	 */
 	flush_cache_vunmap(va->va_start, va->va_end);
 	vunmap_range_noflush(va->va_start, va->va_end);
 	if (debug_pagealloc_enabled_static())
@@ -2547,6 +2899,17 @@ static struct vmap_area *find_unlink_vmap_area(unsigned long addr)
 /*** Per cpu kva allocator ***/
 
 /*
+ * vm_map_ram 常映射少量页且生命周期很短。如果每次都进入全局增强树，描述符分配、
+ * 树锁和邻居合并成本会压过实际映射工作。这里先从全局分配 VMAP_BLOCK_SIZE 大块，
+ * 再用 bitmap 按 2^order 页切分，形成针对虚拟地址的小对象分配器。
+ *
+ * block 内有三个概念：used_map 表示调用者仍拥有的子区间；free 表示从未映射、
+ * 可立即分配的尾部；dirty 表示页表已拆但旧 TLB alias 可能存在的空间。dirty
+ * 在 flush 前绝不能重新计入 free。收益是热路径低延迟，代价是块内碎片和更复杂
+ * 的延迟回收状态机，因此大请求仍直接使用全局 VA 分配器。
+ */
+
+/*
  * vmap space is limited especially on 32 bit architectures. Ensure there is
  * room for at least 16 percpu vmap blocks per CPU.
  */
@@ -2596,6 +2959,12 @@ struct vmap_block_queue {
 	struct xarray vmap_blocks;
 };
 
+/*
+ * queue 的 free 链表供当前 CPU 快速扫描仍有容量的 block；xarray 则按地址反查
+ * block，供任意 CPU 执行 free。per-CPU 数组在反查路径里被当作 hash buckets，
+ * bucket 编号不表示释放操作必须运行在对应 CPU。
+ */
+
 struct vmap_block {
 	spinlock_t lock;
 	struct vmap_area *va;
@@ -2607,6 +2976,11 @@ struct vmap_block {
 	struct list_head purge;
 	unsigned int cpu;
 };
+
+/*
+ * vb->lock 保护 bitmap、free/dirty 计数和 dirty 边界；queue lock 只保护 free_list。
+ * 对象从 xarray/free_list 摘除后仍可能被 RCU 读者持有，因此最终使用 kfree_rcu。
+ */
 
 /* Queue of free and dirty vmap blocks, for allocation and flushing purposes */
 static DEFINE_PER_CPU(struct vmap_block_queue, vmap_block_queue);
@@ -2650,6 +3024,10 @@ static DEFINE_PER_CPU(struct vmap_block_queue, vmap_block_queue);
 static struct xarray *
 addr_to_vb_xa(unsigned long addr)
 {
+	/*
+	 * 地址按 block 大小散列到 possible CPU 对应的 xarray。possible mask 可能有洞，
+	 * 因而需要跳到下一个有效编号；插入、查询和删除必须使用完全相同的映射规则。
+	 */
 	int index = (addr / VMAP_BLOCK_SIZE) % nr_cpu_ids;
 
 	/*
@@ -2696,6 +3074,11 @@ static void *vmap_block_vaddr(unsigned long va_start, unsigned long pages_off)
  */
 static void *new_vmap_block(unsigned int order, gfp_t gfp_mask)
 {
+	/*
+	 * 创建顺序是：分配 block 元数据、从全局 VA 取得整块、初始化首个已用子区间、
+	 * 发布到地址 xarray、最后发布到 RCU free_list。任一步失败只回滚已取得的前缀
+	 * 资源；两个索引都发布后，分配和释放路径才都能发现该 block。
+	 */
 	struct vmap_block_queue *vbq;
 	struct vmap_block *vb;
 	struct vmap_area *va;
@@ -2758,6 +3141,10 @@ static void *new_vmap_block(unsigned int order, gfp_t gfp_mask)
 
 static void free_vmap_block(struct vmap_block *vb)
 {
+	/*
+	 * 先从 xarray 取消地址反查，再从全局 busy tree 摘除整块 VA，随后进入 lazy
+	 * TLB 回收。元数据延迟到 RCU 宽限期后释放，避免并发分配扫描发生 UAF。
+	 */
 	struct vmap_node *vn;
 	struct vmap_block *tmp;
 	struct xarray *xa;
@@ -2778,6 +3165,11 @@ static void free_vmap_block(struct vmap_block *vb)
 static bool purge_fragmented_block(struct vmap_block *vb,
 		struct list_head *purge_list, bool force_purge)
 {
+	/*
+	 * 只有已无 used 子区间的 block 才能整体 purge。普通路径还要求可立即使用的
+	 * free 少于容量四分之一，避免销毁仍有价值的缓存；强制回收忽略该阈值。
+	 * 先把 free 置零、dirty 置满，作为门闩阻止新的分配和重复 purge。
+	 */
 	struct vmap_block_queue *vbq = &per_cpu(vmap_block_queue, vb->cpu);
 
 	if (vb->free + vb->dirty != VMAP_BBMAP_BITS ||
@@ -2803,6 +3195,10 @@ static bool purge_fragmented_block(struct vmap_block *vb,
 
 static void free_purged_blocks(struct list_head *purge_list)
 {
+	/*
+	 * purge_list 是本轮扫描的私有工作队列：扫描阶段只在各 block 锁下摘除，
+	 * 真正修改全局 VA 树和安排 RCU 释放放到锁外执行，缩短细粒度锁持有时间。
+	 */
 	struct vmap_block *vb, *n_vb;
 
 	list_for_each_entry_safe(vb, n_vb, purge_list, purge) {
@@ -2813,6 +3209,10 @@ static void free_purged_blocks(struct list_head *purge_list)
 
 static void purge_fragmented_blocks(int cpu)
 {
+	/*
+	 * 对一个 queue 做强制碎片回收。RCU 保证遍历期间 block 不消失；无锁读取仅作
+	 * 快速筛选，命中后必须在 vb->lock 下重新判断，不能把 READ_ONCE 当作提交条件。
+	 */
 	LIST_HEAD(purge);
 	struct vmap_block *vb;
 	struct vmap_block_queue *vbq = &per_cpu(vmap_block_queue, cpu);
@@ -2831,11 +3231,13 @@ static void purge_fragmented_blocks(int cpu)
 		spin_unlock(&vb->lock);
 	}
 	rcu_read_unlock();
+	/* free_vmap_block 会触碰全局索引，故不在 RCU 遍历和 vb 锁的嵌套区执行。 */
 	free_purged_blocks(&purge);
 }
 
 static void purge_fragmented_blocks_allcpus(void)
 {
+	/* possible CPU 的 queue 即使当前离线也可能保存历史 block，不能只扫 online CPU。 */
 	int cpu;
 
 	for_each_possible_cpu(cpu)
@@ -2844,6 +3246,11 @@ static void purge_fragmented_blocks_allcpus(void)
 
 static void *vb_alloc(unsigned long size, gfp_t gfp_mask)
 {
+	/*
+	 * 分配只使用 block 尚未触碰的连续尾部，不搜索中间 dirty 洞。这样扫描和分配
+	 * 都是常量级 bitmap 更新，但内部碎片要等 purge 才能回收。RCU 稳定链表存储，
+	 * vb->lock 在命中后重新验证容量并提交 bitmap/计数变化。
+	 */
 	struct vmap_block_queue *vbq;
 	struct vmap_block *vb;
 	void *vaddr = NULL;
@@ -2900,6 +3307,10 @@ static void *vb_alloc(unsigned long size, gfp_t gfp_mask)
 
 static void vb_free(unsigned long addr, unsigned long size)
 {
+	/*
+	 * 释放先清 used_map 并拆页表，再把范围加入 dirty，而不是 free。只有统一 TLB
+	 * flush 后地址才可复用。debug_pagealloc 要求更强的立即失效保证，因此单独 flush。
+	 */
 	unsigned long offset;
 	unsigned int order;
 	struct vmap_block *vb;
@@ -2942,6 +3353,12 @@ static void vb_free(unsigned long addr, unsigned long size)
 
 static void _vm_unmap_aliases(unsigned long start, unsigned long end, int flush)
 {
+	/*
+	 * 这是 block dirty 状态与全局 lazy VA 回收的统一屏障。扫描把所有待失效区间
+	 * 合并成一个 [start,end)，先完成可整体销毁 block 的摘除，再让一次 TLB flush
+	 * 覆盖它们。vmap_purge_lock 串行化“收集 dirty 边界—清边界—执行 flush”，否则
+	 * 两个回收者可能都认为对方会负责同一批旧翻译。
+	 */
 	LIST_HEAD(purge_list);
 	int cpu;
 
@@ -2956,6 +3373,7 @@ static void _vm_unmap_aliases(unsigned long start, unsigned long end, int flush)
 		unsigned long idx;
 
 		rcu_read_lock();
+		/* xarray 按地址覆盖所有 block；这里不能只扫描 queue 的可分配链表。 */
 		xa_for_each(&vbq->vmap_blocks, idx, vb) {
 			spin_lock(&vb->lock);
 
@@ -2972,6 +3390,7 @@ static void _vm_unmap_aliases(unsigned long start, unsigned long end, int flush)
 				s = va_start + (vb->dirty_min << PAGE_SHIFT);
 				e = va_start + (vb->dirty_max << PAGE_SHIFT);
 
+				/* 扩大公共 flush 包络；可能多刷空洞，以换取一次跨 CPU shootdown。 */
 				start = min(s, start);
 				end   = max(e, end);
 
@@ -2987,6 +3406,10 @@ static void _vm_unmap_aliases(unsigned long start, unsigned long end, int flush)
 	}
 	free_purged_blocks(&purge_list);
 
+	/*
+	 * 全局 lazy purge 若已经执行了覆盖性 flush，就无需再刷 block 范围；否则只要
+	 * 扫描发现 dirty block，便在此补上 flush。清 dirty 边界发生在它之前。
+	 */
 	if (!__purge_vmap_area_lazy(start, end, false) && flush)
 		flush_tlb_kernel_range(start, end);
 	mutex_unlock(&vmap_purge_lock);
@@ -3007,6 +3430,7 @@ static void _vm_unmap_aliases(unsigned long start, unsigned long end, int flush)
  */
 void vm_unmap_aliases(void)
 {
+	/* 反向的初始区间使扫描到的第一个 dirty 范围自然成为最终包络。 */
 	_vm_unmap_aliases(ULONG_MAX, 0, 0);
 }
 EXPORT_SYMBOL_GPL(vm_unmap_aliases);
@@ -3018,6 +3442,11 @@ EXPORT_SYMBOL_GPL(vm_unmap_aliases);
  */
 void vm_unmap_ram(const void *mem, unsigned int count)
 {
+	/*
+	 * 调用者必须用与 vm_map_ram 完全相同的 base/count 释放，接口不保存独立长度。
+	 * 小映射由 block 元数据定位，大映射由全局 busy tree 定位；两条路径最终都只
+	 * 延迟回收虚拟地址，pages 的生命周期始终归调用者。
+	 */
 	unsigned long size = (unsigned long)count << PAGE_SHIFT;
 	unsigned long addr = (unsigned long)kasan_reset_tag(mem);
 	struct vmap_area *va;
@@ -3028,14 +3457,17 @@ void vm_unmap_ram(const void *mem, unsigned int count)
 	BUG_ON(addr > VMALLOC_END);
 	BUG_ON(!PAGE_ALIGNED(addr));
 
+	/* 先撤销检测器可访问性，避免页表拆除窗口内的 use-after-unmap 被漏报。 */
 	kasan_poison_vmalloc(mem, size);
 
 	if (likely(count <= VMAP_MAX_ALLOC)) {
+		/* block 路径由地址反查所属 block，并把子区间转为 dirty。 */
 		debug_check_no_locks_freed(mem, size);
 		vb_free(addr, size);
 		return;
 	}
 
+	/* 大映射在 busy tree 中是独立 vmap_area，先摘除以阻止再次查到。 */
 	va = find_unlink_vmap_area(addr);
 	if (WARN_ON_ONCE(!va))
 		return;
@@ -3061,17 +3493,25 @@ EXPORT_SYMBOL(vm_unmap_ram);
  */
 void *vm_map_ram(struct page **pages, unsigned int count, int node)
 {
+	/*
+	 * 此 API 只建立 pages[] 到连续 KVA 的临时视图，不分配也不接管物理页。小请求
+	 * 走 per-CPU block 缓存；大请求绕过 block，避免一个长寿命对象钉住整块空间。
+	 * 映射失败必须调用对称 unmap 路径，因为此时 VA 已经发布到相应分配器。
+	 */
 	unsigned long size = (unsigned long)count << PAGE_SHIFT;
 	unsigned long addr;
 	void *mem;
 
 	if (likely(count <= VMAP_MAX_ALLOC)) {
+		/* 阈值以内优先减少全局树锁竞争，但代价是可能留下 block 内 dirty 碎片。 */
 		mem = vb_alloc(size, GFP_KERNEL);
 		if (IS_ERR(mem))
 			return NULL;
 		addr = (unsigned long)mem;
 	} else {
 		struct vmap_area *va;
+
+		/* 大对象拥有独立描述符，node 只影响管理结构的 NUMA 放置，不改变 pages。 */
 		va = alloc_vmap_area(size, PAGE_SIZE,
 				VMALLOC_START, VMALLOC_END,
 				node, GFP_KERNEL, VMAP_RAM,
@@ -3083,6 +3523,7 @@ void *vm_map_ram(struct page **pages, unsigned int count, int node)
 		mem = (void *)addr;
 	}
 
+	/* 到这里仅保留了 KVA；此调用才真正安装指向调用者 pages[] 的页表项。 */
 	if (vmap_pages_range(addr, addr + size, PAGE_KERNEL,
 				pages, PAGE_SHIFT) < 0) {
 		vm_unmap_ram(mem, count);
@@ -3102,8 +3543,14 @@ EXPORT_SYMBOL(vm_map_ram);
 
 static struct vm_struct *vmlist __initdata;
 
+/*
+ * vm_struct 是面向调用者的映射描述，vmap_area 是底层地址空间索引节点。启动早期
+ * 尚未建立并发树，只能把固定区域挂到临时有序 vmlist；vmalloc_init 后会迁移。
+ */
+
 static inline unsigned int vm_area_page_order(struct vm_struct *vm)
 {
+	/* page_order 描述 backing page/页表可采用的粒度；不支持 huge vmalloc 时恒为 0。 */
 #ifdef CONFIG_HAVE_ARCH_HUGE_VMALLOC
 	return vm->page_order;
 #else
@@ -3137,6 +3584,10 @@ static inline void set_vm_area_page_order(struct vm_struct *vm, unsigned int ord
  */
 void __init vm_area_add_early(struct vm_struct *vm)
 {
+	/*
+	 * 调用者已经选定地址，本函数只验证按地址排序且无重叠并插入。此阶段没有并发，
+	 * BUG_ON 表示启动期静态布局错误，而不是可恢复的运行时资源不足。
+	 */
 	struct vm_struct *tmp, **p;
 
 	BUG_ON(vmap_initialized);
@@ -3165,6 +3616,10 @@ void __init vm_area_add_early(struct vm_struct *vm)
  */
 void __init vm_area_register_early(struct vm_struct *vm, size_t align)
 {
+	/*
+	 * 从 VMALLOC_START 做 first-fit 扫描：跨过每个已登记区并重新对齐，找到首个洞。
+	 * 与运行期分配器分离可避免初始化它自身所依赖的数据结构时出现循环依赖。
+	 */
 	unsigned long addr = ALIGN(VMALLOC_START, align);
 	struct vm_struct *cur, **p;
 
@@ -3177,6 +3632,7 @@ void __init vm_area_register_early(struct vm_struct *vm, size_t align)
 	}
 
 	BUG_ON(addr > VMALLOC_END - vm->size);
+	/* 插入后立即建立 KASAN shadow；真实映射可稍后由早期调用者安装。 */
 	vm->addr = (void *)addr;
 	vm->next = *p;
 	*p = vm;
@@ -3190,6 +3646,7 @@ void clear_vm_uninitialized_flag(struct vm_struct *vm)
 	 * we should make sure that vm has proper values.
 	 * Pair with smp_rmb() in vread_iter() and vmalloc_info_show().
 	 */
+	/* 发布协议：先令 addr/pages 等字段全局可见，再让无锁读者看到“已初始化”。 */
 	smp_wmb();
 	vm->flags &= ~VM_UNINITIALIZED;
 }
@@ -3199,30 +3656,40 @@ struct vm_struct *__get_vm_area_node(unsigned long size,
 		unsigned long start, unsigned long end, int node,
 		gfp_t gfp_mask, const void *caller)
 {
+	/*
+	 * 本层只保留 KVA 并创建 vm_struct，不安装页表。requested_size 保留用户语义，
+	 * size 则会因映射粒度向上取整并可能追加 guard page；后续释放必须使用后者。
+	 * 返回的 area 已由 vmap_area->vm 关联，因而地址树查询能回到高层描述符。
+	 */
 	struct vmap_area *va;
 	struct vm_struct *area;
 	unsigned long requested_size = size;
 
 	BUG_ON(in_nmi() || in_hardirq());
+	/* 页表映射粒度决定可表示的最小范围；溢出到 0 也按失败处理。 */
 	size = ALIGN(size, 1ul << shift);
 	if (unlikely(!size))
 		return NULL;
 
 	if (flags & VM_IOREMAP)
+		/* I/O 映射按规模提高对齐，为架构使用更大页表项保留机会，同时设上限。 */
 		align = 1ul << clamp_t(int, get_count_order_long(size),
 				       PAGE_SHIFT, IOREMAP_MAX_ORDER);
 
+	/* 描述符分配不能继承与 slab 无关的 GFP 位，只保留 reclaim 语义。 */
 	area = kzalloc_node(sizeof(*area), gfp_mask & GFP_RECLAIM_MASK, node);
 	if (unlikely(!area))
 		return NULL;
 
 	if (!(flags & VM_NO_GUARD))
+		/* 尾部 guard page 保留但不映射，使顺序越界尽早 fault；它计入 VA 消耗。 */
 		size += PAGE_SIZE;
 
 	area->flags = flags;
 	area->caller = caller;
 	area->requested_size = requested_size;
 
+	/* 成功后底层 busy tree 已公开该区间，失败路径只需销毁尚未发布的 vm_struct。 */
 	va = alloc_vmap_area(size, align, start, end, node, gfp_mask, 0, area);
 	if (IS_ERR(va)) {
 		kfree(area);
@@ -3248,6 +3715,7 @@ struct vm_struct *__get_vm_area_caller(unsigned long size, unsigned long flags,
 				       unsigned long start, unsigned long end,
 				       const void *caller)
 {
+	/* 保留调用者指定窗口中的 KVA，默认基本页粒度、普通内核可回收分配语义。 */
 	return __get_vm_area_node(size, 1, PAGE_SHIFT, flags, start, end,
 				  NUMA_NO_NODE, GFP_KERNEL, caller);
 }
@@ -3265,6 +3733,7 @@ struct vm_struct *__get_vm_area_caller(unsigned long size, unsigned long flags,
  */
 struct vm_struct *get_vm_area(unsigned long size, unsigned long flags)
 {
+	/* 公共包装器限定在标准 vmalloc 窗口，并记录直接调用点以供 vmallocinfo 诊断。 */
 	return __get_vm_area_node(size, 1, PAGE_SHIFT, flags,
 				  VMALLOC_START, VMALLOC_END,
 				  NUMA_NO_NODE, GFP_KERNEL,
@@ -3274,6 +3743,7 @@ struct vm_struct *get_vm_area(unsigned long size, unsigned long flags)
 struct vm_struct *get_vm_area_caller(unsigned long size, unsigned long flags,
 				const void *caller)
 {
+	/* 与 get_vm_area 相同，但允许中间封装层保留真正资源所有者的 caller。 */
 	return __get_vm_area_node(size, 1, PAGE_SHIFT, flags,
 				  VMALLOC_START, VMALLOC_END,
 				  NUMA_NO_NODE, GFP_KERNEL, caller);
@@ -3291,6 +3761,7 @@ struct vm_struct *get_vm_area_caller(unsigned long size, unsigned long flags,
  */
 struct vm_struct *find_vm_area(const void *addr)
 {
+	/* 只接受区域起始地址语义；返回值借用 busy tree 中对象，调用者需自行保证生命周期。 */
 	struct vmap_area *va;
 
 	va = find_vmap_area((unsigned long)addr);
@@ -3312,6 +3783,11 @@ struct vm_struct *find_vm_area(const void *addr)
  */
 struct vm_struct *remove_vm_area(const void *addr)
 {
+	/*
+	 * 释放的线性化点是从 busy tree 摘除 vmap_area：此后新查询不会获得该映射。
+	 * 随后先撤销调试器/KASAN 元数据和页表，最后把 VA 放进 lazy 回收；返回的
+	 * vm_struct 仍由上层决定是仅释放描述符，还是连同 backing pages 一并释放。
+	 */
 	struct vmap_area *va;
 	struct vm_struct *vm;
 
@@ -3326,6 +3802,7 @@ struct vm_struct *remove_vm_area(const void *addr)
 		return NULL;
 	vm = va->vm;
 
+	/* 在内存失效前检查是否遗留锁或已跟踪对象，错误报告才能指向原地址。 */
 	debug_check_no_locks_freed(vm->addr, get_vm_area_size(vm));
 	debug_check_no_obj_freed(vm->addr, get_vm_area_size(vm));
 	kasan_free_module_shadow(vm);
@@ -3338,6 +3815,7 @@ struct vm_struct *remove_vm_area(const void *addr)
 static inline void set_area_direct_map(const struct vm_struct *area,
 				       int (*set_direct_map)(struct page *page))
 {
+	/* vmalloc 可用大页映射，但 direct map 权限 API 仍逐个 base page 处理。 */
 	int i;
 
 	/* HUGE_VMALLOC passes small pages to set_direct_map */
@@ -3351,6 +3829,11 @@ static inline void set_area_direct_map(const struct vm_struct *area,
  */
 static void vm_reset_perms(struct vm_struct *area)
 {
+	/*
+	 * VM_FLUSH_RESET_PERMS 用于曾修改 backing page direct-map 权限的映射。必须先把
+	 * direct map 设为 invalid，再统一清除 vmalloc alias 与 direct-map TLB，最后恢复
+	 * 默认权限；否则 CPU 可能在恢复过程中重新缓存一个旧的宽松翻译。
+	 */
 	unsigned long start = ULONG_MAX, end = 0;
 	unsigned int page_order = vm_area_page_order(area);
 	int flush_dmap = 0;
@@ -3360,6 +3843,7 @@ static void vm_reset_perms(struct vm_struct *area)
 	 * Find the start and end range of the direct mappings to make sure that
 	 * the vm_unmap_aliases() flush includes the direct map.
 	 */
+	/* pages[] 按 base page 记账，但相邻 2^order 项属于同一物理分配块。 */
 	for (i = 0; i < area->nr_pages; i += 1U << page_order) {
 		unsigned long addr = (unsigned long)page_address(area->pages[i]);
 
@@ -3385,6 +3869,7 @@ static void vm_reset_perms(struct vm_struct *area)
 
 static void delayed_vfree_work(struct work_struct *w)
 {
+	/* 原子上下文只入无锁链表；worker 在可睡眠上下文复用完整 vfree 路径。 */
 	struct vfree_deferred *p = container_of(w, struct vfree_deferred, wq);
 	struct llist_node *t, *llnode;
 
@@ -3401,6 +3886,10 @@ static void delayed_vfree_work(struct work_struct *w)
  */
 void vfree_atomic(const void *addr)
 {
+	/*
+	 * 地址本身的首字被临时当作 llist_node，因此调用后对象内容立即无效。只有空链表
+	 * 到非空的入队者调度 work，可将一批释放合并，且 lockless add 容忍任务迁移。
+	 */
 	struct vfree_deferred *p = raw_cpu_ptr(&vfree_deferred);
 
 	BUG_ON(in_nmi());
@@ -3430,12 +3919,14 @@ void vfree_atomic(const void *addr)
 static void vm_area_free_pages(struct vm_struct *vm, unsigned int start_idx,
 			       unsigned int end_idx)
 {
+	/* VM_MAP_PUT_PAGES 表示页来自调用者并转移引用，相关记账由对应所有权路径处理。 */
 	unsigned int i;
 
 	if (!(vm->flags & VM_MAP_PUT_PAGES)) {
 		for (i = start_idx; i < end_idx; i++)
 			mod_lruvec_page_state(vm->pages[i], NR_VMALLOC, -1);
 	}
+	/* bulk helper 释放各 base-page 引用；随后清槽位，支持部分收缩后的幂等清理。 */
 	free_pages_bulk(vm->pages + start_idx, end_idx - start_idx);
 
 	for (i = start_idx; i < end_idx; i++)
@@ -3461,6 +3952,11 @@ static void vm_area_free_pages(struct vm_struct *vm, unsigned int start_idx,
  */
 void vfree(const void *addr)
 {
+	/*
+	 * vfree 是“解除映射 + 释放 backing pages”的所有权 API。中断上下文不能执行树锁、
+	 * TLB 回收和页释放中的可睡眠操作，故转交 worker；进程上下文则同步撤销映射，
+	 * 必要时恢复 direct-map 权限，再按 pages[] 释放物理页与两层元数据。
+	 */
 	struct vm_struct *vm;
 
 	if (unlikely(in_interrupt())) {
@@ -3475,6 +3971,7 @@ void vfree(const void *addr)
 	if (!addr)
 		return;
 
+	/* remove_vm_area 已让地址不可查询并拆掉页表，但尚未释放 vm/pages。 */
 	vm = remove_vm_area(addr);
 	if (unlikely(!vm)) {
 		WARN(1, KERN_ERR "Trying to vfree() nonexistent vm area (%p)\n",
@@ -3502,6 +3999,10 @@ EXPORT_SYMBOL(vfree);
  */
 void vunmap(const void *addr)
 {
+	/*
+	 * vunmap 只销毁由 vmap 建立的视图，默认不拥有 pages[] 或物理页；因此与 vfree
+	 * 共用 remove_vm_area 后只释放 vm_struct。误把 vmalloc 地址传来会泄漏 backing 页。
+	 */
 	struct vm_struct *vm;
 
 	BUG_ON(in_interrupt());
@@ -3537,6 +4038,11 @@ EXPORT_SYMBOL(vunmap);
 void *vmap(struct page **pages, unsigned int count,
 	   unsigned long flags, pgprot_t prot)
 {
+	/*
+	 * vmap 将既有、可离散的 pages[] 投影成连续 KVA。默认所有权仍在调用者；仅当
+	 * VM_MAP_PUT_PAGES 被设置，描述符才保存数组并约定未来用 vfree 归还页面引用。
+	 * 映射强制 NX 变体，调用者不能借普通 vmap 随意制造可执行别名。
+	 */
 	struct vm_struct *area;
 	unsigned long addr;
 	unsigned long size;		/* In bytes */
@@ -3553,10 +4059,12 @@ void *vmap(struct page **pages, unsigned int count,
 	if (WARN_ON_ONCE(flags & VM_NO_GUARD))
 		flags &= ~VM_NO_GUARD;
 
+	/* 同时避免 count 左移溢出，并拒绝显然不可能满足的物理页规模。 */
 	if (count > totalram_pages())
 		return NULL;
 
 	size = (unsigned long)count << PAGE_SHIFT;
+	/* 第一阶段仅保留带 guard page 的地址；第二阶段才安装传入 pages 的 PTE。 */
 	area = get_vm_area_caller(size, flags, __builtin_return_address(0));
 	if (!area)
 		return NULL;
@@ -3569,6 +4077,7 @@ void *vmap(struct page **pages, unsigned int count,
 	}
 
 	if (flags & VM_MAP_PUT_PAGES) {
+		/* 到映射成功后才提交所有权，失败时调用者仍可安全清理原 pages[]。 */
 		area->pages = pages;
 		area->nr_pages = count;
 	}
@@ -3585,6 +4094,10 @@ struct vmap_pfn_data {
 
 static int vmap_pfn_apply(pte_t *pte, unsigned long addr, void *private)
 {
+	/*
+	 * PFN 路径面向没有 struct page 的设备/特殊物理地址；有效普通 RAM PFN 被拒绝，
+	 * 防止绕开正常页引用和 cache 属性规则。special PTE 告诉 VM 不按普通页管理它。
+	 */
 	struct vmap_pfn_data *data = private;
 	unsigned long pfn = data->pfns[data->idx];
 	pte_t ptent;
@@ -3610,6 +4123,7 @@ static int vmap_pfn_apply(pte_t *pte, unsigned long addr, void *private)
  */
 void *vmap_pfn(unsigned long *pfns, unsigned int count, pgprot_t prot)
 {
+	/* 先保留 VM_IOREMAP 地址，再由通用页表 walker 逐 PTE 消费 PFN；失败整体回滚。 */
 	struct vmap_pfn_data data = { .pfns = pfns, .prot = pgprot_nx(prot) };
 	struct vm_struct *area;
 
@@ -3636,6 +4150,10 @@ EXPORT_SYMBOL_GPL(vmap_pfn);
  */
 static inline gfp_t vmalloc_gfp_adjust(gfp_t flags, const bool large)
 {
+	/*
+	 * vmalloc 本身有分级回退并会在最终失败处报告，底层高阶尝试无需刷屏；高阶
+	 * __GFP_NOFAIL 可能触发长期压缩/OOM，故只允许最小粒度阶段承担 nofail 语义。
+	 */
 	flags |= __GFP_NOWARN;
 	if (large)
 		flags &= ~__GFP_NOFAIL;
@@ -3646,6 +4164,11 @@ static inline unsigned int
 vm_area_alloc_pages(gfp_t gfp, int nid,
 		unsigned int order, unsigned int nr_pages, struct page **pages)
 {
+	/*
+	 * 物理页分配采用三级策略：先非阻塞地试较大 order 以利 huge mapping；order-0
+	 * 使用批量分配降低锁开销；剩余部分用更宽松的单次分配补齐。pages[] 始终按
+	 * base page 展开，令 vmalloc_to_page、统计及部分释放不依赖实际映射粒度。
+	 */
 	unsigned int nr_allocated = 0;
 	unsigned int nr_remaining = nr_pages;
 	unsigned int max_attempt_order = MAX_PAGE_ORDER;
@@ -3662,6 +4185,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
 	 * __vmap_pages_range() expects physically contigous pages of exactly
 	 * order long chunks.
 	 */
+	/* 大阶尝试不做 direct reclaim，失败就逐阶下降，避免优化性尝试造成抖动。 */
 	while (large_order > order && nr_remaining) {
 		if (nid == NUMA_NO_NODE)
 			page = alloc_pages_noprof(large_gfp, large_order);
@@ -3675,6 +4199,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
 
 		mod_lruvec_page_state(page, NR_VMALLOC, 1 << large_order);
 
+		/* 拆分复合分配的引用语义，但物理连续性仍在，可供后续大页页表映射。 */
 		split_page(page, large_order);
 		for (i = 0; i < (1U << large_order); i++)
 			pages[nr_allocated + i] = page + i;
@@ -3693,6 +4218,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
 	 * more permissive.
 	 */
 	if (!order) {
+		/* bulk 只优化 order-0；部分成功合法，余量留给后面的单页慢路径。 */
 		while (nr_allocated < nr_pages) {
 			unsigned int nr, nr_pages_request;
 			int i;
@@ -3734,6 +4260,7 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
 	}
 
 	/* High-order pages or fallback path if "bulk" fails. */
+	/* 这是高阶目标的正式分配路径，也是 bulk 未补齐时的兜底路径。 */
 	while (nr_allocated < nr_pages) {
 		if (!(gfp & __GFP_NOFAIL) && fatal_signal_pending(current))
 			break;
@@ -3775,6 +4302,10 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
 static LLIST_HEAD(pending_vm_area_cleanup);
 static void cleanup_vm_area_work(struct work_struct *work)
 {
+	/*
+	 * 错误清理可能来自受限 reclaim/原子语义的调用链，统一推迟到 worker。pages
+	 * 尚未分配时仅撤销 VA；一旦存在 pages[]，vfree 可按 nr_pages 清理部分成果。
+	 */
 	struct vm_struct *area, *tmp;
 	struct llist_node *head;
 
@@ -3797,6 +4328,7 @@ static void cleanup_vm_area_work(struct work_struct *work)
 static DECLARE_WORK(cleanup_vm_area, cleanup_vm_area_work);
 static void defer_vm_area_cleanup(struct vm_struct *area)
 {
+	/* 只由首个把全局链表从空变非空的提交者调度 worker，天然合并并发失败。 */
 	if (llist_add(&area->llnode, &pending_vm_area_cleanup))
 		schedule_work(&cleanup_vm_area);
 }
@@ -3819,6 +4351,10 @@ static void defer_vm_area_cleanup(struct vm_struct *area)
 unsigned int
 memalloc_apply_gfp_scope(gfp_t gfp_mask)
 {
+	/*
+	 * 页表分配器不直接接收外层 GFP，此处把 NOFS/NOIO/不回收约束写入 current，
+	 * 使嵌套分配遵守调用者的递归边界。cookie 必须在同一执行流中配对恢复。
+	 */
 	unsigned int flags = 0;
 
 	if (!gfpflags_allow_blocking(gfp_mask) ||
@@ -3844,6 +4380,11 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 				 pgprot_t prot, unsigned int page_shift,
 				 int node)
 {
+	/*
+	 * area 已占有 KVA；本函数完成 pages[] 元数据、物理页和页表三个后续阶段。
+	 * 任一阶段失败都不能就地做可能递归/睡眠的复杂释放，而把部分初始化对象交给
+	 * cleanup worker。成功前 VM_UNINITIALIZED 仍保留，无锁诊断读者会跳过它。
+	 */
 	const gfp_t nested_gfp = (gfp_mask & GFP_RECLAIM_MASK) | __GFP_ZERO;
 	bool nofail = gfp_mask & __GFP_NOFAIL;
 	unsigned long addr = (unsigned long)area->addr;
@@ -3864,6 +4405,7 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 		gfp_mask |= __GFP_HIGHMEM;
 
 	/* Please note that the recursion is strictly bounded. */
+	/* 大 pages[] 本身用 vmalloc，形成递归；其规模每层快速缩小，因此递归有界。 */
 	if (array_size > PAGE_SIZE) {
 		area->pages = __vmalloc_node_noprof(array_size, 1, nested_gfp, node,
 					area->caller);
@@ -3889,6 +4431,7 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 	 * Please note, the __vmalloc_node_range_noprof() falls-back
 	 * to order-0 pages if high-order attempt is unsuccessful.
 	 */
+	/* nr_pages 随成功进度更新，失败清理据此只释放实际取得的页面。 */
 	area->nr_pages = vm_area_alloc_pages(
 			vmalloc_gfp_adjust(gfp_mask, page_order), node,
 			page_order, nr_small_pages, area->pages);
@@ -3919,6 +4462,7 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 	 * page tables allocations ignore external gfp mask, enforce it
 	 * by the scope API
 	 */
+	/* 页表安装也会分配内存，先把外层 GFP 的 reclaim 限制传播到 current。 */
 	flags = memalloc_apply_gfp_scope(gfp_mask);
 	do {
 		ret = __vmap_pages_range(addr, addr + size, prot, area->pages,
@@ -3938,6 +4482,7 @@ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
 	return area->addr;
 
 fail:
+	/* area 仍挂在 busy tree；异步清理会选择 free_vm_area 或完整 vfree。 */
 	defer_vm_area_cleanup(area);
 	return NULL;
 }
@@ -4005,6 +4550,11 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
 			pgprot_t prot, unsigned long vm_flags, int node,
 			const void *caller)
 {
+	/*
+	 * vmalloc 的总控事务：先决定页表/物理页粒度，再保留 VA，随后分配 backing pages
+	 * 并安装页表，最后才向 KASAN、无锁诊断读者和 kmemleak 发布完整对象。大页只是
+	 * 优化路径，任何阶段失败都会把 shift 降回 PAGE_SHIFT 重做，保证功能不依赖大页。
+	 */
 	struct vm_struct *area;
 	void *ret;
 	kasan_vmalloc_flags_t kasan_flags = KASAN_VMALLOC_NONE;
@@ -4015,6 +4565,7 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
 	if (WARN_ON_ONCE(!size))
 		return NULL;
 
+	/* 在任何乘法和元数据分配前拒绝超过系统总页数的明显不可能请求。 */
 	if ((size >> PAGE_SHIFT) > totalram_pages()) {
 		warn_alloc(gfp_mask, NULL,
 			"vmalloc error: size %lu, exceeds total pages",
@@ -4030,6 +4581,7 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
 		 * supporting them.
 		 */
 
+		/* 架构能力、保护属性和大小共同决定候选 shift；并同步提高 VA 对齐。 */
 		if (arch_vmap_pmd_supported(prot) && size >= PMD_SIZE)
 			shift = PMD_SHIFT;
 		else
@@ -4039,6 +4591,7 @@ void *__vmalloc_node_range_noprof(unsigned long size, unsigned long align,
 	}
 
 again:
+	/* VM_UNINITIALIZED 是发布屏障的一部分：busy tree 可先看到 area，但不能读取半成品。 */
 	area = __get_vm_area_node(size, align, shift, VM_ALLOC |
 				  VM_UNINITIALIZED | vm_flags, start, end, node,
 				  gfp_mask & ~__GFP_SKIP_KASAN, caller);
@@ -4048,6 +4601,7 @@ again:
 			"vmalloc error: size %lu, vm_struct allocation failed%s",
 			size, (nofail) ? ". Retrying." : "");
 		if (nofail) {
+			/* nofail 通过让出 CPU 后重试实现，不在地址树锁内忙等。 */
 			schedule_timeout_uninterruptible(1);
 			goto again;
 		}
@@ -4064,6 +4618,7 @@ again:
 			 * Modify protection bits to allow tagging.
 			 * This must be done before mapping.
 			 */
+			/* 页表属性必须先支持 tag；物理页的 poison/zero 延后到统一 KASAN 步骤。 */
 			prot = arch_vmap_pgprot_tagged(prot);
 
 			/*
@@ -4079,6 +4634,7 @@ again:
 	}
 
 	/* Allocate physical pages and map them into vmalloc space. */
+	/* 此调用提交物理资源与页表，但 area 对观察者仍标记为未初始化。 */
 	ret = __vmalloc_area_node(area, gfp_mask, prot, shift, node);
 	if (!ret)
 		goto fail;
@@ -4096,6 +4652,7 @@ again:
 	    (gfp_mask & __GFP_SKIP_ZERO))
 		kasan_flags |= KASAN_VMALLOC_INIT;
 	/* KASAN_VMALLOC_PROT_NORMAL already set if required. */
+	/* 返回带 tag 的地址可能不同于 area 原始指针，必须保存它供后续对称释放。 */
 	if (!skip_vmalloc_kasan)
 		area->addr = kasan_unpoison_vmalloc(area->addr, size, kasan_flags);
 
@@ -4104,6 +4661,7 @@ again:
 	 * flag. It means that vm_struct is not fully initialized.
 	 * Now, it is fully initialized, so remove this flag here.
 	 */
+	/* release 式发布全部字段；vread/proc 侧以读屏障配对。 */
 	clear_vm_uninitialized_flag(area);
 
 	if (!(vm_flags & VM_DEFER_KMEMLEAK))
@@ -4113,6 +4671,7 @@ again:
 
 fail:
 	if (shift > PAGE_SHIFT) {
+		/* 高阶失败不改变 API 语义：恢复调用者对齐并从保留 VA 阶段完整重试。 */
 		shift = PAGE_SHIFT;
 		align = original_align;
 		goto again;
@@ -4140,6 +4699,7 @@ fail:
 void *__vmalloc_node_noprof(unsigned long size, unsigned long align,
 			    gfp_t gfp_mask, int node, const void *caller)
 {
+	/* 把常用全 vmalloc 窗口/PAGE_KERNEL 策略收敛到 range 总控函数。 */
 	return __vmalloc_node_range_noprof(size, align, VMALLOC_START, VMALLOC_END,
 				gfp_mask, PAGE_KERNEL, 0, node, caller);
 }
@@ -4154,6 +4714,7 @@ EXPORT_SYMBOL_GPL(__vmalloc_node_noprof);
 
 void *__vmalloc_noprof(unsigned long size, gfp_t gfp_mask)
 {
+	/* 通用可控 GFP 入口会过滤 vmalloc 无法兑现的标志，避免静默产生错误语义。 */
 	if (unlikely(gfp_mask & ~GFP_VMALLOC_SUPPORTED))
 		gfp_mask = vmalloc_fix_flags(gfp_mask);
 	return __vmalloc_node_noprof(size, 1, gfp_mask, NUMA_NO_NODE,
@@ -4175,6 +4736,7 @@ EXPORT_SYMBOL(__vmalloc_noprof);
  */
 void *vmalloc_noprof(unsigned long size)
 {
+	/* 默认接口选择 GFP_KERNEL、任意 NUMA 节点和最小对齐，适合绝大多数内核对象。 */
 	return __vmalloc_node_noprof(size, 1, GFP_KERNEL, NUMA_NO_NODE,
 				__builtin_return_address(0));
 }
@@ -4195,6 +4757,7 @@ EXPORT_SYMBOL(vmalloc_noprof);
  */
 void *vmalloc_huge_node_noprof(unsigned long size, gfp_t gfp_mask, int node)
 {
+	/* VM_ALLOW_HUGE_VMAP 仅授权尝试；不连续或架构不支持时总控路径自动退回基本页。 */
 	if (unlikely(gfp_mask & ~GFP_VMALLOC_SUPPORTED))
 		gfp_mask = vmalloc_fix_flags(gfp_mask);
 	return __vmalloc_node_range_noprof(size, 1, VMALLOC_START, VMALLOC_END,
@@ -4218,6 +4781,7 @@ EXPORT_SYMBOL_GPL(vmalloc_huge_node_noprof);
  */
 void *vzalloc_noprof(unsigned long size)
 {
+	/* 零填充通过 GFP 语义贯穿物理页与 KASAN 初始化路径，不在映射后另做一次 memset。 */
 	return __vmalloc_node_noprof(size, 1, GFP_KERNEL | __GFP_ZERO, NUMA_NO_NODE,
 				__builtin_return_address(0));
 }
@@ -4234,6 +4798,7 @@ EXPORT_SYMBOL(vzalloc_noprof);
  */
 void *vmalloc_user_noprof(unsigned long size)
 {
+	/* 用户可映射内存必须清零防信息泄漏，并按 SHMLBA 对齐满足架构共享映射约束。 */
 	return __vmalloc_node_range_noprof(size, SHMLBA,  VMALLOC_START, VMALLOC_END,
 				    GFP_KERNEL | __GFP_ZERO, PAGE_KERNEL,
 				    VM_USERMAP, NUMA_NO_NODE,
@@ -4256,6 +4821,7 @@ EXPORT_SYMBOL(vmalloc_user_noprof);
  */
 void *vmalloc_node_noprof(unsigned long size, int node)
 {
+	/* node 是优选放置而非绝对约束；需要强制节点时应在底层 GFP 中加入 THISNODE。 */
 	return __vmalloc_node_noprof(size, 1, GFP_KERNEL, node,
 			__builtin_return_address(0));
 }
@@ -4274,6 +4840,7 @@ EXPORT_SYMBOL(vmalloc_node_noprof);
  */
 void *vzalloc_node_noprof(unsigned long size, int node)
 {
+	/* NUMA 优选与零初始化的组合包装器，失败/回退语义仍由统一总控路径决定。 */
 	return __vmalloc_node_noprof(size, 1, GFP_KERNEL | __GFP_ZERO, node,
 				__builtin_return_address(0));
 }
@@ -4315,6 +4882,11 @@ EXPORT_SYMBOL(vzalloc_node_noprof);
 void *vrealloc_node_align_noprof(const void *p, size_t size, unsigned long align,
 				 gfp_t flags, int nid)
 {
+	/*
+	 * vrealloc 优先保持地址稳定：逻辑收缩只更新 requested_size，跨页收缩在安全条件
+	 * 下拆尾部映射并归还页，重新增长若仍落在已保留/已映射容量内也原地完成；只有
+	 * 容量、NUMA 强约束不满足时才分配复制。失败保持旧对象有效，符合 realloc 契约。
+	 */
 	struct vm_struct *vm = NULL;
 	size_t alloced_size = 0;
 	size_t old_size = 0;
@@ -4326,12 +4898,14 @@ void *vrealloc_node_align_noprof(const void *p, size_t size, unsigned long align
 	}
 
 	if (p) {
+		/* find_vm_area 返回借用对象；接口明确禁止与同一地址的 vfree/vrealloc 并发。 */
 		vm = find_vm_area(p);
 		if (unlikely(!vm)) {
 			WARN(1, "Trying to vrealloc() nonexistent vm area (%p)\n", p);
 			return NULL;
 		}
 
+		/* alloced_size 含当前可用映射容量，requested_size 是调用者可见的逻辑长度。 */
 		alloced_size = get_vm_area_size(vm);
 		old_size = vm->requested_size;
 		if (WARN(alloced_size < old_size,
@@ -4355,6 +4929,7 @@ void *vrealloc_node_align_noprof(const void *p, size_t size, unsigned long align
 		unsigned int new_nr_pages = PAGE_ALIGN(size) >> PAGE_SHIFT;
 
 		/* Zero out "freed" memory, potentially for future realloc. */
+		/* 即使暂不归还整页，也清除缩短尾部，防止未来原地扩展暴露旧内容。 */
 		if (want_init_on_free() || want_init_on_alloc(flags))
 			memset((void *)p + size, 0, old_size - size);
 
@@ -4389,6 +4964,7 @@ void *vrealloc_node_align_noprof(const void *p, size_t size, unsigned long align
 			 */
 			struct vmap_node *vn = addr_to_node(addr);
 
+			/* 先缩短公开 nr_pages，诊断读者便不会进入即将解除映射的尾部。 */
 			spin_lock(&vn->busy.lock);
 			vm->nr_pages = new_nr_pages;
 			spin_unlock(&vn->busy.lock);
@@ -4400,6 +4976,7 @@ void *vrealloc_node_align_noprof(const void *p, size_t size, unsigned long align
 				(unsigned long)(old_nr_pages - new_nr_pages)
 					<< PAGE_SHIFT);
 
+			/* kmemleak、页表、物理页按观察层次依次收缩，避免任何层引用已释放页。 */
 			vunmap_range(addr + ((unsigned long)new_nr_pages
 					     << PAGE_SHIFT),
 				     addr + ((unsigned long)old_nr_pages
@@ -4416,6 +4993,7 @@ void *vrealloc_node_align_noprof(const void *p, size_t size, unsigned long align
 	 * We already have the bytes available in the allocation; use them.
 	 */
 	if (size <= vm->nr_pages << PAGE_SHIFT) {
+		/* 先前按页向上取整或收缩保留的容量足够，只恢复逻辑可见长度。 */
 		/*
 		 * No need to zero memory here, as unused memory will have
 		 * already been zeroed at initial allocation time or during
@@ -4428,6 +5006,7 @@ void *vrealloc_node_align_noprof(const void *p, size_t size, unsigned long align
 
 need_realloc:
 	/* TODO: Grow the vm_area, i.e. allocate and map additional pages. */
+	/* 当前实现不能扩展相邻 VA，故分配新对象；成功后复制再释放，确保失败原子性。 */
 	n = __vmalloc_node_noprof(size, align, flags, nid, __builtin_return_address(0));
 
 	if (!n)
@@ -4465,6 +5044,7 @@ EXPORT_SYMBOL(vrealloc_node_align_noprof);
  */
 void *vmalloc_32_noprof(unsigned long size)
 {
+	/* “32”约束 backing page 的物理可寻址范围，返回的 KVA 本身仍位于 vmalloc 窗口。 */
 	return __vmalloc_node_noprof(size, 1, GFP_VMALLOC32, NUMA_NO_NODE,
 			__builtin_return_address(0));
 }
@@ -4481,6 +5061,7 @@ EXPORT_SYMBOL(vmalloc_32_noprof);
  */
 void *vmalloc_32_user_noprof(unsigned long size)
 {
+	/* 面向用户映射的 DMA 可寻址内存同时要求 SHMLBA 对齐和清零，避免数据泄漏。 */
 	return __vmalloc_node_range_noprof(size, SHMLBA,  VMALLOC_START, VMALLOC_END,
 				    GFP_VMALLOC32 | __GFP_ZERO, PAGE_KERNEL,
 				    VM_USERMAP, NUMA_NO_NODE,
@@ -4495,6 +5076,7 @@ EXPORT_SYMBOL(vmalloc_32_user_noprof);
  */
 static size_t zero_iter(struct iov_iter *iter, size_t count)
 {
+	/* hole 不直接 memset 用户目标，而通过 nofault iterator API，避免调试读取触发 fault。 */
 	size_t remains = count;
 
 	while (remains > 0) {
@@ -4520,6 +5102,10 @@ static size_t zero_iter(struct iov_iter *iter, size_t count)
 static size_t aligned_vread_iter(struct iov_iter *iter,
 				 const char *addr, size_t count)
 {
+	/*
+	 * 每页重新做 vmalloc_to_page，并以 nofault 局部映射复制。它牺牲调试读取性能，
+	 * 换取不长期持有 vmalloc 全局锁；并发解除映射时缺页按洞返回零而不是解引用 KVA。
+	 */
 	size_t remains = count;
 	struct page *page;
 
@@ -4564,6 +5150,10 @@ static size_t aligned_vread_iter(struct iov_iter *iter,
 static size_t vmap_ram_vread_iter(struct iov_iter *iter, const char *addr,
 				  size_t count, unsigned long flags)
 {
+	/*
+	 * 一个 VMAP_BLOCK 的 VA 包含多个活跃 bitmap 区间以及 free/dirty 洞。持有 vb 锁
+	 * 固定 bitmap 快照，逐段复制活跃页、对洞补零，避免把旧 alias 内容暴露给 kcore。
+	 */
 	char *start;
 	struct vmap_block *vb;
 	struct xarray *xa;
@@ -4596,6 +5186,7 @@ static size_t vmap_ram_vread_iter(struct iov_iter *iter, const char *addr,
 		goto finished_zero;
 	}
 
+	/* set-bit range 表示仍归调用者所有的连续子映射；range 之间全部视为不可读。 */
 	for_each_set_bitrange(rs, re, vb->used_map, VMAP_BBMAP_BITS) {
 		size_t copied;
 
@@ -4667,6 +5258,12 @@ finished:
  */
 long vread_iter(struct iov_iter *iter, const char *addr, size_t count)
 {
+	/*
+	 * 这是面向 /proc/kcore 等“不掌握对象生命周期”的容错遍历器，不是普通数据路径。
+	 * 它按 busy tree 顺序覆盖请求区间：活跃普通映射安全复制，IO/sparse/地址洞补零，
+	 * 未完成发布的 vm_struct 跳过。每跨过一个 area 都释放节点锁后重新查找，避免
+	 * 长时间阻塞分配/释放；代价是只能提供安全快照语义，而非全区间原子快照。
+	 */
 	struct vmap_node *vn;
 	struct vmap_area *va;
 	struct vm_struct *vm;
@@ -4682,6 +5279,7 @@ long vread_iter(struct iov_iter *iter, const char *addr, size_t count)
 
 	remains = count;
 
+	/* helper 返回时持有对应 busy.lock，va 生命周期在本轮检查和复制期间稳定。 */
 	vn = find_vmap_area_exceed_addr_lock((unsigned long) addr, &va);
 	if (!vn)
 		goto finished_zero;
@@ -4707,6 +5305,7 @@ long vread_iter(struct iov_iter *iter, const char *addr, size_t count)
 		if (!vm && !flags)
 			goto next_va;
 
+		/* 跳过已进树但物理页/页表/KASAN 尚未全部发布的分配。 */
 		if (vm && (vm->flags & VM_UNINITIALIZED))
 			goto next_va;
 
@@ -4730,6 +5329,7 @@ long vread_iter(struct iov_iter *iter, const char *addr, size_t count)
 		if (addr >= vaddr + size)
 			goto next_va;
 
+		/* 当前游标到下一个活跃 area 之间的 VA 洞必须显式输出零。 */
 		if (addr < vaddr) {
 			size_t to_zero = min_t(size_t, vaddr - addr, remains);
 			size_t zeroed = zero_iter(iter, to_zero);
@@ -4745,6 +5345,7 @@ long vread_iter(struct iov_iter *iter, const char *addr, size_t count)
 		if (n > remains)
 			n = remains;
 
+		/* vm_map_ram 需解释 block bitmap；设备和 sparse 映射绝不能作为普通 RAM 读取。 */
 		if (flags & VMAP_RAM)
 			copied = vmap_ram_vread_iter(iter, addr, n, flags);
 		else if (!(vm && (vm->flags & (VM_IOREMAP | VM_SPARSE))))
@@ -4798,6 +5399,11 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 				void *kaddr, unsigned long pgoff,
 				unsigned long size)
 {
+	/*
+	 * 将内核 vmalloc backing pages 逐页插入用户 VMA。只有显式 VM_USERMAP 或
+	 * VM_DMA_COHERENT 区域可导出；对 offset/size 的溢出与边界检查必须先于任何
+	 * vm_insert_page，避免部分映射后才发现越界。成功后禁止 VMA 扩展及 core dump。
+	 */
 	struct vm_struct *area;
 	unsigned long off;
 	unsigned long end_index;
@@ -4810,6 +5416,7 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 	if (!PAGE_ALIGNED(uaddr) || !PAGE_ALIGNED(kaddr))
 		return -EINVAL;
 
+	/* kaddr 必须是登记区域的 base，pgoff 单独表达内部偏移，避免接受任意内点。 */
 	area = find_vm_area(kaddr);
 	if (!area)
 		return -EINVAL;
@@ -4822,6 +5429,7 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 		return -EINVAL;
 	kaddr += off;
 
+	/* vm_insert_page 为每个用户 PTE 获取所需页引用；中途失败保留已插入前缀供 VMA 清理。 */
 	do {
 		struct page *page = vmalloc_to_page(kaddr);
 		int ret;
@@ -4857,6 +5465,7 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 int remap_vmalloc_range(struct vm_area_struct *vma, void *addr,
 						unsigned long pgoff)
 {
+	/* 全区间包装器以 VMA 长度为 size，所有验证和逐页插入仍集中在 partial 版本。 */
 	return remap_vmalloc_range_partial(vma, vma->vm_start,
 					   addr, pgoff,
 					   vma->vm_end - vma->vm_start);
@@ -4865,6 +5474,7 @@ EXPORT_SYMBOL(remap_vmalloc_range);
 
 void free_vm_area(struct vm_struct *area)
 {
+	/* 仅释放地址映射描述，不释放 backing pages；严格校验摘除的是调用者传入对象。 */
 	struct vm_struct *ret;
 	ret = remove_vm_area(area->addr);
 	BUG_ON(ret != area);
@@ -4875,6 +5485,7 @@ EXPORT_SYMBOL_GPL(free_vm_area);
 #ifdef CONFIG_SMP
 static struct vmap_area *node_to_va(struct rb_node *n)
 {
+	/* rb_entry_safe 允许逆向扫描越过树首时把 NULL 直接传播给终止逻辑。 */
 	return rb_entry_safe(n, struct vmap_area, rb_node);
 }
 
@@ -4890,6 +5501,10 @@ static struct vmap_area *node_to_va(struct rb_node *n)
 static struct vmap_area *
 pvm_find_va_enclose_addr(unsigned long addr)
 {
+	/*
+	 * 在全局 free tree 中找包含 addr 的洞；若不包含，则返回 addr 下方最近的洞。
+	 * per-CPU allocator 随后从高地址向低地址扫描，因此这个 predecessor 语义正合适。
+	 */
 	struct vmap_area *va, *tmp;
 	struct rb_node *n;
 
@@ -4925,6 +5540,7 @@ pvm_find_va_enclose_addr(unsigned long addr)
 static unsigned long
 pvm_determine_end_from_reverse(struct vmap_area **va, unsigned long align)
 {
+	/* 跳过对齐后为空的洞，返回不超过 VMALLOC_END 的最高可用对齐终点。 */
 	unsigned long vmalloc_end = VMALLOC_END & ~(align - 1);
 	unsigned long addr;
 
@@ -4968,6 +5584,12 @@ struct vm_struct **pcpu_get_vm_areas(const unsigned long *offsets,
 				     const size_t *sizes, int nr_vms,
 				     size_t align)
 {
+	/*
+	 * percpu 需要多段 KVA 共享同一 base，使各段间 offsets 在所有 CPU chunk 中保持
+	 * 同余。普通逐段分配无法保证这个整体约束，因此这里在全局 free tree 上做一次
+	 * 自顶向下的多区间装箱：不断下移 base，直到所有 [base+offset, +size) 同时落洞。
+	 * 搜索成功后才批量裁剪 free tree、建立 KASAN shadow 并发布 busy 节点，近似事务。
+	 */
 	const unsigned long vmalloc_start = ALIGN(VMALLOC_START, align);
 	const unsigned long vmalloc_end = VMALLOC_END & ~(align - 1);
 	struct vmap_area **vas, *va;
@@ -4977,6 +5599,7 @@ struct vm_struct **pcpu_get_vm_areas(const unsigned long *offsets,
 	bool purged = false;
 
 	/* verify parameters and allocate data structures */
+	/* 先验证对齐、互不重叠，并找到相对终点最高的 area 作为反向扫描锚点。 */
 	BUG_ON(offset_in_page(align) || !is_power_of_2(align));
 	for (last_area = 0, area = 0; area < nr_vms; area++) {
 		start = offsets[area];
@@ -5004,6 +5627,7 @@ struct vm_struct **pcpu_get_vm_areas(const unsigned long *offsets,
 		return NULL;
 	}
 
+	/* 所有描述符预分配，保证持有 free tree 锁的提交阶段不因普通内存分配失败。 */
 	vms = kzalloc_objs(vms[0], nr_vms);
 	vas = kzalloc_objs(vas[0], nr_vms);
 	if (!vas || !vms)
@@ -5023,9 +5647,11 @@ retry:
 	start = offsets[area];
 	end = start + sizes[area];
 
+	/* 令最高相对终点贴近最高可用洞，再环形检查其余 area 是否都能容纳。 */
 	va = pvm_find_va_enclose_addr(vmalloc_end);
 	base = pvm_determine_end_from_reverse(&va, align) - end;
 
+	/* 每次冲突只会把 base 向下拉，搜索单调且最终到达成功或地址空间下界。 */
 	while (true) {
 		/*
 		 * base might have underflowed, add last_end before
@@ -5074,6 +5700,7 @@ retry:
 	}
 
 	/* we've found a fitting base, insert all va's */
+	/* 已找到共同 base；在同一 free-tree 锁临界区逐段裁剪，其他分配者看不到半提交。 */
 	for (area = 0; area < nr_vms; area++) {
 		int ret;
 
@@ -5100,12 +5727,14 @@ retry:
 	spin_unlock(&free_vmap_area_lock);
 
 	/* populate the kasan shadow space */
+	/* free tree 已占位但 busy tree 尚未发布，先准备全部 shadow；失败仍可整体回滚。 */
 	for (area = 0; area < nr_vms; area++) {
 		if (kasan_populate_vmalloc(vas[area]->va_start, sizes[area], GFP_KERNEL))
 			goto err_free_shadow;
 	}
 
 	/* insert all vm's */
+	/* 最终逐节点发布到分片 busy tree，并建立 vmap_area->vm 的高层关联。 */
 	for (area = 0; area < nr_vms; area++) {
 		struct vmap_node *vn = addr_to_node(vas[area]->va_start);
 
@@ -5134,6 +5763,7 @@ recovery:
 	 * because they are inserted only on the final step
 	 * and when pcpu_get_vm_areas() is success.
 	 */
+	/* va_clip 中途异常时，把此前裁剪出的前缀逐一并回 free tree。 */
 	while (area--) {
 		orig_start = vas[area]->va_start;
 		orig_end = vas[area]->va_end;
@@ -5149,6 +5779,7 @@ recovery:
 overflow:
 	spin_unlock(&free_vmap_area_lock);
 	if (!purged) {
+		/* lazy VA 可能造成假性空间不足；只允许一次全局 purge 后从头搜索。 */
 		reclaim_and_purge_vmap_areas();
 		purged = true;
 
@@ -5179,6 +5810,7 @@ err_free2:
 	return NULL;
 
 err_free_shadow:
+	/* shadow 阶段失败时所有 VA 都已裁剪但尚未进 busy tree，可在 free 锁下整体归还。 */
 	spin_lock(&free_vmap_area_lock);
 	/*
 	 * We release all the vmalloc shadows, even the ones for regions that
@@ -5212,6 +5844,7 @@ err_free_shadow:
  */
 void pcpu_free_vm_areas(struct vm_struct **vms, int nr_vms)
 {
+	/* 这些 area 只代表地址预留，backing 映射由 percpu 子系统另行管理。 */
 	int i;
 
 	for (i = 0; i < nr_vms; i++)
@@ -5223,6 +5856,10 @@ void pcpu_free_vm_areas(struct vm_struct **vms, int nr_vms)
 #ifdef CONFIG_PRINTK
 bool vmalloc_dump_obj(void *object)
 {
+	/*
+	 * printk 错误路径不能等待可能由当前上下文持有的 busy 锁，所以 trylock 失败即放弃。
+	 * 锁内只快照诊断字段，符号解析和打印放在锁外，避免递归进入复杂基础设施。
+	 */
 	const void *caller;
 	struct vm_struct *vm;
 	struct vmap_area *va;
@@ -5266,6 +5903,7 @@ bool vmalloc_dump_obj(void *object)
 static void show_numa_info(struct seq_file *m, struct vm_struct *v,
 				 unsigned int *counters)
 {
+	/* pages[] 按 base page 展开；大页映射按 page_order 跨步并一次累计整块页数。 */
 	unsigned int nr;
 	unsigned int step = 1U << vm_area_page_order(v);
 
@@ -5283,6 +5921,7 @@ static void show_numa_info(struct seq_file *m, struct vm_struct *v,
 
 static void show_purge_info(struct seq_file *m)
 {
+	/* lazy tree 中的区间已从 busy 视图消失，但 TLB flush 前仍占用 VA，单独展示。 */
 	struct vmap_node *vn;
 	struct vmap_area *va;
 
@@ -5299,6 +5938,11 @@ static void show_purge_info(struct seq_file *m)
 
 static int vmalloc_info_show(struct seq_file *m, void *p)
 {
+	/*
+	 * /proc/vmallocinfo 逐个分片持锁生成弱一致快照。它跳过未发布对象，并依赖
+	 * clear_vm_uninitialized_flag 的写屏障读取完整字段；输出期间持锁的代价可接受，
+	 * 因为这是低频诊断接口。最后追加 lazy 区间解释“地址已释放却尚不可复用”。
+	 */
 	struct vmap_node *vn;
 	struct vmap_area *va;
 	struct vm_struct *v;
@@ -5387,6 +6031,10 @@ module_init(proc_vmalloc_init);
 
 static void __init vmap_init_free_space(void)
 {
+	/*
+	 * early vmlist 是按地址排序的 busy 集合。本函数取其补集，构造运行期增强 free
+	 * tree/list：从地址 1 而非 0 开始保留 NULL 语义，并在最后补上尾部大洞。
+	 */
 	unsigned long vmap_start = 1;
 	const unsigned long vmap_end = ULONG_MAX;
 	struct vmap_area *free;
@@ -5429,6 +6077,10 @@ static void __init vmap_init_free_space(void)
 
 static void vmap_init_nodes(void)
 {
+	/*
+	 * busy/lazy 索引按地址 zone 分片以降低大机器锁竞争，节点数最多 128；数组分配
+	 * 失败就退化为静态单节点，正确性不依赖分片。每节点另有按大小分桶的 VA 缓存。
+	 */
 	struct vmap_node *vn;
 	int i;
 
@@ -5483,6 +6135,7 @@ static void vmap_init_nodes(void)
 static unsigned long
 vmap_node_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 {
+	/* shrinker 只统计节点 pool 中缓存的描述符数量，不把仍在 busy/lazy 的区间算作可回收。 */
 	unsigned long count = 0;
 	struct vmap_node *vn;
 	int i;
@@ -5498,6 +6151,7 @@ vmap_node_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 static unsigned long
 vmap_node_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 {
+	/* 全局 purge mutex 与正常衰减串行，强制把各节点过期 pool 项归还到底层。 */
 	struct vmap_node *vn;
 
 	guard(mutex)(&vmap_purge_lock);
@@ -5509,6 +6163,12 @@ vmap_node_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 
 void __init vmalloc_init(void)
 {
+	/*
+	 * 初始化顺序存在依赖：先建描述符 cache 和 per-CPU 快路径，再建分片节点；随后
+	 * 把 early vmlist 导入 busy tree，以其补集生成 free tree，最后才置 initialized。
+	 * 这个布尔值是运行期 API 可访问树结构的发布点；shrinker 注册失败只损失回收
+	 * 效率，不影响已经可用的 vmalloc 分配器。
+	 */
 	struct shrinker *vmap_node_shrinker;
 	struct vmap_area *va;
 	struct vmap_node *vn;
@@ -5520,6 +6180,7 @@ void __init vmalloc_init(void)
 	 */
 	vmap_area_cachep = KMEM_CACHE(vmap_area, SLAB_PANIC);
 
+	/* 离线但 possible 的 CPU 将来也可能上线，queue/work/xarray 必须预先完整初始化。 */
 	for_each_possible_cpu(i) {
 		struct vmap_block_queue *vbq;
 		struct vfree_deferred *p;
@@ -5539,6 +6200,7 @@ void __init vmalloc_init(void)
 	vmap_init_nodes();
 
 	/* Import existing vmlist entries. */
+	/* 此时仍无并发运行期访问，导入 early busy 区域不需要逐节点加锁。 */
 	for (tmp = vmlist; tmp; tmp = tmp->next) {
 		va = kmem_cache_zalloc(vmap_area_cachep, GFP_NOWAIT);
 		if (WARN_ON_ONCE(!va))
@@ -5555,6 +6217,7 @@ void __init vmalloc_init(void)
 	/*
 	 * Now we can initialize a free vmap space.
 	 */
+	/* free tree 完成后再发布 initialized，避免查询者看到只有 busy、没有 free 的半状态。 */
 	vmap_init_free_space();
 	vmap_initialized = true;
 

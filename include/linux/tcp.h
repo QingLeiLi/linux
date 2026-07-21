@@ -1,5 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
+ * TCP Echo 核心状态对象学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。本轮注释聚焦 struct tcp_sock 中
+ * send/ACK/receive 主路径使用的字段。tcp_sock 通过首成员嵌入逐层扩展
+ * inet_connection_sock/inet_sock/sock；tcp_sk(sk) 只是按已知布局恢复外层地址，
+ * 不分配、不复制。字段按 cacheline 热路径分组，以空间和维护复杂度换取少量
+ * cacheline 访问及较低多核伪共享。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -201,10 +210,12 @@ struct tcp_sock {
 	 */
 
 	/* inet_connection_sock has to be the first member of tcp_sock */
+	/* 首成员地址与外层对象地址相同，这是 inet_csk/tcp_sk 安全转换的布局前提。 */
 	struct inet_connection_sock	inet_conn;
 
 	/* TX read-mostly hotpath cache lines */
 	__cacheline_group_begin(tcp_sock_read_tx);
+	/* 对端历史最大公告窗口，影响 forced-push、重排和发送启发式，不是当前窗口。 */
 	u32	max_window;	/* Maximal window ever seen from peer	*/
 	u32	rcv_ssthresh;	/* Current window clamp			*/
 	u32	reordering;	/* Packet reordering metric.		*/
@@ -220,8 +231,10 @@ struct tcp_sock {
 	/* TXRX read-mostly hotpath cache lines */
 	__cacheline_group_begin(tcp_sock_read_txrx);
 	u32	tsoffset;	/* timestamp offset */
+	/* 对端当前公告的 receive window；发送右边界不能越过 snd_una + snd_wnd。 */
 	u32	snd_wnd;	/* The window we expect to receive	*/
 	u32	mss_cache;	/* Cached effective mss, not including SACKS */
+	/* 本端拥塞控制窗口，约束网络在途量；与保护对端内存的 snd_wnd 相互独立。 */
 	u32	snd_cwnd;	/* Sending congestion window		*/
 	u32	prr_out;	/* Total number of pkts sent during Recovery. */
 	u32	lost_out;	/* Lost packets			*/
@@ -237,6 +250,7 @@ struct tcp_sock {
 
 	/* RX read-mostly hotpath cache lines */
 	__cacheline_group_begin(tcp_sock_read_rx);
+	/* 应用下一个要读取的序列号；recv 推进它，MSG_PEEK 只使用临时副本。 */
 	u32	copied_seq;	/* Head of yet unread data */
 	u32	snd_wl1;	/* Sequence for window update		*/
 	u32	tlp_high_seq;	/* snd_nxt at the time of TLP */
@@ -248,6 +262,7 @@ struct tcp_sock {
 	u32	snd_ssthresh;	/* Slow start size threshold		*/
 	struct  minmax rtt_min;
 	/* OOO segments go in this rbtree. Socket lock must be held. */
+	/* seq > rcv_nxt 的洞后数据；不能被 recv 扫描，填洞后迁入 receive queue。 */
 	struct rb_root	out_of_order_queue;
 	__cacheline_group_end(tcp_sock_read_rx);
 
@@ -271,6 +286,7 @@ struct tcp_sock {
 	u8	chrono_type;	/* current chronograph type */
 	u32	chrono_start;	/* Start time in jiffies of a TCP chrono */
 	u32	chrono_stat[3];	/* Time in jiffies for chrono_stat stats */
+	/* 应用已交给 TCP 的最右字节边界；可能领先 snd_nxt，故不等于已经发送。 */
 	u32	write_seq;	/* Tail(+1) of data held in tcp send buffer */
 	u32	pushed_seq;	/* Last pushed seq, required to talk to windows */
 	u32	lsndtime;	/* timestamp of last sent data packet (for restart window) */
@@ -309,11 +325,15 @@ struct tcp_sock {
 	__be32	pred_flags;
 	u64	tcp_clock_cache; /* cache last tcp_clock_ns() (see tcp_mstamp_refresh()) */
 	u64	tcp_mstamp;	/* most recent packet received/sent */
+	/* 连续接收右边界；只有填满所有洞后才能推进并作为累计 ACK。 */
 	u32	rcv_nxt;	/* What we want to receive next		*/
+	/* 已发送右边界；[snd_nxt, write_seq) 仍只在 TCP 排队。 */
 	u32	snd_nxt;	/* Next sequence we send		*/
+	/* 最早未累计确认字节；[snd_una, snd_nxt) 是已发送但尚未累计确认范围。 */
 	u32	snd_una;	/* First byte we want an ack for	*/
 	u32	window_clamp;	/* Maximal window to advertise		*/
 	u32	srtt_us;	/* smoothed round trip time << 3 in usecs */
+	/* 以逻辑 segment/pcount 计的在途量，不是 skb 对象数。 */
 	u32	packets_out;	/* Packets which are "in flight"	*/
 	u32	snd_up;		/* Urgent pointer		*/
 	u32	received_ce;	/* Like the above but for rcvd CE marked pkts */

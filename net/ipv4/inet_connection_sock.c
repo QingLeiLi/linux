@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * INET 面向连接 socket 公共生命周期学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 本文件为 TCP/DCCP 等面向连接协议提供 bind hash、listen request/accept queue、
+ * child 发布和通用定时器框架。对 TCP Echo 服务端，第三次握手不是直接“返回一个
+ * fd”：TCP 先把 request 升级为 full child，插入 established hash，再在 listener
+ * accept queue 中发布；accept() 最后摘队并由 socket/VFS 层安装新 fd。
+ *
+ * 并发上，listener socket ownership 保护控制流程，rskq_lock 保护 accept queue，
+ * ehash bucket lock/引用保护网络查找。关闭 listener 可与第三次 ACK、accept 并发，
+ * 所以每个发布点都必须重新验证 TCP_LISTEN，并在失败时回收 child/request。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -645,6 +659,18 @@ static int inet_csk_wait_for_connect(struct sock *sk, long timeo)
 
 /*
  * This will accept the next outstanding connection.
+ */
+/*
+ * inet_csk_accept - 从 listener accept queue 取得一个已建立 child。
+ *
+ * @sk 必须是监听 socket；@arg 提供 O_NONBLOCK 等策略并输出 err/is_empty。函数在
+ * 进程上下文取得 lock_sock；队列空时阻塞调用把任务加入等待队列、释放 listener
+ * ownership 睡眠，非阻塞立即以 NULL + -EAGAIN 返回。成功从队列摘 request，取出
+ * req->sk，把 child 返回给上层创建新 socket/file/fd；调用者获得 child 引用。
+ *
+ * 普通三次握手到这里已经完成。TFO 允许数据和 child 早于最终 ACK 进入 accept
+ * queue，若应用先 accept，就把 req->sk 清空并让后续握手完成/终止路径释放 req，
+ * 避免 accept 与 ACK 两边重复 put。返回前初始化 child 自己的 socket lock 状态。
  */
 struct sock *inet_csk_accept(struct sock *sk, struct proto_accept_arg *arg)
 {
@@ -1378,6 +1404,15 @@ static void inet_child_forget(struct sock *sk, struct request_sock *req,
 	inet_csk_destroy_sock(child);
 }
 
+/*
+ * inet_csk_reqsk_queue_add - 把已建立 child 发布到 listener 的 accept queue。
+ *
+ * @sk 为候选 listener，@req 携带 @child；调用者仍持相应引用。rskq_lock 串行
+ * 第三次 ACK、accept 和 listener close。锁内再次检查 TCP_LISTEN：若已关闭，
+ * inet_child_forget 撤销 child/request 关系并返回 NULL；成功则 req->sk=child、
+ * 尾插 FIFO、增加 acceptq 计数并返回 child。WRITE_ONCE 发布首节点，等待侧在
+ * listener 锁/队列协议下观察。成功后 child 对网络 hash 和 accept() 都可发现。
+ */
 struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
 				      struct request_sock *req,
 				      struct sock *child)
@@ -1402,6 +1437,16 @@ struct sock *inet_csk_reqsk_queue_add(struct sock *sk,
 	return child;
 }
 
+/*
+ * inet_csk_complete_hashdance - 完成 request 到 child 的两索引所有权迁移。
+ *
+ * @sk 是最终 listener；@child 已在 established hash；@req 仍可能在原 SYN queue；
+ * @own_req 表示本 CPU 是否赢得 ehash 替换竞态。胜者先从 SYN queue 摘除 req，再
+ * 处理 reuseport listener 迁移，最后调用 inet_csk_reqsk_queue_add 发布 accept。
+ * 成功返回 child，保持调用者预期的锁/引用；败者或 listener 关闭时解锁并 put
+ * child，返回 NULL。顺序必须先确保 established hash 唯一，再让 accept 可见，
+ * 否则应用可能取得一个网络接收查找不到或与另一个 child 冲突的 socket。
+ */
 struct sock *inet_csk_complete_hashdance(struct sock *sk, struct sock *child,
 					 struct request_sock *req, bool own_req)
 {

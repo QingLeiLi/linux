@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * TCP Echo IPv4 输出学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 本文件为传输层 skb 查询/复用路由、前压 IPv4 header，并经过 LOCAL_OUT 和
+ * POST_ROUTING hook 交给 dst/neighbour/netdevice。route cache 是常见快速路径，
+ * 失效时回退 FIB 查询；邻居解析或 qdisc 仍可能在本函数返回后异步排队。
+ *
+ * 主线：__ip_queue_xmit -> ip_local_out -> dst_output -> ip_output
+ *       -> ip_finish_output2 -> neighbour output -> dev_queue_xmit。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -99,6 +111,15 @@ void ip_send_check(struct iphdr *iph)
 }
 EXPORT_SYMBOL(ip_send_check);
 
+/*
+ * __ip_local_out - 完成 IPv4 头并运行 LOCAL_OUT hook，但不保证已经调用 dst output。
+ *
+ * @net/@sk 给出网络命名空间和本地 socket；@skb 已绑定 dst 且 IPv4 头已预留，
+ * ownership 交给本机输出框架。函数写 total length/checksum，经 L3 master 和
+ * Netfilter 后返回：1 表示 hook 接受且调用者仍需执行 dst_output；0 表示 skb
+ * 已被 hook 消费；负值表示丢弃/错误且 skb 也已消费。这种特殊“1=继续”约定是
+ * ip_local_out() 不能把返回值直接当 errno 的原因。
+ */
 int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	struct iphdr *iph = ip_hdr(skb);
@@ -122,6 +143,13 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
 		       dst_output);
 }
 
+/*
+ * ip_local_out - 把 __ip_local_out 的“hook 接受”结果继续提交给路由输出函数。
+ *
+ * 参数和 ownership 与 __ip_local_out 相同；所有返回分支均不再由调用者拥有 skb。
+ * dst_output 是路由对象中的函数指针：普通本机 IPv4 route 通常进入 ip_output，
+ * XFRM、隧道或特殊 route 可以选择不同实现，因此这里不能硬编码下一层函数。
+ */
 int ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	int err;
@@ -196,6 +224,15 @@ int ip_build_and_send_pkt(struct sk_buff *skb, const struct sock *sk,
 	return ip_local_out(net, skb->sk, skb);
 }
 
+/*
+ * ip_finish_output2 - 在分片决策完成后解析下一跳，并把 skb 交给邻居/L2 输出。
+ *
+ * @skb 已满足出口 MTU 或已经是单个分片，且 dst 决定出口设备和 gateway；函数
+ * 接管 ownership。若 L2 头部空间不足，skb_expand_head() 可能重新分配 skb，旧
+ * 指针已被消费；轻量隧道可重定向；普通路径在 RCU 下查 neighbour，neigh_output
+ * 可能直接构造 L2 头并 dev_queue_xmit，也可能因 ARP 未完成而把 skb 排队。
+ * 找不到邻居时本函数释放 skb 并返回指针编码错误，调用者不得重试同一对象。
+ */
 static int ip_finish_output2(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	struct dst_entry *dst = skb_dst(skb);
@@ -245,6 +282,14 @@ static int ip_finish_output2(struct net *net, struct sock *sk, struct sk_buff *s
 	return PTR_ERR(neigh);
 }
 
+/*
+ * ip_finish_output_gso - 处理“单个 GSO segment 仍大于出口 MTU”的异常慢路径。
+ *
+ * 正常 TSO/GSO skb 的每个逻辑 segment 不超过 MTU，可整体交给设备；若隧道叠加
+ * 或转发元数据使 segment 过大，先关闭 GSO feature 做软件分段，再逐段执行 IPv4
+ * fragmentation。skb_gso_segment 成功后原聚合 skb 被 consume，segs 链由循环
+ * 逐个接管；单段失败只记录首个错误，其余段仍需释放/发送，不能中途遗留链表。
+ */
 static int ip_finish_output_gso(struct net *net, struct sock *sk,
 				struct sk_buff *skb, unsigned int mtu)
 {
@@ -293,6 +338,14 @@ static int ip_finish_output_gso(struct net *net, struct sock *sk,
 	return ret;
 }
 
+/*
+ * __ip_finish_output - 根据 XFRM、GSO 和 MTU 选择最后的 IPv4 输出策略。
+ *
+ * SNAT 后出现新的 XFRM policy 时重新走 dst_output，IPSKB_REROUTED 防止把同一
+ * 报文当作首次输出。普通路径先取 route MTU：GSO 交给专用验证；非 GSO 超 MTU
+ * 或带 frag_max_size 时调用 ip_fragment；其余直接进入 neighbour 输出。每个
+ * 被调函数都接管 skb，因此这里没有失败后的本地释放分支。
+ */
 static int __ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	unsigned int mtu;
@@ -314,6 +367,14 @@ static int __ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *
 	return ip_finish_output2(net, sk, skb);
 }
 
+/*
+ * ip_finish_output - 在真正处理 MTU/邻居前执行 cgroup egress BPF 策略。
+ *
+ * BPF 返回 SUCCESS 时继续；NET_XMIT_CN 表示拥塞通知但仍允许发送，GNU `?:`
+ * 保留下层更严重的错误，否则返回 CN；其他结果表示策略拒绝，本函数释放 skb。
+ * 成功继续后 __ip_finish_output 根据 GSO、MTU 和 DF/分片状态选择软件分段、IPv4
+ * 分片或直接 ip_finish_output2，因而此函数返回时 ownership 始终已经下移/释放。
+ */
 static int ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	int ret;
@@ -424,6 +485,14 @@ int ip_mc_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 			    !(IPCB(skb)->flags & IPSKB_REROUTED));
 }
 
+/*
+ * ip_output - 普通 IPv4 route 的 dst_output 实现，运行 POST_ROUTING 后下沉。
+ *
+ * @skb 已有完整 IPv4 header 和有效 dst；函数把 route 的出口设备写入 skb->dev，
+ * 更新发送统计，再通过 POST_ROUTING 允许 SNAT/filter 修改或消费报文。hook 接受
+ * 后调用 ip_finish_output；返回值是网络层发送状态而非“发送字节数”，skb 在所有
+ * 路径均被消费。TCP 可靠性不会依赖这里同步返回已上网，只把错误作为发送提示。
+ */
 int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 {
 	struct net_device *dev, *indev = skb->dev;
@@ -459,9 +528,34 @@ static void ip_copy_addrs(struct iphdr *iph, const struct flowi4 *fl4)
 }
 
 /* Note: skb->sk can be different from sk, in case of tunnels */
+/*
+ * __ip_queue_xmit - 为传输层 skb 选择 IPv4 路由、构造 IP 头并进入本机输出链。
+ *
+ * @sk 提供 namespace、地址、协议和 route cache；@skb 已有传输层 header，成功
+ * 或失败均由本路径消费；@fl 是调用者提供的 flow scratch；@tos 是 IPv4 DS/TOS。
+ * 调用者通常持有 socket 序列化条件；函数用 RCU 读取 options/dst，可在路由
+ * 查询和 Netfilter/下层中产生复杂副作用。返回 0/网络层状态或负 errno。
+ * no_route 会在本地释放 skb；一旦 ip_local_out 接管，调用者不得再次使用它。
+ *
+ * 局部调用地图：
+ *
+ *   __ip_queue_xmit
+ *     -> __sk_dst_check                 验证 socket route cache
+ *     -> ip_route_output_flow           cache miss 时查询 policy/FIB
+ *     -> skb_push                       在 TCP header 前暴露 IP headroom
+ *     -> ip_local_out                   LOCAL_OUT Netfilter
+ *        -> dst_output/ip_output        route 选择的输出函数
+ *        -> POST_ROUTING/ip_finish_output
+ *        -> neighbour output/dev_queue_xmit
+ *
+ * route 是“借用并绑定到 skb 的输出决策”，不是复制一份路由表。skb_dst_set_noref
+ * 依赖 RCU/cache 生命周期，减少每包原子引用；离开相应保护后若要长期保存必须
+ * 转成真正引用。
+ */
 int __ip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl,
 		    __u8 tos)
 {
+	/* inet 是 TCP socket 的 IPv4 视图；fl4 是调用者 flow union 中的 IPv4 分支。 */
 	struct inet_sock *inet = inet_sk(sk);
 	struct net *net = sock_net(sk);
 	struct ip_options_rcu *inet_opt;
@@ -473,16 +567,21 @@ int __ip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl,
 	/* Skip all of this if the packet is already routed,
 	 * f.e. by something like SCTP.
 	 */
+	/* 隧道/SCTP 等上层可能已经绑定 dst；重复查询会覆盖其显式路径。 */
+	/* 阶段 1：在 RCU 下借用 IP options 和缓存 dst，防止并发更新立即释放对象。 */
 	rcu_read_lock();
 	inet_opt = rcu_dereference(inet->inet_opt);
 	fl4 = &fl->u.ip4;
+	/* skb 自带 route 最优先；否则验证 socket cache，失效才完整查询 FIB。 */
 	rt = skb_rtable(skb);
 	if (rt)
 		goto packet_routed;
 
 	/* Make sure we can route this packet. */
+	/* __sk_dst_check 不只读指针，还验证 generation/cookie；失效返回 NULL。 */
 	rt = dst_rtable(__sk_dst_check(sk, 0));
 	if (!rt) {
+		/* 从已连接 socket 重建查询键：地址、端口、mark、bound device 等。 */
 		inet_sk_init_flowi4(inet, fl4);
 
 		/* sctp_v4_xmit() uses its own DSCP value */
@@ -492,21 +591,30 @@ int __ip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl,
 		 * keep trying until route appears or the connection times
 		 * itself out.
 		 */
+		/* 慢路径可能执行 policy rule/table lookup；错误由 TCP 后续重传/超时处理。 */
 		rt = ip_route_output_flow(net, fl4, sk);
 		if (IS_ERR(rt))
 			goto no_route;
+		/* cache route 并把 SG/GSO/checksum 等设备能力投影到 socket 后续发送策略。 */
 		sk_setup_caps(sk, &rt->dst);
 	}
+	/* noref 绑定依赖当前 RCU/route cache 生命周期，避免每包一次原子引用操作。 */
 	skb_dst_set_noref(skb, &rt->dst);
 
 packet_routed:
 	if (inet_opt && inet_opt->opt.is_strictroute && rt->rt_uses_gateway)
+		/* strict source route 禁止 route 选择 gateway；该失败必须在构造 header 前发生。 */
 		goto no_route;
 
 	/* OK, we know where to send it, allocate and build IP header. */
+	/* 阶段 2：前压 IP header；payload/TCP header 不搬动，只改变 skb->data。 */
 	skb_push(skb, sizeof(struct iphdr) + (inet_opt ? inet_opt->opt.optlen : 0));
 	skb_reset_network_header(skb);
 	iph = ip_hdr(skb);
+	/*
+	 * 把 version/IHL/TOS 一次写入前 16 bit：4 位 version=4，4 位 IHL=5，
+	 * 低 8 位为 TOS。后续若有 options 再增加 ihl；htons 转网络字节序。
+	 */
 	*((__be16 *)iph) = htons((4 << 12) | (5 << 8) | (tos & 0xff));
 	if (ip_dont_fragment(sk, &rt->dst) && !skb->ignore_df)
 		iph->frag_off = htons(IP_DF);
@@ -523,20 +631,25 @@ packet_routed:
 		ip_options_build(skb, &inet_opt->opt, inet->inet_daddr, rt);
 	}
 
+	/* `?:` 省略中间操作数是 GNU C：gso_segs 非零取自身，否则取 1。 */
 	ip_select_ident_segs(net, skb, sk,
 			     skb_shinfo(skb)->gso_segs ?: 1);
 
 	/* TODO : should we use skb->sk here instead of sk ? */
+	/* priority/mark 会影响 qdisc、policy route 或 Netfilter；取当前消息发送快照。 */
 	skb->priority = READ_ONCE(sk->sk_priority);
 	skb->mark = READ_ONCE(sk->sk_mark);
 
+	/* 阶段 3：发布给 LOCAL_OUT/dst/output；Netfilter 可改写、丢弃或重定向 skb。 */
 	res = ip_local_out(net, sk, skb);
 	rcu_read_unlock();
 	return res;
 
 no_route:
+	/* 路由尚未建立，skb 从未向下发布，由本函数完成唯一释放并报告不可达。 */
 	rcu_read_unlock();
 	IP_INC_STATS(net, IPSTATS_MIB_OUTNOROUTES);
+	/* 带 reason 释放同时保留 drop 诊断；此后 skb 指针失效。 */
 	kfree_skb_reason(skb, SKB_DROP_REASON_IP_OUTNOROUTES);
 	return -EHOSTUNREACH;
 }

@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * TCP Echo 通用 socket 并发与唤醒学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 配套注释聚焦 lock_sock/release_sock、sk_backlog 和 sk_data_ready：进程上下文
+ * 可以睡眠地拥有 socket；收包 softirq 不能等待 owner，故把未处理 skb 放入
+ * backlog；owner 释放时经 sk_prot->backlog_rcv 串行补做协议处理。receive queue
+ * 发布数据后，sk_wq 通过 RCU 安全唤醒 recv/epoll waiter。
+ */
+/*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
  *		interface as the means of communication with the user level.
@@ -3238,6 +3248,14 @@ static void __lock_sock(struct sock *sk)
 	finish_wait(&sk->sk_lock.wq, &wait);
 }
 
+/*
+ * __release_sock - 在用户 owner 交还 socket 前排空软中断积累的 backlog。
+ *
+ * @sk 的 slock 在入口和返回时均持有；函数处理中间主动解锁并允许 BH，使协议
+ * backlog_rcv 不在长 spinlock 临界区运行。每个 skb ownership 从 backlog 转给
+ * sk_prot->backlog_rcv（TCP 为 tcp_v4_do_rcv）。新生产者可在解锁窗口追加新链，
+ * 外层循环会再次摘取。无返回值；结束时 backlog head/tail/len 归零。
+ */
 void __release_sock(struct sock *sk)
 	__releases(&sk->sk_lock.slock)
 	__acquires(&sk->sk_lock.slock)
@@ -3245,9 +3263,11 @@ void __release_sock(struct sock *sk)
 	struct sk_buff *skb, *next;
 	int nb = 0;
 
+	/* 先在锁内整链摘除，使本批次只由当前 consumer 拥有。 */
 	while ((skb = sk->sk_backlog.head) != NULL) {
 		sk->sk_backlog.head = sk->sk_backlog.tail = NULL;
 
+		/* 协议处理可能很长；释放短锁，但 owned 标志仍阻止另一用户 owner。 */
 		spin_unlock_bh(&sk->sk_lock.slock);
 
 		while (1) {
@@ -3255,6 +3275,7 @@ void __release_sock(struct sock *sk)
 			prefetch(next);
 			DEBUG_NET_WARN_ON_ONCE(skb_dst_is_noref(skb));
 			skb_mark_not_on_list(skb);
+			/* 函数表分派到 TCP backlog_rcv，并最终入 receive/OOO queue 或释放。 */
 			sk_backlog_rcv(sk, skb);
 
 			skb = next;
@@ -3299,15 +3320,32 @@ EXPORT_SYMBOL_GPL(__sk_flush_backlog);
  * We check receive queue before schedule() only as optimization;
  * it is very likely that release_sock() added new data.
  */
+/*
+ * @sk 已由当前进程 lock_sock；@timeo 是输入/输出剩余 jiffies，
+ * @skb 是睡眠前观察到的 receive-queue 尾部借用指针，可为 NULL。函数把当前
+ * 任务加入 sk_sleep(sk) 等待队列，并通过 sk_wait_event 临时释放 socket owner，
+ * 在数据、错误、timeout 或 signal 后重新取得它。返回 0/唤醒结果或负 errno。
+ *
+ * 防丢失唤醒协议：先加入 waitqueue，再检查“当前队尾 != 旧尾”；若数据恰好在
+ * 检查与睡眠之间到达，waker 能看到 waiter；若在入队前已经到达，条件检查直接
+ * 阻止 schedule。不能改成“先检查空、再 add_wait_queue”。
+ */
 int sk_wait_data(struct sock *sk, long *timeo, const struct sk_buff *skb)
 {
 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
 	int rc;
 
+	/* 阶段 1：先发布 waiter，关闭检查与入睡之间的竞态窗口。 */
 	add_wait_queue(sk_sleep(sk), &wait);
+	/* 告诉异步通知/协议当前确有 reader 等数据，便于选择唤醒策略。 */
 	sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
+	/*
+	 * 比较队尾身份而非只看非空：原队列可能已有但不足 low-water 的数据，新增
+	 * skb 仍应结束本轮等待。宏负责 release_sock、schedule 和重新 lock_sock。
+	 */
 	rc = sk_wait_event(sk, timeo, skb_peek_tail(&sk->sk_receive_queue) != skb, &wait);
 	sk_clear_bit(SOCKWQ_ASYNC_WAITDATA, sk);
+	/* 所有出口撤销 waiter/标志；返回时调用者重新拥有 socket。 */
 	remove_wait_queue(sk_sleep(sk), &wait);
 	return rc;
 }
@@ -3644,12 +3682,20 @@ static void sock_def_error_report(struct sock *sk)
 	rcu_read_unlock();
 }
 
+/*
+ * sock_def_readable - 在协议发布可读数据/EOF 后通知阻塞 recv、poll/epoll 和 SIGIO。
+ *
+ * @sk 在调用期间有效；函数可在 softirq 中运行，不能睡眠。sk_wq 由 RCU 保护，
+ * 因为 close 可并发断开 socket 与等待队列的关联。唤醒只把任务变为 runnable
+ * 或发布 poll 事件，不保证任务立即获得 CPU，也不转移 socket/data ownership。
+ */
 void sock_def_readable(struct sock *sk)
 {
 	struct socket_wq *wq;
 
 	trace_sk_data_ready(sk);
 
+	/* close 侧必须等待 RCU reader，故这里可安全借用旧 wq 到临界区结束。 */
 	rcu_read_lock();
 	wq = rcu_dereference(sk->sk_wq);
 	if (skwq_has_sleeper(wq))
@@ -3849,6 +3895,14 @@ void noinline lock_sock_nested(struct sock *sk, int subclass)
 }
 EXPORT_SYMBOL(lock_sock_nested);
 
+/*
+ * release_sock - 结束一次进程上下文 socket ownership。
+ *
+ * @sk 必须由当前路径先经 lock_sock 获得。函数先在 slock 下排空 backlog，再执行
+ * 协议延迟 callback，最后清 owned 并唤醒争锁者。顺序不能把 clear-owned 提前：
+ * 否则新用户线程可能与旧 backlog 同时修改 TCP 状态。无返回值，返回后调用者
+ * 不再拥有 socket 状态锁。
+ */
 void release_sock(struct sock *sk)
 {
 	spin_lock_bh(&sk->sk_lock.slock);

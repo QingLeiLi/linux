@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * TCP Echo netdevice 收发主路径学习导读
+ *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 本文件是协议栈与 net_device/驱动的公共边界。发送侧选择 TX queue、执行
+ * egress hook/qdisc 并按 ndo_start_xmit 契约转移 skb；接收侧由 NET_RX_SOFTIRQ
+ * 按 budget 轮询 NAPI，再经 XDP/VLAN/tc/RX handler/packet_type 分派给 IPv4。
+ *
+ * 并发模型是 per-CPU softnet_data + per-NAPI 状态 + per-TX-queue/qdisc 锁，
+ * 而不是一把网络总锁。驱动与 CPU 还必须通过 DMA API 和 descriptor 协议转移
+ * buffer ownership；这与 skb 引用计数、TCP ACK 是三个不同生命周期层次。
+ */
+/*
  *      NET3    Protocol independent device support routines.
  *
  *	Derived from the non IP parts of dev.c 1.0.19
@@ -4765,8 +4778,27 @@ struct netdev_queue *netdev_core_pick_tx(struct net_device *dev,
  * * positive qdisc return code	- NET_XMIT_DROP etc.
  * * negative errno		- other errors
  */
+/*
+ * @skb 必须已包含完整 L2/L3/L4 发送元数据并设置 skb->dev；@sb_dev
+ * 仅为下级设备 offload 选择提供上下文，可空。函数可从进程或中断相关上下文
+ * 调用，但入口硬中断必须开启。无论返回成功、drop 或错误，skb ownership 都
+ * 被消费；调用者若需重试必须在调用前另持引用，不能根据返回值解引用原指针。
+ *
+ * 主阶段：egress hook -> 选 TX queue -> qdisc enqueue/direct run ->
+ * dev_hard_start_xmit -> ndo_start_xmit。返回值表达本机排队/发送提交结果，不是
+ * TCP ACK 或对端接收结果。
+ *
+ * 两种成功 ownership：
+ *
+ *   有 qdisc：skb 被 enqueue 或在 qdisc run 中交给 driver；
+ *   noqueue：  validate_xmit_skb 后同步调用 ndo_start_xmit。
+ *
+ * `skb == NULL` 在本函数内部表示下层已经消费完整 skb/list；非 NULL 表示 busy
+ * 后仍有未接管对象，必须由本函数 drop/释放，不能直接把责任退还上层 TCP。
+ */
 int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 {
+	/* dev 来自 skb 路由/邻居输出；txq/q 在 RCU 保护下只是借用配置对象。 */
 	struct net_device *dev = skb->dev;
 	struct netdev_queue *txq = NULL;
 	enum skb_drop_reason reason;
@@ -4774,13 +4806,16 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	bool again = false;
 	struct Qdisc *q;
 
+	/* data 当前指向 L2 header，把 mac_header offset 重设到该位置。 */
 	skb_reset_mac_header(skb);
 	skb_assert_len(skb);
 
 	if (unlikely(skb_shinfo(skb)->tx_flags &
 		     (SKBTX_SCHED_TSTAMP | SKBTX_BPF)))
+		/* 记录进入调度层的时间，不是 NIC 硬件真正发出时间。 */
 		__skb_tstamp_tx(skb, NULL, NULL, skb->sk, SCM_TSTAMP_SCHED);
 
+	/* 将 GSO skb 折算为 qdisc 可记账的线速长度/segment 数；异常会直接消费 skb。 */
 	reason = qdisc_pkt_len_segs_init(skb);
 	if (unlikely(reason)) {
 		dev_core_stats_tx_dropped_inc(dev);
@@ -4790,6 +4825,10 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	/* Disable soft irqs for various locks below. Also
 	 * stops preemption for RCU.
 	 */
+	/*
+	 * 阶段 1：关闭 BH 同时进入 RCU 读侧，保护 qdisc、BPF/tc 和 netdev 配置
+	 * 指针；这也固定当前 CPU，供 per-CPU/queue 选择使用。
+	 */
 	rcu_read_lock_bh();
 
 	skb_update_prio(skb);
@@ -4797,7 +4836,9 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	tcx_set_ingress(skb, false);
 #ifdef CONFIG_NET_EGRESS
 	if (static_branch_unlikely(&egress_needed_key)) {
+		/* static branch 让未启用 egress hook 的常见系统几乎不支付分支成本。 */
 		if (nf_hook_egress_active()) {
+			/* hook 可返回原 skb、替换 skb 或返回 NULL 表示已 drop/stolen。 */
 			skb = nf_hook_egress(skb, &rc, dev);
 			if (!skb)
 				goto out;
@@ -4818,18 +4859,22 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	/* If device/qdisc don't need skb->dst, release it right now while
 	 * its hot in this cpu cache.
 	 */
+	/* 设备声明不需要 route 时尽早 dst_drop；否则把 noref dst 转成可跨 RCU 保存的真实引用。 */
 	if (dev->priv_flags & IFF_XMIT_DST_RELEASE)
 		skb_dst_drop(skb);
 	else
 		skb_dst_force(skb);
 
+	/* 阶段 2：用 socket 缓存、XPS 或 flow hash 选择一条设备 TX queue。 */
 	if (!txq)
 		txq = netdev_core_pick_tx(dev, skb, sb_dev);
 
+	/* qdisc 指针由配置侧用 RCU 替换，本函数只在读侧借用。 */
 	q = rcu_dereference_bh(txq->qdisc);
 
 	trace_net_dev_queue(skb);
 	if (q->enqueue) {
+		/* 排队设备把 skb ownership 转给 qdisc；稍后 run 才调用驱动。 */
 		rc = __dev_xmit_skb(skb, q, dev, txq);
 		goto out;
 	}
@@ -4846,40 +4891,53 @@ int __dev_queue_xmit(struct sk_buff *skb, struct net_device *sb_dev)
 	 * Check this and shot the lock. It is not prone from deadlocks.
 	 *Either shot noqueue qdisc, it is even simpler 8)
 	 */
+	/* loopback/隧道常无需软件排队，但仍需防递归和按设备约定串行调用。 */
+	/* noqueue 软件设备可直发，但 DOWN 设备必须在发布给驱动前统一丢弃。 */
 	if (unlikely(!(dev->flags & IFF_UP))) {
 		reason = SKB_DROP_REASON_DEV_READY;
 		goto drop;
 	}
 
+	/* BH 已关闭并禁止抢占，所以当前 CPU id 在本临界区保持稳定。 */
 	cpu = smp_processor_id(); /* ok because BHs are off */
 
 	if (likely(!netif_tx_owned(txq, cpu))) {
 		bool is_list = false;
 
 		if (dev_xmit_recursion())
+			/* 虚拟设备可能把包再次送回自身；限制递归防止内核栈耗尽。 */
 			goto recursion_alert;
 
+		/*
+		 * 根据设备 feature 校验 checksum/GSO/VLAN；不支持的 offload 在这里
+		 * 软件 fallback，且一个大 skb 可能变成 next 链接的 segment list。
+		 */
 		skb = validate_xmit_skb(skb, dev, &again);
 		if (!skb)
 			goto out;
 
+		/* 串行同一硬件 TX queue 的驱动提交；不同 queue 仍可并行。 */
 		HARD_TX_LOCK(dev, txq, cpu);
 
 		if (!netif_xmit_stopped(txq)) {
+			/* `!!` 把 next 指针规范化为 bool：软件 GSO 后可能是一条 skb list。 */
 			is_list = !!skb->next;
 
 			dev_xmit_recursion_inc();
+			/* 最终调用 netdev_ops->ndo_start_xmit；NULL 返回表示全部 ownership 已转移。 */
 			skb = dev_hard_start_xmit(skb, dev, txq, &rc);
 			dev_xmit_recursion_dec();
 
 			/* GSO segments a single SKB into a list of frames.
 			 * TCP expects error to mean none of the data was sent.
 			 */
+			/* list 可能已部分发送，TCP 无法把“部分 segment 失败”映射回一个原 GSO skb，因此按已接收处理。 */
 			if (is_list)
 				rc = NETDEV_TX_OK;
 		}
 		HARD_TX_UNLOCK(dev, txq);
 		if (!skb) /* xmit completed */
+			/* 驱动或软件设备已接管/释放，绝不能再触碰旧指针。 */
 			goto out;
 
 		net_crit_ratelimited("Virtual device %s asks to queue packet!\n",
@@ -4898,12 +4956,14 @@ recursion_alert:
 
 	reason = SKB_DROP_REASON_RECURSION_LIMIT;
 drop:
+	/* 本函数仍持有未被驱动接管的 skb/list，退出 RCU 后统一记 drop 并释放。 */
 	rcu_read_unlock_bh();
 
 	dev_core_stats_tx_dropped_inc(dev);
 	kfree_skb_list_reason(skb, reason);
 	return rc;
 out:
+	/* 正常出口只释放本函数的 RCU/BH 保护；skb ownership 已在前面完成转移。 */
 	rcu_read_unlock_bh();
 	return rc;
 }
@@ -5973,6 +6033,29 @@ static inline int nf_ingress(struct sk_buff *skb, struct packet_type **pt_prev,
 	return 0;
 }
 
+/*
+ * __netif_receive_skb_core - 通用 L2 接收分派核心。
+ *
+ * @pskb 是输入/输出 skb 指针：VLAN、XDP、RX handler 可替换或消费对象；
+ * @pfmemalloc 标记它是否使用内存保留池，只有能保证内存回收进展的协议可接收；
+ * @ppt_prev 用于 list 批处理时延迟最后一个 packet_type 调用，可空。
+ * 前置条件：调用链处于 RCU/BH 保护的接收上下文，不能睡眠。函数依次运行
+ * generic XDP、VLAN、tap、tc/Netfilter ingress、RX handler 和 packet_type。
+ * 返回 NET_RX_*；任一 handler 接管后原调用者不得再访问 skb。
+ *
+ * 普通 Ethernet/IPv4 主线：
+ *
+ *   driver/NAPI 已设置 skb->dev、protocol、checksum/hash/VLAN metadata
+ *     -> generic XDP（若启用）
+ *     -> VLAN 解封装/重跑
+ *     -> ptype_all taps（如 packet socket/tcpdump，通常取得 clone/ref）
+ *     -> tc/Netfilter ingress
+ *     -> rx_handler（bridge/bond 等可能改 dev 或消费）
+ *     -> protocol packet_type：ETH_P_IP 命中 ip_rcv
+ *
+ * `pt_prev` 的延迟调用用于批量分派：遍历到下一个 consumer 时才交付前一个，
+ * 最后一个可直接取得原 skb ownership，从而减少不必要 clone。
+ */
 static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 				    struct packet_type **ppt_prev)
 {
@@ -5989,8 +6072,10 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 
 	trace_netif_receive_skb(skb);
 
+	/* 保存物理/初始入口设备；bridge/VLAN/redirect 可能随后改变 skb->dev。 */
 	orig_dev = skb->dev;
 
+	/* L2 已解析完，当前 data 是 L3 起点；重设 network header offset。 */
 	skb_reset_network_header(skb);
 #if !defined(CONFIG_DEBUG_NET)
 	/* We plan to no longer reset the transport header here.
@@ -6005,11 +6090,13 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
 	pt_prev = NULL;
 
 another_round:
+	/* redirect/VLAN 解封装可要求以新设备身份重跑分派，故使用受控循环。 */
 	skb->skb_iif = skb->dev->ifindex;
 
 	__this_cpu_inc(softnet_data.processed);
 
 	if (static_branch_unlikely(&generic_xdp_needed_key)) {
+		/* XDP 非 PASS 会消费/重定向 skb，不能继续送协议栈。 */
 		int ret2;
 
 		migrate_disable();
@@ -6024,6 +6111,7 @@ another_round:
 	}
 
 	if (eth_type_vlan(skb->protocol)) {
+		/* 软件剥除 VLAN header 后 protocol/dev 语义可能改变，失败路径已消费 skb。 */
 		skb = skb_vlan_untag(skb);
 		if (unlikely(!skb))
 			goto out;
@@ -6037,6 +6125,7 @@ another_round:
 
 	list_for_each_entry_rcu(ptype, &dev_net_rcu(skb->dev)->ptype_all,
 				list) {
+		/* 前一个 tap 需要 clone/ref 交付，原 skb 留给后续 consumer。 */
 		if (unlikely(pt_prev))
 			ret = deliver_skb(skb, pt_prev, orig_dev);
 		pt_prev = ptype;
@@ -6074,6 +6163,7 @@ skip_classify:
 	}
 
 	if (skb_vlan_tag_present(skb)) {
+		/* 硬件剥离 VLAN 时 tag 在 metadata；vlan_do_receive 可切换到 VLAN netdev 并重跑。 */
 		if (unlikely(pt_prev)) {
 			ret = deliver_skb(skb, pt_prev, orig_dev);
 			pt_prev = NULL;
@@ -6084,6 +6174,7 @@ skip_classify:
 			goto out;
 	}
 
+	/* bridge/bond 等 rx_handler 可改写 dev 或接管；配置侧用 RCU 安装/卸载。 */
 	rx_handler = rcu_dereference(skb->dev->rx_handler);
 	if (rx_handler) {
 		if (unlikely(pt_prev)) {
@@ -6091,6 +6182,7 @@ skip_classify:
 			pt_prev = NULL;
 		}
 		switch (rx_handler(&skb)) {
+		/* handler 返回值明确 ownership：CONSUMED 后 skb 可能已释放，不能继续。 */
 		case RX_HANDLER_CONSUMED:
 			ret = NET_RX_SUCCESS;
 			goto out;
@@ -7907,8 +7999,30 @@ static int napi_threaded_poll(void *data)
 	return 0;
 }
 
+/*
+ * net_rx_action - NET_RX_SOFTIRQ 的 NAPI 调度器，按预算轮询本 CPU poll_list。
+ *
+ * 无显式参数/返回值；输入是当前 CPU softnet_data.poll_list，可观察输出是驱动
+ * RX/TX completion 被处理、skb 被交给协议栈，以及未完成 NAPI 被重新排队。
+ * 运行于 softirq，不能睡眠。packet budget 与 time budget 任一耗尽都会让出 CPU，
+ * 避免持续收包形成 livelock；代价是剩余工作增加一轮调度延迟。
+ *
+ * 状态流转：
+ *
+ *   IRQ/____napi_schedule
+ *      -> sd->poll_list
+ *      -> 本函数私有 list
+ *      -> napi_poll
+ *         -> driver poll -> napi_gro_receive -> 协议栈
+ *      -> 完成：NAPI 清 scheduled，驱动重开 IRQ
+ *         未完成：进入 repoll，下一轮继续
+ *
+ * poll_list 是每 CPU 侵入式链表。关 IRQ 只保护本 CPU IRQ producer 与 softirq
+ * consumer 的短暂搬链，不是让整个 driver poll 在关硬中断状态运行。
+ */
 static __latent_entropy void net_rx_action(void)
 {
+	/* time_limit 与 budget 是本次 softirq 的全局上限，不是每个 NAPI 各一份。 */
 	struct softnet_data *sd = this_cpu_ptr(&softnet_data);
 	unsigned long time_limit = jiffies +
 		usecs_to_jiffies(READ_ONCE(net_hotdata.netdev_budget_usecs));
@@ -7917,20 +8031,28 @@ static __latent_entropy void net_rx_action(void)
 	LIST_HEAD(list);
 	LIST_HEAD(repoll);
 
+	/* 在栈上安装本次网络/BPF 上下文，所有出口必须 clear。 */
 	bpf_net_ctx = bpf_net_ctx_set(&__bpf_net_ctx);
 start:
+	/* 阶段 1：在短暂关本地 IRQ 下把共享 poll_list 搬到私有 list。 */
 	sd->in_net_rx_action = true;
 	local_irq_disable();
+	/* splice_init 原子语义由关 IRQ 保证：移动全部节点并把源链重新初始化为空。 */
 	list_splice_init(&sd->poll_list, &list);
 	local_irq_enable();
 
 	for (;;) {
 		struct napi_struct *n;
 
+		/* 批量释放此前延后的 skb，摊薄 refcount/page 回收成本。 */
 		skb_defer_free_flush();
 
 		if (list_empty(&list)) {
 			if (list_empty(&repoll)) {
+				/*
+				 * 先声明将退出，再用 barrier 阻止编译器把后续 poll_list 检查
+				 * 提前；scheduler producer 会依据 in_net_rx_action 决定是否 raise。
+				 */
 				sd->in_net_rx_action = false;
 				barrier();
 				/* We need to check if ____napi_schedule()
@@ -7945,7 +8067,9 @@ start:
 			break;
 		}
 
+		/* 阶段 2：每个 NAPI 的 poll 自己处理驱动 ring，但总工作量由这里扣 budget。 */
 		n = list_first_entry(&list, struct napi_struct, poll_list);
+		/* napi_poll 返回实际 work 数；未完成实例由 helper 接到 repoll。 */
 		budget -= napi_poll(n, &repoll);
 
 		/* If softirq window is exhausted then punt.
@@ -7955,6 +8079,7 @@ start:
 		if (unlikely(budget <= 0 ||
 			     time_after_eq(jiffies, time_limit))) {
 			/* Pairs with READ_ONCE() in softnet_seq_show() */
+			/* time_squeeze 是“预算被用尽”的诊断证据，不等价于硬件丢包。 */
 			WRITE_ONCE(sd->time_squeeze, sd->time_squeeze + 1);
 			break;
 		}
@@ -7962,7 +8087,12 @@ start:
 
 	local_irq_disable();
 
+	/*
+	 * 阶段 3：合并执行期间 IRQ 新增的 NAPI 与本轮需 repoll 的 NAPI。只有列表
+	 * 真空才结束 softirq；否则重新 raise，防止 schedule 与结束检查之间丢工作。
+	 */
 	list_splice_tail_init(&sd->poll_list, &list);
+	/* 把需继续轮询的实例排在新到工作之后/既定顺序中，避免单一繁忙 queue 独占。 */
 	list_splice_tail(&repoll, &list);
 	list_splice(&list, &sd->poll_list);
 	if (!list_empty(&sd->poll_list))
