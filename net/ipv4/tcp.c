@@ -304,6 +304,7 @@
 #include "../core/devmem.h"
 
 /* Track pending CMSGs. */
+/* 位值记录解锁后仍需生成的 INQ/时间戳控制消息，避免持 socket lock 访问用户缓冲。 */
 enum {
 	TCP_CMSG_INQ = 1,
 	TCP_CMSG_TS = 2
@@ -324,6 +325,7 @@ EXPORT_SYMBOL(tcp_have_smc);
 /*
  * Current number of TCP sockets.
  */
+/* percpu_counter 让创建/销毁热路径分散更新，读取总数时才跨 CPU 汇总。 */
 struct percpu_counter tcp_sockets_allocated ____cacheline_aligned_in_smp;
 
 /*
@@ -503,15 +505,18 @@ void tcp_init_sock(struct sock *sk)
 	 * algorithms that we must have the following bandaid to talk
 	 * efficiently to them.  -DaveM
 	 */
+	/* 兼容部分把 SYN 错算进 delayed-ACK/拥塞控制的对端，初始 cwnd 采用传统默认值。 */
 	tcp_snd_cwnd_set(tp, TCP_INIT_CWND);
 
 	/* There's a bubble in the pipe until at least the first ACK. */
+	/* 首个 ACK 前不存在可靠 delivery-rate 样本，用哨兵标记应用受限区间。 */
 	tp->app_limited = ~0U;
 	tp->rate_app_limited = 1;
 
 	/* See draft-stevens-tcpca-spec-01 for discussion of the
 	 * initialization of these values.
 	 */
+	/* ssthresh 先视为无限，cwnd clamp 不限，MSS 在 route/握手确定前使用安全默认。 */
 	tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
 	tp->snd_cwnd_clamp = ~0;
 	tp->mss_cache = TCP_MSS_DEFAULT;
@@ -630,6 +635,7 @@ __poll_t tcp_poll(struct file *file, struct socket *sock, poll_table *wait)
 	 * by poll logic and correct handling of state changes
 	 * made by other threads is impossible in any case.
 	 */
+	/* poll 只生成瞬时提示；注册 waitqueue 后的状态变化由对应 wakeup 保证不会永久遗漏。 */
 
 	mask = 0;
 
@@ -660,6 +666,11 @@ __poll_t tcp_poll(struct file *file, struct socket *sock, poll_table *wait)
 	 * NOTE. Check for TCP_CLOSE is added. The goal is to prevent
 	 * blocking on fresh not-connected or disconnected socket. --ANK
 	 */
+	/*
+	 * poll 没有“仅一个方向 HUP”的表达。Linux 仅在双向 shutdown/CLOSE 报 HUP，
+	 * 单独收到 FIN 则用 RDHUP+IN，保留 CLOSE_WAIT 下继续写的能力；宁可多报可重查
+	 * 的事件，也不能少报导致应用永久阻塞。
+	 */
 	shutdown = READ_ONCE(sk->sk_shutdown);
 	if (shutdown == SHUTDOWN_MASK || state == TCP_CLOSE)
 		mask |= EPOLLHUP;
@@ -667,6 +678,7 @@ __poll_t tcp_poll(struct file *file, struct socket *sock, poll_table *wait)
 		mask |= EPOLLIN | EPOLLRDNORM | EPOLLRDHUP;
 
 	/* Connected or passive Fast Open socket? */
+	/* 握手完成或 TFO child 已存在时才按普通连接检查数据与写空间。 */
 	if (state != TCP_SYN_SENT &&
 	    (state != TCP_SYN_RECV || rcu_access_pointer(tp->fastopen_rsk))) {
 		int target = sock_rcvlowat(sk, 0, INT_MAX);
@@ -684,6 +696,7 @@ __poll_t tcp_poll(struct file *file, struct socket *sock, poll_table *wait)
 			if (__sk_stream_is_writeable(sk, 1)) {
 				mask |= EPOLLOUT | EPOLLWRNORM;
 			} else {  /* send SIGIO later */
+				/* 先登记异步缺空间，释放 wmem 的路径才知道需要发送 SIGIO/EPOLLOUT。 */
 				sk_set_bit(SOCKWQ_ASYNC_NOSPACE, sk);
 				set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 
@@ -692,6 +705,7 @@ __poll_t tcp_poll(struct file *file, struct socket *sock, poll_table *wait)
 				 * IO signal will be lost. Memory barrier
 				 * pairs with the input side.
 				 */
+				/* 原子位置位后屏障，再检查一次空间，闭合“先释放、后登记”的丢失通知窗口。 */
 				smp_mb__after_atomic();
 				if (__sk_stream_is_writeable(sk, 1))
 					mask |= EPOLLOUT | EPOLLWRNORM;
@@ -707,9 +721,11 @@ __poll_t tcp_poll(struct file *file, struct socket *sock, poll_table *wait)
 		 * Return EPOLLOUT so application can call write()
 		 * in order for kernel to generate SYN+data
 		 */
+		/* 延迟 connect 的 TFO 需要应用 write 才生成 SYN+data，因此提前报告可写。 */
 		mask |= EPOLLOUT | EPOLLWRNORM;
 	}
 	/* This barrier is coupled with smp_wmb() in tcp_done_with_error() */
+	/* 先读 shutdown/队列，再以读屏障观察错误；与错误发布写屏障共同保证不漏 EPOLLERR。 */
 	smp_rmb();
 	if (READ_ONCE(sk->sk_err) ||
 	    !skb_queue_empty_lockless(&sk->sk_error_queue))
@@ -879,6 +895,7 @@ void tcp_push(struct sock *sk, int flags, int mss_now,
 	if (tcp_should_autocork(sk, skb, size_goal)) {
 
 		/* avoid atomic op if TSQ_THROTTLED bit is already set */
+		/* 位已设置时跳过重复原子 RMW，降低 send 热路径 cacheline 争用。 */
 		if (!test_bit(TSQ_THROTTLED, &sk->sk_tsq_flags)) {
 			NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPAUTOCORKING);
 			set_bit(TSQ_THROTTLED, &sk->sk_tsq_flags);
@@ -887,6 +904,7 @@ void tcp_push(struct sock *sk, int flags, int mss_now,
 		/* It is possible TX completion already happened
 		 * before we set TSQ_THROTTLED.
 		 */
+		/* completion 可能早于节流位发布；复查 wmem，已排空则不能返回等待不存在的唤醒。 */
 		if (refcount_read(&sk->sk_wmem_alloc) > skb->truesize)
 			return;
 	}
@@ -921,6 +939,7 @@ int tcp_splice_data_recv(read_descriptor_t *rd_desc, struct sk_buff *skb,
 static int __tcp_splice_read(struct sock *sk, struct tcp_splice_state *tss)
 {
 	/* Store TCP splice context information in read_descriptor_t. */
+	/* read_descriptor 把剩余长度和 pipe 私有状态统一传给逐 skb actor。 */
 	read_descriptor_t rd_desc = {
 		.arg.data = tss,
 		.count	  = tss->len,
@@ -968,6 +987,7 @@ ssize_t tcp_splice_read(struct socket *sock, loff_t *ppos,
 	/*
 	 * We can't seek on a socket input
 	 */
+	/* TCP 是字节流当前游标接口，没有文件偏移语义。 */
 	if (unlikely(*ppos))
 		return -ESPIPE;
 
@@ -996,6 +1016,7 @@ ssize_t tcp_splice_read(struct socket *sock, loff_t *ppos,
 				 * This occurs when user tries to read
 				 * from never connected socket.
 				 */
+				/* 从未连接/已 disconnect 的 CLOSED socket 无 EOF 语义，返回 ENOTCONN。 */
 				ret = -ENOTCONN;
 				break;
 			}
@@ -1007,6 +1028,7 @@ ssize_t tcp_splice_read(struct socket *sock, loff_t *ppos,
 			 * an skb in receive queue, we do not want to loop.
 			 * This might happen with URG data.
 			 */
+			/* 队列非空但 actor 无进度通常是 urgent 边界；继续循环会忙等。 */
 			if (!skb_queue_empty(&sk->sk_receive_queue))
 				break;
 			ret = sk_wait_data(sk, &timeo, NULL);
@@ -1128,9 +1150,11 @@ static unsigned int tcp_xmit_size_goal(struct sock *sk, u32 mss_now,
 		return mss_now;
 
 	/* Note : tcp_tso_autosize() will eventually split this later */
+	/* 当前只定聚合目标，输出阶段仍会按 pacing/cwnd/设备限制重新切分。 */
 	new_size_goal = tcp_bound_to_half_wnd(tp, sk->sk_gso_max_size);
 
 	/* We try hard to avoid divides here */
+	/* 缓存 gso_segs，仅跨 MSS 档位时做除法，减少每次 send 的整数除法成本。 */
 	size_goal = tp->gso_segs * mss_now;
 	if (unlikely(new_size_goal < size_goal ||
 		     new_size_goal >= size_goal + mss_now)) {
@@ -1216,6 +1240,7 @@ int tcp_wmem_schedule(struct sock *sk, int copy)
 	 * Use whatever is left in sk->sk_forward_alloc and tcp_wmem[0]
 	 * to guarantee some progress.
 	 */
+	/* 空队列若完全拒绝首包将无法靠 ACK 释放空间，借最低 sndbuf 预算保证启动进展。 */
 	left = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_wmem[0]) - sk->sk_wmem_queued;
 	if (left > 0)
 		sk_forced_mem_schedule(sk, min(left, copy));
@@ -1255,6 +1280,7 @@ int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *copied,
 		return -EOPNOTSUPP;
 	if (tp->fastopen_req)
 		return -EALREADY; /* Another Fast Open is in progress */
+	/* 同一 socket 只能有一个持有 msg 生命周期的 TFO 请求，避免覆盖悬挂指针。 */
 
 	tp->fastopen_req = kzalloc_obj(struct tcp_fastopen_request,
 				       sk->sk_allocation);
@@ -1267,6 +1293,7 @@ int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *copied,
 	if (inet_test_bit(DEFER_CONNECT, sk)) {
 		err = tcp_connect(sk);
 		/* Same failure procedure as in tcp_v4/6_connect */
+		/* connect 已发布过部分状态，失败必须恢复为可再次连接的 CLOSED 身份。 */
 		if (err) {
 			tcp_set_state(sk, TCP_CLOSE);
 			inet->inet_dport = 0;
@@ -1279,6 +1306,7 @@ int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *copied,
 	/* fastopen_req could already be freed in __inet_stream_connect
 	 * if the connection times out or gets rst
 	 */
+	/* connect 等待期间 RST/timeout 可异步结束请求，故只能在非 NULL 时读取 copied。 */
 	if (tp->fastopen_req) {
 		*copied = tp->fastopen_req->copied;
 		tcp_free_fastopen_req(tp);
@@ -1299,12 +1327,16 @@ void tcp_rate_check_app_limited(struct sock *sk)
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	if (/* We have less than one packet to send. */
+	    /* 不足一 MSS 表示发送端当前没有持续供数。 */
 	    tp->write_seq - tp->snd_nxt < tp->mss_cache &&
 	    /* Nothing in sending host's qdisc queues or NIC tx queue. */
+	    /* wmem 近空排除“数据只是滞留本机下层”的情况。 */
 	    sk_wmem_alloc_get(sk) < SKB_TRUESIZE(1) &&
 	    /* We are not limited by CWND. */
+	    /* cwnd 尚有余额，低发送量不能归因于拥塞窗口。 */
 	    tcp_packets_in_flight(tp) < tcp_snd_cwnd(tp) &&
 	    /* All lost packets have been retransmitted. */
+	    /* 若仍有待重传 loss，发送空档属于恢复受限而非应用受限。 */
 	    tp->lost_out <= tp->retrans_out)
 		tp->app_limited =
 			(tp->delivered + tcp_packets_in_flight(tp)) ? : 1;
@@ -1471,6 +1503,7 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
 
 	/* 给带宽采样标记“应用供数不足”，避免拥塞控制把低速误判为网络容量。 */
 	tcp_rate_check_app_limited(sk);  /* is sending application-limited? */
+	/* 在本轮加入新数据前记录空档边界，避免新 write_seq 掩盖应用供数不足。 */
 
 	/* Wait for a connection to finish. One exception is TCP Fast Open
 	 * (passive side) where data is allowed to be sent before a connection
@@ -1501,6 +1534,7 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
 			goto out_err;
 
 		/* 'common' sending to sendq */
+		/* repair 模式指定的队列合法；未选特殊队列时继续走普通发送队列。 */
 	}
 
 	if (sockc_err) {
@@ -1586,6 +1620,7 @@ new_segment:
 			 * already been sent. skb_mstamp_ns isn't set to
 			 * avoid wrong rtt estimation.
 			 */
+			/* repair 注入的是历史队列状态，不生成新发送时间样本，否则 RTT/RACK 会误判。 */
 			if (tp->repair)
 				TCP_SKB_CB(skb)->sacked |= TCPCB_REPAIRED;
 		}
@@ -1661,6 +1696,7 @@ new_segment:
 			/* First append to a fragless skb builds initial
 			 * pure zerocopy skb
 			 */
+			/* 首次直接附加用户页时先标 pure，后续混入复制数据才补收较高 truesize。 */
 			if (!skb->len)
 				skb_shinfo(skb)->flags |= SKBFL_PURE_ZEROCOPY;
 
@@ -1681,6 +1717,7 @@ new_segment:
 			copy = err;
 		} else if (zc == MSG_SPLICE_PAGES) {
 			/* Splice in data if we can; copy if we can't. */
+			/* helper 优先转移页引用；布局不支持时内部复制，但 TCP 序列语义相同。 */
 			if (tcp_downgrade_zcopy_pure(sk, skb))
 				goto wait_for_space;
 			copy = tcp_wmem_schedule(sk, copy);
@@ -1869,9 +1906,10 @@ static int tcp_recv_urg(struct sock *sk, struct msghdr *msg, int len, int flags)
 	struct tcp_sock *tp = tcp_sk(sk);
 
 	/* No URG data to read. */
+	/* OOBINLINE 由普通 recv 消费；无数据或已经读取时 MSG_OOB 请求本身无效。 */
 	if (sock_flag(sk, SOCK_URGINLINE) || !tp->urg_data ||
 	    tp->urg_data == TCP_URG_READ)
-		return -EINVAL;	/* Yes this is right ! */
+		return -EINVAL;	/* 没有可供 MSG_OOB 单独读取的字节，EINVAL 正是历史 ABI。 */
 
 	if (sk->sk_state == TCP_CLOSE && !sock_flag(sk, SOCK_DONE))
 		return -ENOTCONN;
@@ -1884,6 +1922,7 @@ static int tcp_recv_urg(struct sock *sk, struct msghdr *msg, int len, int flags)
 			WRITE_ONCE(tp->urg_data, TCP_URG_READ);
 
 		/* Read urgent data. */
+		/* urgent 缓存只有一个字节；非 PEEK 先标已读，copy fault 也不重复交付。 */
 		msg->msg_flags |= MSG_OOB;
 
 		if (len > 0) {
@@ -1961,6 +2000,7 @@ void __tcp_cleanup_rbuf(struct sock *sk, int copied)
 		const struct inet_connection_sock *icsk = inet_csk(sk);
 
 		if (/* Once-per-two-segments ACK was not sent by tcp_input.c */
+		    /* 接收推进超过一个 rcv_mss 时立即补 ACK，避免 delayed ACK 再拖延。 */
 		    tp->rcv_nxt - tp->rcv_wup > icsk->icsk_ack.rcv_mss ||
 		    /*
 		     * If this read emptied read buffer, we send ACK, if
@@ -1968,6 +2008,7 @@ void __tcp_cleanup_rbuf(struct sock *sk, int copied)
 		     * receive buffer and there was a small segment
 		     * in queue.
 		     */
+		    /* 队列被读空且曾收到 PUSH/小段时，立即 ACK 可及时反馈窗口与交付。 */
 		    (copied > 0 &&
 		     ((icsk->icsk_ack.pending & ICSK_ACK_PUSHED2) ||
 		      ((icsk->icsk_ack.pending & ICSK_ACK_PUSHED) &&
@@ -1982,10 +2023,12 @@ void __tcp_cleanup_rbuf(struct sock *sk, int copied)
 	 * Even if window raised up to infinity, do not send window open ACK
 	 * in states, where we will not receive more. It is useless.
 	 */
+	/* 已 shutdown 接收方向时不再公告新窗口；仍接收时仅对显著扩窗主动发 ACK。 */
 	if (copied > 0 && !time_to_ack && !(sk->sk_shutdown & RCV_SHUTDOWN)) {
 		__u32 rcv_window_now = tcp_receive_window(tp);
 
 		/* Optimize, __tcp_select_window() is not cheap. */
+		/* 当前窗口已超过 clamp 一半时不可能再翻倍，省去昂贵窗口计算。 */
 		if (2*rcv_window_now <= tp->window_clamp) {
 			__u32 new_window = __tcp_select_window(sk);
 
@@ -1994,6 +2037,7 @@ void __tcp_cleanup_rbuf(struct sock *sk, int copied)
 			 * We can advertise it now, if it is not less than current one.
 			 * "Lots" means "at least twice" here.
 			 */
+			/* 窗口至少翻倍才值得单独发 ACK，避免小幅 read 造成 ACK 风暴。 */
 			if (new_window && new_window >= 2 * rcv_window_now)
 				time_to_ack = true;
 		}
@@ -2062,6 +2106,7 @@ struct sk_buff *tcp_recv_skb(struct sock *sk, u32 seq, u32 *off)
 		 * splitted a fat GRO packet, while we released socket lock
 		 * in skb_splice_bits()
 		 */
+		/* 释放锁期间队列形态可变，但 seq 单调；过期队首可安全消费后继续定位。 */
 		tcp_eat_recv_skb(sk, skb);
 	}
 	return NULL;
@@ -2109,6 +2154,7 @@ static int __tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 
 			len = skb->len - offset;
 			/* Stop reading if we hit a patch of urgent data */
+			/* actor API 不支持 OOB，必须在 urgent 序号前截断并留给专用接口。 */
 			if (unlikely(tp->urg_data)) {
 				u32 urg_offset = tp->urg_seq - seq;
 				if (urg_offset < len)
@@ -2133,12 +2179,14 @@ static int __tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 			 * getting here: tcp_collapse might have deleted it
 			 * while aggregating skbs from the socket queue.
 			 */
+			/* 回调后只信任 seq，不信任旧 skb 地址；重新查找防止 collapse 后 UAF。 */
 			skb = tcp_recv_skb(sk, seq - 1, &offset);
 			if (!skb)
 				break;
 			/* TCP coalescing might have appended data to the skb.
 			 * Try to splice more frags
 			 */
+			/* 若原尾部被扩展，继续同一逻辑段可减少 actor/pipe 调用。 */
 			if (offset + 1 != skb->len)
 				continue;
 		}
@@ -2160,6 +2208,7 @@ static int __tcp_read_sock(struct sock *sk, read_descriptor_t *desc,
 	tcp_rcv_space_adjust(sk);
 
 	/* Clean up data we have read: This will do ACK frames. */
+	/* 已消费的数据必须在此回收；释放接收窗口还可能触发 ACK/窗口更新。 */
 	if (copied > 0) {
 		tcp_recv_skb(sk, seq, &offset);
 		tcp_cleanup_rbuf(sk, copied);
@@ -2262,6 +2311,7 @@ void tcp_read_done(struct sock *sk, size_t len)
 	tcp_rcv_space_adjust(sk);
 
 	/* Clean up data we have read: This will do ACK frames. */
+	/* splice 成功移走的字节等价于 read 消费，也要回收队列并推进 ACK。 */
 	if (left != len)
 		tcp_cleanup_rbuf(sk, len - left);
 }
@@ -2294,6 +2344,7 @@ int tcp_set_rcvlowat(struct sock *sk, int val)
 	WRITE_ONCE(sk->sk_rcvlowat, val ? : 1);
 
 	/* Check if we need to signal EPOLLIN right now */
+	/* 阈值降低后旧数据可能已满足条件，不能等待下一包才产生边沿通知。 */
 	tcp_data_ready(sk);
 
 	if (sk->sk_userlocks & SOCK_RCVBUF_LOCK)
@@ -2335,6 +2386,7 @@ int tcp_mmap(struct file *file, struct socket *sock,
 	vm_flags_clear(vma, VM_MAYWRITE | VM_MAYEXEC);
 
 	/* Instruct vm_insert_page() to not mmap_read_lock(mm) */
+	/* zerocopy 路径自行持 per-VMA 或 mmap read lock，避免 helper 重复获取同一锁。 */
 	vm_flags_set(vma, VM_MIXEDMAP);
 
 	vma->vm_ops = &tcp_vm_ops;
@@ -2426,9 +2478,11 @@ static void tcp_zerocopy_set_hint_for_skb(struct sock *sk,
 	skb_frag_t *frag;
 
 	/* worst case: skip to next skb. try to improve on this case below */
+	/* 先给保守上界，后续只有确认更早可映射整页时才缩小 hint。 */
 	zc->recv_skip_hint = skb->len - offset;
 
 	/* Find the frag containing this offset (and how far into that frag) */
+	/* copied_seq 可能落在 frag 中部，必须同时得到 descriptor 和相对偏移。 */
 	frag = skb_advance_to_frag(skb, offset, &frag_offset);
 	if (!frag)
 		return;
@@ -2437,10 +2491,12 @@ static void tcp_zerocopy_set_hint_for_skb(struct sock *sk,
 		struct skb_shared_info *info = skb_shinfo(skb);
 
 		/* We read part of the last frag, must recvmsg() rest of skb. */
+		/* 最后 frag 无后续整页可映射，只能把其余数据全部普通复制。 */
 		if (frag == &info->frags[info->nr_frags - 1])
 			return;
 
 		/* Else, we must at least read the remainder in this frag. */
+		/* 先复制当前 partial frag 尾部，下一 frag 才可能从页边界映射。 */
 		partial_frag_remainder = skb_frag_size(frag) - frag_offset;
 		zc->recv_skip_hint -= partial_frag_remainder;
 		++frag;
@@ -2450,6 +2506,7 @@ static void tcp_zerocopy_set_hint_for_skb(struct sock *sk,
 	 * mappable_offset: Bytes till next mappable frag, *not* counting bytes
 	 * in partial_frag_remainder.
 	 */
+	/* hint 等于 partial 尾数加其后不可映射 frags，总是指向下一整页边界。 */
 	mappable_offset = find_next_mappable_frag(frag, zc->recv_skip_hint);
 	zc->recv_skip_hint = mappable_offset + partial_frag_remainder;
 }
@@ -2550,6 +2607,7 @@ static int tcp_zc_handle_leftover(struct tcp_zerocopy_receive *zc,
 	if (!copylen)
 		return 0;
 	/* skb is null if inq < PAGE_SIZE. */
+	/* 小于一页的快速路径尚未定位 skb，只有需要 copy 尾数时再查。 */
 	if (skb) {
 		offset = *seq - TCP_SKB_CB(skb)->seq;
 	} else {
@@ -2584,13 +2642,18 @@ static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
 					      int err)
 {
 	/* At least one page did not map. Try zapping if we skipped earlier. */
+	/* TLB-clean hint 可能错误，EBUSY 时用 zap 纠正后给本批一次重试机会。 */
 	if (err == -EBUSY &&
 	    zc->flags & TCP_RECEIVE_ZEROCOPY_FLAG_TLB_CLEAN_HINT) {
 		u32 maybe_zap_len;
 
-		maybe_zap_len = total_bytes_to_map -  /* All bytes to map */
-				*length + /* Mapped or pending */
-				(pages_remaining * PAGE_SIZE); /* Failed map. */
+		/*
+		 * 失败区间 = 原计划映射量 - 已映射或待提交量 + 最后一批未映射页。
+		 * 只撤销失败尾部，保留已经成功建立的用户映射。
+		 */
+		maybe_zap_len = total_bytes_to_map -  /* 原计划映射的全部字节 */
+				*length + /* 已映射或正在提交的字节 */
+				(pages_remaining * PAGE_SIZE); /* 本批映射失败的尾部 */
 		zap_vma_range(vma, *address, maybe_zap_len);
 		err = 0;
 	}
@@ -2600,6 +2663,7 @@ static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
 		int bytes_mapped;
 
 		/* We called zap_vma_range, try to reinsert. */
+		/* 重试仍允许部分成功，pages_remaining 是唯一可靠的未映射数量。 */
 		err = vm_insert_pages(vma, *address,
 				      pending_pages,
 				      &pages_remaining);
@@ -2613,6 +2677,7 @@ static int tcp_zerocopy_vm_insert_batch_error(struct vm_area_struct *vma,
 		 * is the number of pages we were unable to map, and we unroll
 		 * some state we speculatively touched before.
 		 */
+		/* 只撤销未映射后缀；已建立 PTE 的前缀必须继续计入 length/seq。 */
 		const int bytes_not_mapped = PAGE_SIZE * pages_remaining;
 
 		*length -= bytes_not_mapped;
@@ -2648,6 +2713,7 @@ static int tcp_zerocopy_vm_insert_batch(struct vm_area_struct *vma,
 	/* Even if vm_insert_pages fails, it may have partially succeeded in
 	 * mapping (some but not all of the pages).
 	 */
+	/* 因此无论 err 是否为零，都先按 pages_to_map-pages_remaining 提交地址和 seq。 */
 	*seq += bytes_mapped;
 	*address += bytes_mapped;
 
@@ -2655,6 +2721,7 @@ static int tcp_zerocopy_vm_insert_batch(struct vm_area_struct *vma,
 		return 0;
 
 	/* Error: maybe zap and retry + rollback state for failed inserts. */
+	/* error helper 接收成功前缀后的 pages 指针，避免重插已经映射的页面。 */
 	return tcp_zerocopy_vm_insert_batch_error(vma, pages + pages_mapped,
 		pages_remaining, address, length, seq, zc, total_bytes_to_map,
 		err);
@@ -2850,6 +2917,7 @@ static int tcp_zerocopy_receive(struct sock *sk,
 			/* Either full batch, or we're about to go to next skb
 			 * (and we cannot unroll failed ops across skbs).
 			 */
+			/* 失败回滚账本不能跨 skb，故切换 skb 前也必须强制提交当前小批。 */
 			ret = tcp_zerocopy_vm_insert_batch(vma, pages,
 							   pages_to_map,
 							   &address, &length,
@@ -2880,6 +2948,7 @@ out:
 		tcp_rcv_space_adjust(sk);
 
 		/* Clean up data we have read: This will do ACK frames. */
+		/* 映射建立后数据已对用户可见，再释放 receive buffer 并更新公告窗口。 */
 		tcp_recv_skb(sk, seq, &offset);
 		tcp_cleanup_rbuf(sk, length + copylen);
 		ret = 0;
@@ -2993,6 +3062,7 @@ static int tcp_inq_hint(struct sock *sk)
 	/* After receiving a FIN, tell the user-space to continue reading
 	 * by returning a non-zero inq.
 	 */
+	/* 用 1 代表“还需观察 EOF”而非真实 payload，下一次 recv 最终返回 0。 */
 	if (inq == 0 && sock_flag(sk, SOCK_DONE))
 		inq = 1;
 	return inq;
@@ -3005,7 +3075,7 @@ static int tcp_inq_hint(struct sock *sk)
  * 未使用后缀回滚；把多次 xa_lock 合成一次，代价是显式维护 max/idx 两个阶段游标。
  */
 struct tcp_xa_pool {
-	u8		max; /* max <= MAX_SKB_FRAGS */
+	u8		max; /* max <= MAX_SKB_FRAGS；本批次预留槽位数。 */
 	u8		idx; /* idx <= max */
 	__u32		tokens[MAX_SKB_FRAGS];
 	netmem_ref	netmems[MAX_SKB_FRAGS];
@@ -3017,10 +3087,12 @@ static void tcp_xa_pool_commit_locked(struct sock *sk, struct tcp_xa_pool *p)
 	int i;
 
 	/* Commit part that has been copied to user space. */
+	/* idx 前缀已有成功 cmsg，可把 XA_ZERO_ENTRY 原子替换为真实 netmem。 */
 	for (i = 0; i < p->idx; i++)
 		__xa_cmpxchg(&sk->sk_user_frags, p->tokens[i], XA_ZERO_ENTRY,
 			     (__force void *)p->netmems[i], GFP_KERNEL);
 	/* Rollback what has been pre-allocated and is no longer needed. */
+	/* idx 之后未向用户发送 token，直接 erase 占位且不增加 netmem 引用。 */
 	for (; i < p->max; i++)
 		__xa_erase(&sk->sk_user_frags, p->tokens[i]);
 
@@ -3113,6 +3185,7 @@ static int tcp_recvmsg_dmabuf(struct sock *sk, const struct sk_buff *skb,
 		}
 
 		/* Copy header. */
+		/* linear 区仍在普通内存，必须复制并用 SO_DEVMEM_LINEAR 描述这段混合布局。 */
 		copy = start - offset;
 		if (copy > 0) {
 			copy = min(copy, remaining_len);
@@ -3130,6 +3203,7 @@ static int tcp_recvmsg_dmabuf(struct sock *sk, const struct sk_buff *skb,
 			/* First a dmabuf_cmsg for # bytes copied to user
 			 * buffer.
 			 */
+			/* 先发 linear 描述，保持 control message 顺序与 TCP 字节顺序一致。 */
 			memset(&dmabuf_cmsg, 0, sizeof(dmabuf_cmsg));
 			dmabuf_cmsg.frag_size = copy;
 			err = put_cmsg_notrunc(msg, SOL_SOCKET,
@@ -3148,6 +3222,7 @@ static int tcp_recvmsg_dmabuf(struct sock *sk, const struct sk_buff *skb,
 		/* after that, send information of dmabuf pages through a
 		 * sequence of cmsg
 		 */
+		/* 每个 frag 只传位置与 token；payload 留在 device memory，不由 CPU copy。 */
 		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 			struct net_iov *niov;
@@ -3161,6 +3236,7 @@ static int tcp_recvmsg_dmabuf(struct sock *sk, const struct sk_buff *skb,
 			 * skb_frags_readable() correctly, we still don't want
 			 * to crash here.
 			 */
+			/* 外层类型位若损坏也不能盲目强转，逐 frag 验证是防崩溃的第二道边界。 */
 			if (!skb_frag_net_iov(frag)) {
 				net_err_ratelimited("Found non-dmabuf skb with net_iov");
 				err = -ENODEV;
@@ -3190,6 +3266,7 @@ static int tcp_recvmsg_dmabuf(struct sock *sk, const struct sk_buff *skb,
 					goto out;
 
 				/* Will perform the exchange later */
+				/* token 先占位，只有 cmsg 成功后才增加引用并在批末发布映射。 */
 				dmabuf_cmsg.frag_token = tcp_xa_pool.tokens[tcp_xa_pool.idx];
 				dmabuf_cmsg.dmabuf_id = net_devmem_iov_binding_id(niov);
 
@@ -3221,6 +3298,7 @@ static int tcp_recvmsg_dmabuf(struct sock *sk, const struct sk_buff *skb,
 		/* if remaining_len is not satisfied yet, we need to go to the
 		 * next frag in the frag_list to satisfy remaining_len.
 		 */
+		/* frag_list 优先保持聚合 skb 的逻辑顺序，否则沿 receive queue next 继续。 */
 		skb = skb_shinfo(skb)->frag_list ?: skb->next;
 
 		offset = offset - start;
@@ -3293,13 +3371,13 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 	 *   urg_hole  OOB 字节未内联时在序列空间中跳过的 1 字节。
 	 */
 	struct tcp_sock *tp = tcp_sk(sk);
-	int last_copied_dmabuf = -1; /* uninitialized */
+	int last_copied_dmabuf = -1; /* 尚未向控制消息报告任何 dmabuf 片段。 */
 	int copied = 0;
 	u32 peek_seq;
 	u32 *seq;
 	unsigned long used;
 	int err;
-	int target;		/* Read at least this many bytes */
+	int target;		/* 至少读取这么多字节，除非 EOF、错误或超时先发生。 */
 	long timeo;
 	struct sk_buff *skb, *last;
 	u32 peek_offset = 0;
@@ -3384,6 +3462,7 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 			/* Now that we have two receive queues this
 			 * shouldn't happen.
 			 */
+			/* 两条接收队列已按序分工；若序号倒退，说明队列迁移或排序不变量被破坏。 */
 			if (WARN(before(*seq, TCP_SKB_CB(skb)->seq),
 				 "TCP recvmsg seq # bug: copied %X, seq %X, rcvnxt %X, fl %X\n",
 				 *seq, TCP_SKB_CB(skb)->seq, tp->rcv_nxt,
@@ -3436,6 +3515,7 @@ static int tcp_recvmsg_locked(struct sock *sk, struct msghdr *msg, size_t len,
 				/* This occurs when user tries to read
 				 * from never connected socket.
 				 */
+				/* 从未连接的 CLOSED socket 没有正常 EOF 语义，应报告 ENOTCONN。 */
 				copied = -ENOTCONN;
 				break;
 			}
@@ -3535,6 +3615,7 @@ found_ok_skb:
 					/* dmabuf skbs can only be received
 					 * with the MSG_SOCK_DEVMEM flag.
 					 */
+					/* 设备内存不能按普通用户缓冲复制；调用者必须显式请求其元数据。 */
 					if (!copied)
 						copied = -EFAULT;
 
@@ -3689,6 +3770,7 @@ void tcp_set_state(struct sock *sk, int state)
 	 * need to remap the internal value to the BPF value before calling
 	 * tcp_call_bpf_2arg.
 	 */
+	/* 编译期逐值比对允许直接把内部 state 交给 BPF；若未来分叉必须增加显式映射。 */
 	BUILD_BUG_ON((int)BPF_TCP_ESTABLISHED != (int)TCP_ESTABLISHED);
 	BUILD_BUG_ON((int)BPF_TCP_SYN_SENT != (int)TCP_SYN_SENT);
 	BUILD_BUG_ON((int)BPF_TCP_SYN_RECV != (int)TCP_SYN_RECV);
@@ -3713,6 +3795,7 @@ void tcp_set_state(struct sock *sk, int state)
 	 * above-mentioned anonymous enum in the vmlinux DWARF and hence BTF
 	 * regardless of which compiler is used.
 	 */
+	/* Clang 会优化掉纯断言，显式 BTF emit 保证 CO-RE/BPF 仍能看到匿名枚举类型。 */
 	BTF_TYPE_EMIT_ENUM(BPF_TCP_ESTABLISHED);
 
 	if (BPF_SOCK_OPS_TEST_FLAG(tcp_sk(sk), BPF_SOCK_OPS_STATE_CB_FLAG))
@@ -3745,6 +3828,7 @@ void tcp_set_state(struct sock *sk, int state)
 	/* Change state AFTER socket is unhashed to avoid closed
 	 * socket sitting in hash tables.
 	 */
+	/* 先让网络查找不可见，再发布 CLOSE，保证 hash 可见性与状态不发生矛盾。 */
 	inet_sk_state_store(sk, state);
 }
 
@@ -3754,10 +3838,11 @@ void tcp_set_state(struct sock *sk, int state)
  *	states. A shutdown() may have already sent the FIN, or we may be
  *	closed.
  */
+/* new_state 把“目标状态”和“是否需新排 FIN”编码在同一字节，避免分散 switch 漏状态。 */
 
 static const unsigned char new_state[16] = {
-  /* current state:        new state:      action:	*/
-  [0 /* (Invalid) */]	= TCP_CLOSE,
+  /* 当前状态：             新状态：        附加动作： */
+  [0 /* 无效状态槽 */]	= TCP_CLOSE,
   [TCP_ESTABLISHED]	= TCP_FIN_WAIT1 | TCP_ACTION_FIN,
   [TCP_SYN_SENT]	= TCP_CLOSE,
   [TCP_SYN_RECV]	= TCP_FIN_WAIT1 | TCP_ACTION_FIN,
@@ -3803,19 +3888,23 @@ void tcp_shutdown(struct sock *sk, int how)
 	 *	and then put it into the queue to be sent.
 	 *		Tim MacKenzie(tym@dibbler.cs.monash.edu.au) 4 Dec '92.
 	 */
+	/* FIN 分配允许走强制内存预算，因为尽快关闭反而能释放更多连接资源。 */
 	if (!(how & SEND_SHUTDOWN))
 		return;
 
 	/* If we've already sent a FIN, or it's a closed state, skip this. */
+	/* 状态表之外意味着 FIN 已排队/确认或连接不具备发送方向，重复 shutdown 幂等。 */
 	if ((1 << sk->sk_state) &
 	    (TCPF_ESTABLISHED | TCPF_SYN_SENT |
 	     TCPF_CLOSE_WAIT)) {
 		/* Clear out any half completed packets.  FIN if needed. */
+		/* 状态转换返回 action 位，只有首次关闭发送方向才创建 FIN。 */
 		if (tcp_close_state(sk))
 			tcp_send_fin(sk);
 	}
 }
 
+/* 汇总所有 possible CPU 的 orphan 计数；迁移/并发近似可能短暂为负，最终钳到 0。 */
 int tcp_orphan_count_sum(void)
 {
 	int i, total = 0;
@@ -3830,18 +3919,21 @@ static int tcp_orphan_cache;
 static struct timer_list tcp_orphan_timer;
 #define TCP_ORPHAN_TIMER_PERIOD msecs_to_jiffies(100)
 
+/* 每 100ms 把昂贵的 per-CPU 汇总缓存成热路径可 READ_ONCE 的全局近似值。 */
 static void tcp_orphan_update(struct timer_list *unused)
 {
 	WRITE_ONCE(tcp_orphan_cache, tcp_orphan_count_sum());
 	mod_timer(&tcp_orphan_timer, jiffies + TCP_ORPHAN_TIMER_PERIOD);
 }
 
+/* shift 用于在更高压力场景收紧阈值；缓存允许至多一个 timer 周期的策略滞后。 */
 static bool tcp_too_many_orphans(int shift)
 {
 	return READ_ONCE(tcp_orphan_cache) << shift >
 		READ_ONCE(sysctl_tcp_max_orphans);
 }
 
+/* 只有单 socket 已超过最小 sndbuf 且协议总内存越过 high 水位，才判真实内存压力。 */
 static bool tcp_out_of_memory(const struct sock *sk)
 {
 	if (sk->sk_wmem_queued > SOCK_MIN_SNDBUF &&
@@ -3850,6 +3942,11 @@ static bool tcp_out_of_memory(const struct sock *sk)
 	return false;
 }
 
+/*
+ * tcp_check_oom - 综合 orphan 数量和协议内存决定无用户连接是否应被牺牲。
+ * 返回 true 供 close/timer 发送 reset 或销毁；日志限速，避免资源灾难再被 printk
+ * 放大。该结果是资源策略快照，不是分配器的确定失败证明。
+ */
 bool tcp_check_oom(const struct sock *sk, int shift)
 {
 	bool too_many_orphans, out_of_socket_memory;
@@ -3889,6 +3986,7 @@ void __tcp_close(struct sock *sk, long timeout)
 		tcp_set_state(sk, TCP_CLOSE);
 
 		/* Special case. */
+		/* listener 没有字节流 FIN，关闭含义是停止接收新 request/child。 */
 		inet_csk_listen_stop(sk);
 
 		goto adjudge_to_death;
@@ -3898,6 +3996,7 @@ void __tcp_close(struct sock *sk, long timeout)
 	 *  descriptor close, not protocol-sourced closes, because the
 	 *  reader process may not have drained the data yet!
 	 */
+	/* 只有 fd close 表示应用放弃未读数据；协议侧关闭仍需保留队列供 reader 取完。 */
 	while ((skb = skb_peek(&sk->sk_receive_queue)) != NULL) {
 		u32 end_seq = TCP_SKB_CB(skb)->end_seq;
 
@@ -3910,6 +4009,7 @@ void __tcp_close(struct sock *sk, long timeout)
 	}
 
 	/* If socket has been already reset (e.g. in tcp_reset()) - kill it. */
+	/* 状态机已提交 CLOSE 时无需再构造 FIN/RST，直接进入 orphan/析构裁决。 */
 	if (sk->sk_state == TCP_CLOSE)
 		goto adjudge_to_death;
 
@@ -3920,22 +4020,26 @@ void __tcp_close(struct sock *sk, long timeout)
 	 * advertise a zero window, then kill -9 the FTP client, wheee...
 	 * Note: timeout is always zero in such a case.
 	 */
+	/* 丢弃未读数据意味着无法再兑现可靠有序交付，RST 才能明确通知对端数据作废。 */
 	if (unlikely(tcp_sk(sk)->repair)) {
 		sk->sk_prot->disconnect(sk, 0);
 	} else if (data_was_unread) {
 		/* Unread data was tossed, zap the connection. */
+		/* 先置 CLOSE 再发 active reset，阻止后续路径继续按正常连接处理。 */
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTONCLOSE);
 		tcp_set_state(sk, TCP_CLOSE);
 		tcp_send_active_reset(sk, sk->sk_allocation,
 				      SK_RST_REASON_TCP_ABORT_ON_CLOSE);
 	} else if (sock_flag(sk, SOCK_LINGER) && !sk->sk_lingertime) {
 		/* Check zero linger _after_ checking for unread data. */
+		/* 未读数据的 abort 原因优先；否则 SO_LINGER=0 明确要求立即中止。 */
 		sk->sk_prot->disconnect(sk, 0);
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTONDATA);
 	} else if (tcp_close_state(sk)) {
 		/* We FIN if the application ate all the data before
 		 * zapping the connection.
 		 */
+		/* 只有应用消费完接收数据，FIN 才能表达不丢数据的有序半关闭。 */
 
 		/* RED-PEN. Formally speaking, we have broken TCP state
 		 * machine. State transitions:
@@ -3962,6 +4066,9 @@ void __tcp_close(struct sock *sk, long timeout)
 		 * probably need API support or TCP_CORK SYN-ACK until
 		 * data is written and socket is closed.)
 		 */
+		/* Linux 在 FIN 仍因窗口排队时就提前显示 FIN_WAIT1/LAST_ACK；简化实现但会使
+		 * 少数 reset/TIME_WAIT 决策与严格 RFC 瞬时状态不同，后续分支显式补偿。
+		 */
 		tcp_send_fin(sk);
 	}
 
@@ -3976,11 +4083,13 @@ adjudge_to_death:
 	local_bh_disable();
 	bh_lock_sock(sk);
 	/* remove backlog if any, without releasing ownership. */
+	/* orphan 前把延迟收包串行处理完，但仍保持用户 owner，避免 close 与 backlog 竞态。 */
 	__release_sock(sk);
 
 	tcp_orphan_count_inc();
 
 	/* Have we already been destroyed by a softirq or backlog? */
+	/* backlog 可能处理 RST/最终 ACK 并关闭 socket，必须以最新状态重新裁决。 */
 	if (state != TCP_CLOSE && sk->sk_state == TCP_CLOSE)
 		goto out;
 
@@ -3997,6 +4106,7 @@ adjudge_to_death:
 	 *	consume significant resources. Let's do it with special
 	 *	linger2	option.					--ANK
 	 */
+	/* orphan 的 FIN_WAIT2 无应用负责超时，linger2 给它有限存活期，避免对端永久占资源。 */
 
 	if (sk->sk_state == TCP_FIN_WAIT2) {
 		struct tcp_sock *tp = tcp_sk(sk);
@@ -4027,6 +4137,7 @@ adjudge_to_death:
 					LINUX_MIB_TCPABORTONMEMORY);
 		} else if (!check_net(sock_net(sk))) {
 			/* Not possible to send reset; just close */
+			/* netns 已退出，发送路径不可用，只能本地摘除状态。 */
 			tcp_set_state(sk, TCP_CLOSE);
 		}
 	}
@@ -4040,11 +4151,13 @@ adjudge_to_death:
 		 * aborted (e.g., closed with unread data) before 3WHS
 		 * finishes.
 		 */
+		/* 三次握手未完就 abort 时仍要解除 child/request 的 Fast Open 互引。 */
 		if (req)
 			reqsk_fastopen_remove(sk, req, false);
 		inet_csk_destroy_sock(sk);
 	}
 	/* Otherwise, socket is reprieved until protocol close. */
+	/* 非 CLOSE orphan 继续由 FIN/ACK/timer 持有，不能在 close syscall 返回时销毁。 */
 
 out:
 	bh_unlock_sock(sk);
@@ -4071,6 +4184,7 @@ void tcp_close(struct sock *sk, long timeout)
 EXPORT_SYMBOL(tcp_close);
 
 /* These states need RST on ABORT according to RFC793 */
+/* 这些状态仍代表可见连接/半连接，中止时需用 RST 明确通知对端。 */
 
 static inline bool tcp_need_reset(int state)
 {
@@ -4098,6 +4212,7 @@ static void tcp_rtx_queue_purge(struct sock *sk)
 		/* Since we are deleting whole queue, no need to
 		 * list_del(&skb->tcp_tsorted_anchor)
 		 */
+		/* 整条时间链马上重建，逐节点 list_del 只增加成本且不改善可观察一致性。 */
 		tcp_rtx_queue_unlink(skb, sk);
 		tcp_wmem_free_skb(sk, skb);
 	}
@@ -4151,6 +4266,7 @@ int tcp_disconnect(struct sock *sk, int flags)
 		tcp_set_state(sk, TCP_CLOSE);
 
 	/* ABORT function of RFC793 */
+	/* 根据旧状态选择 listener stop、RST 或仅本地错误，之后统一清空全部状态。 */
 	if (old_state == TCP_LISTEN) {
 		inet_csk_listen_stop(sk);
 	} else if (unlikely(tp->repair)) {
@@ -4163,6 +4279,7 @@ int tcp_disconnect(struct sock *sk, int flags)
 		/* The last check adjusts for discrepancy of Linux wrt. RFC
 		 * states
 		 */
+		/* Linux 可能已进入关闭状态但 FIN 尚未实际发送，仍有尾数据时必须 RST。 */
 		tcp_send_active_reset(sk, gfp_any(),
 				      SK_RST_REASON_TCP_DISCONNECT_WITH_DATA);
 		WRITE_ONCE(sk->sk_err, ECONNRESET);
@@ -4225,6 +4342,7 @@ int tcp_disconnect(struct sock *sk, int flags)
 	/* Initialize rcv_mss to TCP_MIN_MSS to avoid division by 0
 	 * issue in __tcp_select_window()
 	 */
+	/* 清空 rx_opt 后仍给窗口算法非零分母，直到新连接重新测得 rcv_mss。 */
 	icsk->icsk_ack.rcv_mss = TCP_MIN_MSS;
 	memset(&tp->rx_opt, 0, sizeof(tp->rx_opt));
 	__sk_dst_reset(sk);
@@ -4249,6 +4367,7 @@ int tcp_disconnect(struct sock *sk, int flags)
 	tp->last_oow_ack_time = 0;
 	tp->plb_rehash = 0;
 	/* There's a bubble in the pipe until at least the first ACK. */
+	/* 重连初始 delivery sample 再次标 application-limited 哨兵。 */
 	tp->app_limited = ~0U;
 	tp->rate_app_limited = 1;
 	tp->rack.mstamp = 0;
@@ -4266,6 +4385,7 @@ int tcp_disconnect(struct sock *sk, int flags)
 
 
 	/* Clean up fastopen related fields */
+	/* request 与客户端请求分别持有不同资源，均需释放并清 DEFER_CONNECT。 */
 	req = rcu_dereference_protected(tp->fastopen_rsk,
 					lockdep_sock_is_held(sk));
 	if (req)
@@ -4285,12 +4405,20 @@ int tcp_disconnect(struct sock *sk, int flags)
 	return 0;
 }
 
+/* TCP_REPAIR 可直接伪造队列/序号，只允许当前 netns 的 CAP_NET_ADMIN，且禁止 listener。 */
 static inline bool tcp_can_repair_sock(const struct sock *sk)
 {
 	return sockopt_ns_capable(sock_net(sk)->user_ns, CAP_NET_ADMIN) &&
 		(sk->sk_state != TCP_LISTEN);
 }
 
+/*
+ * tcp_repair_set_window - 从 checkpoint 数据恢复发送/接收窗口游标。
+ *
+ * 仅 repair 模式且长度精确匹配才读取用户结构。先验证 max_window>=snd_wnd、snd_wl1
+ * 未越过当前接收窗口右界、rcv_wup 未越过 rcv_nxt，再一次性写入所有字段并重建
+ * rcv_mwnd_seq。验证完成前不修改 tp，因此 EFAULT/EINVAL/EPERM 均保持原状态。
+ */
 static int tcp_repair_set_window(struct tcp_sock *tp, sockptr_t optbuf, int len)
 {
 	struct tcp_repair_window opt;
@@ -4324,6 +4452,14 @@ static int tcp_repair_set_window(struct tcp_sock *tp, sockptr_t optbuf, int len)
 	return 0;
 }
 
+/*
+ * tcp_repair_options_est - 为尚未发送数据的恢复连接重建握手协商结果。
+ *
+ * optbuf 是 tcp_repair_opt 数组，逐项恢复 MSS、window scale、SACK permitted 和
+ * timestamp；未知 opt_code 被忽略以保持扩展兼容。window scale 超协议上限、无需
+ * value 的选项却带非零值时返回错误。前面已成功的选项不会回滚，因此调用者应把
+ * 输入视为有序配置事务，并只在 repair+ESTABLISHED+bytes_sent==0 时调用。
+ */
 static int tcp_repair_options_est(struct sock *sk, sockptr_t optbuf,
 		unsigned int len)
 {
@@ -4376,6 +4512,14 @@ static int tcp_repair_options_est(struct sock *sk, sockptr_t optbuf,
 
 DEFINE_STATIC_KEY_FALSE(tcp_tx_delay_enabled);
 
+/*
+ * tcp_enable_tx_delay - 启用每 socket 发送延迟模型，并校正存量 RTT 派生状态。
+ *
+ * 全局 static key 只在首次非零配置时开启，使默认关闭的发送热路径几乎无成本。
+ * 活连接修改 delay 时，srtt_us 内部按 1/8 微秒保存，故 delta 左移 3；随后重算
+ * RTO、清最小 RTT 样本并更新 pacing。校正是 best effort，已有 RTO backoff 不被
+ * 完整逆推。调用者最后才写 tp->tcp_tx_delay。
+ */
 static void tcp_enable_tx_delay(struct sock *sk, int val)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -4393,6 +4537,7 @@ static void tcp_enable_tx_delay(struct sock *sk, int val)
 	 * tp->rtt_min, icsk_rto and sk->sk_pacing_rate.
 	 * This is best effort.
 	 */
+	/* delay 属于本地调度而非网络 RTT，修改时补偿估计，避免 RTO/pacing 突跳。 */
 	if (delta && sk->sk_state == TCP_ESTABLISHED) {
 		s64 srtt = (s64)tp->srtt_us + delta;
 
@@ -4400,6 +4545,7 @@ static void tcp_enable_tx_delay(struct sock *sk, int val)
 			   clamp_t(s64, srtt, 1, ~0U));
 
 		/* Note: does not deal with non zero icsk_backoff */
+		/* 已处于超时退避的 RTO 仍是 best-effort，不能精确反演历史 backoff。 */
 		tcp_set_rto(sk);
 
 		minmax_reset(&tp->rtt_min, tcp_jiffies32, ~0U);
@@ -4417,6 +4563,12 @@ static void tcp_enable_tx_delay(struct sock *sk, int val)
  * TCP_CORK can be set together with TCP_NODELAY and it is stronger than
  * TCP_NODELAY.
  */
+/*
+ * __tcp_sock_set_cork - 在已持 socket lock 时切换“尽量填满再发”的持久策略。
+ *
+ * 开启只置 CORK；关闭时若 NODELAY 同时存在，置一次性 PUSH，并立即推动队列。
+ * 因而 CORK 在持续期间强于 NODELAY，但解除 CORK 不会忘记用户先前的 NODELAY。
+ */
 void __tcp_sock_set_cork(struct sock *sk, bool on)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -4431,6 +4583,7 @@ void __tcp_sock_set_cork(struct sock *sk, bool on)
 	}
 }
 
+/* 为内核调用者提供取得/释放可睡眠 socket lock 的 CORK 包装。 */
 void tcp_sock_set_cork(struct sock *sk, bool on)
 {
 	lock_sock(sk);
@@ -4445,6 +4598,11 @@ EXPORT_SYMBOL(tcp_sock_set_cork);
  * However, when TCP_NODELAY is set we make an explicit push, which overrides
  * even TCP_CORK for currently queued segments.
  */
+/*
+ * __tcp_sock_set_nodelay - 切换 Nagle 禁用位；开启时额外 PUSH 当前已排队数据。
+ * CORK 仍控制后续小 skb 聚合，但显式设置 NODELAY 的这一刻会覆盖 CORK 推一次，
+ * 避免应用以为设置成功却让已有命令/请求头继续滞留。
+ */
 void __tcp_sock_set_nodelay(struct sock *sk, bool on)
 {
 	if (on) {
@@ -4455,6 +4613,7 @@ void __tcp_sock_set_nodelay(struct sock *sk, bool on)
 	}
 }
 
+/* 内核便捷接口：持锁开启 NODELAY；关闭能力由通用 setsockopt 传 false 完成。 */
 void tcp_sock_set_nodelay(struct sock *sk)
 {
 	lock_sock(sk);
@@ -4463,6 +4622,13 @@ void tcp_sock_set_nodelay(struct sock *sk)
 }
 EXPORT_SYMBOL(tcp_sock_set_nodelay);
 
+/*
+ * __tcp_sock_set_quickack - 调整 delayed-ACK 的 ping-pong/quickack 模式。
+ *
+ * val=0 进入交互流 ping-pong 模式，允许延迟 ACK；非零退出并在已建立且 ACK pending
+ * 时标 PUSHED，通过 cleanup_rbuf 立即重新评估发送。偶数非零值在完成一次 quick
+ * ACK 后重新进入 ping-pong，是内部一次性语义。它不是永久“每包立即 ACK”保证。
+ */
 static void __tcp_sock_set_quickack(struct sock *sk, int val)
 {
 	if (!val) {
@@ -4480,6 +4646,7 @@ static void __tcp_sock_set_quickack(struct sock *sk, int val)
 	}
 }
 
+/* 取得 socket lock 后设置 quickack，避免与接收 ACK 状态机并发修改 pending 位。 */
 void tcp_sock_set_quickack(struct sock *sk, int val)
 {
 	lock_sock(sk);
@@ -4488,6 +4655,7 @@ void tcp_sock_set_quickack(struct sock *sk, int val)
 }
 EXPORT_SYMBOL(tcp_sock_set_quickack);
 
+/* 设置主动 SYN 最大重试次数；范围外 EINVAL，WRITE_ONCE 与 timer 路径无锁读取配对。 */
 int tcp_sock_set_syncnt(struct sock *sk, int val)
 {
 	if (val < 1 || val > MAX_TCP_SYNCNT)
@@ -4498,11 +4666,16 @@ int tcp_sock_set_syncnt(struct sock *sk, int val)
 }
 EXPORT_SYMBOL(tcp_sock_set_syncnt);
 
+/*
+ * 设置 TCP_USER_TIMEOUT（毫秒）：限制数据无确认或零窗口 probe 无进展的总时长。
+ * 0 恢复协议默认；它不等同 keepalive，也不限制正常空闲连接。
+ */
 int tcp_sock_set_user_timeout(struct sock *sk, int val)
 {
 	/* Cap the max time in ms TCP will retry or probe the window
 	 * before giving up and aborting (ETIMEDOUT) a connection.
 	 */
+	/* USER_TIMEOUT 只约束“已发送但无交付进展”，最终由重传/probe timer 判 ETIMEDOUT。 */
 	if (val < 0)
 		return -EINVAL;
 
@@ -4511,6 +4684,12 @@ int tcp_sock_set_user_timeout(struct sock *sk, int val)
 }
 EXPORT_SYMBOL(tcp_sock_set_user_timeout);
 
+/*
+ * tcp_sock_set_keepidle_locked - 设置首次 keepalive probe 前的空闲秒数并重装活跃 timer。
+ *
+ * 调用者持锁。若 SO_KEEPALIVE 已启用且状态有效，按已经空闲的 elapsed 计算剩余
+ * 时间；新阈值已过去则以 0 尽快触发。参数错误不修改字段/定时器。
+ */
 int tcp_sock_set_keepidle_locked(struct sock *sk, int val)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
@@ -4519,6 +4698,7 @@ int tcp_sock_set_keepidle_locked(struct sock *sk, int val)
 		return -EINVAL;
 
 	/* Paired with WRITE_ONCE() in keepalive_time_when() */
+	/* 与无锁读取配对，避免编译器把并发更新拆分或重复读取。 */
 	WRITE_ONCE(tp->keepalive_time, val * HZ);
 	if (sock_flag(sk, SOCK_KEEPOPEN) &&
 	    !((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_LISTEN))) {
@@ -4534,6 +4714,7 @@ int tcp_sock_set_keepidle_locked(struct sock *sk, int val)
 	return 0;
 }
 
+/* 取得 socket lock 的 keepidle 包装，返回 locked helper 的 0 或 EINVAL。 */
 int tcp_sock_set_keepidle(struct sock *sk, int val)
 {
 	int err;
@@ -4545,6 +4726,7 @@ int tcp_sock_set_keepidle(struct sock *sk, int val)
 }
 EXPORT_SYMBOL(tcp_sock_set_keepidle);
 
+/* 设置 keepalive probe 之间的秒数；只更新策略，现有 timer 在下一次处理时采用。 */
 int tcp_sock_set_keepintvl(struct sock *sk, int val)
 {
 	if (val < 1 || val > MAX_TCP_KEEPINTVL)
@@ -4555,17 +4737,26 @@ int tcp_sock_set_keepintvl(struct sock *sk, int val)
 }
 EXPORT_SYMBOL(tcp_sock_set_keepintvl);
 
+/* 设置判定 keepalive 失败前允许的 probe 次数，与 timer 路径 READ_ONCE 配对。 */
 int tcp_sock_set_keepcnt(struct sock *sk, int val)
 {
 	if (val < 1 || val > MAX_TCP_KEEPCNT)
 		return -EINVAL;
 
 	/* Paired with READ_ONCE() in keepalive_probes() */
+	/* 探测定时器可在另一 CPU 无锁读取，因此用单次原子可见的字段发布。 */
 	WRITE_ONCE(tcp_sk(sk)->keepalive_probes, val);
 	return 0;
 }
 EXPORT_SYMBOL(tcp_sock_set_keepcnt);
 
+/*
+ * tcp_set_window_clamp - 限制本端最大公告接收窗口并同步 autotuning 阈值。
+ *
+ * val=0 只允许未连接 socket，用于恢复自动默认。非零至少为 SOCK_MIN_RCVBUF/2。
+ * 缩小时 __tcp_adjust_rcv_ssthresh 同步 reserved-memory provisioning；扩大时只提高
+ * rcv_ssthresh 到当前 rcv_wnd/新 clamp 的合理值，不能凭配置声称尚无 buffer 的空间。
+ */
 int tcp_set_window_clamp(struct sock *sk, int val)
 {
 	u32 old_window_clamp, new_window_clamp, new_rcv_ssthresh;
@@ -4589,6 +4780,7 @@ int tcp_set_window_clamp(struct sock *sk, int val)
 	/* Need to apply the reserved mem provisioning only
 	 * when shrinking the window clamp.
 	 */
+	/* 缩窗可能使既有 reserved 预算过大，需同步降低；扩窗不要求立即预留全部内存。 */
 	if (new_window_clamp < old_window_clamp) {
 		__tcp_adjust_rcv_ssthresh(sk, new_window_clamp);
 	} else {
@@ -4598,12 +4790,14 @@ int tcp_set_window_clamp(struct sock *sk, int val)
 	return 0;
 }
 
+/* 设置用户 MSS clamp；0 表示自动，最终仍受 route MTU 限制，设置时可能尚未知出口。 */
 int tcp_sock_set_maxseg(struct sock *sk, int val)
 {
 	/* Values greater than interface MTU won't take effect. However
 	 * at the point when this call is done we typically don't yet
 	 * know which interface is going to be used
 	 */
+	/* 这里只保存用户上限；route 确定后再与 PMTU/option 开销取更小值。 */
 	if (val && (val < TCP_MIN_MSS || val > MAX_TCP_WINDOW))
 		return -EINVAL;
 
@@ -4614,6 +4808,18 @@ int tcp_sock_set_maxseg(struct sock *sk, int val)
 /*
  *	Socket option code for TCP.
  */
+/*
+ * do_tcp_setsockopt - 解析并应用 SOL_TCP 选项的核心分派。
+ *
+ * @optval 是用户或内核 sockptr，必须使用 copy_from_sockptr 系列访问；@optlen 是
+ * 字节数。字符串/结构选项先独立处理，普通 int 统一复制一次。只含单字段且 timer
+ * 使用 READ_ONCE 的选项可无 socket lock 更新；会改变队列、状态机、拥塞算法、
+ * ACK 或发送行为的选项必须包在 sockopt_lock_sock 内。返回 0 或精确 errno。
+ *
+ * 这不是全有或全无事务：单值选项均先验证再写，但 repair option 数组、ULP/认证
+ * 等子系统可能已有自己的部分更新语义。TCP_REPAIR 尤其能直接修改序列空间，只对
+ * CAP_NET_ADMIN 开放；关闭 repair 默认发送 window probe，让恢复后的对端重新同步。
+ */
 int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		      sockptr_t optval, unsigned int optlen)
 {
@@ -4623,7 +4829,9 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 	int val;
 	int err = 0;
 
+	/* 阶段 1：变长字符串/密钥不能按 int 读取，分别验证长度并复制到有界内核缓冲。 */
 	/* These are data/string values, all the others are ints */
+	/* 先分流非整数 ABI；否则统一 copy 一个 int 会截断字符串或密钥。 */
 	switch (optname) {
 	case TCP_CONGESTION: {
 		char name[TCP_CA_NAME_MAX];
@@ -4669,6 +4877,7 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		/* Allow a backup key as well to facilitate key rotation
 		 * First key is the active one.
 		 */
+		/* 同时接受 active+backup，使轮换期间旧 cookie 仍可验证而新 cookie 用首 key。 */
 		if (optlen != TCP_FASTOPEN_KEY_LENGTH &&
 		    optlen != TCP_FASTOPEN_KEY_BUF_LENGTH)
 			return -EINVAL;
@@ -4683,6 +4892,7 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 	}
 	default:
 		/* fallthru */
+		/* 非变长选项落入下面的整数解析与分派。 */
 		break;
 	}
 
@@ -4692,7 +4902,9 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 	if (copy_from_sockptr(&val, optval, sizeof(val)))
 		return -EFAULT;
 
+	/* 阶段 2：这些选项以单字段 WRITE_ONCE 发布，接收者容忍配置在任意时刻变化。 */
 	/* Handle options that can be set without locking the socket. */
+	/* 这些 setter 自己用 READ/WRITE_ONCE 维护单字段并发语义，可省去 socket 锁。 */
 	switch (optname) {
 	case TCP_SYNCNT:
 		return tcp_sock_set_syncnt(sk, val);
@@ -4712,6 +4924,7 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		return 0;
 	case TCP_DEFER_ACCEPT:
 		/* Translate value in seconds to number of retransmits */
+		/* request timer 按重传轮次运行，故把用户秒数映射为退避模型的次数。 */
 		WRITE_ONCE(icsk->icsk_accept_queue.rskq_defer_accept,
 			   secs_to_retrans(val, TCP_TIMEOUT_INIT / HZ,
 					   TCP_RTO_MAX / HZ));
@@ -4741,6 +4954,7 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		return tcp_sock_set_maxseg(sk, val);
 	}
 
+	/* 阶段 3：以下分支会联合修改队列/状态/定时器，必须与 TCP 数据面串行。 */
 	sockopt_lock_sock(sk);
 
 	switch (optname) {
@@ -4761,6 +4975,7 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		break;
 
 	case TCP_REPAIR:
+		/* ON 冻结正常协议语义并允许复用地址；OFF 恢复后主动探测对端窗口。 */
 		if (!tcp_can_repair_sock(sk))
 			err = -EPERM;
 		else if (val == TCP_REPAIR_ON) {
@@ -4789,6 +5004,7 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		break;
 
 	case TCP_QUEUE_SEQ:
+		/* 只允许 CLOSED 且目标队列为空，防止新游标与既有 skb 序列范围冲突。 */
 		if (sk->sk_state != TCP_CLOSE) {
 			err = -EPERM;
 		} else if (tp->repair_queue == TCP_SEND_QUEUE) {
@@ -4826,6 +5042,7 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		break;
 	case TCP_SAVE_SYN:
 		/* 0: disable, 1: enable, 2: start from ether_header */
+		/* 模式 1 保存 L3+L4，模式 2 连 L2 一并保存；只影响后续新 SYN。 */
 		if (val < 0 || val > 2)
 			err = -EINVAL;
 		else
@@ -4855,6 +5072,7 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		 * sk_state has to be LISTEN or CLOSE. Allow TCP_REPAIR
 		 * in any state.
 		 */
+		/* 首次建立 AO 状态会改变认证不变量，已连接 socket 仅在已有 AO 或 repair 时允许。 */
 		if ((1 << sk->sk_state) & (TCPF_LISTEN | TCPF_CLOSE))
 			goto ao_parse;
 		if (rcu_dereference_protected(tcp_sk(sk)->ao_info,
@@ -4915,6 +5133,7 @@ ao_parse:
 		 * and low order bit contains usec_ts enable bit.
 		 * Its a best effort, and we do not care if user makes an error.
 		 */
+		/* checkpoint 保存的是带本地 clock offset 的不透明时间域，仅低位显式编码精度。 */
 		tp->tcp_usec_ts = val & 1;
 		WRITE_ONCE(tp->tsoffset, val - tcp_clock_ts(tp->tcp_usec_ts));
 		break;
@@ -4923,6 +5142,7 @@ ao_parse:
 		break;
 	case TCP_NOTSENT_LOWAT:
 		WRITE_ONCE(tp->notsent_lowat, val);
+		/* 阈值变化本身可能已使 socket 可写，立即重评估并通知 epoll waiter。 */
 		READ_ONCE(sk->sk_write_space)(sk);
 		break;
 	case TCP_INQ:
@@ -4933,6 +5153,7 @@ ao_parse:
 		break;
 	case TCP_TX_DELAY:
 		/* tp->srtt_us is u32, and is shifted by 3 */
+		/* 限制 val 确保换算成内部 1/8 微秒后不溢出有符号校正范围。 */
 		if (val < 0 || val >= (1U << (31 - 3))) {
 			err = -EINVAL;
 			break;
@@ -4949,6 +5170,12 @@ ao_parse:
 	return err;
 }
 
+/*
+ * tcp_setsockopt - TCP proto 入口；非 SOL_TCP 选项转交当前地址族实现。
+ *
+ * af_ops 可在 IPv6/映射连接配置期间替换，READ_ONCE 保证函数表指针只取一次；
+ * SOL_TCP 进入通用实现。参数 ownership 全部借用，返回值直接传给 syscall 层。
+ */
 int tcp_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval,
 		   unsigned int optlen)
 {
@@ -4956,11 +5183,19 @@ int tcp_setsockopt(struct sock *sk, int level, int optname, sockptr_t optval,
 
 	if (level != SOL_TCP)
 		/* Paired with WRITE_ONCE() in do_ipv6_setsockopt() and tcp_v6_connect() */
+		/* af_ops 可因地址族切换而更新；一次快照保证函数表指针读取一致。 */
 		return READ_ONCE(icsk->icsk_af_ops)->setsockopt(sk, level, optname,
 								optval, optlen);
 	return do_tcp_setsockopt(sk, level, optname, optval, optlen);
 }
 
+/*
+ * tcp_get_info_chrono_stats - 汇总 busy/rwnd-limited/sndbuf-limited 持续微秒数。
+ *
+ * 当前 chrono 尚未结算时把 now-start 临时加入对应桶。函数可能无 socket lock，
+ * READ_ONCE 只能给 best-effort 诊断快照；为了热路径不加昂贵同步，三个桶与总和
+ * 可能跨越一次状态切换，但不会影响协议行为。
+ */
 static void tcp_get_info_chrono_stats(const struct tcp_sock *tp,
 				      struct tcp_info *info)
 {
@@ -4972,6 +5207,7 @@ static void tcp_get_info_chrono_stats(const struct tcp_sock *tp,
 	 * This is best effort, tcp_get_timestamping_opt_stats() can
 	 * see wrong values. A real fix would be too costly for TCP fast path.
 	 */
+	/* 允许桶切换时出现轻微跨时刻误差，换取发送热路径无需诊断专用锁。 */
 	cur = READ_ONCE(tp->chrono_type);
 	for (i = TCP_CHRONO_BUSY; i < __TCP_CHRONO_MAX; ++i) {
 		stats[i] = READ_ONCE(tp->chrono_stat[i - 1]);
@@ -4987,9 +5223,19 @@ static void tcp_get_info_chrono_stats(const struct tcp_sock *tp,
 }
 
 /* Return information about state of tcp endpoint in API format. */
+/*
+ * tcp_get_info - 把内部 TCP 状态转换为稳定 struct tcp_info UAPI 快照。
+ *
+ * @info 先清零，非 SOCK_STREAM 直接返回空结构。state、pacing 和 listener backlog
+ * 可无锁读取；full connection 用 lock_sock_fast 在无竞争时取得轻量锁，再转换
+ * RTO/RTT 单位、队列计数、窗口、速率、ECN 和累计统计。listener 复用 unacked/
+ * sacked 字段表示 ready/max accept backlog，这是 UAPI 约定而非发送 ACK 含义。
+ * 函数无错误返回，允许相邻无锁字段来自略有不同的时刻，适合诊断而非控制决策。
+ */
 void tcp_get_info(struct sock *sk, struct tcp_info *info)
 {
 	const struct tcp_sock *tp = tcp_sk(sk); /* iff sk_type == SOCK_STREAM */
+	/* tcp_sk 只是基于嵌入布局的转换，故读取任何 tcp_sock 字段前先验证 SOCK_STREAM。 */
 	const struct inet_connection_sock *icsk = inet_csk(sk);
 	const u8 ect1_idx = INET_ECN_ECT_1 - 1;
 	const u8 ect0_idx = INET_ECN_ECT_0 - 1;
@@ -5006,6 +5252,7 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
 	info->tcpi_state = inet_sk_state_load(sk);
 
 	/* Report meaningful fields for all TCP states, including listeners */
+	/* pacing/reordering/cwnd 在 listener 也有定义，可先无锁填充通用前缀。 */
 	rate = READ_ONCE(sk->sk_pacing_rate);
 	rate64 = (rate != ~0UL) ? rate : ~0ULL;
 	info->tcpi_pacing_rate = rate64;
@@ -5022,6 +5269,7 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
 		 * tcpi_unacked -> Number of children ready for accept()
 		 * tcpi_sacked  -> max backlog
 		 */
+		/* UAPI 历史复用字段：此状态下不能按发送队列的 unacked/sacked 解读。 */
 		info->tcpi_unacked = READ_ONCE(sk->sk_ack_backlog);
 		info->tcpi_sacked = READ_ONCE(sk->sk_max_ack_backlog);
 		return;
@@ -5092,6 +5340,7 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
 	info->tcpi_segs_out = tp->segs_out;
 
 	/* segs_in and data_segs_in can be updated from tcp_segs_in() from BH */
+	/* 即便持用户锁，BH 统计仍可能更新，单次读取防编译器撕裂但快照允许变化。 */
 	info->tcpi_segs_in = READ_ONCE(tp->segs_in);
 	info->tcpi_data_segs_in = READ_ONCE(tp->data_segs_in);
 
@@ -5142,6 +5391,7 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
 }
 EXPORT_SYMBOL_GPL(tcp_get_info);
 
+/* 精确累计 timestamping 可选统计的 netlink attribute 对齐空间，供一次性 alloc_skb。 */
 static size_t tcp_opt_stats_get_size(void)
 {
 	return
@@ -5176,6 +5426,7 @@ static size_t tcp_opt_stats_get_size(void)
 }
 
 /* Returns TTL or hop limit of an incoming packet from skb. */
+/* 按 skb->protocol 选择 IPv4 TTL 或 IPv6 hop_limit；未知 L3 返回 0 作为“无样本”。 */
 static u8 tcp_skb_ttl_or_hop_limit(const struct sk_buff *skb)
 {
 	if (skb->protocol == htons(ETH_P_IP))
@@ -5186,6 +5437,14 @@ static u8 tcp_skb_ttl_or_hop_limit(const struct sk_buff *skb)
 		return 0;
 }
 
+/*
+ * tcp_get_timestamping_opt_stats - 为发送时间戳 completion 构造 TCP 统计 netlink skb。
+ *
+ * @orig_skb 提供 EDT，@ack_skb 可选地提供反向 TTL；三者均只借用。GFP_ATOMIC
+ * 分配失败返回 NULL，不影响时间戳主体。成功返回由调用者拥有的 stats skb，内部
+ * 以预计算容量追加 NLA；字段多为 READ_ONCE/data_race 的近似快照，避免 ACK 热路径
+ * 取得 socket lock。该统计用于观测，不应被当成同一时刻的控制事务。
+ */
 struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk,
 					       const struct sk_buff *orig_skb,
 					       const struct sk_buff *ack_skb)
@@ -5258,6 +5517,18 @@ struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk,
 	return stats;
 }
 
+/*
+ * do_tcp_getsockopt - 把内部 TCP 配置/状态复制为 SOL_TCP UAPI。
+ *
+ * @optlen 是输入输出 sockptr：先读取用户容量，成功时写实际/所需长度；@optval 为
+ * 输出。普通整数最多复制 sizeof(int)；TCP_INFO、CC_INFO、密钥、saved SYN、repair
+ * 和 zerocopy 使用各自结构长度。返回 0 或 EFAULT/EINVAL/EPERM/ENOPROTOOPT。
+ *
+ * 多数值是诊断快照，可无锁 READ_ONCE；会消费对象或修改接收状态的 SAVED_SYN、
+ * TCP_ZEROCOPY_RECEIVE、AO 查询显式取得 sockopt lock。zerocopy 是特殊“get”操作：
+ * 它映射/复制数据并推进 copied_seq，随后按调用者结构版本选择可写回的字段，保持
+ * UAPI 向后兼容。SAVED_SYN 成功复制后释放保存对象，因而也不是幂等查询。
+ */
 int do_tcp_getsockopt(struct sock *sk, int level,
 		      int optname, sockptr_t optval, sockptr_t optlen)
 {
@@ -5544,6 +5815,7 @@ int do_tcp_getsockopt(struct sock *sk, int level,
 			return -EINVAL;
 		if (zc.msg_flags &  ~(TCP_VALID_ZC_MSG_FLAGS))
 			return -EINVAL;
+		/* 名为 getsockopt 但会消费 receive queue，必须与普通 recv 串行。 */
 		sockopt_lock_sock(sk);
 		err = tcp_zerocopy_receive(sk, &zc, &tss);
 		err = BPF_CGROUP_RUN_PROG_GETSOCKOPT_KERN(sk, level, optname,
@@ -5623,17 +5895,23 @@ zerocopy_rcv_out:
 	return 0;
 }
 
+/*
+ * 标记 TCP_ZEROCOPY_RECEIVE 绕过通用 BPF getsockopt 包装；核心实现已在持锁临界区
+ * 内显式运行 BPF_CGROUP_RUN_PROG_GETSOCKOPT_KERN，重复包装会多拿锁或执行两次。
+ */
 bool tcp_bpf_bypass_getsockopt(int level, int optname)
 {
 	/* TCP do_tcp_getsockopt has optimized getsockopt implementation
 	 * to avoid extra socket lock for TCP_ZEROCOPY_RECEIVE.
 	 */
+	/* 零拷贝接收在 TCP 层已有专门的无额外加锁路径，BPF 包装层应让它直达。 */
 	if (level == SOL_TCP && optname == TCP_ZEROCOPY_RECEIVE)
 		return true;
 
 	return false;
 }
 
+/* 非 SOL_TCP 转地址族函数表；SOL_TCP 把裸用户指针封成 USER_SOCKPTR 后进入通用实现。 */
 int tcp_getsockopt(struct sock *sk, int level, int optname, char __user *optval,
 		   int __user *optlen)
 {
@@ -5641,6 +5919,7 @@ int tcp_getsockopt(struct sock *sk, int level, int optname, char __user *optval,
 
 	if (level != SOL_TCP)
 		/* Paired with WRITE_ONCE() in do_ipv6_setsockopt() and tcp_v6_connect() */
+		/* 对地址族函数表只取一次快照，避免检查与间接调用看到不同指针。 */
 		return READ_ONCE(icsk->icsk_af_ops)->getsockopt(sk, level, optname,
 								optval, optlen);
 	return do_tcp_getsockopt(sk, level, optname, USER_SOCKPTR(optval),
@@ -5648,6 +5927,11 @@ int tcp_getsockopt(struct sock *sk, int level, int optname, char __user *optval,
 }
 
 #ifdef CONFIG_TCP_MD5SIG
+/*
+ * tcp_md5_hash_skb_data - 按线上顺序把 TCP payload 的 linear、page frags、frag_list
+ * 递归送入 MD5。@header_len 跳过当前 skb 的 TCP header；高端页用 kmap_local_page
+ * 临时映射并立即 kunmap，不能跨循环保存 vaddr。函数只读 skb，不改变引用。
+ */
 void tcp_md5_hash_skb_data(struct md5_ctx *ctx, const struct sk_buff *skb,
 			   unsigned int header_len)
 {
@@ -5677,18 +5961,32 @@ void tcp_md5_hash_skb_data(struct md5_ctx *ctx, const struct sk_buff *skb,
 		tcp_md5_hash_skb_data(ctx, frag_iter, 0);
 }
 
+/*
+ * tcp_md5_hash_key - 把一个可由配置侧并发替换的 key 加入当前 MD5 上下文。
+ * keylen 用 READ_ONCE 取得；key bytes 用 data_race 明示允许非原子快照。配置更新
+ * 竞态最多使当前报文认证失败，避免为每包 hash 获取管理锁拖慢热路径。
+ */
 void tcp_md5_hash_key(struct md5_ctx *ctx,
 		      const struct tcp_md5sig_key *key)
 {
 	u8 keylen = READ_ONCE(key->keylen); /* paired with WRITE_ONCE() in tcp_md5_do_add */
+	/* 先稳定取得长度；更新端以 WRITE_ONCE 发布它。 */
 
 	/* We use data_race() because tcp_md5_do_add() might change
 	 * key->key under us
 	 */
+	/* 这里允许与密钥替换并发：data_race 标明这是审计过的有意竞争，而非漏锁。 */
 	data_race(({ md5_update(ctx, key->key, keylen), 0; }));
 }
 
 /* Called with rcu_read_lock() */
+/*
+ * tcp_inbound_md5_hash - 查找匹配 peer/VRF 的 key 并常量时间比较报文签名。
+ *
+ * 调用者持 RCU，@hash_location 指向 skb TCP option。无预期 key 和摘要不匹配使用
+ * 不同 drop reason/统计；IPv4 与地址族 hook 构造各自 pseudo-header。crypto_memneq
+ * 避免普通 memcmp 的早停时序泄露。函数只验证，不消费 skb。
+ */
 static enum skb_drop_reason
 tcp_inbound_md5_hash(const struct sock *sk, const struct sk_buff *skb,
 		     const void *saddr, const void *daddr,
@@ -5699,6 +5997,7 @@ tcp_inbound_md5_hash(const struct sock *sk, const struct sk_buff *skb,
 	 * o An MD5 signature is present, but we're not expecting one.
 	 * o The MD5 signature is wrong.
 	 */
+	/* “带签名但未配置 key”和“配置 key但摘要错误”分别计数，便于区分策略与攻击。 */
 	const struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_md5sig_key *key;
 	u8 newhash[16];
@@ -5714,6 +6013,7 @@ tcp_inbound_md5_hash(const struct sock *sk, const struct sk_buff *skb,
 	 * To support dual stack listeners, we need to handle
 	 * IPv4-mapped case.
 	 */
+	/* 双栈 listener 的 IPv4-mapped 报文必须按实际 IPv4 pseudo-header 计算摘要。 */
 	if (family == AF_INET)
 		tcp_v4_md5_hash_skb(newhash, key, NULL, skb);
 	else
@@ -5740,6 +6040,13 @@ tcp_inbound_md5_hash(const struct sock *sk, const struct sk_buff *skb,
 /*
  * Parse Signature options
  */
+/*
+ * tcp_do_parse_auth_options - 单遍扫描 TCP option 并定位唯一 MD5 或 AO 认证字段。
+ *
+ * @th->doff 给出 option 总长度；@md5_hash/@ao_hash 先置 NULL，成功后输出借用指针。
+ * NOP 消耗 1 字节，普通 option 必须至少 2 字节且不越界；认证长度错误或同一报文
+ * 出现两个认证 option 返回 EINVAL/EEXIST。函数不验证摘要，只建立后续验证所需位置。
+ */
 int tcp_do_parse_auth_options(const struct tcphdr *th,
 			      const u8 **md5_hash, const u8 **ao_hash)
 {
@@ -5754,6 +6061,7 @@ int tcp_do_parse_auth_options(const struct tcphdr *th,
 	*ao_hash = NULL;
 
 	/* If not enough data remaining, we can short cut */
+	/* 剩余长度小于最短认证 option 时不可能再命中，避免读 opcode/opsize 越界。 */
 	while (length >= minlen) {
 		int opcode = *ptr++;
 		int opsize;
@@ -5790,6 +6098,14 @@ int tcp_do_parse_auth_options(const struct tcphdr *th,
 #endif
 
 /* Called with rcu_read_lock() */
+/*
+ * tcp_inbound_hash - 强制执行连接配置的 TCP-AO/MD5 入站认证策略。
+ *
+ * @req 可空，握手 request 存在时还验证报文认证类型与 SYN 阶段协商一致；dif/sdif
+ * 用于计算 L3 master 域，防止跨 VRF 误用 key。无认证 option 的 fast path 仍必须
+ * 查询“该 peer 是否要求签名”，否则攻击者可通过删除 option 绕过认证。返回
+ * SKB_NOT_DROPPED_YET 表示验证通过，其他值是精确 drop reason；函数不消费 skb。
+ */
 enum skb_drop_reason
 tcp_inbound_hash(struct sock *sk, const struct request_sock *req,
 		 const struct sk_buff *skb,
@@ -5802,6 +6118,7 @@ tcp_inbound_hash(struct sock *sk, const struct request_sock *req,
 	int l3index;
 
 	/* Invalid option or two times meet any of auth options */
+	/* option 结构错误或 MD5/AO 重复/并存都在做任何 key lookup 前拒绝。 */
 	if (tcp_parse_auth_options(th, &md5_location, &aoh)) {
 		trace_tcp_hash_bad_header(sk, skb);
 		return SKB_DROP_REASON_TCP_AUTH_HDR;
@@ -5828,15 +6145,18 @@ tcp_inbound_hash(struct sock *sk, const struct request_sock *req,
 	/* sdif set, means packet ingressed via a device
 	 * in an L3 domain and dif is set to the l3mdev
 	 */
+	/* VRF 场景用 master 域索引选择 key，普通设备则 l3index=0。 */
 	l3index = sdif ? dif : 0;
 
 	/* Fast path: unsigned segments */
+	/* 无认证 option 是常见路径，但仍需确认连接策略没有强制认证。 */
 	if (likely(!md5_location && !aoh)) {
 		/* Drop if there's TCP-MD5 or TCP-AO key with any rcvid/sndid
 		 * for the remote peer. On TCP-AO established connection
 		 * the last key is impossible to remove, so there's
 		 * always at least one current_key.
 		 */
+		/* 配置要求认证却缺 option 必须丢弃；否则“去掉签名”会成为直接绕过。 */
 		if (tcp_ao_required(sk, saddr, family, l3index, true)) {
 			trace_tcp_hash_ao_required(sk, skb);
 			return SKB_DROP_REASON_TCP_AONOTFOUND;
@@ -5873,6 +6193,7 @@ void tcp_done(struct sock *sk)
 	 * inet_csk_prepare_forced_close() has been called
 	 * so we can not use lockdep_sock_is_held(sk)
 	 */
+	/* 强制关闭准备阶段可能没有常规 lockdep owner，但调用协议仍保证对象受保护。 */
 	req = rcu_dereference_protected(tcp_sk(sk)->fastopen_rsk, 1);
 
 	if (sk->sk_state == TCP_SYN_SENT || sk->sk_state == TCP_SYN_RECV)
@@ -5891,6 +6212,14 @@ void tcp_done(struct sock *sk)
 		inet_csk_destroy_sock(sk);
 }
 
+/*
+ * tcp_abort - 由内核/BPF 管理路径强制终止任意形态的 TCP endpoint。
+ *
+ * NEW_SYN_RECV 只是 request，需从 listener SYN queue 摘除；TIME_WAIT 是轻量对象，
+ * 临时加引用后 deschedule；full socket 则取得用户锁（BPF 上下文已保证锁），防止与
+ * close 并发，再在 BH lock 下按状态发 RST并以 @err 完成。已 CLOSE 返回 ENOENT。
+ * 成功 0 只表示本地对象已中止，RST 仍可能丢失。
+ */
 int tcp_abort(struct sock *sk, int err)
 {
 	int state = inet_sk_state_load(sk);
@@ -5914,11 +6243,14 @@ int tcp_abort(struct sock *sk, int err)
 	}
 
 	/* BPF context ensures sock locking. */
+	/* BPF hook 已由调用框架串行 socket，重复 lock_sock 会自锁。 */
 	if (!has_current_bpf_ctx())
 		/* Don't race with userspace socket closes such as tcp_close. */
+		/* 非 BPF 管理调用必须取得用户锁，确保只一个路径执行 full-socket abort。 */
 		lock_sock(sk);
 
 	/* Avoid closing the same socket twice. */
+	/* 第二个 abort 不再发送 RST/重复析构，以 ENOENT 表示目标已结束。 */
 	if (sk->sk_state == TCP_CLOSE) {
 		if (!has_current_bpf_ctx())
 			release_sock(sk);
@@ -5931,6 +6263,7 @@ int tcp_abort(struct sock *sk, int err)
 	}
 
 	/* Don't race with BH socket closes such as inet_csk_listen_stop. */
+	/* 用户锁之外再取 BH 短锁，串行软中断状态变化和 reset 发送。 */
 	local_bh_disable();
 	bh_lock_sock(sk);
 
@@ -5950,6 +6283,7 @@ EXPORT_SYMBOL_GPL(tcp_abort);
 extern struct tcp_congestion_ops tcp_reno;
 
 static __initdata unsigned long thash_entries;
+/* 解析启动参数 thash_entries=；返回 1 表示参数已消费，非法值保持自动大小。 */
 static int __init set_thash_entries(char *str)
 {
 	ssize_t ret;
@@ -5965,6 +6299,11 @@ static int __init set_thash_entries(char *str)
 }
 __setup("thash_entries=", set_thash_entries);
 
+/*
+ * tcp_init_mem - 按可用于 buffer 的物理页数计算 TCP 全局 pressure 三水位。
+ * 最少以 128 页基准；low/pressure/high 约为 limit 的 3/4、1、3/2。仅启动期写入，
+ * 后续 sysctl 可覆盖，百分比是对总 buffer pages 的经验性资源预算。
+ */
 static void __init tcp_init_mem(void)
 {
 	unsigned long limit = nr_free_buffer_pages() / 16;
@@ -5975,9 +6314,15 @@ static void __init tcp_init_mem(void)
 	sysctl_tcp_mem[2] = sysctl_tcp_mem[0] * 2;	/* 9.37 % */
 }
 
+/*
+ * tcp_struct_check - 编译/启动期验证 tcp_sock 热字段仍位于声明的 cacheline 分组。
+ * CACHELINE_ASSERT_GROUP_MEMBER 失败会在构建期暴露结构体布局漂移，防止普通字段
+ * 添加悄然把 TX/RX 热路径跨更多 cache line。它不调整布局，只验证头文件契约。
+ */
 static void __init tcp_struct_check(void)
 {
 	/* TX read-mostly hotpath cache lines */
+	/* 发送频繁读取、较少写入的字段必须保持在指定 cacheline group。 */
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_tx, max_window);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_tx, rcv_ssthresh);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_tx, reordering);
@@ -5989,6 +6334,7 @@ static void __init tcp_struct_check(void)
 #endif
 
 	/* TXRX read-mostly hotpath cache lines */
+	/* 收发两侧共享只读热点集中放置，减少两个方向的 cache miss。 */
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_txrx, tsoffset);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_txrx, snd_wnd);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_txrx, mss_cache);
@@ -5999,6 +6345,7 @@ static void __init tcp_struct_check(void)
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_txrx, scaling_ratio);
 
 	/* RX read-mostly hotpath cache lines */
+	/* 接收路径频繁读取的游标、RTT、乱序树入口保持局部。 */
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_rx, copied_seq);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_rx, snd_wl1);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_rx, tlp_high_seq);
@@ -6012,6 +6359,7 @@ static void __init tcp_struct_check(void)
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_read_rx, snd_ssthresh);
 
 	/* TX read-write hotpath cache lines */
+	/* 高频写字段与只读组隔离，降低其他 CPU 读取时的伪共享失效。 */
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_tx, data_segs_out);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_tx, delivered);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_tx, delivered_ce);
@@ -6038,6 +6386,7 @@ static void __init tcp_struct_check(void)
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_tx, ecn_flags);
 
 	/* TXRX read-write hotpath cache lines */
+	/* ACK 同时读写的核心序号、窗口和时间字段共享一组。 */
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_txrx, pred_flags);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_txrx, tcp_clock_cache);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_txrx, tcp_mstamp);
@@ -6059,6 +6408,7 @@ static void __init tcp_struct_check(void)
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_txrx, segs_out);
 
 	/* RX read-write hotpath cache lines */
+	/* 只由接收提交频繁修改的统计和窗口估计集中，避免污染发送专用行。 */
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_rx, bytes_received);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_rx, data_segs_in);
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_rx, rcv_wup);
@@ -6069,6 +6419,19 @@ static void __init tcp_struct_check(void)
 	CACHELINE_ASSERT_GROUP_MEMBER(struct tcp_sock, tcp_sock_write_rx, rcvq_space);
 }
 
+/*
+ * tcp_init - 启动期建立全局 TCP hash、slab、内存水位、timer 和默认算法。
+ *
+ * `__init` 表示系统启动完成后函数代码可释放，不能在运行期再调用。BUILD_BUG_ON
+ * 验证最小 MSS 足以容纳 option、tcp_skb_cb 装得进 skb->cb；随后验证 cacheline
+ * 布局。函数创建 listen/established/bind/bind2 索引及 bucket locks，大小按物理
+ * 内存和 thash_entries 启动参数决定；SLAB_PANIC/显式 panic 表示这些基础设施失败
+ * 无法降级启动网络栈。
+ *
+ * 发布顺序是先完成所有表和锁，再设置内存/sysctl 默认，最后初始化 IPv4、metrics、
+ * 注册 Reno、TSQ 与 MPTCP。返回后收包查找和 socket 创建才可安全依赖 tcp_hashinfo。
+ * 函数无返回值；不可恢复错误直接 BUG/panic。
+ */
 void __init tcp_init(void)
 {
 	int max_rshare, max_wshare, cnt;
@@ -6087,7 +6450,7 @@ void __init tcp_init(void)
 	mod_timer(&tcp_orphan_timer, jiffies + TCP_ORPHAN_TIMER_PERIOD);
 
 	inet_hashinfo2_init(&tcp_hashinfo, "tcp_listen_portaddr_hash",
-			    thash_entries, 21,  /* one slot per 2 MB*/
+			    thash_entries, 21,  /* 每 2 MB 内存预留一个槽位 */
 			    0, 64 * 1024);
 	tcp_hashinfo.bind_bucket_cachep =
 		kmem_cache_create("tcp_bind_bucket",
@@ -6107,11 +6470,13 @@ void __init tcp_init(void)
 	 *
 	 * The methodology is similar to that of the buffer cache.
 	 */
+	/* 按内存比例自动缩放，显式 thash_entries 则尊重管理员容量选择。 */
+	/* established ehash 按四元组查 full/request/timewait；nulls hlist 可检测遍历期间重排。 */
 	tcp_hashinfo.ehash =
 		alloc_large_system_hash("TCP established",
 					sizeof(struct inet_ehash_bucket),
 					thash_entries,
-					17, /* one slot per 128 KB of memory */
+					17, /* 每 128 KB 内存预留一个槽位 */
 					0,
 					NULL,
 					&tcp_hashinfo.ehash_mask,
@@ -6122,11 +6487,12 @@ void __init tcp_init(void)
 
 	if (inet_ehash_locks_alloc(&tcp_hashinfo))
 		panic("TCP: failed to alloc ehash_locks");
+	/* bhash/bhash2 分别支持端口和端口+地址约束；连续分配后拆成两个同尺寸数组。 */
 	tcp_hashinfo.bhash =
 		alloc_large_system_hash("TCP bind",
 					2 * sizeof(struct inet_bind_hashbucket),
 					tcp_hashinfo.ehash_mask + 1,
-					17, /* one slot per 128 KB of memory */
+					17, /* 每 128 KB 内存预留一个槽位 */
 					0,
 					&tcp_hashinfo.bhash_size,
 					NULL,
@@ -6148,6 +6514,7 @@ void __init tcp_init(void)
 
 	tcp_init_mem();
 	/* Set per-socket limits to no more than 1/128 the pressure threshold */
+	/* 默认单连接上限限制为总 pressure 预算的 1/128，防止少数连接独占全局内存。 */
 	limit = nr_free_buffer_pages() << (PAGE_SHIFT - 7);
 	max_wshare = min(4UL*1024*1024, limit);
 	max_rshare = min(32UL*1024*1024, limit);
@@ -6163,6 +6530,7 @@ void __init tcp_init(void)
 	pr_info("Hash tables configured (established %u bind %u)\n",
 		tcp_hashinfo.ehash_mask + 1, tcp_hashinfo.bhash_size);
 
+	/* 所有共享资源就绪后才注册协议入口，避免早到报文观察半初始化全局状态。 */
 	tcp_v4_init();
 	tcp_metrics_init();
 	BUG_ON(tcp_register_congestion_control(&tcp_reno) != 0);
