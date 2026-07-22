@@ -3,6 +3,47 @@
  *  Kernel timekeeping code and accessor functions. Based on code from
  *  timer.c, moved in commit 8524070b7982.
  */
+/*
+ * 补充说明：本文件把“不规则增长的硬件计数器”转换成内核可使用的多个时间域。
+ * clocksource 只回答“当前周期数是多少”；timekeeper 负责保存上次采样、换算斜率、
+ * 历史基点和各时间域偏移，并在 tick、设时、NTP、挂起恢复时提交新状态。
+ *
+ * 【宏观地图】
+ *
+ *   硬件 clocksource.read() -> cycles
+ *          |  delta = (cycles - cycle_last) & mask
+ *          |  ns = (delta * mult + xtime_nsec) >> shift
+ *          v
+ *   tk_read_base / timekeeper
+ *          |-- CLOCK_MONOTONIC     base + 当前周期增量；不随 settimeofday 跳变
+ *          |-- CLOCK_REALTIME      monotonic + offs_real；可被人工/NTP 调整
+ *          |-- CLOCK_BOOTTIME      monotonic + offs_boot；包含 suspend 睡眠
+ *          |-- CLOCK_TAI           monotonic + offs_tai；realtime 再加 TAI 偏移
+ *          `-- CLOCK_MONOTONIC_RAW 原始 mult，不施加 NTP 频率校正
+ *
+ *   写侧：tkd->lock -> 修改 shadow_timekeeper -> write_seqcount_begin
+ *         -> 更新 VDSO/fast timekeeper -> memcpy 发布正式 timekeeper
+ *         -> write_seqcount_end
+ *   读侧：read_seqcount_begin -> 复制基点/偏移并读取 clocksource
+ *         -> read_seqcount_retry；若写侧穿插则整次重读
+ *
+ * 【贯穿例子】
+ * 假设 clocksource 为 1 GHz，cycle_last=1000，本次读到 1300；mult/shift 把 300 cycles
+ * 换成 300 ns，再加到已提交的 monotonic base。若用户随后把墙上时间向前拨 10 秒，
+ * offs_real 增加 10 秒，因此 realtime 跳变；wall_to_monotonic/offs_real 同步反向调整，
+ * monotonic 仍连续。系统 suspend 5 秒后恢复，会把 5 秒补进 realtime，同时反向调整
+ * wall_to_monotonic 让 monotonic 不跳，并把同一 delta 加入 offs_boot，使 boottime
+ * 包含睡眠时间。
+ *
+ * 【核心矛盾与方案代价】
+ * 读时间是极热路径，不能每次拿全局锁；Linux 用 seqcount 提供一致快照，用 latch
+ * 双缓冲满足 NMI/tracing，用 VDSO 把常用读取搬到用户态。代价是写侧必须同时维护
+ * 多份派生状态并严格排序，而且 fast 接口为 NMI 安全接受极小的跨更新乱序风险。
+ *
+ * 建议阅读顺序：tk_setup_internals/timekeeping_cycles_to_ns -> 普通读取 API ->
+ * timekeeping_update_from_shadow -> update_wall_time -> settimeofday/clocksource switch ->
+ * suspend/resume -> adjtimex；辅助时钟属于最后的扩展分支。
+ */
 #include <linux/audit.h>
 #include <linux/clocksource.h>
 #include <linux/compiler.h>
@@ -42,6 +83,11 @@ enum timekeeping_adv_mode {
 };
 
 /*
+ * 补充说明：TK_ADV_TICK 允许“不足一个固定 interval”直接返回；TK_ADV_FREQ 用于
+ * adjtimex 立即应用新频率，即使本次没有完整 tick 可累计也不能跳过斜率更新。
+ */
+
+/*
  * The most important data for readout fits into a single 64 byte
  * cache line.
  */
@@ -52,46 +98,111 @@ struct tk_data {
 	raw_spinlock_t		lock;
 } ____cacheline_aligned;
 
+/*
+ * 补充说明：每个 tk_data 有一份读者可见的 timekeeper 和一份只供写侧演算的 shadow。
+ * raw spinlock 串行化 tick、settimeofday、clocksource 切换和 suspend；seqcount 不负责
+ * 排斥写者，只让无锁读者发现写入穿插。seqcount_raw_spinlock_t 还把这把锁关联给
+ * lockdep，帮助验证写序列确实处于正确锁保护下。
+ *
+ * shadow 的意义类似事务工作区：先在不可见副本完成周期推进、NTP/闰秒和派生基点，
+ * 再在一个 seqcount 写区间内更新 VDSO/fast 副本并 memcpy 发布。这样读者不会看到
+ * “秒已增加但 offset/VDSO 仍是旧值”的混合状态。
+ *
+ * 字段地图：
+ *   seq               读者版本号；变化表示写事务穿插，并关联 lock 做 lockdep 验证。
+ *   timekeeper        已提交、供无锁读者观察的正式状态。
+ *   shadow_timekeeper 写者持 lock 时演算的候选状态，提交前对读者不可见。
+ *   lock              该 tk_data 唯一写者锁；IRQ 也会推进时间，写侧通常 irqsave。
+ */
+
+/*
+ * timekeeper_data 是所有软件 timekeeper 的固定槽位数组：索引 0 为系统 core，其余在
+ * CONFIG_POSIX_AUX_CLOCKS 下作为 AUX。静态存储期保证对象永不释放，读者无需引用计数；
+ * 每个槽自己的 lock/seq 管理内容并发。
+ */
 static struct tk_data timekeeper_data[TIMEKEEPERS_MAX];
 
 /* The core timekeeper */
 #define tk_core		(timekeeper_data[TIMEKEEPER_CORE])
+/* tk_core 是系统主时钟槽位的左值别名，不创建对象，也不增加指针间接访问。 */
 
 #ifdef CONFIG_POSIX_AUX_CLOCKS
+/*
+ * tk_get_aux_ts64 - 用内部 timekeeper ID 读取对应的 POSIX AUX 时钟。
+ *
+ * AUX（auxiliary，辅助时钟）不是 CLOCK_MONOTONIC 的别名，而是可选的独立软件
+ * timekeeper：它复用 core raw clocksource 的硬件周期，却拥有自己的 offset、频率
+ * 校正和有效状态，可供需要与外部设备建立独立时间域的用户空间使用。
+ *
+ * timekeeper 内部编号从 TIMEKEEPER_AUX_FIRST 开始，POSIX ABI 编号从 CLOCK_AUX
+ * 开始；两者做相同距离的平移。返回 false 表示对应 AUX 尚未启用或读取时失效，
+ * @ts 不能当作有效输出。
+ */
 static inline bool tk_get_aux_ts64(unsigned int tkid, struct timespec64 *ts)
 {
 	return ktime_get_aux_ts64(CLOCK_AUX + tkid - TIMEKEEPER_AUX_FIRST, ts);
 }
 
+/*
+ * tk_is_aux - 判断一个 timekeeper 是否属于辅助时钟槽位。
+ *
+ * @tk->id 是 tkd_basic_setup() 在启动时写入的稳定内部身份，不是用户传入的 clockid。
+ * TIMEKEEPER_CORE 位于 AUX 范围之外；TIMEKEEPER_AUX_FIRST..LAST 是闭区间，所以两端
+ * 都使用包含比较。当前主要调用者 timekeeping_update_from_shadow() 据此选择发布目标：
+ * core 更新通用 VDSO、pvclock 和 NMI fast timekeeper；AUX 只更新自己的 VDSO 数据。
+ * 若误把 core 判成 AUX，会漏掉全局时间发布；若误把 AUX 判成 core，则会污染系统钟。
+ */
 static inline bool tk_is_aux(const struct timekeeper *tk)
 {
 	return tk->id >= TIMEKEEPER_AUX_FIRST && tk->id <= TIMEKEEPER_AUX_LAST;
 }
+/* 真正定义位于文件末尾；前向声明让前面的通用读取/cross-timestamp 路径可以分派。 */
 static inline struct tk_data *aux_get_tk_data(clockid_t id);
 #else
+/* 配置关闭时这些 inline stub 会被编译消除，使 core 热路径无需散布条件编译。 */
+/* 没有 AUX ABI 时任何内部 ID 都不可读取为辅助时钟，输出保持不可用。 */
 static inline bool tk_get_aux_ts64(unsigned int tkid, struct timespec64 *ts)
 {
+	/* @tkid/@ts 在本配置中均不使用；false 明确要求调用者不得读取 @ts 原有内容。 */
 	return false;
 }
 
+/*
+ * CONFIG_POSIX_AUX_CLOCKS=n 时系统只有 core timekeeper，因此恒 false 正是配置语义。
+ * 这使 timekeeping_update_from_shadow() 不可能进入 vdso_time_update_aux() 分支，编译器
+ * 还能把整个 AUX 发布路径消除；它不是“尚未判断”，也不是运行时禁用状态。
+ */
 static inline bool tk_is_aux(const struct timekeeper *tk)
 {
+	/* @tk 只是为保持两种配置签名一致而保留的借用参数，本配置不解引用它。 */
 	return false;
 }
+/* 无 AUX 槽位时所有 POSIX AUX clockid 都映射失败。 */
 static inline struct tk_data *aux_get_tk_data(clockid_t id)
 {
+	/* @id 在无 AUX 配置下没有合法取值；NULL 表示不存在可借用的 tk_data 槽。 */
 	return NULL;
 }
 #endif
 
 static inline void tk_update_aux_offs(struct timekeeper *tk, ktime_t offs)
 {
+	/*
+	 * @tk 是持锁写侧对象；@offs 是 AUX 相对其 raw-derived monotonic 基点的有符号纳秒
+	 * 偏移。函数同步更新标量与 timespec 派生表示，后者供 VDSO 避免运行时 64 位除法。
+	 */
 	tk->offs_aux = offs;
 	tk->monotonic_to_aux = ktime_to_timespec64(offs);
 }
 
 /* flag for if timekeeping is suspended */
 int __read_mostly timekeeping_suspended;
+
+/*
+ * 补充说明：timekeeping_suspended 是挂起协议的全局状态，不是保护 timekeeper 的锁。
+ * 它主要阻止不安全的 clocksource 读取并让 dummy clock 返回固定周期；状态切换仍在
+ * timekeeper 锁和 syscore suspend/resume 排序下完成。
+ */
 
 /**
  * struct tk_fast - NMI safe timekeeper
@@ -107,11 +218,22 @@ struct tk_fast {
 	struct tk_read_base	base[2];
 };
 
+/*
+ * 字段补充：seq 的最低位选择当前安全副本，高位用于发现更新；base[0]/base[1] 保存
+ * 同一 readout base 的双缓冲。写者分阶段更新两份，NMI 读者总能选择完整的一份。
+ */
+
 /* Suspend-time cycles value for halted fast timekeeper. */
 static u64 cycles_at_suspend;
+/* cycles_at_suspend 保存 suspend 提交点的绝对 clocksource 周期，dummy read 恒返回它。 */
 
 static u64 dummy_clock_read(struct clocksource *cs)
 {
+	/*
+	 * @cs 是为满足 clocksource.read() 统一函数指针签名而传入的借用对象，本实现不读取
+	 * 其字段。suspend 后真实 clocksource 可能停摆或不可访问，fast reader 必须只看到
+	 * cycles_at_suspend；启动早期未 suspend 时以 local_clock() 纳秒值充当 1:1 周期。
+	 */
 	if (timekeeping_suspended)
 		return cycles_at_suspend;
 	return local_clock();
@@ -120,6 +242,7 @@ static u64 dummy_clock_read(struct clocksource *cs)
 static struct clocksource dummy_clock = {
 	.read = dummy_clock_read,
 };
+/* dummy_clock 只有 read 操作，用作早期 local_clock 适配和 suspend 期间冻结 fast reader。 */
 
 /*
  * Boot time initialization which allows local_clock() to be utilized
@@ -141,18 +264,21 @@ static struct tk_fast tk_fast_mono ____cacheline_aligned = {
 	.base[0] = FAST_TK_INIT,
 	.base[1] = FAST_TK_INIT,
 };
+/* tk_fast_mono 是 NMI-safe monotonic/realtime 的双缓冲发布对象，独占 cacheline。 */
 
 static struct tk_fast tk_fast_raw  ____cacheline_aligned = {
 	.seq     = SEQCNT_LATCH_ZERO(tk_fast_raw.seq),
 	.base[0] = FAST_TK_INIT,
 	.base[1] = FAST_TK_INIT,
 };
+/* tk_fast_raw 保存未经 NTP 调斜率的 raw 双缓冲，与 mono 分开避免 cache 相互污染。 */
 
 #ifdef CONFIG_POSIX_AUX_CLOCKS
 static __init void tk_aux_setup(void);
 static void tk_aux_update_clocksource(void);
 static void tk_aux_advance(void);
 #else
+/* aux 未编译时 setup/switch/tick 三个调用点都退化为空操作。 */
 static inline void tk_aux_setup(void) { }
 static inline void tk_aux_update_clocksource(void) { }
 static inline void tk_aux_advance(void) { }
@@ -160,6 +286,10 @@ static inline void tk_aux_advance(void) { }
 
 unsigned long timekeeper_lock_irqsave(void)
 {
+	/*
+	 * 对外提供 core 写锁封装。irqsave 防止本 CPU 的 timer/IRQ 在持锁区重入同一写侧；
+	 * 返回 flags 把“恢复到调用前 IRQ 状态”的责任交给 unlock 调用者。
+	 */
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&tk_core.lock, flags);
@@ -168,6 +298,7 @@ unsigned long timekeeper_lock_irqsave(void)
 
 void timekeeper_unlock_irqrestore(unsigned long flags)
 {
+	/* @flags 必须来自配对 lock 调用；它不是任意布尔值。 */
 	raw_spin_unlock_irqrestore(&tk_core.lock, flags);
 }
 
@@ -187,9 +318,15 @@ void timekeeper_unlock_irqrestore(unsigned long flags)
  * such an event occurs, a timestamp can appear to be earlier than a previous one.
  */
 static __cacheline_aligned_in_smp atomic64_t mg_floor;
+/* atomic64 允许并发文件时间发布者无锁抬高 floor；cacheline 隔离减少跨 CPU 伪共享。 */
 
 static inline void tk_normalize_xtime(struct timekeeper *tk)
 {
+	/*
+	 * @tk 是写侧持锁操作的 timekeeper；函数原地修改 mono/raw 的整秒和定点小数基点，
+	 * 无返回值。xtime_nsec 使用“左移 shift 的纳秒”保存小数精度，跨秒后分别搬运到
+	 * xtime_sec/raw_sec，从而恢复两个小数字段均小于一秒的不变量。
+	 */
 	while (tk->tkr_mono.xtime_nsec >= ((u64)NSEC_PER_SEC << tk->tkr_mono.shift)) {
 		tk->tkr_mono.xtime_nsec -= (u64)NSEC_PER_SEC << tk->tkr_mono.shift;
 		tk->xtime_sec++;
@@ -202,6 +339,8 @@ static inline void tk_normalize_xtime(struct timekeeper *tk)
 
 static inline struct timespec64 tk_xtime(const struct timekeeper *tk)
 {
+	/* 这里只读取已累计基点，不额外读取 clocksource；调用者决定是否需要 fine 增量。 */
+	/* @tk 是借用的稳定快照；ts 是按普通纳秒单位组装的返回值。 */
 	struct timespec64 ts;
 
 	ts.tv_sec = tk->xtime_sec;
@@ -211,6 +350,8 @@ static inline struct timespec64 tk_xtime(const struct timekeeper *tk)
 
 static inline struct timespec64 tk_xtime_coarse(const struct timekeeper *tk)
 {
+	/* coarse_nsec 被维护为不后退的独立快照，读取快但精度只到最近一次更新。 */
+	/* @tk 由调用者负责同步；ts 临时承载 coarse realtime 的秒/纳秒。 */
 	struct timespec64 ts;
 
 	ts.tv_sec = tk->xtime_sec;
@@ -229,11 +370,17 @@ static inline struct timespec64 tk_xtime_coarse(const struct timekeeper *tk)
  */
 static inline void tk_update_coarse_nsecs(struct timekeeper *tk)
 {
+	/* @tk 是写侧对象；把 mono 定点小数截成普通纳秒写入 coarse_nsec，无返回值。 */
 	tk->coarse_nsec = tk->tkr_mono.xtime_nsec >> tk->tkr_mono.shift;
 }
 
 static void tk_set_xtime(struct timekeeper *tk, const struct timespec64 *ts)
 {
+	/*
+	 * @tk 是待原地更新的写侧对象，@ts 是借用的规范化 realtime 绝对值；函数不保留
+	 * @ts。输入子秒是普通纳秒，写入内部定点格式时左移当前 clocksource 的 shift，
+	 * 并同步 coarse 副本；调用者负责锁和随后发布，无显式返回值。
+	 */
 	tk->xtime_sec = ts->tv_sec;
 	tk->tkr_mono.xtime_nsec = (u64)ts->tv_nsec << tk->tkr_mono.shift;
 	tk_update_coarse_nsecs(tk);
@@ -241,6 +388,10 @@ static void tk_set_xtime(struct timekeeper *tk, const struct timespec64 *ts)
 
 static void tk_xtime_add(struct timekeeper *tk, const struct timespec64 *ts)
 {
+	/*
+	 * @tk 是持锁写侧对象，@ts 是借用的增量而非绝对时间。函数把秒/纳秒增量加入
+	 * realtime 基点，随后规范化进位并同步 coarse_nsec；它只修改 @tk，不负责发布。
+	 */
 	tk->xtime_sec += ts->tv_sec;
 	tk->tkr_mono.xtime_nsec += (u64)ts->tv_nsec << tk->tkr_mono.shift;
 	tk_normalize_xtime(tk);
@@ -249,6 +400,7 @@ static void tk_xtime_add(struct timekeeper *tk, const struct timespec64 *ts)
 
 static void tk_set_wall_to_mono(struct timekeeper *tk, struct timespec64 wtm)
 {
+	/* @tk 是待更新对象；@wtm 是新 wall_to_monotonic；tmp 用于构造其规范化相反数。 */
 	struct timespec64 tmp;
 
 	/*
@@ -261,13 +413,16 @@ static void tk_set_wall_to_mono(struct timekeeper *tk, struct timespec64 wtm)
 	tk->wall_to_monotonic = wtm;
 	set_normalized_timespec64(&tmp, -wtm.tv_sec, -wtm.tv_nsec);
 	/* Paired with READ_ONCE() in ktime_mono_to_any() */
+	/* 补充说明：offs_real = -wall_to_monotonic；二者必须作为同一逻辑更新维护。 */
 	WRITE_ONCE(tk->offs_real, timespec64_to_ktime(tmp));
 	WRITE_ONCE(tk->offs_tai, ktime_add(tk->offs_real, ktime_set(tk->tai_offset, 0)));
 }
 
 static inline void tk_update_sleep_time(struct timekeeper *tk, ktime_t delta)
 {
+	/* @tk 是持锁写侧对象；@delta 是本次 suspend 睡眠的纳秒时长，累加到 offs_boot。 */
 	/* Paired with READ_ONCE() in ktime_mono_to_any() */
+	/* 补充说明：只增加 boot offset，使 suspend 时间出现在 boottime 而不污染 monotonic。 */
 	WRITE_ONCE(tk->offs_boot, ktime_add(tk->offs_boot, delta));
 	/*
 	 * Timespec representation for VDSO update to avoid 64bit division
@@ -280,6 +435,7 @@ static inline void tk_update_sleep_time(struct timekeeper *tk, ktime_t delta)
 #include <asm/clock_inlined.h>
 
 static DEFINE_STATIC_KEY_FALSE(clocksource_read_inlined);
+/* 该 static key 是全局热路径开关：启用时架构可内联读当前源，换源期间由写侧切换。 */
 
 /*
  * tk_clock_read - atomic clocksource read() helper
@@ -296,6 +452,12 @@ static DEFINE_STATIC_KEY_FALSE(clocksource_read_inlined);
  */
 static __always_inline u64 tk_clock_read(const struct tk_read_base *tkr)
 {
+	/*
+	 * READ_ONCE 只保证先取得一个完整 clock 指针。必须把同一快照同时用于选择 read
+	 * 实现和传参；否则 clocksource 切换夹在两次读取之间，可能把 A 的回调传入 B。
+	 * static key 让“不支持架构内联读取”的常态不承担普通条件分支成本。
+	 */
+	/* @tkr 是借用 read base；clock 是本次调用固定使用的 clocksource 指针快照。 */
 	struct clocksource *clock = READ_ONCE(tkr->clock);
 
 	if (static_branch_likely(&clocksource_read_inlined))
@@ -306,16 +468,20 @@ static __always_inline u64 tk_clock_read(const struct tk_read_base *tkr)
 
 static inline void clocksource_disable_inline_read(void)
 {
+	/* 关闭全局 static key，使后续热读改走 clock->read；无参数、无返回和所有权变化。 */
 	static_branch_disable(&clocksource_read_inlined);
 }
 
 static inline void clocksource_enable_inline_read(void)
 {
+	/* 打开全局 static key，使支持架构走内联硬件读；调用者须确保当前源适合该实现。 */
 	static_branch_enable(&clocksource_read_inlined);
 }
 #else
 static __always_inline u64 tk_clock_read(const struct tk_read_base *tkr)
 {
+	/* 非内联配置仍先稳定函数表 owner，再通过该对象自己的 read 回调读取。 */
+	/* @tkr 是借用 read base；clock 固定本次回调与参数属于同一 clocksource。 */
 	struct clocksource *clock = READ_ONCE(tkr->clock);
 
 	return clock->read(clock);
@@ -338,6 +504,23 @@ static inline void clocksource_enable_inline_read(void) { }
  */
 static void tk_setup_internals(struct timekeeper *tk, struct clocksource *clock)
 {
+	/*
+	 * 补充说明：调用者持有对应 tk_data 写锁，并已把旧时间推进到切换瞬间。本函数
+	 * 重新建立“周期 <-> 定点纳秒”参数，但不自行向读者发布。
+	 *
+	 * 变量关系：clock->mult/shift 给出 ns ~= cycles*mult>>shift；cycle_interval 是一个
+	 * NTP 更新周期对应的硬件 cycles；xtime_interval 是用当前 mult 换回的 shifted-ns；
+	 * xtime_remainder 保存取整误差，后续 timekeeping_adjust 逐步偿还而不是丢失。
+	 */
+	/*
+	 * 变量地图：
+	 *   tk          调用者持锁的 shadow timekeeper，修改在随后提交前不可见。
+	 *   clock       新 clocksource；函数借用，生命周期由切换路径的 module 引用保证。
+	 *   old_clock   旧源快照，仅用于把 xtime_nsec 的定点 shift 无损换到新尺度。
+	 *   tmp         ns/cycle 反算的可变工作值。
+	 *   ntpinterval 一个 NTP 周期的 shifted-ns 精确预算。
+	 *   interval    取整后一个 NTP 周期对应的硬件 cycles，最小为 1。
+	 */
 	u64 interval;
 	u64 tmp, ntpinterval;
 	struct clocksource *old_clock;
@@ -353,6 +536,7 @@ static void tk_setup_internals(struct timekeeper *tk, struct clocksource *clock)
 	tk->tkr_raw.cycle_last = tk->tkr_mono.cycle_last;
 
 	/* Do the ns -> cycle conversion first, using original mult */
+	/* 补充说明：加 mult/2 实现四舍五入；极低频时至少取 1 cycle，保证推进循环有进展。 */
 	tmp = NTP_INTERVAL_LENGTH;
 	tmp <<= clock->shift;
 	ntpinterval = tmp;
@@ -370,6 +554,7 @@ static void tk_setup_internals(struct timekeeper *tk, struct clocksource *clock)
 	tk->raw_interval = interval * clock->mult;
 
 	 /* if changing clocks, convert xtime_nsec shift units */
+	/* 补充说明：xtime_nsec 是定点数；换 clocksource shift 时只变表示尺度，不改变时间值。 */
 	if (old_clock) {
 		int shift_change = clock->shift - old_clock->shift;
 		if (shift_change < 0) {
@@ -423,12 +608,14 @@ static void tk_setup_internals(struct timekeeper *tk, struct clocksource *clock)
 /* Timekeeper helper functions. */
 static noinline u64 delta_to_ns_safe(const struct tk_read_base *tkr, u64 delta)
 {
+	/* 拆分乘加避免 delta*mult 在 u64 中间值溢出；仅异常大 delta 走慢路径。 */
 	return mul_u64_u32_add_u64_shr(delta, tkr->mult, tkr->xtime_nsec, tkr->shift);
 }
 
 static __always_inline u64 timekeeping_cycles_to_ns(const struct tk_read_base *tkr, u64 cycles)
 {
 	/* Calculate the delta since the last update_wall_time() */
+	/* @cycles 是绝对硬件读数；mask 定义回绕宽度；delta 是相对 cycle_last 的周期数。 */
 	u64 mask = tkr->mask, delta = (cycles - tkr->cycle_last) & mask;
 
 	/*
@@ -440,6 +627,10 @@ static __always_inline u64 timekeeping_cycles_to_ns(const struct tk_read_base *t
 		 * Handle clocksource inconsistency between CPUs to prevent
 		 * time from going backwards by checking for the MSB of the
 		 * mask being set in the delta.
+		 */
+		/*
+		 * 环形计数器的差值若落在 mask 的“后半圈”，更可能是另一 CPU 读到了稍旧周期，
+		 * 而不是真经过了接近完整一圈；返回已累计基点可避免时间倒退/巨大跃迁。
 		 */
 		if (delta & ~(mask >> 1))
 			return tkr->xtime_nsec >> tkr->shift;
@@ -473,6 +664,12 @@ static __always_inline u64 timekeeping_get_ns(const struct tk_read_base *tkr)
 static void update_fast_timekeeper(const struct tk_read_base *tkr,
 				   struct tk_fast *tkf)
 {
+	/*
+	 * 补充说明：latch 的低位选择读副本。写者先把读者赶到 base[1] 再更新 base[0]，
+	 * 然后赶回 base[0] 再更新 base[1]；任意 NMI 打断写者时至少有一份完整副本。
+	 * memcpy 复制 clock 指针、cycle_last、mult/shift 和 base，缺一项都会混合两个时代。
+	 */
+	/* @tkr 是待发布源快照；@tkf 是目标 latch；base 指向其两个连续副本的首元素。 */
 	struct tk_read_base *base = tkf->base;
 
 	/* Force readers off to base[1] */
@@ -492,6 +689,11 @@ static void update_fast_timekeeper(const struct tk_read_base *tkr,
 
 static __always_inline u64 __ktime_get_fast_ns(struct tk_fast *tkf)
 {
+	/*
+	 * seq&1 是数组索引而非“写入中”判断。若更新期间 latch 序号改变，retry 丢弃整个
+	 * base+delta 结果。这里不取 tk_core.lock，因此能在 NMI/tracing 中使用。
+	 */
+	/* tkr 指向 seq 低位选中的副本；seq 是验证 token；now 累计 base 与增量纳秒。 */
 	struct tk_read_base *tkr;
 	unsigned int seq;
 	u64 now;
@@ -540,6 +742,12 @@ static __always_inline u64 __ktime_get_fast_ns(struct tk_fast *tkf)
  */
 u64 notrace ktime_get_mono_fast_ns(void)
 {
+	/*
+	 * 补充说明：fast 家族服务 NMI、trace 和递归观测，不能依赖普通 seqcount 写者最终
+	 * 跑完，所以读 latch 双副本。mono 可能在调斜率更新边界出现极小倒退；raw 因斜率
+	 * 固定没有该问题；boot/TAI 额外 data_race 读取 offset，可能短暂混合两个版本；
+	 * real 把 base_real 与 delta 放在同一 latch 重试中。普通业务应优先使用严格 API。
+	 */
 	return __ktime_get_fast_ns(&tk_fast_mono);
 }
 EXPORT_SYMBOL_GPL(ktime_get_mono_fast_ns);
@@ -582,6 +790,7 @@ EXPORT_SYMBOL_GPL(ktime_get_raw_fast_ns);
  */
 u64 notrace ktime_get_boot_fast_ns(void)
 {
+	/* mono 与 offs_boot 不是一个原子快照；data_race 明确接受更新边界的短暂混合。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 
 	return (ktime_get_mono_fast_ns() + ktime_to_ns(data_race(tk->offs_boot)));
@@ -599,6 +808,7 @@ EXPORT_SYMBOL_GPL(ktime_get_boot_fast_ns);
  */
 u64 notrace ktime_get_tai_fast_ns(void)
 {
+	/* TAI offset 极少变化，NMI 路径选择可后处理的偶发误差而不是不可用的全局锁。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 
 	return (ktime_get_mono_fast_ns() + ktime_to_ns(data_race(tk->offs_tai)));
@@ -612,6 +822,8 @@ EXPORT_SYMBOL_GPL(ktime_get_tai_fast_ns);
  */
 u64 ktime_get_real_fast_ns(void)
 {
+	/* 与 boot/TAI 不同，base_real 已嵌入 latch 副本，可与本次 delta 一起重试。 */
+	/* tkf 是全局 mono latch；tkr 为选中副本；baser/delta 分别是 realtime 基点/增量。 */
 	struct tk_fast *tkf = &tk_fast_mono;
 	struct tk_read_base *tkr;
 	u64 baser, delta;
@@ -640,6 +852,12 @@ EXPORT_SYMBOL_GPL(ktime_get_real_fast_ns);
  */
 static void halt_fast_timekeeper(const struct timekeeper *tk)
 {
+	/*
+	 * 把最后真实周期连同原 conversion/base 复制到静态 dummy base，再把 read 回调换成
+	 * 固定 cycles_at_suspend。这样 fast/NMI reader 无需知道设备已 suspend，也不会调用
+	 * 可能掉电的寄存器。resume 的正常 update 会重新发布真实 clocksource。
+	 */
+	/* tkr_dummy 是 suspend 期间长期存在的冻结副本；tkr 依次借用 mono 和 raw 源。 */
 	static struct tk_read_base tkr_dummy;
 	const struct tk_read_base *tkr = &tk->tkr_mono;
 
@@ -656,9 +874,14 @@ static void halt_fast_timekeeper(const struct timekeeper *tk)
 }
 
 static RAW_NOTIFIER_HEAD(pvclock_gtod_chain);
+/* 链中元素由虚拟化时钟注册，通知参数是最新 core timekeeper 与“是否设时”标志。 */
 
 static void update_pvclock_gtod(struct timekeeper *tk, bool was_set)
 {
+	/*
+	 * @tk 是锁内借用的最新 core 状态，通知仅在回调期间有效；@was_set 区分墙钟跳变或
+	 * 首次全量同步与普通推进。返回值被忽略，因为监听者不能否决已经形成的时间状态。
+	 */
 	raw_notifier_call_chain(&pvclock_gtod_chain, was_set, tk);
 }
 
@@ -668,9 +891,11 @@ static void update_pvclock_gtod(struct timekeeper *tk, bool was_set)
  */
 int pvclock_gtod_register_notifier(struct notifier_block *nb)
 {
+	/* tk 是要立即推送给新监听者的 core 快照；ret 保存链表注册结果。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	int ret;
 
+	/* guard 离开作用域自动 irqrestore/unlock；注册与首次快照处于同一锁区，避免漏更新。 */
 	guard(raw_spinlock_irqsave)(&tk_core.lock);
 	ret = raw_notifier_chain_register(&pvclock_gtod_chain, nb);
 	update_pvclock_gtod(tk, true);
@@ -686,6 +911,7 @@ EXPORT_SYMBOL_GPL(pvclock_gtod_register_notifier);
  */
 int pvclock_gtod_unregister_notifier(struct notifier_block *nb)
 {
+	/* @nb 是调用者拥有的 notifier 节点；锁内摘链，返回 notifier 核心的注销状态码。 */
 	guard(raw_spinlock_irqsave)(&tk_core.lock);
 	return raw_notifier_chain_unregister(&pvclock_gtod_chain, nb);
 }
@@ -696,6 +922,11 @@ EXPORT_SYMBOL_GPL(pvclock_gtod_unregister_notifier);
  */
 static inline void tk_update_leap_state(struct timekeeper *tk)
 {
+	/*
+	 * @tk 是对应 NTP 实例的写侧对象；函数覆盖 next_leap_ktime。NTP 给出 realtime
+	 * 闰秒时刻；有限值减 offs_real 转成不随 settimeofday 跳变的 monotonic 域；
+	 * KTIME_MAX 保持“当前没有计划闰秒”的哨兵语义。
+	 */
 	tk->next_leap_ktime = ntp_get_next_leap(tk->id);
 	if (tk->next_leap_ktime != KTIME_MAX)
 		/* Convert to monotonic time */
@@ -708,6 +939,10 @@ static inline void tk_update_leap_state(struct timekeeper *tk)
  */
 static void tk_update_leap_state_all(struct tk_data *tkd)
 {
+	/*
+	 * @tkd 是目标永久容器，调用者已持 tkd->lock。shadow 与正式副本只更新一个标量，
+	 * seqcount 仍需覆盖两次写，防读者看到不同代；无返回值，结果直接提交到两副本。
+	 */
 	write_seqcount_begin(&tkd->seq);
 	tk_update_leap_state(&tkd->shadow_timekeeper);
 	tkd->timekeeper.next_leap_ktime = tkd->shadow_timekeeper.next_leap_ktime;
@@ -719,6 +954,11 @@ static void tk_update_leap_state_all(struct tk_data *tkd)
  */
 static inline void tk_update_ktime_data(struct timekeeper *tk)
 {
+	/*
+	 * 把 timespec 风格的 wall_to_monotonic 与 realtime 秒基点折叠成热读路径使用的
+	 * ktime base。之后读取只需 base+本次 clocksource 增量，不必反复规范化 timespec。
+	 */
+	/* seconds 是折叠后的 monotonic 整秒；nsec 是 wall_to_mono 与 xtime 的亚秒进位工作值。 */
 	u64 seconds;
 	u32 nsec;
 
@@ -749,6 +989,12 @@ static inline void tk_update_ktime_data(struct timekeeper *tk)
 
 static inline void tk_update_ns_to_cyc(struct timekeeper *tks, struct timekeeper *tkc)
 {
+	/*
+	 * coupled clockevent 需要把绝对纳秒 expiry 反算为同源 comparator cycles。只有 NTP
+	 * 改变 core mono 的 mult/shift 时才重算倒数比例和安全上限；raw clocksource 参数
+	 * 本身不变时快速返回。
+	 */
+	/* tkrs 是 shadow 新参数，tkrc 是已提交旧参数；shift 是构造倒数定点比例的总移位。 */
 	struct tk_read_base *tkrs = &tks->tkr_mono;
 	struct tk_read_base *tkrc = &tkc->tkr_mono;
 	unsigned int shift;
@@ -782,12 +1028,20 @@ static inline void tk_update_ns_to_cyc(struct timekeeper *tks, struct timekeeper
  */
 static void timekeeping_restore_shadow(struct tk_data *tkd)
 {
+	/* 新一轮写事务必须从刚发布的正式状态开始，不能在上次临时演算残留上继续累积。 */
 	lockdep_assert_held(&tkd->lock);
 	memcpy(&tkd->shadow_timekeeper, &tkd->timekeeper, sizeof(tkd->timekeeper));
 }
 
 static void timekeeping_update_from_shadow(struct tk_data *tkd, unsigned int action)
 {
+	/*
+	 * 这是 timekeeper 写事务的提交函数。入口：tkd->lock 已持有，shadow 包含完整候选
+	 * 状态；出口：内核读副本、VDSO、pvclock、NMI fast 副本处于同一逻辑版本。
+	 * seqcount 写区覆盖所有外部发布，避免用户先从新 VDSO 读时间、再从旧内核副本读到
+	 * 更早时间。最后 memcpy 而非交换指针，是用一次冷写换取所有热读的少一次间接访问。
+	 */
+	/* @tkd 是持锁槽位；@action 是清 NTP/报告设时位图；tk 指向待提交 shadow。 */
 	struct timekeeper *tk = &tkd->shadow_timekeeper;
 
 	lockdep_assert_held(&tkd->lock);
@@ -846,6 +1100,12 @@ static void timekeeping_update_from_shadow(struct tk_data *tkd, unsigned int act
  */
 static void timekeeping_forward_now(struct timekeeper *tk)
 {
+	/*
+	 * 在设时、调频或切换 clocksource 前先结算 cycle_last 到 now 的旧斜率时间，建立清晰
+	 * 分界：旧周期按旧 mult 计价，新配置只作用于此后的周期。大 delta 分块不超过
+	 * max_cycles，避免乘法溢出并复用安全换算上限。
+	 */
+	/* cycle_now 是本次绝对硬件读数；delta 是尚未结算、可能需分块消费的 cycles。 */
 	u64 cycle_now, delta;
 
 	cycle_now = tk_clock_read(&tk->tkr_mono);
@@ -889,6 +1149,17 @@ static void timekeeping_forward_now(struct timekeeper *tk)
  */
 bool ktime_expiry_to_cycles(enum clocksource_ids id, ktime_t expires_ns, u64 *cycles)
 {
+	/*
+	 * 补充说明：这是给“clockevent comparator 与 timekeeper 使用同一计数基准”的优化。
+	 * 快速 data_race 检查只负责尽早拒绝，不承担正确性；seqcount 内再次核对 cs_id 并
+	 * 复制 base/mult/shift 才形成有效快照。过期时间早于 base 时钳成 0，过远时钳到
+	 * max_ns，避免负数转 u64 和乘法溢出。失败后调用者必须退回普通相对定时路径。
+	 */
+	/*
+	 * 变量地图：tk/tkrm 指向 core 正式 mono base；base_ns/base_cycles 是同一提交点；
+	 * delta_ns/delta_cycles 是目标相对基点的两种单位；max_ns 防溢出；mult/shift 是
+	 * ns->cycles 定点比例；seq 验证上述字段同代；@cycles 是成功时才有意义的输出。
+	 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	struct tk_read_base *tkrm = &tk->tkr_mono;
 	ktime_t base_ns, delta_ns, max_ns;
@@ -939,6 +1210,12 @@ bool ktime_expiry_to_cycles(enum clocksource_ids id, ktime_t expires_ns, u64 *cy
  */
 void ktime_get_real_ts64(struct timespec64 *ts)
 {
+	/*
+	 * 典型 fine-grained seqcount 读取：在同一序列版本内取得 realtime 整秒基点和
+	 * clocksource 增量，retry 后才在局部变量中规范化 timespec。seqcount 保护一致性
+	 * 而非对象生命周期；全局 timekeeper 永久存在，所以无需引用计数。
+	 */
+	/* tk 是永久 core 对象；seq 验证快照；nsecs 是基点后增量；@ts 是调用者输出。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 	u64 nsecs;
@@ -960,6 +1237,8 @@ EXPORT_SYMBOL(ktime_get_real_ts64);
 
 ktime_t ktime_get(void)
 {
+	/* CLOCK_MONOTONIC = 已提交 base + cycle_last 之后按校正 mult 换算的当前增量。 */
+	/* base 是已提交 monotonic 基点；nsecs 是当前增量；seq 保证二者来自同代 tkr。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 	ktime_t base;
@@ -980,6 +1259,8 @@ EXPORT_SYMBOL_GPL(ktime_get);
 
 u32 ktime_get_resolution_ns(void)
 {
+	/* 每个硬件 cycle 对应的整数纳秒近似值；clocksource 切换时必须与 mult/shift 同读。 */
+	/* nsecs 是返回分辨率，seq 防止读取到旧 mult 配新 shift。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 	u32 nsecs;
@@ -1001,8 +1282,15 @@ static const ktime_t *const offsets[TK_OFFS_MAX] = {
 	[TK_OFFS_TAI]	= &tk_core.timekeeper.offs_tai,
 };
 
+/*
+ * 补充说明：offsets 把“monotonic 基准 + 哪个稳定偏移”统一成一条读路径。索引必须是
+ * 合法 tk_offsets；该内部 API 不做边界检查。REAL 可随设时改变，BOOT 只在恢复时
+ * 累加睡眠，TAI 还包含 tai_offset，但三者都从同一 monotonic 快照派生。
+ */
+
 ktime_t ktime_get_with_offset(enum tk_offsets offs)
 {
+	/* tk 是 core；offset 由 @offs 选定；base/nsecs 是目标域基点和当前硬件增量；seq 验证。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	const ktime_t *offset = offsets[offs];
 	unsigned int seq;
@@ -1025,6 +1313,8 @@ EXPORT_SYMBOL_GPL(ktime_get_with_offset);
 
 ktime_t ktime_get_coarse_with_offset(enum tk_offsets offs)
 {
+	/* coarse 省掉一次硬件 read，代价是只返回最近 update_wall_time 提交的 nsec。 */
+	/* base 合入目标 offset；nsecs 取 coarse_nsec；seq 保证 offset/base/coarse 同代。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	const ktime_t *offset = offsets[offs];
 	unsigned int seq;
@@ -1051,6 +1341,7 @@ EXPORT_SYMBOL_GPL(ktime_get_coarse_with_offset);
  */
 ktime_t ktime_mono_to_any(ktime_t tmono, enum tk_offsets offs)
 {
+	/* @tmono 是输入 monotonic；offset 选择目标域；tconv 是 32 位 seqcount 路径的候选结果。 */
 	const ktime_t *offset = offsets[offs];
 	unsigned int seq;
 	ktime_t tconv;
@@ -1060,9 +1351,11 @@ ktime_t ktime_mono_to_any(ktime_t tmono, enum tk_offsets offs)
 		 * Paired with WRITE_ONCE()s in tk_set_wall_to_mono() and
 		 * tk_update_sleep_time().
 		 */
+		/* 64 位单次 load 不会撕裂，允许用稍旧/稍新的完整 offset 快照换取无循环读取。 */
 		return ktime_add(tmono, READ_ONCE(*offset));
 	}
 
+	/* 32 位读取 64 位 ktime 可能撕裂，必须用 seqcount 检测写侧穿插。 */
 	do {
 		seq = read_seqcount_begin(&tk_core.seq);
 		tconv = ktime_add(tmono, *offset);
@@ -1077,6 +1370,8 @@ EXPORT_SYMBOL_GPL(ktime_mono_to_any);
  */
 ktime_t ktime_get_raw(void)
 {
+	/* raw 使用未被 NTP 改斜率的 tkr_raw，适合测量硬件经过时间而非民用时钟。 */
+	/* base 是 raw 已提交基点；nsecs 是 raw 周期增量；seq 验证同一 read base 版本。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 	ktime_t base;
@@ -1103,6 +1398,11 @@ EXPORT_SYMBOL_GPL(ktime_get_raw);
  */
 void ktime_get_ts64(struct timespec64 *ts)
 {
+	/*
+	 * 旧式表示从 realtime xtime 加 wall_to_monotonic 得到 monotonic；两部分必须处于
+	 * 同一 seqcount 版本，否则一次 settimeofday 会令 monotonic 跟着墙钟跳变。
+	 */
+	/* tomono 缓存 wall_to_monotonic；nsec 是 realtime 当前增量；@ts 承载最终 mono 输出。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	struct timespec64 tomono;
 	unsigned int seq;
@@ -1135,6 +1435,7 @@ EXPORT_SYMBOL_GPL(ktime_get_ts64);
  */
 time64_t ktime_get_seconds(void)
 {
+	/* 秒级缓存故意放弃亚秒精度，换取一次本机字长 load；适合超时统计而非事件排序。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 
 	WARN_ON(timekeeping_suspended);
@@ -1154,6 +1455,8 @@ EXPORT_SYMBOL_GPL(ktime_get_seconds);
  */
 time64_t ktime_get_real_seconds(void)
 {
+	/* 64 位可单次读 xtime_sec；32 位会撕裂同一 64 位字段，故用 seqcount 重试。 */
+	/* seconds 是 32 位重试路径的局部完整副本；seq 只在该配置路径使用。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	time64_t seconds;
 	unsigned int seq;
@@ -1183,6 +1486,7 @@ EXPORT_SYMBOL_GPL(ktime_get_real_seconds);
  */
 noinstr time64_t __ktime_get_real_seconds(void)
 {
+	/* MCE/KGDB 等受限上下文宁可接受竞态快照，也不能调用可能被插桩/重试的普通路径。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 
 	return tk->xtime_sec;
@@ -1191,6 +1495,8 @@ noinstr time64_t __ktime_get_real_seconds(void)
 static inline u64 tk_clock_read_snapshot(const struct tk_read_base *tkr,
 					 struct clocksource_hw_snapshot *chs)
 {
+	/* read_snapshot 可同时采集关联硬件 counter；没有该能力时只返回普通 clocksource 值。 */
+	/* clock 是本次固定源；@chs 是可选关联硬件快照输出，由具体 clocksource 填写。 */
 	struct clocksource *clock = READ_ONCE(tkr->clock);
 
 	if (unlikely(clock->read_snapshot))
@@ -1209,6 +1515,17 @@ static inline u64 tk_clock_read_snapshot(const struct tk_read_base *tkr,
  */
 void ktime_get_snapshot_id(clockid_t clock_id, struct system_time_snapshot *systime_snapshot)
 {
+	/*
+	 * 补充说明：一次 clocksource 读取同时投影到目标系统时间和 MONOTONIC_RAW，供 PTP
+	 * 等调用者建立“同一硬件瞬间”的相关性。输出先置 invalid，只有地址域、aux 有效性、
+	 * clocksource snapshot 和全部基点通过同一 seqcount 版本后才置 true。
+	 * cs_was_changed_seq/clock_was_set_seq 是给历史插值检测不连续的版本戳，不是时间值。
+	 */
+	/*
+	 * 变量地图：tkd/tk 是所选时钟槽及正式状态；offs 指向目标域 offset，offs_zero
+	 * 表示 mono/raw 无额外偏移；base_sys/base_raw 是同一提交点两种基点；now 是唯一
+	 * clocksource 读数；nsec_sys/nsec_raw 是其两种斜率投影；seq 验证全组；输出先 invalid。
+	 */
 	ktime_t base_raw, base_sys, offs_sys, *offs, offs_zero = 0;
 	u64 nsec_raw, nsec_sys, now;
 	struct timekeeper *tk;
@@ -1293,6 +1610,11 @@ EXPORT_SYMBOL_GPL(ktime_get_snapshot_id);
 /* Scale base by mult/div checking for overflow */
 static int scale64_check_overflow(u64 mult, u64 div, u64 *base)
 {
+	/*
+	 * 把 base 拆成 quotient/remainder 后分别乘 numerator，避免先做 base*mult 溢出。
+	 * fls64 预检位宽；失败不修改 *base，成功才提交缩放结果。
+	 */
+	/* @base 是输入输出被缩放量；tmp/rem 分别保存除法商和余数；@mult/@div 是比例。 */
 	u64 tmp, rem;
 
 	tmp = div64_u64_rem(*base, div, &rem);
@@ -1330,6 +1652,16 @@ static int adjust_historical_crosststamp(struct system_time_snapshot *history,
 					 bool discontinuity,
 					 struct system_device_crosststamp *ts)
 {
+	/*
+	 * 补充说明：设备给出的系统 counter 可能早于当前 timekeeper interval，只能借历史
+	 * snapshot 按 cycle 比例插值。选择离区间起点或终点更近的一侧可缩小乘法操作数；
+	 * 若期间墙钟被设置，不能直接按 realtime 端点线性插值，改用 raw 修正再乘当前
+	 * mono/raw 斜率比。返回错误表示历史跨 clocksource 或算术范围不足，结果不可用。
+	 */
+	/*
+	 * tk 提供 mono/raw 斜率；corr_raw/corr_sys 是两个时间域的插值修正纳秒；
+	 * interp_forward 选择从 history 向前或从当前端点向后；ret 传播溢出错误；@ts 是输出。
+	 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	u64 corr_raw, corr_sys;
 	bool interp_forward;
@@ -1391,6 +1723,10 @@ static int adjust_historical_crosststamp(struct system_time_snapshot *history,
  */
 static bool timestamp_in_interval(u64 start, u64 end, u64 ts)
 {
+	/*
+	 * @start/@end 是同一周期域的闭区间边界，@ts 是待判定周期值；true 表示含端点命中。
+	 * 第二个分支处理环形计数器跨 mask 回绕时 start > end 的区间。
+	 */
 	if (ts >= start && ts <= end)
 		return true;
 	if (start > end && (ts >= start || ts <= end))
@@ -1400,6 +1736,8 @@ static bool timestamp_in_interval(u64 start, u64 end, u64 ts)
 
 static bool convert_clock(u64 *val, u32 numerator, u32 denominator)
 {
+	/* quotient/remainder 分解避免 *val*numerator 的中间溢出；零比例没有可逆含义。 */
+	/* res/rem 是 @val/denominator 的商路径和余数路径，最终合并写回 @val。 */
 	u64 rem, res;
 
 	if (!numerator || !denominator)
@@ -1412,6 +1750,12 @@ static bool convert_clock(u64 *val, u32 numerator, u32 denominator)
 
 static bool convert_base_to_cs(struct system_counterval_t *scv)
 {
+	/*
+	 * 驱动可报告当前 clocksource 或其声明的 base counter。READ_ONCE 稳定 base 指针，
+	 * 随后按比例和 offset 折算到 timekeeper clocksource 域，并更新 cs_id 表示 ownership
+	 * 已变；clocksource 并发切换最终仍由外层 seqcount retry 兜底。
+	 */
+	/* cs 是当前源快照；base 是其关联底层源；num/den 是 base->cs 的换算比例。 */
 	struct clocksource *cs = tk_core.timekeeper.tkr_mono.clock;
 	struct clocksource_base *base;
 	u32 num, den;
@@ -1442,6 +1786,7 @@ static bool convert_base_to_cs(struct system_counterval_t *scv)
 
 static bool convert_cs_to_base(u64 *cycles, enum clocksource_ids base_id)
 {
+	/* 当前 clocksource absolute cycles 先减 base offset，再按声明比例还原到 base 域。 */
 	struct clocksource *cs = tk_core.timekeeper.tkr_mono.clock;
 	struct clocksource_base *base;
 
@@ -1461,6 +1806,7 @@ static bool convert_cs_to_base(u64 *cycles, enum clocksource_ids base_id)
 
 static bool convert_ns_to_cs(u64 *delta)
 {
+	/* 反解 ns=(cycles*mult+xtime_nsec)>>shift；左移前先检查位宽，拒绝不可表示的未来值。 */
 	struct tk_read_base *tkr = &tk_core.timekeeper.tkr_mono;
 
 	if (BITS_TO_BYTES(fls64(*delta) + tkr->shift) >= sizeof(*delta))
@@ -1482,6 +1828,12 @@ static bool convert_ns_to_cs(u64 *delta)
  */
 bool ktime_real_to_base_clock(ktime_t treal, enum clocksource_ids base_id, u64 *cycles)
 {
+	/*
+	 * 补充说明：只接受不早于当前 base_real 的未来 realtime；先反解成当前 clocksource
+	 * absolute cycles，再转换到设备要求的 base。任一步失败或写侧更新穿插都不发布
+	 * 成功，调用者应退回普通时间换算/编程路径。
+	 */
+	/* @treal 是未来 realtime；delta 先转当前源 cycles；@cycles 再写成 @base_id 域；seq 验证。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 	u64 delta;
@@ -1521,6 +1873,21 @@ int get_device_system_crosststamp(int (*get_time_fn)
 				  struct system_time_snapshot *history_begin,
 				  struct system_device_crosststamp *xtstamp)
 {
+	/*
+	 * 补充说明：驱动回调必须近同步地返回 device_time 和 system counter，而不是两个
+	 * 任意时刻的独立读取。回调运行在 seqcount 读循环内但没有持 timekeeper 写锁；
+	 * 若写侧穿插，整个循环（包括回调）可能重做，因此回调必须容忍重复调用和重试。
+	 *
+	 * 若 counter 位于 [cycle_last, now]，可直接用当前 base/mult 投影；若更早，则要求
+	 * history_begin 与当前使用同一 clocksource，并通过版本戳判断墙钟是否跳变后插值。
+	 * 返回 0 承诺 device/sys_systime/sys_monoraw 对应同一捕获点；错误时输出不可采用。
+	 */
+	/*
+	 * 变量地图：syscnt_cycles 保留驱动原始 counter；cycles 可改成当前 interval 起点用于
+	 * 插值；now/interval_start 界定本轮有效区间；tkd/tk/offs 选择目标时间域；base_* 与
+	 * nsec_* 构造 system/raw 输出；两个 *_seq 检测历史不连续；do_interp 决定慢路径；
+	 * ret 传播驱动或算术错误。@ctx 借给回调，@xtstamp 是调用者输出对象。
+	 */
 	u64 syscnt_cycles, cycles, now, interval_start;
 	unsigned int seq, clock_was_set_seq = 0;
 	ktime_t base_sys, base_raw, *offs;
@@ -1600,6 +1967,9 @@ int get_device_system_crosststamp(int (*get_time_fn)
 	 * current interval
 	 */
 	if (do_interp) {
+		/* partial 是驱动点到当前起点距离，total 是 history 到当前起点距离；discontinuity
+		 * 表示两端之间发生过墙钟设置，决定 system 修正使用哪种斜率。
+		 */
 		u64 partial_history_cycles, total_history_cycles;
 		bool discontinuity;
 
@@ -1639,6 +2009,10 @@ EXPORT_SYMBOL_GPL(get_device_system_crosststamp);
 bool timekeeping_clocksource_has_base(enum clocksource_ids id)
 {
 	/*
+	 * 这里只提供瞬时能力探测，不试图把结果稳定到调用者使用时刻。READ_ONCE 防编译器
+	 * 重取 base 指针造成同一表达式混合；需要强一致性的调用者必须使用更高层锁协议。
+	 */
+	/*
 	 * This is a snapshot, so no point in using the sequence
 	 * count. Just prevent the compiler from re-evaluating @base as the
 	 * clocksource might change concurrently.
@@ -1657,6 +2031,15 @@ EXPORT_SYMBOL_GPL(timekeeping_clocksource_has_base);
  */
 int do_settimeofday64(const struct timespec64 *ts)
 {
+	/*
+	 * 补充说明：这是“绝对设墙钟”事务。先在锁内 forward_now 把旧 clocksource 斜率
+	 * 结算到调用瞬间，再计算 new-old 的 ts_delta；xtime 增加 delta 的同时让
+	 * wall_to_monotonic 减去同一 delta，因此 CLOCK_MONOTONIC 保持连续。
+	 *
+	 * 若新组合会使 monotonic 基点非法，restore_shadow 撤销尚未发布的演算。提交后才
+	 * 在锁外通知 hrtimer/timerfd、audit 和随机池，避免回调在 timekeeper 锁内重入。
+	 */
+	/* @ts 是借用的新绝对墙钟；xt 是 forward 后旧墙钟；ts_delta=new-old，驱动两类 offset。 */
 	struct timespec64 ts_delta, xt;
 
 	if (!timespec64_valid_settod(ts))
@@ -1691,6 +2074,7 @@ EXPORT_SYMBOL(do_settimeofday64);
 
 static inline bool timekeeper_is_core_tk(struct timekeeper *tk)
 {
+	/* aux 配置关闭时唯一 timekeeper 天然是 core；开启时用稳定 id 区分不同设时语义。 */
 	return !IS_ENABLED(CONFIG_POSIX_AUX_CLOCKS) || tk->id == TIMEKEEPER_CORE;
 }
 
@@ -1703,6 +2087,12 @@ static inline bool timekeeper_is_core_tk(struct timekeeper *tk)
  */
 static int __timekeeping_inject_offset(struct tk_data *tkd, const struct timespec64 *ts)
 {
+	/*
+	 * 补充说明：调用者已经持有 tkd->lock，@ts 是有符号相对偏移且 tv_nsec 必须规范化。
+	 * core 与 settimeofday 一样反向调整 wall_to_monotonic；aux 只改变 offs_aux，并拒绝
+	 * 结果落到负时间。错误发生在提交前，用正式副本覆盖 shadow 完成回滚。
+	 */
+	/* tkd/tks 是持锁槽位及 shadow；@ts 是借用相对量；tmp 验证 core 新 realtime。 */
 	struct timekeeper *tks = &tkd->shadow_timekeeper;
 	struct timespec64 tmp;
 
@@ -1723,6 +2113,7 @@ static int __timekeeping_inject_offset(struct tk_data *tkd, const struct timespe
 		tk_xtime_add(tks, ts);
 		tk_set_wall_to_mono(tks, timespec64_sub(tks->wall_to_monotonic, *ts));
 	} else {
+		/* tkr_mono 是 aux 基准；now 是当前无 offset 时间；offs 是注入后的新 aux offset。 */
 		struct tk_read_base *tkr_mono = &tks->tkr_mono;
 		ktime_t now, offs;
 
@@ -1745,6 +2136,8 @@ static int __timekeeping_inject_offset(struct tk_data *tkd, const struct timespe
 
 static int timekeeping_inject_offset(const struct timespec64 *ts)
 {
+	/* core 包装负责锁和锁外 clock_was_set；内部 helper 也被 aux 路径复用。 */
+	/* ret 保存锁内 helper 结果，决定锁外是否广播；@ts 全程只借用。 */
 	int ret;
 
 	scoped_guard (raw_spinlock_irqsave, &tk_core.lock)
@@ -1780,7 +2173,12 @@ int persistent_clock_is_local;
  */
 void timekeeping_warp_clock(void)
 {
+	/*
+	 * 历史兼容：RTC 若按 local time 保存，用 sys_tz 把启动墙钟扭成 UTC。现代系统应让
+	 * RTC 直接存 UTC；否则 DST/时区策略进入内核并容易重复校正。
+	 */
 	if (sys_tz.tz_minuteswest != 0) {
+		/* adjust 是把“UTC 落后本地时间多少分钟”换成规范化秒偏移的栈对象。 */
 		struct timespec64 adjust;
 
 		persistent_clock_is_local = 1;
@@ -1795,6 +2193,7 @@ void timekeeping_warp_clock(void)
  */
 static void __timekeeping_set_tai_offset(struct timekeeper *tk, s32 tai_offset)
 {
+	/* TAI = monotonic + offs_real + tai_offset；必须同时缓存标量 offset 供热读。 */
 	tk->tai_offset = tai_offset;
 	tk->offs_tai = ktime_add(tk->offs_real, ktime_set(tai_offset, 0));
 }
@@ -1806,6 +2205,13 @@ static void __timekeeping_set_tai_offset(struct timekeeper *tk, s32 tai_offset)
  */
 static int change_clocksource(void *data)
 {
+	/*
+	 * 补充说明：由 stop_machine 在所有 CPU 不会并发执行旧 clocksource 内联读的环境中
+	 * 调用。先取得新 clocksource 模块引用并 enable；锁内 forward 旧时间、替换换算参数
+	 * 并原子发布；成功后才 disable/put 旧源。任何前置失败都保留旧源且返回 0，最终
+	 * 是否切换由 timekeeping_notify 比较实际指针判断。
+	 */
+	/* new 借用 stop_machine 的 @data，引用在本函数取得；old 成功提交后负责 disable/put。 */
 	struct clocksource *new = data, *old = NULL;
 
 	/*
@@ -1851,6 +2257,12 @@ static int change_clocksource(void *data)
  */
 int timekeeping_notify(struct clocksource *clock)
 {
+	/*
+	 * 补充说明：clocksource_mutex 只串行化候选选择；实际 timekeeper 与各 CPU 的代码
+	 * patch/读取还需 stop_machine。切换前关闭 static-key 内联路径，避免 CPU 在替换
+	 * 回调期间执行绑定旧源的架构指令；确认新源真正安装且支持后再重新开启。
+	 */
+	/* @clock 是 clocksource core 选出的候选；tk 用于切换前后确认实际 active 指针。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 
 	if (tk->tkr_mono.clock == clock)
@@ -1880,6 +2292,8 @@ int timekeeping_notify(struct clocksource *clock)
  */
 void ktime_get_raw_ts64(struct timespec64 *ts)
 {
+	/* raw_sec 与 raw cycle 增量必须同代读取；结果完全不应用 NTP/设时 offset。 */
+	/* nsecs 是 raw_sec 基点后的当前增量；seq 验证；@ts 是调用者输出。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 	u64 nsecs;
@@ -1906,6 +2320,7 @@ EXPORT_SYMBOL(ktime_get_raw_ts64);
  */
 void ktime_get_clock_ts64(clockid_t id, struct timespec64 *ts)
 {
+	/* 通用分派先把输出置 invalid；不支持/禁用 aux 时调用者不会误用旧栈内容。 */
 	/* Invalidate time stamp */
 	ts->tv_sec = -1;
 	ts->tv_nsec = 0;
@@ -1935,6 +2350,8 @@ EXPORT_SYMBOL_GPL(ktime_get_clock_ts64);
  */
 int timekeeping_valid_for_hres(void)
 {
+	/* clocksource flags 与指针在切换时一起变化，seqcount 保证能力判断属于当前源。 */
+	/* ret 保存 CLOCK_SOURCE_VALID_FOR_HRES 位快照；非零即 true 语义。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 	int ret;
@@ -1954,6 +2371,8 @@ int timekeeping_valid_for_hres(void)
  */
 u64 timekeeping_max_deferment(void)
 {
+	/* max_idle_ns 限定 NO_HZ 最久多久必须再读源，防计数器绕回后无法辨认真实 delta。 */
+	/* ret 是纳秒单位的返回快照；seq 保证它与当前 clocksource 对应。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 	u64 ret;
@@ -1980,6 +2399,7 @@ u64 timekeeping_max_deferment(void)
  */
 void __weak read_persistent_clock64(struct timespec64 *ts)
 {
+	/* weak 默认 0 表示“没有可靠持久时钟”；架构强实现可由电池 RTC/固件提供 UTC。 */
 	ts->tv_sec = 0;
 	ts->tv_nsec = 0;
 }
@@ -2001,12 +2421,15 @@ void __weak __init
 read_persistent_wall_and_boot_offset(struct timespec64 *wall_time,
 				     struct timespec64 *boot_offset)
 {
+	/* local_clock 只能近似开机以来经过时间；架构有跨重启/跨 suspend 来源时应覆盖。 */
 	read_persistent_clock64(wall_time);
 	*boot_offset = ns_to_timespec64(local_clock());
 }
 
 static __init void tkd_basic_setup(struct tk_data *tkd, enum timekeeper_ids tk_id, bool valid)
 {
+	/* seqcount 绑定刚初始化的 raw lock；正式和 shadow 必须从同一身份/有效位起步。 */
+	/* @tkd 是待初始化槽；@tk_id 是稳定身份；@valid 决定该槽能否立即被读者使用。 */
 	raw_spin_lock_init(&tkd->lock);
 	seqcount_raw_spinlock_init(&tkd->seq, &tkd->lock);
 	tkd->timekeeper.id = tkd->shadow_timekeeper.id = tk_id;
@@ -2028,14 +2451,30 @@ static __init void tkd_basic_setup(struct tk_data *tkd, enum timekeeper_ids tk_i
  */
 static bool suspend_timing_needed;
 
+/* true 表示 timekeeping 尚未用 non-stop/persistent 来源补睡眠，RTC resume 仍需兜底。 */
+
 /* Flag for if there is a persistent clock on this platform */
 static bool persistent_clock_exists;
+/* 一旦探测到非零持久时钟便保持 true，供后续 suspend 选择无需 IRQ 的睡眠时间来源。 */
 
 /*
  * timekeeping_init - Initializes the clocksource and common timekeeping values
  */
 void __init timekeeping_init(void)
 {
+	/*
+	 * 补充说明：启动时还没有可靠 realtime，优先从 persistent clock 取墙钟，并用
+	 * boot_offset 建立 wall_to_monotonic，使 monotonic 从启动时刻附近开始且不为负。
+	 * 无效/缺失 persistent clock 回退 Unix epoch，但 raw/monotonic 仍从 0 正常推进。
+	 *
+	 * 选择默认 clocksource 并 enable 后，在 core 锁下初始化 NTP、conversion、xtime、
+	 * raw 和 offset，最后一次提交同步 VDSO/fast timekeeper。函数返回后普通时间读取
+	 * 才拥有完整基点；初始化失败没有可恢复 errno 路径。
+	 */
+	/*
+	 * 变量地图：wall_time 是持久墙钟；boot_offset 是固件估计的开机后经过时间；
+	 * wall_to_mono=boot_offset-wall_time；tks 是 core shadow；clock 是默认硬件源。
+	 */
 	struct timespec64 wall_time, boot_offset, wall_to_mono;
 	struct timekeeper *tks = &tk_core.shadow_timekeeper;
 	struct clocksource *clock;
@@ -2081,6 +2520,7 @@ void __init timekeeping_init(void)
 
 /* time in seconds when suspend began for persistent clock */
 static struct timespec64 timekeeping_suspend_time;
+/* 保存 suspend 入口的 persistent wall time；resume 与新读数相减得到候选睡眠 delta。 */
 
 /**
  * __timekeeping_inject_sleeptime - Internal function to add sleep interval
@@ -2093,6 +2533,10 @@ static struct timespec64 timekeeping_suspend_time;
 static void __timekeeping_inject_sleeptime(struct timekeeper *tk,
 					   const struct timespec64 *delta)
 {
+	/*
+	 * suspend 期间 realtime 与 boottime 应继续前进，而 monotonic 应停住：xtime 加 delta，
+	 * wall_to_monotonic 减 delta 抵消 monotonic，offs_boot 加 delta 恢复 boottime。
+	 */
 	if (!timespec64_valid_strict(delta)) {
 		printk_deferred(KERN_WARNING
 				"__timekeeping_inject_sleeptime: Invalid "
@@ -2124,6 +2568,7 @@ static void __timekeeping_inject_sleeptime(struct timekeeper *tk,
  */
 bool timekeeping_rtc_skipresume(void)
 {
+	/* timekeeping 已用更优来源注入睡眠时返回 true，防 RTC core 再注入一次。 */
 	return !suspend_timing_needed;
 }
 
@@ -2138,6 +2583,7 @@ bool timekeeping_rtc_skipresume(void)
  */
 bool timekeeping_rtc_skipsuspend(void)
 {
+	/* persistent clock 可在 IRQ 关闭阶段读取时，无需 RTC 子系统另存一份 suspend 基点。 */
 	return persistent_clock_exists;
 }
 
@@ -2154,6 +2600,7 @@ bool timekeeping_rtc_skipsuspend(void)
  */
 void timekeeping_inject_sleeptime64(const struct timespec64 *delta)
 {
+	/* RTC fallback 在 IRQ 已可用时调用；成功注入后清 needed，防后续来源重复计算睡眠。 */
 	scoped_guard(raw_spinlock_irqsave, &tk_core.lock) {
 		struct timekeeper *tks = &tk_core.shadow_timekeeper;
 
@@ -2173,6 +2620,17 @@ void timekeeping_inject_sleeptime64(const struct timespec64 *delta)
  */
 void timekeeping_resume(void)
 {
+	/*
+	 * 补充说明：恢复按精度/可靠性优先选择 non-stop clocksource、persistent clock，最后
+	 * 留给 RTC core。锁内只接受正 delta，注入一次后重置 cycle_last，避免恢复后把
+	 * suspend 周期再次当运行时间累计。清 suspended 并发布真实 fast base 后才恢复
+	 * tick/timerfd；timerfd 把 resume 当作 wall/boot clock 发生跳变处理。
+	 */
+	/*
+	 * 变量地图：tks/clock 是恢复中的 shadow 与 active 源；ts_new 是恢复后 persistent
+	 * 读数，ts_delta 是选中的睡眠量；cycle_now/nsec 是 non-stop 源读数及推导纳秒；
+	 * inject_sleeptime 标记是否已有可靠来源；flags 保存 IRQ 状态供配对恢复。
+	 */
 	struct timekeeper *tks = &tk_core.shadow_timekeeper;
 	struct clocksource *clock = tks->tkr_mono.clock;
 	struct timespec64 ts_new, ts_delta;
@@ -2233,11 +2691,26 @@ void timekeeping_resume(void)
 
 static void timekeeping_syscore_resume(void *data)
 {
+	/* syscore 回调签名适配层；@data 未使用，实际状态全部属于全局 core timekeeper。 */
 	timekeeping_resume();
 }
 
 int timekeeping_suspend(void)
 {
+	/*
+	 * 补充说明：syscore suspend 的晚期入口。先采 persistent clock，再在 core 锁内把
+	 * 当前运行时间结算并置 suspended；保存 cycle_last 给 non-stop 源测睡眠，发布冻结
+	 * 状态并把 NMI fast reader 切到 dummy clock。出锁后按 tick -> clocksource ->
+	 * clockevent 顺序停设备。
+	 *
+	 * old_delta 记录系统墙钟与 persistent clock 的长期差；用相邻 suspend 的差值补偿
+	 * 秒级读取取整误差，但若差值突变 >=2 秒则视为人工/NTP 校时，重新建立基准。
+	 */
+	/*
+	 * 变量地图：tks 是持锁 shadow；delta 是 system-persistent 差，old_delta 跨电源周期
+	 * 保存上次差值，delta_delta 是漂移变化；curr_clock/cycle_now 建立 non-stop 测量
+	 * 起点；flags 保存 IRQ；timekeeping_suspend_time 是本次持久时钟基点。
+	 */
 	struct timekeeper *tks = &tk_core.shadow_timekeeper;
 	struct timespec64 delta, delta_delta;
 	static struct timespec64 old_delta;
@@ -2305,6 +2778,7 @@ int timekeeping_suspend(void)
 
 static int timekeeping_syscore_suspend(void *data)
 {
+	/* 把 timekeeping_suspend 的错误码直接交给 syscore，失败可中止系统 suspend。 */
 	return timekeeping_suspend();
 }
 
@@ -2313,13 +2787,16 @@ static const struct syscore_ops timekeeping_syscore_ops = {
 	.resume		= timekeeping_syscore_resume,
 	.suspend	= timekeeping_syscore_suspend,
 };
+/* ops 表描述 timekeeping 在 syscore 阶段的 suspend/resume 两个回调入口。 */
 
 static struct syscore timekeeping_syscore = {
 	.ops = &timekeeping_syscore_ops,
 };
+/* 注册对象把上述操作表挂入全局 syscore 顺序；静态生命周期覆盖所有电源周期。 */
 
 static int __init timekeeping_init_ops(void)
 {
+	/* 注册为 syscore，确保设备 suspend 的极晚/恢复的极早阶段仍能维护时间基准。 */
 	register_syscore(&timekeeping_syscore);
 	return 0;
 }
@@ -2332,6 +2809,12 @@ static __always_inline void timekeeping_apply_adjustment(struct timekeeper *tk,
 							 s64 offset,
 							 s32 mult_adj)
 {
+	/*
+	 * 补充说明：改变 mult 会改变“尚未累计 offset cycles”的估值。为保证调整瞬间时间
+	 * 连续，mult 每增 1，就从 xtime_nsec 减去 offset；同时修正下个固定 interval 的
+	 * shifted-ns 预算。这里调斜率而不直接跳墙钟，是 NTP 平滑校频的核心。
+	 */
+	/* @offset 是未累计 cycles；@mult_adj 是斜率量化步数；interval 是相应 shifted-ns 修正。 */
 	s64 interval = tk->cycle_interval;
 
 	if (mult_adj == 0) {
@@ -2408,6 +2891,13 @@ static __always_inline void timekeeping_apply_adjustment(struct timekeeper *tk,
  */
 static void timekeeping_adjust(struct timekeeper *tk, s64 offset)
 {
+	/*
+	 * 根据 NTP 给出的目标 tick 长度重算理想 mult，并用 ntp_error 的符号决定是否再加
+	 * 一个最小量化单位偿还余差。maxadj 告警表示校正已超出 clocksource 声明安全范围；
+	 * xtime_nsec 被连续性补偿减成负数时借前一秒，并令 next second_overflow 跳过一次，
+	 * 避免闰秒/NTP 秒级状态被重复推进。
+	 */
+	/* ntp_tl 是 NTP 目标 tick 长度；mult 是由它和累计 error 推出的新 mono 斜率。 */
 	u64 ntp_tl = ntp_tick_length(tk->id);
 	u32 mult;
 
@@ -2470,10 +2960,17 @@ static void timekeeping_adjust(struct timekeeper *tk, s64 offset)
  */
 static inline unsigned int accumulate_nsecs_to_secs(struct timekeeper *tk)
 {
+	/*
+	 * 补充说明：把 shifted-ns 的整秒进位到 xtime_sec，并在每个真实跨秒点调用 NTP
+	 * second_overflow 处理状态机/闰秒。闰秒改变 realtime 秒数时反向修正 mono offset，
+	 * 所以 monotonic 不跳；TAI offset 同步改变以维持其连续原子时间语义。
+	 */
+	/* nsecps 是内部定点格式的一秒；clock_set 累计闰秒导致的发布动作位。 */
 	u64 nsecps = (u64)NSEC_PER_SEC << tk->tkr_mono.shift;
 	unsigned int clock_set = 0;
 
 	while (tk->tkr_mono.xtime_nsec >= nsecps) {
+		/* leap 是 second_overflow 返回的 -1/0/+1 秒修正。 */
 		int leap;
 
 		tk->tkr_mono.xtime_nsec -= nsecps;
@@ -2520,6 +3017,12 @@ static inline unsigned int accumulate_nsecs_to_secs(struct timekeeper *tk)
 static u64 logarithmic_accumulation(struct timekeeper *tk, u64 offset,
 				    u32 shift, unsigned int *clock_set)
 {
+	/*
+	 * 补充说明：NO_HZ 后可能一次积压成千上万个 interval。@shift 表示一次吞掉
+	 * cycle_interval*2^shift，像二进制分解一样把 O(n) tick 循环降为 O(log n)。mono、
+	 * raw、cycle_last 和 NTP error 必须消费同一块 cycles，否则时间域会逐步失配。
+	 */
+	/* interval 是本轮消费 cycles；snsec_per_sec 是 raw 定点格式一秒；offset 是剩余输入输出。 */
 	u64 interval = tk->cycle_interval << shift;
 	u64 snsec_per_sec;
 
@@ -2557,6 +3060,18 @@ static u64 logarithmic_accumulation(struct timekeeper *tk, u64 offset,
  */
 static bool __timekeeping_advance(struct tk_data *tkd, enum timekeeping_adv_mode mode)
 {
+	/*
+	 * 补充说明：入口持有 tkd->lock，shadow 已从上次提交继续维护。TK_ADV_TICK 在不足
+	 * 一个 interval 时可直接跳过；TK_ADV_FREQ 即使没有足够 cycles 也要立即重算 mult。
+	 * 流程是：读取 offset -> 对数累计完整 intervals -> 用残余 offset 调整 NTP 斜率 ->
+	 * 规范化秒/coarse -> 原子提交。返回 true 仅表示闰秒等需要 clock_was_set 通知，
+	 * 不表示“时间是否推进”。
+	 */
+	/*
+	 * 变量地图：tk 是演算 shadow，real_tk 只供 tick 快速阈值；offset 是未消费 cycles，
+	 * orig_offset 用来判断是否真正累计；shift/maxshift 控制二进制块大小；clock_set 是
+	 * 闰秒等动作位；@mode 区分 tick 与强制调频。
+	 */
 	struct timekeeper *tk = &tkd->shadow_timekeeper;
 	struct timekeeper *real_tk = &tkd->timekeeper;
 	unsigned int clock_set = 0;
@@ -2618,6 +3133,7 @@ static bool __timekeeping_advance(struct tk_data *tkd, enum timekeeping_adv_mode
 
 static bool timekeeping_advance(enum timekeeping_adv_mode mode)
 {
+	/* guard 自动 irqsave/解锁；bool 结果直接传给 tick 入口决定是否广播 clock-set。 */
 	guard(raw_spinlock_irqsave)(&tk_core.lock);
 	return __timekeeping_advance(&tk_core, mode);
 }
@@ -2629,6 +3145,7 @@ static bool timekeeping_advance(enum timekeeping_adv_mode mode)
  */
 void update_wall_time(void)
 {
+	/* tick 主入口：core 写事务后再推进已启用 aux；通知延后，避免在 IRQ 热路径同步广播。 */
 	if (timekeeping_advance(TK_ADV_TICK))
 		clock_was_set_delayed();
 	tk_aux_advance();
@@ -2647,6 +3164,8 @@ void update_wall_time(void)
  */
 void getboottime64(struct timespec64 *ts)
 {
+	/* boot 的 realtime 时刻 = offs_real - offs_boot；settimeofday 会重估它，suspend 不会。 */
+	/* t 是该差值的 ktime 临时量，随后转换到调用者 @ts。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	ktime_t t = ktime_sub(tk->offs_real, tk->offs_boot);
 
@@ -2656,6 +3175,7 @@ EXPORT_SYMBOL_GPL(getboottime64);
 
 void ktime_get_coarse_real_ts64(struct timespec64 *ts)
 {
+	/* tk 是正式 core；seq 验证 coarse 秒/纳秒成对；@ts 是输出。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 
@@ -2678,6 +3198,12 @@ EXPORT_SYMBOL(ktime_get_coarse_real_ts64);
  */
 void ktime_get_coarse_real_ts64_mg(struct timespec64 *ts)
 {
+	/*
+	 * multigrain 文件时间不能比本机此前发出的 fine timestamp 更早。mg_floor 保存在
+	 * monotonic 域，读取时用同一 seqcount 快照的 offs_real 转 realtime，再与 coarse
+	 * 取较晚者；墙钟向后拨是文档明确允许的例外。
+	 */
+	/* floor 是 mono 原子下限；offset 转 realtime；coarse/f_real 是两个候选；seq 验证 offset。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	u64 floor = atomic64_read(&mg_floor);
 	ktime_t f_real, offset, coarse;
@@ -2716,6 +3242,11 @@ void ktime_get_coarse_real_ts64_mg(struct timespec64 *ts)
  */
 void ktime_get_real_ts64_mg(struct timespec64 *ts)
 {
+	/*
+	 * fine reader尝试把本次 mono 写成全局 floor。cmpxchg 失败会把 @old 更新成胜者的
+	 * 新值；所有合法写入都递增 floor，因此无需循环，采用胜者值同样足以推动 ctime。
+	 */
+	/* old 是 cmpxchg 的期望/失败输出；mono 是本次 fine 值；offset 用于把胜者转 realtime。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	ktime_t old = atomic64_read(&mg_floor);
 	ktime_t offset, mono;
@@ -2757,6 +3288,8 @@ void ktime_get_real_ts64_mg(struct timespec64 *ts)
 
 void ktime_get_coarse_ts64(struct timespec64 *ts)
 {
+	/* coarse realtime + wall_to_monotonic 得到 coarse monotonic；seqcount 防设时混合。 */
+	/* now 是 coarse realtime，mono 是 wall_to_monotonic，二者规范化相加写入 @ts。 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	struct timespec64 now, mono;
 	unsigned int seq;
@@ -2778,6 +3311,7 @@ EXPORT_SYMBOL(ktime_get_coarse_ts64);
  */
 void do_timer(unsigned long ticks)
 {
+	/* jiffies_lock 由调用者持有；这里推进全局 tick 计数并触发基于它的负载采样。 */
 	jiffies_64 += ticks;
 	calc_global_load();
 }
@@ -2798,6 +3332,16 @@ void do_timer(unsigned long ticks)
 ktime_t ktime_get_update_offsets_now(unsigned int *cwsseq, ktime_t *offs_real,
 				     ktime_t *offs_boot, ktime_t *offs_tai)
 {
+	/*
+	 * 补充说明：hrtimer 缓存三种 offset，并用 clock_was_set_seq 判断何时刷新，避免每次
+	 * 中断复制。当前 monotonic 与 offset 必须来自同一 seqcount 版本。若已跨入待插入
+	 * 闰秒但 timekeeper 尚未正式推进，临时把 realtime offset 减 1 秒，使到期重编程
+	 * 采用即将生效的墙钟关系。
+	 */
+	/*
+	 * tk 是 core；seq 验证；base/nsecs 构造当前 mono；@cwsseq 是调用者缓存版本；三个
+	 * offs_* 是仅在版本变化时刷新的输出缓存，均由调用者提供有效存储。
+	 */
 	struct timekeeper *tk = &tk_core.timekeeper;
 	unsigned int seq;
 	ktime_t base;
@@ -2831,6 +3375,11 @@ ktime_t ktime_get_update_offsets_now(unsigned int *cwsseq, ktime_t *offs_real,
  */
 static int timekeeping_validate_timex(const struct __kernel_timex *txc, bool aux_clock)
 {
+	/*
+	 * 在关 IRQ/取写锁前完成纯输入验证和权限检查，缩短全局时间锁临界区。ADJ_ADJTIME
+	 * singleshot 不能与普通模式混用；ADJ_SETOFFSET 的子秒字段必须规范化；频率乘法先
+	 * 做边界检查。aux 没有闰秒/TAI/PPS 语义，因此显式拒绝而不是静默忽略。
+	 */
 	if (txc->modes & ADJ_ADJTIME) {
 		/* singleshot must not be used with any other mode bits */
 		if (!(txc->modes & ADJ_OFFSET_SINGLESHOT))
@@ -2913,6 +3462,11 @@ static int timekeeping_validate_timex(const struct __kernel_timex *txc, bool aux
  */
 unsigned long random_get_entropy_fallback(void)
 {
+	/*
+	 * 仅向随机池提供不可预测性候选，不是规范时间读取。suspend 或源未就绪返回 0，避免
+	 * 访问掉电设备；READ_ONCE 稳定 owner，但此 fallback 本身不承诺跨切换一致快照。
+	 */
+	/* tkr/clock 是无锁借用快照；返回值是原始 cycles 截成 unsigned long，不是纳秒。 */
 	struct tk_read_base *tkr = &tk_core.timekeeper.tkr_mono;
 	struct clocksource *clock = READ_ONCE(tkr->clock);
 
@@ -2928,9 +3482,27 @@ struct adjtimex_result {
 	bool			clock_set;
 };
 
+/*
+ * adjtimex_result 是锁内核心向锁外包装层传递的结果包：
+ *   ad        NTP 参数变化的审计快照；
+ *   delta     ADJ_SETOFFSET 实际注入量，亦供 CMOS timer 策略判断；
+ *   clock_set 表示 offset/TAI/频率推进改变了时钟关系，需要广播 clock_was_set。
+ * 它由调用者栈上创建，无独立生命周期或引用。
+ */
+
 static int __do_adjtimex(struct tk_data *tkd, struct __kernel_timex *txc,
 			 struct adjtimex_result *result)
 {
+	/*
+	 * adjtimex 核心事务：锁前验证并采样当前时间，锁内先可选注入 offset，再让 NTP
+	 * 子系统更新频率/状态/TAI。TAI 改变需完整提交；否则只同步 leap state。直接设置
+	 * frequency/tick 时立即 TK_ADV_FREQ，使新 mult 不必等下一 tick。
+	 * result 把 audit/通知所需信息带出锁，避免这些外部路径在 raw spinlock 下执行。
+	 */
+	/*
+	 * 变量地图：tks 是目标 shadow；aux_clock 选择验证规则；ts 是送入 NTP 的当前时间；
+	 * orig_tai/tai 比较 TAI 是否改变；ret 传播验证/NTP/注入结果；@result 是锁外输出包。
+	 */
 	struct timekeeper *tks = &tkd->shadow_timekeeper;
 	bool aux_clock = !timekeeper_is_core_tk(tks);
 	struct timespec64 ts;
@@ -2990,6 +3562,8 @@ static int __do_adjtimex(struct tk_data *tkd, struct __kernel_timex *txc,
  */
 int do_adjtimex(struct __kernel_timex *txc)
 {
+	/* core 包装在成功后完成 audit、hrtimer/timerfd 通知和 CMOS timer 策略更新。 */
+	/* result 零初始化，表示默认无 offset/通知；ret 是最终 syscall 风格状态码。 */
 	struct adjtimex_result result = { };
 	int ret;
 
@@ -3016,6 +3590,7 @@ int do_adjtimex(struct __kernel_timex *txc)
  */
 long ktime_get_ntp_seconds(unsigned int id)
 {
+	/* 调用契约已持对应 timekeeper 锁，故不再套 seqcount；@id 必须是有效 timekeeper。 */
 	return timekeeper_data[id].timekeeper.xtime_sec;
 }
 
@@ -3027,6 +3602,7 @@ long ktime_get_ntp_seconds(unsigned int id)
  */
 void hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_ts)
 {
+	/* PPS discipline 与普通 NTP 更新共享状态，必须使用同一 core timekeeper 写锁。 */
 	guard(raw_spinlock_irqsave)(&tk_core.lock);
 	__hardpps(phase_ts, raw_ts);
 }
@@ -3044,6 +3620,18 @@ EXPORT_SYMBOL(hardpps);
  */
 static unsigned long aux_timekeepers;
 
+/*
+ * 补充说明：bitmap 只是热路径提示，不单独证明某个 aux clock 有效。enable/disable 先
+ * 在各自锁内发布完整 timekeeper，再在 mutex 下设置/清除 bit；读取 bitmap 后仍要取
+ * aux 锁并复查 clock_valid，因此并发看到旧 bit 最多造成一次多余检查。
+ */
+
+/*
+ * clockid_to_tkid - 把用户可见 CLOCK_AUX+n 映射到 timekeeper_data 的 AUX 槽位。
+ *
+ * 这里只做算术平移，不验证范围；调用者必须先通过 clockid_aux_valid()。把验证留在
+ * aux_get_tk_data() 可使所有外部入口共享一处边界检查，内部已验证路径保持轻量。
+ */
 static inline unsigned int clockid_to_tkid(unsigned int id)
 {
 	return TIMEKEEPER_AUX_FIRST + id - CLOCK_AUX;
@@ -3051,6 +3639,11 @@ static inline unsigned int clockid_to_tkid(unsigned int id)
 
 static inline struct tk_data *aux_get_tk_data(clockid_t id)
 {
+	/*
+	 * @id 是用户可见的 POSIX clockid，按值传入且不转移所有权；返回值是全局
+	 * timekeeper_data[] 中借用的永久槽位，不需要 put/free。无效 ID 返回 NULL，
+	 * 使后续入口不会用未经验证的下标构造越界指针。
+	 */
 	if (!clockid_aux_valid(id))
 		return NULL;
 	return &timekeeper_data[clockid_to_tkid(id)];
@@ -3059,6 +3652,18 @@ static inline struct tk_data *aux_get_tk_data(clockid_t id)
 /* Invoked from timekeeping after a clocksource change */
 static void tk_aux_update_clocksource(void)
 {
+	/*
+	 * core 换源后，所有 active aux 必须结算旧源到当前点，再改用 core raw clocksource。
+	 * bitmap 快照允许 enable/disable 并发；每个 aux 锁下复查 valid，保证不复活已禁用项。
+	 */
+	/*
+	 * 变量地图：
+	 *   active  aux_timekeepers 的一次无锁位图快照；每一位对应 CLOCK_AUX+n，
+	 *           只决定是否值得进入该槽检查，不保证槽仍有效。
+	 *   id      active 中当前置位的零基位号，也是 AUX 槽相对首槽的下标。
+	 *   tkd     当前 aux 的永久容器，持有 seqcount、写锁和正式/影子副本。
+	 *   tks     tkd 的影子 timekeeper；只在 tkd->lock 保护下修改，提交后才供读者看见。
+	 */
 	unsigned long active = READ_ONCE(aux_timekeepers);
 	unsigned int id;
 
@@ -3078,6 +3683,12 @@ static void tk_aux_update_clocksource(void)
 
 static void tk_aux_advance(void)
 {
+	/* 每次 core tick 只遍历 bitmap 中 active 项；各 aux 有独立锁，互不污染时间状态。 */
+	/*
+	 * 变量地图：active 是本次 tick 使用的启用位图快照；id 是其中的相对 AUX 编号；
+	 * aux_tkd 是对应的永久容器借用指针。bitmap 可在遍历中变旧，所以真正推进前仍在
+	 * aux_tkd->lock 下复查 shadow_timekeeper.clock_valid。
+	 */
 	unsigned long active = READ_ONCE(aux_timekeepers);
 	unsigned int id;
 
@@ -3100,6 +3711,19 @@ static void tk_aux_advance(void)
  */
 bool ktime_get_aux(clockid_t id, ktime_t *kt)
 {
+	/*
+	 * aux 读取与 core 相同：seqcount 内取 base+offs_aux 和当前 cycles 增量；无效 ID 或
+	 * disable 并发使 clock_valid 为 false 时不写输出并返回 false。
+	 */
+	/*
+	 * 变量地图：
+	 *   @id     要读取的 CLOCK_AUX+n；必须落在配置支持的 AUX 范围。
+	 *   @kt     调用者拥有的输出地址；仅 true 返回时写入有效 ktime_t 纳秒时间戳。
+	 *   aux_tkd 全局 AUX 槽的借用指针；NULL 表示 @id 非法。
+	 *   aux_tk  正式发布副本的借用指针；字段由 aux_tkd->seq 保护一致读取。
+	 *   seq     本轮 seqcount 版本；奇数或重试表示写者在本轮读取期间提交过更新。
+	 *   base    已含 offs_aux 的已累计纳秒基点；nsecs 是从 cycle_last 到当前周期的增量。
+	 */
 	struct tk_data *aux_tkd = aux_get_tk_data(id);
 	struct timekeeper *aux_tk;
 	unsigned int seq;
@@ -3135,6 +3759,11 @@ EXPORT_SYMBOL_GPL(ktime_get_aux);
  */
 bool ktime_get_aux_ts64(clockid_t id, struct timespec64 *ts)
 {
+	/*
+	 * @id 与 ktime_get_aux() 相同；@ts 是调用者拥有的输出对象，只在 true 返回时写入。
+	 * now 是栈上的中间 ktime_t，先承接经 seqcount 验证的纳秒值，再做无状态格式转换；
+	 * 这样底层读取失败时不会把半成品写入 @ts。
+	 */
 	ktime_t now;
 
 	if (!ktime_get_aux(id, &now))
@@ -3146,6 +3775,10 @@ EXPORT_SYMBOL_GPL(ktime_get_aux_ts64);
 
 static int aux_get_res(clockid_t id, struct timespec64 *tp)
 {
+	/*
+	 * @id 只用于验证请求的 AUX 槽存在；@tp 是 POSIX 层提供的输出对象，成功时写入
+	 * 秒/纳秒形式的全局 AUX 分辨率。该接口返回 0 或 -ENODEV，不取得任何引用。
+	 */
 	if (!clockid_aux_valid(id))
 		return -ENODEV;
 
@@ -3156,11 +3789,28 @@ static int aux_get_res(clockid_t id, struct timespec64 *tp)
 
 static int aux_get_timespec(clockid_t id, struct timespec64 *tp)
 {
+	/*
+	 * @id 指定 AUX 时钟，@tp 是调用者输出；本包装不拥有二者，只把内部 bool
+	 * 有效性契约转换成 POSIX k_clock 所需的 0/-ENODEV。
+	 */
 	return ktime_get_aux_ts64(id, tp) ? 0 : -ENODEV;
 }
 
 static int aux_clock_set(const clockid_t id, const struct timespec64 *tnew)
 {
+	/*
+	 * aux 没有 realtime/monotonic 双时间域，只把目标绝对值编码成 offs_aux：先 forward
+	 * 当前 raw-derived base，计算 now，再令 offs_aux=tnew-now。这样设时不需要伪造
+	 * xtime/wall_to_monotonic，频率斜率仍可由 clock_adjtime 独立校正。
+	 */
+	/*
+	 * 变量地图：
+	 *   @id      目标 CLOCK_AUX+n，不转移所有权。
+	 *   @tnew    借用的目标绝对时间；必须是规范化且可用于 settimeofday 的 timespec64。
+	 *   aux_tkd  目标永久槽；NULL 表示 ID 无效。
+	 *   aux_tks  写侧影子副本，只能在 aux_tkd->lock 下修改。
+	 *   nsecs    从最新 cycle_last 换算出的纳秒增量；tnow 是设置前 AUX 当前绝对值。
+	 */
 	struct tk_data *aux_tkd = aux_get_tk_data(id);
 	struct timekeeper *aux_tks;
 	ktime_t tnow, nsecs;
@@ -3204,6 +3854,12 @@ static int aux_clock_set(const clockid_t id, const struct timespec64 *tnew)
 
 static int aux_clock_adj(const clockid_t id, struct __kernel_timex *txc)
 {
+	/*
+	 * @id 选择 AUX 槽；@txc 是 POSIX 层借入的调频请求，同时作为查询结果输出对象。
+	 * aux_tkd 是对应永久槽的借用指针；result 是栈上锁内/锁外结果包，但 AUX 当前没有
+	 * hrtimer、RTC 或 audit 消费者，因此调用结束后直接丢弃。验证层会拒绝 AUX 不具备
+	 * 的 TAI、闰秒与 PPS 模式。
+	 */
 	struct tk_data *aux_tkd = aux_get_tk_data(id);
 	struct adjtimex_result result = { };
 
@@ -3224,8 +3880,25 @@ const struct k_clock clock_aux = {
 	.clock_adj		= aux_clock_adj,
 };
 
+/*
+ * clock_aux 是 POSIX clock 层为所有 CLOCK_AUX+n 共享的只读操作表：getres 查询统一
+ * 分辨率，get_timespec 读取，clock_set 改绝对偏移，clock_adj 调频。具体 AUX 实例不靠
+ * 不同操作表区分，而由每次回调收到的 clockid 映射到 timekeeper_data[] 槽；该静态对象
+ * 生命周期覆盖整个内核运行期，没有引用计数和销毁路径。
+ */
+
 static void aux_clock_enable(clockid_t id)
 {
+	/*
+	 * 锁顺序固定为 core -> aux：先冻结 core clocksource，再嵌套取得 aux 锁，避免换源
+	 * 时建立在过期指针上。清除旧注册残留后以 core raw 的未经 NTP 校正斜率启动；用户
+	 * 负责通过 clock_adjtime 校准 aux 与外部设备的真实频差。
+	 */
+	/*
+	 * 变量地图：@id 已由 sysfs 路径验证为 CLOCK_AUX+n；tkr_raw 借用 core 正式副本的
+	 * raw 换算参数，须由 tk_core.lock 保证换源期间稳定；aux_tkd 是目标永久槽；aux_tks
+	 * 是待重建的影子副本。后两者不取得引用，因 timekeeper_data[] 永不释放。
+	 */
 	struct tk_read_base *tkr_raw = &tk_core.timekeeper.tkr_raw;
 	struct tk_data *aux_tkd = aux_get_tk_data(id);
 	struct timekeeper *aux_tks = &aux_tkd->shadow_timekeeper;
@@ -3254,6 +3927,10 @@ static void aux_clock_enable(clockid_t id)
 
 static void aux_clock_disable(clockid_t id)
 {
+	/*
+	 * @id 是已启用的 CLOCK_AUX+n；aux_tkd 是其永久槽借用指针。先在 seqcount 提交中
+	 * 发布 invalid，调用者随后清 bitmap，读者观察任一顺序都只能读到旧有效时间或失败。
+	 */
 	struct tk_data *aux_tkd = aux_get_tk_data(id);
 
 	guard(raw_spinlock_irq)(&aux_tkd->lock);
@@ -3262,10 +3939,21 @@ static void aux_clock_disable(clockid_t id)
 }
 
 static DEFINE_MUTEX(aux_clock_mutex);
+/* aux_clock_mutex 串行化 sysfs enable 状态机及 aux_timekeepers bitmap，不保护时间读数。 */
 
 static ssize_t aux_clock_enable_store(struct kobject *kobj, struct kobj_attribute *attr,
 				      const char *buf, size_t count)
 {
+	/*
+	 * sysfs 目录名由本文件固定创建为单字符 0..7，因此位与解析成立；CAP_SYS_TIME
+	 * 限制时间域创建。mutex 串行化 bitmap 与 enable/disable 状态机，重复写幂等返回。
+	 */
+	/*
+	 * 变量/参数地图：@kobj 是当前数字子目录的借用对象；@attr 指向共享 enable 属性，
+	 * 本实现无需读取它；@buf/@count 是 sysfs 借入的用户文本及字节数。id 是由目录名
+	 * 解出的零基 AUX 位号；enable 是 kstrtobool 规范化后的目标状态。返回 @count 表示
+	 * 整个输入被消费，负 errno 表示权限、格式或设备错误。
+	 */
 	/* Lazy atoi() as name is "0..7" */
 	int id = kobj->name[0] & 0x7;
 	bool enable;
@@ -3292,6 +3980,11 @@ static ssize_t aux_clock_enable_store(struct kobject *kobj, struct kobj_attribut
 
 static ssize_t aux_clock_enable_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
+	/*
+	 * @kobj 提供数字目录名；@attr 是未使用的共享属性描述；@buf 由 sysfs 拥有并保证
+	 * 容量。active 是控制位图的一次快照，id 是目录对应位号；返回值是写入 @buf 的
+	 * 字节数。展示控制平面状态，不承诺与正在进行的 enable 在同一瞬间同步。
+	 */
 	unsigned long active = READ_ONCE(aux_timekeepers);
 	/* Lazy atoi() as name is "0..7" */
 	int id = kobj->name[0] & 0x7;
@@ -3300,6 +3993,12 @@ static ssize_t aux_clock_enable_show(struct kobject *kobj, struct kobj_attribute
 }
 
 static struct kobj_attribute aux_clock_enable_attr = __ATTR_RW(aux_clock_enable);
+
+/*
+ * aux_clock_enable_attr 把同名 show/store 回调包装成一个读写 sysfs 属性；attrs 以 NULL
+ * 结尾供 sysfs 通用代码遍历；attr_group 把该数组作为每个 AUX 数字目录的共享布局。
+ * 三者均是只在初始化时发布的静态元数据，目录销毁不会释放这些静态对象。
+ */
 
 static struct attribute *aux_clock_enable_attrs[] = {
 	&aux_clock_enable_attr.attr,
@@ -3312,6 +4011,17 @@ static const struct attribute_group aux_clock_enable_attr_group = {
 
 static int __init tk_aux_sysfs_init(void)
 {
+	/*
+	 * 建立 /sys/kernel/time/aux_clocks/{0..N}/enable。任一步失败由父 kobject_put 递归
+	 * 撤销已经建立的子树；late_initcall 时 kobject/sysfs 已可用。
+	 */
+	/*
+	 * 变量地图：tko 是 /sys/kernel/time 的持有引用，auxo 是其 aux_clocks 子目录引用；
+	 * ret 保存首个失败 errno，初值 -ENOMEM 覆盖 kobject 创建返回 NULL 的接口约定。
+	 * 循环中的 i 是零基 AUX 编号；id 是仅含一位数字和 NUL 的目录名；clk 是当前数字
+	 * 子目录的创建引用。成功后 sysfs/kobject 层持有树关系；失败由 err_clean 从父层
+	 * put，递归撤销此前已经发布的子树。
+	 */
 	struct kobject *auxo, *tko = kobject_create_and_add("time", kernel_kobj);
 	int ret = -ENOMEM;
 
@@ -3346,6 +4056,11 @@ late_initcall(tk_aux_sysfs_init);
 
 static __init void tk_aux_setup(void)
 {
+	/*
+	 * 启动期只建立锁、seqcount 和稳定 ID；循环变量 i 是 timekeeper_data[] 的绝对槽号，
+	 * 覆盖 [TIMEKEEPER_AUX_FIRST, TIMEKEEPER_AUX_LAST]。AUX 默认 invalid，之后按 sysfs
+	 * 请求再绑定时钟源；函数无返回值，也不发布可读的 AUX 时间。
+	 */
 	for (int i = TIMEKEEPER_AUX_FIRST; i <= TIMEKEEPER_AUX_LAST; i++)
 		tkd_basic_setup(&timekeeper_data[i], i, false);
 }
