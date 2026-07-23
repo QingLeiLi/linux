@@ -11,6 +11,7 @@
 #   ./kernel-build/run defconfig
 #   ./kernel-build/run build
 #   ./kernel-build/run build Image
+#   ./kernel-build/run compile_commands
 #   ./kernel-build/run menuconfig
 #   ./kernel-build/run shell
 #
@@ -116,6 +117,8 @@ usage()
   setup       构建或重建可复用的工具链镜像。
   defconfig   生成默认 Kconfig 配置。
   build       使用受控并行度构建；后面可跟 Image 等目标。
+  compile_commands
+              从当前输出目录生成供宿主机 clangd 使用的编译数据库。
   shell       进入交互式容器，仓库挂载在 /src。
   help        显示本帮助。
   <目标>      执行其他 Kbuild 目标，例如 menuconfig、olddefconfig。
@@ -167,6 +170,69 @@ ensure_image()
     fi
 }
 
+generate_compile_commands()
+{
+    local host_output_dir
+    local container_database
+    local host_container_database
+    local host_database
+    local host_database_tmp
+
+    host_output_dir="$repo_root${output_dir#/src}"
+    container_database="$output_dir/compile_commands.container.json"
+    host_container_database="$host_output_dir/compile_commands.container.json"
+    host_database="$host_output_dir/compile_commands.json"
+    host_database_tmp="$host_output_dir/compile_commands.json.tmp"
+
+    if [[ ! -f "$host_output_dir/.config" ]]; then
+        echo "输出目录尚未配置：$host_output_dir" >&2
+        echo "请先执行 ./kernel-build/run defconfig 和所需的 build 命令。" >&2
+        exit 2
+    fi
+
+    ensure_image
+
+    # 必须在容器内读取 .cmd：其中的源码和头文件绝对路径以 /src 开头。
+    # 上游生成器也会校验这些路径是否存在，因此不能直接在 macOS 宿主机运行。
+    docker run "${container_args[@]}" "$image_name" \
+        python3 scripts/clang-tools/gen_compile_commands.py \
+        -d "$output_dir" \
+        -o "$container_database"
+
+    # VS Code 中的 clangd 运行在宿主机，无法访问容器的 /src。递归转换 JSON
+    # 中的 file、directory 和 command 字符串，使源码、生成头文件和 -I 参数
+    # 全部指向宿主机仓库，同时通过临时文件原子替换最终数据库。
+    python3 - "$host_container_database" "$host_database_tmp" "$repo_root" <<'PY'
+import json
+import sys
+
+source_path, output_path, repo_root = sys.argv[1:]
+
+def rewrite(value):
+    if isinstance(value, str):
+        if value == "/src":
+            return repo_root
+        return value.replace("/src/", repo_root + "/")
+    if isinstance(value, list):
+        return [rewrite(item) for item in value]
+    if isinstance(value, dict):
+        return {key: rewrite(item) for key, item in value.items()}
+    return value
+
+with open(source_path, encoding="utf-8") as source:
+    database = json.load(source)
+
+with open(output_path, "w", encoding="utf-8") as output:
+    json.dump(rewrite(database), output, indent=2, sort_keys=True)
+    output.write("\n")
+PY
+
+    mv "$host_database_tmp" "$host_database"
+    rm -f "$host_container_database"
+
+    echo "已生成 clangd 编译数据库：$host_database"
+}
+
 validate_settings
 
 command="${1:-build}"
@@ -187,6 +253,9 @@ build)
     ensure_image
     docker run "${container_args[@]}" "$image_name" \
         make "${make_args[@]}" -j"$build_jobs" "$@"
+    ;;
+compile_commands)
+    generate_compile_commands
     ;;
 shell)
     ensure_image

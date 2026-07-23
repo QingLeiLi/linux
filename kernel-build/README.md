@@ -22,6 +22,7 @@
 kernel-build/
 ├── Dockerfile       # Debian/LLVM 内核构建镜像定义
 ├── .dockerignore    # 只允许 Dockerfile 进入镜像构建上下文
+├── CLANGD.md        # VS Code/clangd 编译数据库与路径转换
 ├── run              # 日常构建入口，已包含完整中文注释
 └── README.md        # 本文档
 
@@ -124,6 +125,9 @@ http://mirrors.tuna.tsinghua.edu.cn/debian-security
 # 完整并行构建
 ./kernel-build/run build
 
+# 生成供宿主机 VS Code/clangd 使用的编译数据库
+./kernel-build/run compile_commands
+
 # 构建指定目标
 ./kernel-build/run build Image
 ./kernel-build/run build modules
@@ -138,6 +142,9 @@ http://mirrors.tuna.tsinghua.edu.cn/debian-security
 ```bash
 ./kernel-build/run build Image V=1
 ```
+
+VS Code/clangd 的完整配置、容器 `/src` 路径转换和验收步骤见
+[`CLANGD.md`](CLANGD.md)。
 
 ## 6. 目录如何挂载
 
