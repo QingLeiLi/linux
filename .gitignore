@@ -11,6 +11,7 @@
 # Normal rules (sorted alphabetically)
 #
 .*
+!kernel-build/.dockerignore
 *.a
 *.asn1.[ch]
 *.bc

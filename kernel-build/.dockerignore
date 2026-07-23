@@ -1,0 +1,4 @@
+# 构建镜像只需要 Dockerfile。屏蔽本目录未来可能增加的日志、临时文件等，
+# 保持发送给 Docker daemon 的构建上下文最小。
+*
+!Dockerfile

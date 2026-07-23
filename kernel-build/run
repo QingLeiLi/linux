@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+#
+# 在 macOS 或 Linux 宿主机上复用的 Linux 内核容器构建脚本。
+#
+# 脚本把源码树绑定挂载到容器的 /src。宿主工具和内核目标文件都在
+# Linux 用户态环境中编译，避免 macOS SDK 头文件和 Homebrew 工具布局
+# 泄漏到 Kbuild。
+#
+# 常用命令：
+#   ./kernel-build/run setup
+#   ./kernel-build/run defconfig
+#   ./kernel-build/run build
+#   ./kernel-build/run build Image
+#   ./kernel-build/run menuconfig
+#   ./kernel-build/run shell
+#
+# 在 x86_64 Linux 或 Intel Mac 上会自动选择 linux/amd64 容器和
+# ARCH=x86_64，因此直接执行 setup、defconfig、build 即可。
+#
+# 所有变量和目录挂载细节见本目录的 README.md。
+
+set -euo pipefail
+
+# 根据脚本自身位置定位仓库，使脚本不依赖调用者当前所在目录。
+readonly script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly repo_root="$(cd "$script_dir/.." && pwd)"
+
+# 根据宿主机 CPU 架构选择原生执行路径。环境变量仍可覆盖自动检测结果。
+readonly host_machine="$(uname -m)"
+detected_container_platform=""
+detected_kernel_arch=""
+
+case "$host_machine" in
+arm64 | aarch64)
+    detected_container_platform="linux/arm64"
+    detected_kernel_arch="arm64"
+    ;;
+x86_64 | amd64)
+    detected_container_platform="linux/amd64"
+    detected_kernel_arch="x86_64"
+    ;;
+esac
+
+# 容器架构与内核目标架构互相独立：
+#   - KERNEL_CONTAINER_PLATFORM 决定 Docker 运行哪种用户态二进制。
+#   - KERNEL_ARCH 传给 Kbuild，决定最终生成哪种架构的内核。
+readonly container_platform="${KERNEL_CONTAINER_PLATFORM:-$detected_container_platform}"
+readonly kernel_arch="${KERNEL_ARCH:-$detected_kernel_arch}"
+
+if [[ -z "$container_platform" || -z "$kernel_arch" ]]; then
+    echo "无法自动识别宿主机架构：$host_machine" >&2
+    echo "请显式设置 KERNEL_CONTAINER_PLATFORM 和 KERNEL_ARCH。" >&2
+    exit 2
+fi
+
+case "$container_platform" in
+linux/arm64 | linux/amd64)
+    ;;
+*)
+    echo "不支持的 KERNEL_CONTAINER_PLATFORM：$container_platform" >&2
+    echo "支持的值：linux/arm64、linux/amd64" >&2
+    exit 2
+    ;;
+esac
+
+readonly container_arch="${container_platform#linux/}"
+readonly image_name="${KERNEL_BUILD_IMAGE:-linux-kernel-build:trixie-${container_arch}}"
+
+# 保留当前 arm64 环境已有的默认输出目录。其他组合同时在目录名中包含
+# 内核目标架构和容器架构，避免混用不兼容的宿主工具目标文件。
+if [[ "$kernel_arch" == "arm64" && "$container_arch" == "arm64" ]]; then
+    default_output_dir="/src/.kernel-build/output/arm64"
+elif [[ "$kernel_arch" == "x86_64" && "$container_arch" == "amd64" ]]; then
+    default_output_dir="/src/.kernel-build/output/x86_64"
+else
+    default_output_dir="/src/.kernel-build/output/${kernel_arch}-${container_arch}"
+fi
+readonly output_dir="${KERNEL_OUTPUT_DIR:-$default_output_dir}"
+
+# 并行度过高容易耗尽 Docker Desktop 的内存。自动值最多取 8；
+# 可通过 KERNEL_JOBS 显式调高或调低。
+detected_jobs="$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+if (( detected_jobs > 8 )); then
+    detected_jobs=8
+fi
+readonly build_jobs="${KERNEL_JOBS:-$detected_jobs}"
+
+# 使用宿主机 UID/GID 运行，使绑定挂载目录内生成的文件仍归宿主用户所有。
+# 任意数字 UID 不一定存在于容器 /etc/passwd 中，显式设置 KBUILD_BUILD_*
+# 可以消除无害的 “whoami: cannot find name” 警告。
+readonly container_args=(
+    --rm
+    --platform "$container_platform"
+    --user "$(id -u):$(id -g)"
+    --env HOME=/tmp
+    --env "KBUILD_BUILD_USER=$(id -un)"
+    --env KBUILD_BUILD_HOST=linux-container
+    --volume "$repo_root:/src"
+    --workdir /src
+)
+
+# LLVM=1 选择 clang 和 LLVM binutils。O= 将全部生成物放在独立输出目录，
+# 并与之前由 macOS 宿主工具生成的 out/arm64 彻底隔离。
+readonly make_args=(
+    "O=$output_dir"
+    "ARCH=$kernel_arch"
+    LLVM=1
+)
+
+usage()
+{
+    cat <<EOF
+用法：./kernel-build/run <命令> [make 参数...]
+
+命令：
+  setup       构建或重建可复用的工具链镜像。
+  defconfig   生成默认 Kconfig 配置。
+  build       使用受控并行度构建；后面可跟 Image 等目标。
+  shell       进入交互式容器，仓库挂载在 /src。
+  help        显示本帮助。
+  <目标>      执行其他 Kbuild 目标，例如 menuconfig、olddefconfig。
+
+当前设置：
+  宿主机架构       ：$host_machine
+  容器平台       ：$container_platform
+  内核 ARCH      ：$kernel_arch
+  Docker 镜像   ：$image_name
+  输出目录       ：$output_dir
+  并行任务数     ：$build_jobs
+
+可覆盖的环境变量：
+  KERNEL_CONTAINER_PLATFORM=linux/arm64|linux/amd64
+  KERNEL_ARCH=arm64|x86_64|...
+  KERNEL_BUILD_IMAGE=<Docker 镜像名>
+  KERNEL_OUTPUT_DIR=/src/.kernel-build/output/<目录名>
+  KERNEL_JOBS=<正整数>
+EOF
+}
+
+validate_settings()
+{
+    if [[ ! "$build_jobs" =~ ^[1-9][0-9]*$ ]]; then
+        echo "KERNEL_JOBS 必须是正整数：$build_jobs" >&2
+        exit 2
+    fi
+
+    # 源码在容器中挂载为 /src。拒绝只存在于宿主机、容器无法访问的路径。
+    if [[ "$output_dir" != /src/* ]]; then
+        echo "KERNEL_OUTPUT_DIR 必须位于 /src 挂载目录内：$output_dir" >&2
+        exit 2
+    fi
+}
+
+build_image()
+{
+    docker build \
+        --platform "$container_platform" \
+        --tag "$image_name" \
+        "$script_dir"
+}
+
+ensure_image()
+{
+    # 日常构建不重复执行 apt；仅在镜像不存在时自动构建一次。
+    if ! docker image inspect "$image_name" >/dev/null 2>&1; then
+        build_image
+    fi
+}
+
+validate_settings
+
+command="${1:-build}"
+if [[ $# -gt 0 ]]; then
+    shift
+fi
+
+case "$command" in
+setup)
+    build_image
+    ;;
+defconfig)
+    ensure_image
+    docker run "${container_args[@]}" "$image_name" \
+        make "${make_args[@]}" defconfig "$@"
+    ;;
+build)
+    ensure_image
+    docker run "${container_args[@]}" "$image_name" \
+        make "${make_args[@]}" -j"$build_jobs" "$@"
+    ;;
+shell)
+    ensure_image
+    docker run -it "${container_args[@]}" "$image_name" bash
+    ;;
+help | -h | --help)
+    usage
+    ;;
+*)
+    # 未被脚本单独处理的命令直接视为 Kbuild 目标。
+    ensure_image
+    docker run "${container_args[@]}" "$image_name" \
+        make "${make_args[@]}" "$command" "$@"
+    ;;
+esac
