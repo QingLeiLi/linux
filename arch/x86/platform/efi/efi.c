@@ -90,6 +90,7 @@
 #include <asm/x86_init.h>
 #include <asm/uv/uv.h>
 
+/* boot_params 中 system table 的物理根地址；只在初始化阶段解析使用。 */
 static unsigned long efi_systab_phys __initdata;
 /*
  * efi_systab_phys 是 boot loader 给出的 EFI system table 物理地址，仅
@@ -114,6 +115,7 @@ static const efi_config_table_type_t arch_tables[] __initconst = {
 	{},
 };
 
+/* 所有已知 EFI 表地址槽的只读索引，供精确物理地址匹配。 */
 static const unsigned long * const efi_tables[] = {
 	/*
 	 * 该数组保存“地址变量的地址”，而不是固件表地址本身。这样下面的
@@ -156,6 +158,7 @@ u64 efi_setup;		/* efi setup_data physical address */
  * 前一内核 EFI 虚拟映射”的标志；0 表示普通冷启动。
  */
 
+/* 是否按启动参数把完整 EFI map 合入 e820；参数处理后仅在 init 使用。 */
 static int add_efi_memmap __initdata;
 /*
  * 解析 add_efi_memmap 启动参数。arg 无需内容，参数出现即把 init-only
