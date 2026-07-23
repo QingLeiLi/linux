@@ -2693,7 +2693,7 @@ void start_kernel(void)
 	 */
 	proc_root_init();
 
-	/* 初始化命名空间文件系统（/proc/*/ns/ 目录） */
+	/* 初始化命名空间文件系统（/proc/<pid>/ns/ 目录） */
 	nsfs_init();
 
 	/* 初始化 PID 文件系统（通过文件描述符引用进程，防止 PID 复用竞争） */
