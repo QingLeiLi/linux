@@ -10,6 +10,8 @@
 /*
  * 【文件整体说明】
  *
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
  * 本文件（arch/arm64/mm/proc.S）负责 ARM64 处理器级别的内存管理初始化，
  * 以及系统休眠/唤醒时的 CPU 寄存器上下文保存与恢复。
  *
@@ -80,6 +82,12 @@
  *   而是推迟到实际内存访问时处理。这允许内核在随机化地址尚未完全
  *   映射时安全地进行地址探测，是 KASLR 实现的必要条件。
  */
+/*
+ * 【纠正】上述“NFD1 延迟翻译错误、允许地址探测”的解释不正确。NFD1 的作用
+ * 是让 EL0 执行经 TTBR1 翻译的 fault-suppressing SVE 内存访问在 TLB miss 时
+ * 得到 translation fault，阻止利用 first-fault gather load/FFR 对内核地址布局
+ * 做无异常的计时探测；启用它是为了保护 KASLR，而不是帮助 KASLR 探测地址。
+ */
 #ifdef CONFIG_RANDOMIZE_BASE
 #define TCR_KASLR_FLAGS	TCR_EL1_NFD1
 #else
@@ -103,6 +111,7 @@
  * 两者都设为 WBWA，确保页表遍历在所有级别的 cache 上都有最优性能。
  */
 /* PTWs cacheable, inner/outer WBWA */
+/* TTBR0/TTBR1 的页表 walk 在 inner/outer cache 均采用回写、写分配策略。 */
 #define TCR_CACHE_FLAGS	TCR_IRGN_WBWA | TCR_ORGN_WBWA
 
 /*
@@ -155,6 +164,7 @@
  * match-all tag (0xF) as Tag Unchecked, irrespective of the SCTLR_EL1.TCF
  * setting.
  */
+/* DC GZVA 依赖 EL1 TBI；TCMA1 让 0xF match-all 指针绕过同步/异步 tag-check 模式。 */
 #define TCR_MTE_FLAGS TCR_EL1_TCMA1 | TCR_EL1_TBI1 | TCR_EL1_TBID1
 #else
 #define TCR_MTE_FLAGS 0
@@ -423,6 +433,11 @@ SYM_FUNC_END(cpu_do_resume)
 
 	.pushsection ".idmap.text", "a"
 
+/*
+ * 暂时让 TTBR1 指向 reserved_pg_dir，并完成“写 TTBR -> ISB -> 全失效 TLB ->
+ * DSB/ISB”。调用者正在 TTBR0 的恒等映射中执行，因此移除旧内核 TTBR1 后
+ * 仍可继续取指。这是替换 live 内核页表时的 break 阶段，避免新旧翻译并存。
+ */
 .macro	__idmap_cpu_set_reserved_ttbr1, tmp1, tmp2
 	adrp	\tmp1, reserved_pg_dir
 	phys_to_ttbr \tmp2, \tmp1
@@ -440,7 +455,9 @@ SYM_FUNC_END(cpu_do_resume)
  * This is the low-level counterpart to cpu_replace_ttbr1, and should not be
  * called by anything else. It can only be executed from a TTBR0 mapping.
  */
+/* x0 是新 TTBR1 物理基值；调用者必须已在 TTBR0 idmap 上运行且屏蔽异常。 */
 SYM_TYPED_FUNC_START(idmap_cpu_replace_ttbr1)
+	/* 先隔离旧表并清 TLB，再安装调用者给出的新 PGD；次序不可颠倒。 */
 	__idmap_cpu_set_reserved_ttbr1 x1, x3
 
 	offset_ttbr1 x0, x3
@@ -459,6 +476,7 @@ SYM_FUNC_ALIAS(__pi_idmap_cpu_replace_ttbr1, idmap_cpu_replace_ttbr1)
 
 	.pushsection ".idmap.text", "a"
 
+	/* 从页/块描述符提取物理地址；52-bit PA 的高位散布字段需重新拼接。 */
 	.macro	pte_to_phys, phys, pte
 	and	\phys, \pte, #PTE_ADDR_LOW
 #ifdef CONFIG_ARM64_PA_BITS_52
@@ -467,6 +485,11 @@ SYM_FUNC_ALIAS(__pi_idmap_cpu_replace_ttbr1, idmap_cpu_replace_ttbr1)
 #endif
 	.endm
 
+	/*
+	 * 扫描当前层整张表：忽略 invalid 和已经 nG 的项，其余项设置 PTE_NG。
+	 * 对非 PTE 层，table descriptor 还需跳到 .Lderef_<type> 深入子表；宏利用
+	 * cur/end 寄存器别名形成循环，因此调用前必须先由 kpti_map_pgtbl 建立映射。
+	 */
 	.macro	kpti_mk_tbl_ng, type, num_entries
 	add	end_\type\()p, cur_\type\()p, #\num_entries * 8
 .Ldo_\type:
@@ -487,7 +510,13 @@ SYM_FUNC_ALIAS(__pi_idmap_cpu_replace_ttbr1, idmap_cpu_replace_ttbr1)
 	 * Dereference the current table entry and map it into the temporary
 	 * fixmap slot associated with the current level.
 	 */
+	/* 先 BBM 清旧槽并 TLBI，再把当前子表 PA 映入该层固定槽，返回可遍历 VA。 */
 	.macro	kpti_map_pgtbl, type, level
+	/*
+	 * 临时 fixmap 槽复用时遵循 break-before-make：先清旧 PTE，发布并按 VA
+	 * 失效 TLB，再把当前子表物理页装入相应槽。随后 cur_<type> 可像普通 VA
+	 * 一样遍历该物理页；每层用不同槽，递归返回时无需保存映射。
+	 */
 	str	xzr, [temp_pte, #8 * (\level + 2)]	// break before make
 	dsb	nshst
 	add	pte, temp_pte, #PAGE_SIZE * (\level + 2)
@@ -508,6 +537,12 @@ SYM_FUNC_ALIAS(__pi_idmap_cpu_replace_ttbr1, idmap_cpu_replace_ttbr1)
  *				   unsigned long temp_pte_va)
  *
  * Called exactly once from stop_machine context by each CPU found during boot.
+ *
+ * 【整体过程】所有 CPU 都在 idmap 中会合：辅助 CPU 卸载 swapper_pg_dir 并等待；
+ * CPU0 切到 C 代码预建的最小临时 TTBR1，通过临时 fixmap 深度优先遍历真正的
+ * swapper 页表，将仍为 global 的叶子/块项改为 nG。这样 KPTI 切换地址空间时，
+ * 内核翻译不会以 global TLB 项跨 ASID 残留。最后 CPU0 发布完成，辅助 CPU
+ * 恢复原 TTBR1。stop_machine 保证没有普通内核代码与页表手术并发。
  */
 SYM_TYPED_FUNC_START(idmap_kpti_install_ng_mappings)
 	cpu		.req	w0
@@ -544,6 +579,7 @@ SYM_TYPED_FUNC_START(idmap_kpti_install_ng_mappings)
 #endif
 
 	/* We're the boot CPU. Wait for the others to catch up */
+	/* flag 初值为 1；每个辅助 CPU 原子加一，等于在线 CPU 数才可安全动 swapper。 */
 	sevl
 1:	wfe
 	ldaxr	w17, [flag_ptr]
@@ -551,6 +587,7 @@ SYM_TYPED_FUNC_START(idmap_kpti_install_ng_mappings)
 	cbnz	w17, 1b
 
 	/* Switch to the temporary page tables on this CPU only */
+	/* reserved_pg_dir 充当 break，随后临时 PGD 提供遍历 swapper 所需的最小映射。 */
 	__idmap_cpu_set_reserved_ttbr1 x8, x9
 	offset_ttbr1 temp_pgd_phys, x8
 	msr	ttbr1_el1, temp_pgd_phys
@@ -560,6 +597,7 @@ SYM_TYPED_FUNC_START(idmap_kpti_install_ng_mappings)
 	mov_q	pte_flags, KPTI_NG_PTE_FLAGS
 
 	/* Everybody is enjoying the idmap, so we can rewrite swapper. */
+	/* 此刻无 CPU 使用 swapper 翻译普通 VA，CPU0 可修改其 global 属性。 */
 
 #ifdef CONFIG_ARM64_LPA2
 	/*
@@ -569,6 +607,7 @@ SYM_TYPED_FUNC_START(idmap_kpti_install_ng_mappings)
 	 * address from a PGD level entry, and terminate the PGD level loop
 	 * right after.
 	 */
+	/* 编译支持 LPA2 但运行时退化一层时，把根数组当作被虚构 PGD 解引用的下级表。 */
 	adrp	pgd, swapper_pg_dir	// walk &swapper_pg_dir at the next level
 	mov	cur_pgdp, end_pgdp	// must be equal to terminate the PGD loop
 alternative_if_not ARM64_HAS_VA52
@@ -580,23 +619,28 @@ alternative_else_nop_endif
 	 * bits are repurposed as physical address bits, and should not be
 	 * set in pte_flags.
 	 */
+	/* 52-bit PA descriptor 复用 SH 位承载地址高位，继续写 PTE_SHARED 会破坏 PA。 */
 	bic	pte_flags, pte_flags, #PTE_SHARED
 #endif
 
 	/* PGD */
+	/* kpti_mk_tbl_ng 遇到 table descriptor 会分支到下级标签，形成手写 DFS。 */
 	adrp		cur_pgdp, swapper_pg_dir
 	kpti_map_pgtbl	pgd, -1
 	kpti_mk_tbl_ng	pgd, PTRS_PER_PGD
 
 	/* Ensure all the updated entries are visible to secondary CPUs */
+	/* 发布全部 nG store 后才允许等待 CPU 恢复 TTBR1。 */
 	dsb	ishst
 
 	/* We're done: fire up swapper_pg_dir again */
+	/* CPU0 也经 reserved break 后恢复保存的 swapper TTBR 值，避免旧 TLB 混入。 */
 	__idmap_cpu_set_reserved_ttbr1 x8, x9
 	msr	ttbr1_el1, swapper_ttb
 	isb
 
 	/* Set the flag to zero to indicate that we're all done */
+	/* 清零是释放事件；辅助 CPU 的独占 load 循环观察到 0 后恢复各自 TTBR1。 */
 	str	wzr, [flag_ptr]
 #if CONFIG_PGTABLE_LEVELS > 4
 	ldp	x19, x20, [sp, #16]
@@ -673,8 +717,10 @@ alternative_else_nop_endif
 	.unreq	p4d
 
 	/* Secondary CPUs end up here */
+	/* cpu!=0 直接进入等待协议，不参与页表遍历和修改。 */
 __idmap_kpti_secondary:
 	/* Uninstall swapper before surgery begins */
+	/* 辅助 CPU 保存的 swapper_ttb 保持在 x3，公共等待尾部会把它写回。 */
 	__idmap_cpu_set_reserved_ttbr1 x16, x17
 	b scondary_cpu_wait
 
@@ -685,8 +731,14 @@ SYM_FUNC_END(idmap_kpti_install_ng_mappings)
 #endif
 
 	.pushsection ".idmap.text", "a"
+/*
+ * 线性映射拆 PTE 时辅助 CPU 使用的等待入口。它复用 KPTI 的同一个 flag 协议：
+ * 保存并卸载 swapper TTBR1，在 reserved_pg_dir/idmap 上报告就绪，等 CPU0 完成
+ * 页表层级变化和 TLB 刷新，再恢复 TTBR1。整个等待过程不能访问普通内核 VA。
+ */
 SYM_TYPED_FUNC_START(wait_linear_map_split_to_ptes)
 	/* Must be same registers as in idmap_kpti_install_ng_mappings */
+	/* 跳入共享 scondary_cpu_wait 标签，x3/x4 的寄存器别名必须与 KPTI 入口一致。 */
 	swapper_ttb	.req	x3
 	flag_ptr	.req	x4
 
@@ -696,18 +748,21 @@ SYM_TYPED_FUNC_START(wait_linear_map_split_to_ptes)
 
 scondary_cpu_wait:
 	/* Increment the flag to let the boot CPU we're ready */
+	/* LDXR/STXR 原子加一，防止多个辅助 CPU 同时报到时丢计数。 */
 1:	ldxr	w16, [flag_ptr]
 	add	w16, w16, #1
 	stxr	w17, w16, [flag_ptr]
 	cbnz	w17, 1b
 
 	/* Wait for the boot CPU to finish messing around with swapper */
+	/* WFE 降低自旋功耗；flag 清零是页表手术与 TLB 维护均完成的发布条件。 */
 	sevl
 1:	wfe
 	ldxr	w16, [flag_ptr]
 	cbnz	w16, 1b
 
 	/* All done, act like nothing happened */
+	/* 写回进入函数时保存的 TTBR1 并 ISB，使后续取指重新使用正常内核映射。 */
 	msr	ttbr1_el1, swapper_ttb
 	isb
 	ret
@@ -896,6 +951,11 @@ SYM_FUNC_START(__cpu_setup)
 	 *
 	 * TCR_KASAN_SW_FLAGS / TCR_MTE_FLAGS：
 	 *   根据配置启用 TBI1/TBID1/TCMA1，支持 KASAN 软件标签或 MTE 硬件标签
+	 */
+	/*
+	 * 【纠正】本段对 NFD1 的“延迟 fault、允许探测”描述同样不成立；它恰好
+	 * 强制 EL0 的 fault-suppressing SVE 访问在 TTBR1 TLB miss 时产生翻译错误，
+	 * 从而封堵对 KASLR 地址空间的无异常侧信道探测。
 	 */
 	mov_q	tcr, TCR_T0SZ(IDMAP_VA_BITS) | TCR_T1SZ(VA_BITS_MIN) | TCR_CACHE_FLAGS | \
 		     TCR_SHARED | TCR_TG_FLAGS | TCR_KASLR_FLAGS | TCR_EL1_AS | \

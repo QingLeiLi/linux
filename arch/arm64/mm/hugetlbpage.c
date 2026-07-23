@@ -1,5 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * arm64 HugeTLB 多尺寸页表实现学习导读。
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 同一个 HugeTLB 抽象在 arm64 可由 PUD block、PMD block、CONT PMD 或
+ * CONT PTE 实现。block 只占一个描述符；CONT 由多个 PFN 连续、属性相同
+ * 的描述符组成，硬件可合并为大 TLB 项。公共 helper 以 pte_t* 作为统一
+ * 句柄，运行时根据 huge size/页表层级解释真实 descriptor 粒度。
+ *
+ * 修改 contiguous 组必须整组 break-before-make：清全部项、聚合任意子项
+ * 的 AF/dirty、TLBI，再写回整组，否则硬件可能观察 CONT 位误编程。调用
+ * 路径持相应页表锁，页表页/共享 PMD 生命周期由通用 hugetlb 管理。
+ */
+/*
  * arch/arm64/mm/hugetlbpage.c
  *
  * Copyright (C) 2013 Linaro Ltd.
@@ -29,6 +42,7 @@
  * |    64K    |    2M    | 512M  |    16G   |       |
  * ---------------------------------------------------
  */
+/* 矩阵给出各基础页配置能表达的四类 huge size，是下方 hstate 注册的依据。 */
 
 /*
  * Reserve CMA areas for the largest supported gigantic
@@ -210,6 +224,12 @@ CONT PMD 连续映射：覆盖 [24:0] 共 25 位 → 32MB
 
 xSHIFT - PAGE_SHIFT 就是"该大页包含多少个基础页"的对数，即 buddy order。
 */
+/*
+ * 对上方既有说明的一处修正：64K 基础页配置仍存在可形成 block 的 PMD
+ * 层，单个 PMD block 为 512MiB，CONT PMD 为 16GiB；不能表述为“没有
+ * PMD 级别、对应级别叫 PUD”。源码中的 PMD_SIZE/CONT_PMD_SIZE 分支即
+ * 是当前实现证据。不同 granule 的硬件 level 编号与 Linux 类型名也不应混用。
+ */
 #ifdef CONFIG_CMA
 unsigned int arch_hugetlb_cma_order(void)
 {
@@ -227,7 +247,12 @@ unsigned int arch_hugetlb_cma_order(void)
 }
 #endif /* CONFIG_CMA */
 
+/* 判断 size 是否属于本构建可编码的 PUD/PMD/CONT huge 粒度。 */
 static bool __hugetlb_valid_size(unsigned long size)
+/*
+ * 判断字节 size 是否是本构建支持的 HugeTLB 粒度。PUD_SIZE 还受硬件
+ * block 支持限制；其余三个由配置常量保证。返回 bool，无副作用。
+ */
 {
 	switch (size) {
 #ifndef __PAGETABLE_PMD_FOLDED
@@ -244,7 +269,9 @@ static bool __hugetlb_valid_size(unsigned long size)
 }
 
 #ifdef CONFIG_ARCH_ENABLE_HUGEPAGE_MIGRATION
+/* 迁移仅接受架构已识别的 hstate，未知大小会告警并返回 false。 */
 bool arch_hugetlb_migration_supported(struct hstate *h)
+/* h 给出目标 huge size；合法返回 true，未知尺寸告警并拒绝迁移。 */
 {
 	size_t pagesize = huge_page_size(h);
 
@@ -257,6 +284,11 @@ bool arch_hugetlb_migration_supported(struct hstate *h)
 }
 #endif
 
+/*
+ * 从 ptep 所处真实层级判断 contiguous 组包含多少描述符，并通过 pgsize
+ * 输出单项覆盖字节数。若 ptep 实际指向 PMD 槽则返回 CONT_PMDS，否则
+ * 按 PTE 返回 CONT_PTES；mm/addr 用于重新 walk 层级。
+ */
 static int find_num_contig(struct mm_struct *mm, unsigned long addr,
 			   pte_t *ptep, size_t *pgsize)
 {
@@ -276,6 +308,7 @@ static int find_num_contig(struct mm_struct *mm, unsigned long addr,
 	return CONT_PTES;
 }
 
+/* 将总 huge size 拆为“单项 pgsize × contiguous 项数”；未知 size 告警。 */
 static inline int num_contig_ptes(unsigned long size, size_t *pgsize)
 {
 	int contig_ptes = 1;
@@ -298,6 +331,11 @@ static inline int num_contig_ptes(unsigned long size, size_t *pgsize)
 	return contig_ptes;
 }
 
+/*
+ * 读取 huge descriptor 的逻辑状态。普通/非 present 项直接返回；CONT 组
+ * 扫描所有子项，把 dirty/young OR 到首项快照。调用者持 PTL，返回 PFN/
+ * 权限来自目标项而状态代表整组。
+ */
 pte_t huge_ptep_get(struct mm_struct *mm, unsigned long addr, pte_t *ptep)
 {
 	int ncontig, i;
@@ -328,6 +366,10 @@ pte_t huge_ptep_get(struct mm_struct *mm, unsigned long addr, pte_t *ptep)
  *
  * This helper performs the break step.
  */
+/*
+ * 清除 ncontig 个、每项 pgsize 的完整组并聚合原 AF/dirty。返回首项模板；
+ * 本 helper 只 break 不 TLBI，调用者必须在 make 前完成 flush。
+ */
 static pte_t get_clear_contig(struct mm_struct *mm,
 			     unsigned long addr,
 			     pte_t *ptep,
@@ -353,6 +395,7 @@ static pte_t get_clear_contig(struct mm_struct *mm,
 	return pte;
 }
 
+/* get_clear_contig 后立即对完整组执行 hugetlb TLBI，返回聚合旧 PTE。 */
 static pte_t get_clear_contig_flush(struct mm_struct *mm,
 				    unsigned long addr,
 				    pte_t *ptep,
@@ -376,6 +419,10 @@ static pte_t get_clear_contig_flush(struct mm_struct *mm,
  * This helper performs the break step for use cases where the
  * original pte is not needed.
  */
+/*
+ * 不需要旧状态的 break+flush。init_mm 使用 kernel-range TLBI，用户 mm 用
+ * hugetlb VMA 伪对象选择正确粒度；返回时整组描述符为 none 且旧 TLB 失效。
+ */
 static void clear_flush(struct mm_struct *mm,
 			     unsigned long addr,
 			     pte_t *ptep,
@@ -394,6 +441,11 @@ static void clear_flush(struct mm_struct *mm,
 		__flush_hugetlb_tlb_range(&vma, saddr, addr, pgsize, TLBF_NOWALKCACHE);
 }
 
+/*
+ * 安装 sz 大小的 huge PTE。非 present（swap/marker）逐项原样写；valid->valid
+ * 且 CONT 时先整组 break+flush，再由 __set_ptes_anysz 写 ncontig 个连续
+ * PFN。mm/addr/ptep 由持 PTL 调用者保证对应。
+ */
 void set_huge_pte_at(struct mm_struct *mm, unsigned long addr,
 			    pte_t *ptep, pte_t pte, unsigned long sz)
 {
@@ -410,12 +462,18 @@ void set_huge_pte_at(struct mm_struct *mm, unsigned long addr,
 	}
 
 	/* Only need to "break" if transitioning valid -> valid. */
+	/* invalid->valid 没有旧翻译冲突；只有 valid->valid 才先 clear+TLBI 满足 BBM。 */
 	if (pte_cont(pte) && pte_valid(__ptep_get(ptep)))
 		clear_flush(mm, addr, ptep, pgsize, ncontig);
 
 	__set_ptes_anysz(mm, addr, ptep, pte, ncontig, pgsize);
 }
 
+/*
+ * 为 addr/sz 分配并返回承载 huge entry 的页表槽。逐层按需分配；PUD/PMD
+ * block 直接把对应槽 cast 为 pte_t*，CONT_PTE 分配专用 PTE table，PMD
+ * 尺寸可复用共享 PMD。返回 NULL 表示任一分配失败，已建上层由 mm 持有。
+ */
 pte_t *huge_pte_alloc(struct mm_struct *mm, struct vm_area_struct *vma,
 		      unsigned long addr, unsigned long sz)
 {
@@ -457,6 +515,11 @@ pte_t *huge_pte_alloc(struct mm_struct *mm, struct vm_area_struct *vma,
 	return ptep;
 }
 
+/*
+ * 查找已有 addr/sz huge 槽，不分配。逐级 READ_ONCE；leaf 或 non-present
+ * swap entry 在其所在层直接返回统一 pte_t*，CONT 地址先对齐组首。
+ * 无映射/层级与请求尺寸不匹配返回 NULL。
+ */
 pte_t *huge_pte_offset(struct mm_struct *mm,
 		       unsigned long addr, unsigned long sz)
 {
@@ -478,9 +541,11 @@ pte_t *huge_pte_offset(struct mm_struct *mm,
 	if (sz != PUD_SIZE && pud_none(pud))
 		return NULL;
 	/* hugepage or swap? */
+	/* PUD 叶子或 non-present 软件项本身就是目标 huge/swap 槽，不可继续解引用。 */
 	if (pud_leaf(pud) || !pud_present(pud))
 		return (pte_t *)pudp;
 	/* table; check the next level */
+	/* present 非叶子才指向 PMD 表，继续按目标 huge size 定位下一层。 */
 
 	if (sz == CONT_PMD_SIZE)
 		addr &= CONT_PMD_MASK;
@@ -499,6 +564,10 @@ pte_t *huge_pte_offset(struct mm_struct *mm,
 	return NULL;
 }
 
+/*
+ * 返回一个上级页表覆盖范围内，最后一个该 hstate huge page 起点的 mask/
+ * 偏移上界，供通用 hugetlb 避免跨页表边界。未知尺寸返回 0。
+ */
 unsigned long hugetlb_mask_last_page(struct hstate *h)
 {
 	unsigned long hp_size = huge_page_size(h);
@@ -523,6 +592,10 @@ unsigned long hugetlb_mask_last_page(struct hstate *h)
 	return 0UL;
 }
 
+/*
+ * 把基础 entry 按 shift 对应尺寸编码成 PUD/PMD block 或 CONT 描述符。
+ * flags 当前未使用；未知尺寸告警并返回未修改 entry，避免静默构造坏页表。
+ */
 pte_t arch_make_huge_pte(pte_t entry, unsigned int shift, vm_flags_t flags)
 {
 	size_t pagesize = 1UL << shift;
@@ -548,6 +621,7 @@ pte_t arch_make_huge_pte(pte_t entry, unsigned int shift, vm_flags_t flags)
 	return entry;
 }
 
+/* 清除 sz 对应全部描述符但不主动 TLBI，批量 unmap 路径随后统一 flush。 */
 void huge_pte_clear(struct mm_struct *mm, unsigned long addr,
 		    pte_t *ptep, unsigned long sz)
 {
@@ -560,6 +634,7 @@ void huge_pte_clear(struct mm_struct *mm, unsigned long addr,
 		__pte_clear(mm, addr, ptep);
 }
 
+/* break 整个 huge/CONT 组并返回聚合旧项；不 flush，供 mmu_gather 批量处理。 */
 pte_t huge_ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
 			      pte_t *ptep, unsigned long sz)
 {
@@ -579,6 +654,7 @@ pte_t huge_ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
  * all the contiguous ptes we need to check whether or not there is a
  * discrepancy between dirty or young.
  */
+/* 比较请求 write/dirty/young 与整组 raw 子项；任一不同返回 1。 */
 static int __cont_access_flags_changed(pte_t *ptep, pte_t pte, int ncontig)
 {
 	int i;
@@ -599,6 +675,11 @@ static int __cont_access_flags_changed(pte_t *ptep, pte_t pte, int ncontig)
 	return 0;
 }
 
+/*
+ * fault 路径更新 huge access/write 状态。非 CONT 走单项 helper；CONT 若有
+ * 变化必须整组 break+flush，合并旧 AF/dirty 后重写。返回 1 表示修改，
+ * 0 表示已一致。dirty 参数传达调用者是否要求同步 TLB。
+ */
 int huge_ptep_set_access_flags(struct vm_area_struct *vma,
 			       unsigned long addr, pte_t *ptep,
 			       pte_t pte, int dirty)
@@ -622,6 +703,7 @@ int huge_ptep_set_access_flags(struct vm_area_struct *vma,
 	VM_WARN_ON(!pte_present(orig_pte));
 
 	/* Make sure we don't lose the dirty or young state */
+	/* 硬件可能只更新某个兄弟项，重绘时必须把聚合状态带回每个新项。 */
 	if (pte_dirty(orig_pte))
 		pte = pte_mkdirty(pte);
 
@@ -632,6 +714,7 @@ int huge_ptep_set_access_flags(struct vm_area_struct *vma,
 	return 1;
 }
 
+/* 对普通 huge 单项直接 wrprotect；CONT 组执行整组 BBM 后以 RO 模板写回。 */
 void huge_ptep_set_wrprotect(struct mm_struct *mm,
 			     unsigned long addr, pte_t *ptep)
 {
@@ -655,6 +738,7 @@ void huge_ptep_set_wrprotect(struct mm_struct *mm,
 	__set_ptes_anysz(mm, addr, ptep, pte, ncontig, pgsize);
 }
 
+/* 清除并 flush VMA 对应完整 huge size，返回聚合旧 PTE。 */
 pte_t huge_ptep_clear_flush(struct vm_area_struct *vma,
 			    unsigned long addr, pte_t *ptep)
 {
@@ -666,6 +750,7 @@ pte_t huge_ptep_clear_flush(struct vm_area_struct *vma,
 	return get_clear_contig_flush(mm, addr, ptep, pgsize, ncontig);
 }
 
+/* 启动期注册本构建支持的最多四个 hstate，order 均为 huge_shift-PAGE_SHIFT。 */
 static int __init hugetlbpage_init(void)
 {
 	/*
@@ -679,6 +764,7 @@ static int __init hugetlbpage_init(void)
 	 * supported HugeTLB page sizes will also require changing
 	 * HUGE_MAX_HSTATE as well.
 	 */
+	/* BUILD_BUG_ON 让新增尺寸却忘记扩大通用 hstate 数组时在编译期失败。 */
 	BUILD_BUG_ON(HUGE_MAX_HSTATE < 4);
 	if (pud_sect_supported())
 		hugetlb_add_hstate(PUD_SHIFT - PAGE_SHIFT);
@@ -691,11 +777,17 @@ static int __init hugetlbpage_init(void)
 }
 arch_initcall(hugetlbpage_init);
 
+/* 通用 hugetlb 的架构 size 校验入口，直接复用内部构建配置判定。 */
 bool __init arch_hugetlb_valid_size(unsigned long size)
 {
 	return __hugetlb_valid_size(size);
 }
 
+/*
+ * mprotect 修改开始阶段。正常情况 get-and-clear 留给最终 commit/外层 flush；
+ * CPU erratum 2645198 上 exec->NX 必须立即 BBM+TLBI，避免错误取指权限缓存。
+ * 返回旧 PTE（CONT 时已聚合），调用者持 PTL。
+ */
 pte_t huge_ptep_modify_prot_start(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep)
 {
 	unsigned long psize = huge_page_size(hstate_vma(vma));
@@ -706,12 +798,17 @@ pte_t huge_ptep_modify_prot_start(struct vm_area_struct *vma, unsigned long addr
 		 * when the permission changes from executable to non-executable
 		 * in cases where cpu is affected with errata #2645198.
 		 */
+		/* 仅原映射 user-exec 时触发昂贵 workaround，其他权限变化走常规批量 flush。 */
 		if (pte_user_exec(__ptep_get(ptep)))
 			return huge_ptep_clear_flush(vma, addr, ptep);
 	}
 	return huge_ptep_get_and_clear(vma->vm_mm, addr, ptep, psize);
 }
 
+/*
+ * mprotect 提交阶段，以 VMA huge size 调 set_huge_pte_at 写入新 pte。
+ * old_pte 是通用接口参数，本实现无需读取；必要 CONT BBM 由安装 helper 处理。
+ */
 void huge_ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr, pte_t *ptep,
 				  pte_t old_pte, pte_t pte)
 {

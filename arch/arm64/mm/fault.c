@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
+ * arm64 内存异常解码、页错误处理与信号/oops 分发学习导读。
+ * 中文学习注释模型：OpenAI Codex（GPT-5）。
+ *
+ * 异常入口传入 FAR_EL1（fault address）、ESR_EL1（原因）和 pt_regs。
+ * do_mem_abort 用 FSC 索引 fault_info：translation/access/permission 进入
+ * do_page_fault，SEA/MTE/alignment 走专用处理，未知类型返回上层发信号或
+ * oops。用户 fault 优先尝试 per-VMA RCU 锁快路径，失败退 mmap_lock；
+ * 内核 fault 先查 exception table、pKVM/KFENCE/BPF/EFI 修复，再决定致命。
+ *
+ * 页表修改由 VMA lock/PTL/MM 核心同步；异常路径本身不能假设可睡眠，
+ * interrupt/no-mm 直接 no_context。FAR tag 对内核诊断有用，但暴露用户前
+ * 按架构 UNKNOWN 规则去 tag/sanitize ESR，避免泄漏 kernel-only 映射。
+ */
+/*
  * Based on arch/arm/mm/fault.c
  *
  * Copyright (C) 1995  Linus Torvalds
@@ -46,6 +60,12 @@
 #include <asm/traps.h>
 #include <asm/virt.h>
 
+/* FSC 分发表项：handler 返回 0 表示已处理，非零让 do_mem_abort 执行默认终结。 */
+/*
+ * fn 接收原始 FAR/ESR/寄存器现场并决定是否已消费异常；sig/code 是无法恢复时
+ * 对用户报告的默认信号及 si_code；name 是 oops/signal 的稳定诊断文本。表项
+ * 全部静态只读，不持有任务或 VMA 引用，索引只由 ESR_ELx_FSC 的 6 位产生。
+ */
 struct fault_info {
 	int	(*fn)(unsigned long far, unsigned long esr,
 		      struct pt_regs *regs);
@@ -56,11 +76,13 @@ struct fault_info {
 
 static const struct fault_info fault_info[];
 
+/* 取 ESR.FSC 低位作为 64 项表索引，返回只读静态项。 */
 static inline const struct fault_info *esr_to_fault_info(unsigned long esr)
 {
 	return fault_info + (esr & ESR_ELx_FSC);
 }
 
+/* 解码 data-abort ISS/ISS2 的访问宽度、方向、GCS/MTE/overlay 等诊断字段。 */
 static void data_abort_decode(unsigned long esr)
 {
 	unsigned long iss2 = ESR_ELx_ISS2(esr);
@@ -94,6 +116,7 @@ static void data_abort_decode(unsigned long esr)
 		 (iss2 & ESR_ELx_Xs_MASK) >> ESR_ELx_Xs_SHIFT);
 }
 
+/* 打印通用 memory-abort EC/FSC/EA/S1PTW，数据异常再下钻 ISS 解码。 */
 static void mem_abort_decode(unsigned long esr)
 {
 	pr_alert("Mem abort info:\n");
@@ -115,9 +138,11 @@ static void mem_abort_decode(unsigned long esr)
 		data_abort_decode(esr);
 }
 
+/* init_mm pgd 是镜像符号需 __pa_symbol，普通 mm->pgd 位于 linear map 用 virt_to_phys。 */
 static inline unsigned long mm_to_pgd_phys(struct mm_struct *mm)
 {
 	/* Either init_pg_dir or swapper_pg_dir */
+	/* init_mm 的根可能是启动/正式内核页表符号，均不保证能按普通 linear VA 换算。 */
 	if (mm == &init_mm)
 		return __pa_symbol(mm->pgd);
 
@@ -127,6 +152,11 @@ static inline unsigned long mm_to_pgd_phys(struct mm_struct *mm)
 /*
  * Dump out the page tables associated with 'addr' in the currently active mm.
  */
+/*
+ * 按 addr 属于 TTBR0/TTBR1 选择 current->active_mm 或 init_mm，逐级 READ_ONCE
+ * 打印页表项直到 none/bad/leaf。只做 oops 诊断快照，不持页表锁；并发变化
+ * 允许输出跨时刻组合，但每个单项不撕裂。用户地址配 init_mm 时明确报告。
+ */
 static void show_pte(unsigned long addr)
 {
 	struct mm_struct *mm;
@@ -135,6 +165,7 @@ static void show_pte(unsigned long addr)
 
 	if (is_ttbr0_addr(addr)) {
 		/* TTBR0 */
+		/* 低半地址由当前任务 active_mm 翻译；内核线程借用前一用户 mm。 */
 		mm = current->active_mm;
 		if (mm == &init_mm) {
 			pr_alert("[%016lx] user address but active_mm is swapper\n",
@@ -143,6 +174,7 @@ static void show_pte(unsigned long addr)
 		}
 	} else if (is_ttbr1_addr(addr)) {
 		/* TTBR1 */
+		/* 高半地址始终使用全局 init_mm/swapper 页表诊断。 */
 		mm = &init_mm;
 	} else {
 		pr_alert("[%016lx] address between user and kernel address ranges\n",
@@ -206,6 +238,12 @@ static void show_pte(unsigned long addr)
  *
  * Returns whether or not the PTE actually changed.
  */
+/*
+ * 原子放宽 AF/dirty/write 权限，支持 PAGE/PMD/PUD 粒度。entry 只贡献这四位，
+ * cmpxchg 循环保留硬件并发更新；PTE_RDONLY 反相后用 OR 合并以选择更宽松
+ * 权限。dirty 请求时只本地 TLBI，远端旧 RO 项最多产生可修复 spurious fault。
+ * 返回 1 表示写入，0 表示原值已相同；调用者持相应页表/VMA 约束。
+ */
 int __ptep_set_access_flags_anysz(struct vm_area_struct *vma,
 				  unsigned long address, pte_t *ptep,
 				  pte_t entry, int dirty, unsigned long pgsize)
@@ -218,6 +256,7 @@ int __ptep_set_access_flags_anysz(struct vm_area_struct *vma,
 		return 0;
 
 	/* only preserve the access flags and write permission */
+	/* 调用者的新 entry 只能贡献 AF/dirty/write；PFN、内存类型等必须保持原值。 */
 	pte_val(entry) &= PTE_RDONLY | PTE_AF | PTE_WRITE | PTE_DIRTY;
 
 	/*
@@ -226,6 +265,7 @@ int __ptep_set_access_flags_anysz(struct vm_area_struct *vma,
 	 * be set to the most permissive (lowest value) of *ptep and entry
 	 * (calculated as: a & b == ~(~a | ~b)).
 	 */
+	/* relaxed cmpxchg 负责原子仲裁，TLBI/页表锁协议提供所需硬件可见顺序。 */
 	pte_val(entry) ^= PTE_RDONLY;
 	pteval = pte_val(pte);
 	do {
@@ -241,6 +281,7 @@ int __ptep_set_access_flags_anysz(struct vm_area_struct *vma,
 	 * may still cause page faults and be invalidated via
 	 * flush_tlb_fix_spurious_fault().
 	 */
+	/* NOBROADCAST 只清本 PE；其他 PE 若命中旧只读项会进 fault 再自修复。 */
 	if (dirty) {
 		switch (pgsize) {
 		case PAGE_SIZE:
@@ -265,6 +306,7 @@ int __ptep_set_access_flags_anysz(struct vm_area_struct *vma,
 	return 1;
 }
 
+/* 判断 ESR 是否来自当前 EL 的 instruction/data abort。 */
 static bool is_el1_instruction_abort(unsigned long esr)
 {
 	return ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_CUR;
@@ -275,6 +317,10 @@ static bool is_el1_data_abort(unsigned long esr)
 	return ESR_ELx_EC(esr) == ESR_ELx_EC_DABT_CUR;
 }
 
+/*
+ * 识别 EL1 permission fault；软件 TTBR0 PAN 下，用户地址 translation fault
+ * 且 PSTATE.PAN=1 也等价于权限违规，因为空 TTBR0 是 PAN 的实现手段。
+ */
 static inline bool is_el1_permission_fault(unsigned long addr, unsigned long esr,
 					   struct pt_regs *regs)
 {
@@ -291,15 +337,22 @@ static inline bool is_el1_permission_fault(unsigned long addr, unsigned long esr
 	return false;
 }
 
+/* pKVM 初始化后 ESR.S1PTW 是 hypervisor 注入 host stage-2 abort 的约定标志。 */
 static bool is_pkvm_stage2_abort(unsigned int esr)
 {
 	/*
 	 * S1PTW should only ever be set in ESR_EL1 if the pkvm hypervisor
 	 * injected a stage-2 abort -- see host_inject_mem_abort().
 	 */
+	/* host 原生 EL1 abort 不应带 S1PTW；先确认 pKVM 已启动，避免误分类普通 fault。 */
 	return is_pkvm_initialized() && (esr & ESR_ELx_S1PTW);
 }
 
+/*
+ * 用 AT S1E1R 重走当前 EL1 translation 判断旧 fault 是否已被并发页表更新
+ * 修复。临时关本地 IRQ保护 PAR_EL1 这个 CPU 共享诊断寄存器；AT 成功或
+ * 返回不同 fault 类型均视为 spurious。pKVM 注入时还尝试强制回收 guest 页。
+ */
 static bool __kprobes is_spurious_el1_translation_fault(unsigned long addr,
 							unsigned long esr,
 							struct pt_regs *regs)
@@ -320,6 +373,7 @@ static bool __kprobes is_spurious_el1_translation_fault(unsigned long addr,
 	 * If we now have a valid translation, treat the translation fault as
 	 * spurious.
 	 */
+	/* PAR.F=0 证明现在翻译有效，原异常无需再次执行 MM fault。 */
 	if (!(par & SYS_PAR_EL1_F)) {
 		if (is_pkvm_stage2_abort(esr)) {
 			par &= SYS_PAR_EL1_PA;
@@ -333,10 +387,15 @@ static bool __kprobes is_spurious_el1_translation_fault(unsigned long addr,
 	 * If we got a different type of fault from the AT instruction,
 	 * treat the translation fault as spurious.
 	 */
+	/* 当前重走结果已不再是 translation fault，说明原异常对应的页表状态已变化。 */
 	dfsc = FIELD_GET(SYS_PAR_EL1_FST, par);
 	return !esr_fsc_is_translation_fault(dfsc);
 }
 
+/*
+ * 不可恢复内核 fault 终结器。打开 bust_spinlocks 允许 oops 控制台输出，
+ * 打印 KASAN/ESR/页表/寄存器后 die，并杀死 current。函数不返回。
+ */
 static void die_kernel_fault(const char *msg, unsigned long addr,
 			     unsigned long esr, struct pt_regs *regs)
 {
@@ -356,6 +415,7 @@ static void die_kernel_fault(const char *msg, unsigned long addr,
 }
 
 #ifdef CONFIG_KASAN_HW_TAGS
+/* HW_TAGS 下把同步 MTE fault 报给 KASAN；访问宽度未知所以 size=0。 */
 static void report_tag_fault(unsigned long addr, unsigned long esr,
 			     struct pt_regs *regs)
 {
@@ -363,15 +423,21 @@ static void report_tag_fault(unsigned long addr, unsigned long esr,
 	 * SAS bits aren't set for all faults reported in EL1, so we can't
 	 * find out access size.
 	 */
+	/* 因访问宽度不可靠，向 KASAN 传 size=0，仅保留地址和读写方向。 */
 	bool is_write = !!(esr & ESR_ELx_WNR);
 	kasan_report((void *)addr, 0, is_write, regs->pc);
 }
 #else
 /* Tag faults aren't enabled without CONFIG_KASAN_HW_TAGS. */
+/* 非 HW_TAGS 构建保留空接口，让恢复主路径无需条件编译。 */
 static inline void report_tag_fault(unsigned long addr, unsigned long esr,
 				    struct pt_regs *regs) { }
 #endif
 
+/*
+ * 报告内核 MTE tag fault 后关闭本 CPU EL1 同步 tag check，并 ISB 提交。
+ * 其他 CPU 延迟到各自 fault 时关闭，避免此异常上下文发跨 CPU 操作。
+ */
 static void do_tag_recovery(unsigned long addr, unsigned long esr,
 			   struct pt_regs *regs)
 {
@@ -383,11 +449,13 @@ static void do_tag_recovery(unsigned long addr, unsigned long esr,
 	 * It will be done lazily on the other CPUs when they will hit a
 	 * tag fault.
 	 */
+	/* 这是 per-CPU SCTLR 状态；当前 CPU 立即停查，其他 CPU 无需 IPI，按 fault 自愈。 */
 	sysreg_clear_set(sctlr_el1, SCTLR_EL1_TCF_MASK,
 			 SYS_FIELD_PREP_ENUM(SCTLR_EL1, TCF, NONE));
 	isb();
 }
 
+/* 精确识别当前 EL data abort 且 FSC=MTE 的同步 tag-check fault。 */
 static bool is_el1_mte_sync_tag_check_fault(unsigned long esr)
 {
 	unsigned long fsc = esr & ESR_ELx_FSC;
@@ -401,6 +469,11 @@ static bool is_el1_mte_sync_tag_check_fault(unsigned long esr)
 	return false;
 }
 
+/*
+ * 内核 fault 修复/分类总入口。顺序很重要：先 exception table；再验证并发
+ * translation/pKVM；再 MTE 降级；之后区分权限、NULL、hypervisor protection、
+ * KFENCE/BPF paging，最后给 EFI runtime fixup 一次机会，否则 oops。
+ */
 static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 			      struct pt_regs *regs)
 {
@@ -410,6 +483,7 @@ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 	 * Are we prepared to handle this kernel fault?
 	 * We are almost certainly not prepared to handle instruction faults.
 	 */
+	/* exception table 只修 data/uaccess；instruction abort 不允许跳任意 fixup。 */
 	if (!is_el1_instruction_abort(esr) && fixup_exception(regs, esr))
 		return;
 
@@ -438,6 +512,7 @@ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 		msg = "access to hypervisor-protected memory";
 	} else {
 		if (esr_fsc_is_translation_fault(esr)) {
+			/* guard-page/arena 按自身元数据消化故意制造的 translation fault。 */
 			if (kfence_handle_page_fault(addr, esr & ESR_ELx_WNR, regs))
 				return;
 			if (bpf_arena_handle_page_fault(addr, esr & ESR_ELx_WNR, regs->pc))
@@ -453,6 +528,11 @@ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 	die_kernel_fault(msg, addr, esr, regs);
 }
 
+/*
+ * 保存供 sigcontext/ptrace 使用的 fault address/ESR。若地址不在 TTBR0，
+ * 用户本不应知道 kernel mapping 的真实权限/层级，因此伪装为 level-0
+ * translation fault，并清未来可能定义的 RES0 位。只修改 current->thread。
+ */
 static void set_thread_esr(unsigned long address, unsigned long esr)
 {
 	current->thread.fault_address = address;
@@ -469,6 +549,7 @@ static void set_thread_esr(unsigned long address, unsigned long esr)
 	 * type", so we ignore this wrinkle and just return the translation
 	 * fault.)
 	 */
+	/* sanitize 同时是信息隐藏与稳定用户 ABI，不能直接泄漏原 EL1 ESR。 */
 	if (!is_ttbr0_addr(current->thread.fault_address)) {
 		switch (ESR_ELx_EC(esr)) {
 		case ESR_ELx_EC_DABT_LOW:
@@ -481,6 +562,7 @@ static void set_thread_esr(unsigned long address, unsigned long esr)
 			 * to EL1 and so ISV and the bits in ISS[23:14] are
 			 * clear. (In fact it always will be a fault to EL1.)
 			 */
+			/* 只保留用户已知的方向/长度类信息，强制伪装成 L0 translation fault。 */
 			esr &= ESR_ELx_EC_MASK | ESR_ELx_IL |
 				ESR_ELx_CM | ESR_ELx_WNR;
 			esr |= ESR_ELx_FSC_FAULT;
@@ -491,6 +573,7 @@ static void set_thread_esr(unsigned long address, unsigned long esr)
 			 * All other bits are architecturally RES0 for faults
 			 * reported with that DFSC value, so we clear them.
 			 */
+			/* 指令 abort 同样只保留 EC/IL，避免把保留位或内核上下文泄给用户。 */
 			esr &= ESR_ELx_EC_MASK | ESR_ELx_IL;
 			esr |= ESR_ELx_FSC_FAULT;
 			break;
@@ -501,6 +584,7 @@ static void set_thread_esr(unsigned long address, unsigned long esr)
 			 * exception level). Fail safe by not providing an ESR
 			 * context record at all.
 			 */
+			/* 非预期异常类别时 ESR 清零，比构造可能错误的用户 signal context 更安全。 */
 			WARN(1, "ESR 0x%lx is not DABT or IABT from EL0\n", esr);
 			esr = 0;
 			break;
@@ -510,6 +594,11 @@ static void set_thread_esr(unsigned long address, unsigned long esr)
 	current->thread.fault_code = esr;
 }
 
+/*
+ * 无法走正常 page fault 的地址处理。user mode 根据 fault_info 保存上下文并
+ * 强制信号；kernel mode 交 __do_kernel_fault 尝试架构修复或 oops。FAR 在
+ * 内部分类前去 tag，但信号 si_addr 保留适用的原 far。
+ */
 static void do_bad_area(unsigned long far, unsigned long esr,
 			struct pt_regs *regs)
 {
@@ -519,6 +608,7 @@ static void do_bad_area(unsigned long far, unsigned long esr,
 	 * If we are in kernel mode at this point, we have no context to
 	 * handle this fault with.
 	 */
+	/* 只有用户态异常拥有可投递信号的恢复上下文；内核态必须尝试 fixup 或终结。 */
 	if (user_mode(regs)) {
 		const struct fault_info *inf = esr_to_fault_info(esr);
 
@@ -529,6 +619,11 @@ static void do_bad_area(unsigned long far, unsigned long esr,
 	}
 }
 
+/*
+ * 判断 fault 是否应报告 protection-key violation。不能只信 ESR Overlay：
+ * POR_EL0 更新缺 ISB 可产生假 overlay，而无页 translation fault 也可能被
+ * pkey 禁止。直接用当前 VMA pkey+访问类型重算；返回 bool。
+ */
 static bool fault_from_pkey(struct vm_area_struct *vma, unsigned int mm_flags)
 {
 	if (!system_supports_poe())
@@ -552,12 +647,14 @@ static bool fault_from_pkey(struct vm_area_struct *vma, unsigned int mm_flags)
 	 *   to report the correct error code - SEGV_PKUERR - we must handle
 	 *   that case here.
 	 */
+	/* 因此统一让 arch_vma_access_permitted 以 VMA pkey 和本次访问类型重算结论。 */
 	return !arch_vma_access_permitted(vma,
 			mm_flags & FAULT_FLAG_WRITE,
 			mm_flags & FAULT_FLAG_INSTRUCTION,
 			false);
 }
 
+/* 从 data-abort ISS2.GCS 识别硬件 guarded-control-stack 访问。 */
 static bool is_gcs_fault(unsigned long esr)
 {
 	if (!esr_is_data_abort(esr))
@@ -566,6 +663,7 @@ static bool is_gcs_fault(unsigned long esr)
 	return ESR_ELx_ISS2(esr) & ESR_ELx_GCS;
 }
 
+/* 判断异常来自 EL0 instruction abort。 */
 static bool is_el0_instruction_abort(unsigned long esr)
 {
 	return ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_LOW;
@@ -575,11 +673,16 @@ static bool is_el0_instruction_abort(unsigned long esr)
  * Note: not valid for EL1 DC IVAC, but we never use that such that it
  * should fault. EL0 cannot issue DC IVAC (undef).
  */
+/* WnR=1 且非 cache-maintenance 才是写访问；EL1 DC IVAC 例外按调用约束排除。 */
 static bool is_write_abort(unsigned long esr)
 {
 	return (esr & ESR_ELx_WNR) && !(esr & ESR_ELx_CM);
 }
 
+/*
+ * 检查 GCS 操作与 VMA 类型匹配：GCS 指令只能访问 VM_SHADOW_STACK，普通
+ * 写又不能写 shadow stack。无硬件直接 false；返回 true 代表 SEGV_ACCERR。
+ */
 static bool is_invalid_gcs_access(struct vm_area_struct *vma, u64 esr)
 {
 	if (!system_supports_gcs())
@@ -587,16 +690,26 @@ static bool is_invalid_gcs_access(struct vm_area_struct *vma, u64 esr)
 
 	if (unlikely(is_gcs_fault(esr))) {
 		/* GCS accesses must be performed on a GCS page */
+		/* 专用 GCS 指令落到普通 VMA 说明页类型契约不匹配。 */
 		if (!(vma->vm_flags & VM_SHADOW_STACK))
 			return true;
 	} else if (unlikely(vma->vm_flags & VM_SHADOW_STACK)) {
 		/* Only GCS operations can write to a GCS page */
+		/* 普通读取允许，普通写入必须拒绝；合法更新只能由 GCS 指令完成。 */
 		return esr_is_data_abort(esr) && is_write_abort(esr);
 	}
 
 	return false;
 }
 
+/*
+ * 处理可分页的 translation/access/permission fault。far/esr/regs 来自异常
+ * 现场；返回 0 表示已处理（含已发信号/oops 路径）。先由 ESR 形成所需
+ * VM_EXEC/WRITE/READ 与 FAULT_FLAG，再检查 PAN/uaccess、pKVM stage2。
+ * 用户 fault 优先 lock_vma_under_rcu 快路径，RETRY 或非用户退 mmap_lock；
+ * handle_mm_fault 可能释放锁、睡眠、OOM 或返回信号。所有标签都明确当前
+ * 锁所有权，最终将错误翻译为 SIGSEGV/SIGBUS/MCE 或内核 no_context。
+ */
 static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 				   struct pt_regs *regs)
 {
@@ -611,12 +724,14 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	int pkey = -1;
 
 	if (kprobe_page_fault(regs, esr))
+		/* kprobe 在故意探测指令上命中时已调整 regs，不能再进入 MM。 */
 		return 0;
 
 	/*
 	 * If we're in an interrupt or have no user context, we must not take
 	 * the fault.
 	 */
+	/* IRQ/禁 fault 区或内核线程没有可睡眠的用户 mm，只能内核修复/oops。 */
 	if (faulthandler_disabled() || !mm)
 		goto no_context;
 
@@ -629,8 +744,10 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	 * vma->vm_flags & vm_flags and returns an error if the
 	 * intersection is empty
 	 */
+	/* vm_flags 是 VMA 必须具备的权限集合，mm_flags 是传给 MM 的 fault 行为。 */
 	if (is_el0_instruction_abort(esr)) {
 		/* It was exec fault */
+		/* 取指异常要求 VMA 具备 VM_EXEC，并告知 MM 这是 instruction fault。 */
 		vm_flags = VM_EXEC;
 		mm_flags |= FAULT_FLAG_INSTRUCTION;
 	} else if (is_gcs_fault(esr)) {
@@ -639,23 +756,29 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 		 * write so always handle any GCS fault as a write fault,
 		 * we need to trigger CoW even for GCS reads.
 		 */
+		/* GCS 页的读也可能更新受保护栈状态，按写 fault 才会正确 COW 私有页。 */
 		vm_flags = VM_WRITE;
 		mm_flags |= FAULT_FLAG_WRITE;
 	} else if (is_write_abort(esr)) {
 		/* It was write fault */
+		/* 写异常需要可写 VMA，并使 MM 执行 COW/dirty 等写路径。 */
 		vm_flags = VM_WRITE;
 		mm_flags |= FAULT_FLAG_WRITE;
 	} else {
 		/* It was read fault */
+		/* arm64 权限蕴含关系要求同时接受可写 VMA，EPAN 缺失时还接受可执行 VMA。 */
 		vm_flags = VM_READ;
 		/* Write implies read */
+		/* 架构无“只写不可读”普通映射，VM_WRITE 因而满足读访问。 */
 		vm_flags |= VM_WRITE;
 		/* If EPAN is absent then exec implies read */
+		/* 无 Enhanced PAN 时 privileged data read 也可访问 execute-only 用户页。 */
 		if (!alternative_has_cap_unlikely(ARM64_HAS_EPAN))
 			vm_flags |= VM_EXEC;
 	}
 
 	if (is_ttbr0_addr(addr) && is_el1_permission_fault(addr, esr, regs)) {
+		/* EL1 访问用户地址必须来自 exception-table 标记的 uaccess 指令。 */
 		if (is_el1_instruction_abort(esr))
 			die_kernel_fault("execution of user memory",
 					 addr, esr, regs);
@@ -666,6 +789,7 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	}
 
 	if (is_pkvm_stage2_abort(esr)) {
+		/* 用户态注入可报告 ACCERR；内核 stage2 abort 需要更严格 no_context 分类。 */
 		if (!user_mode(regs))
 			goto no_context;
 		arm64_force_sig_fault(SIGSEGV, SEGV_ACCERR, far, "stage-2 fault");
@@ -675,9 +799,11 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, addr);
 
 	if (!(mm_flags & FAULT_FLAG_USER))
+		/* 内核 uaccess fault 不走 per-VMA RCU fast path，使用稳定 mmap_lock。 */
 		goto lock_mmap;
 
 	vma = lock_vma_under_rcu(mm, addr);
+	/* fast path 获取单 VMA read lock；失败不代表无映射，必须退全局查找。 */
 	if (!vma)
 		goto lock_mmap;
 
@@ -706,6 +832,7 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	}
 
 	fault = handle_mm_fault(vma, addr, mm_flags | FAULT_FLAG_VMA_LOCK, regs);
+	/* RETRY/COMPLETED 的锁释放语义由 MM core 定义，其他结果由本函数 vma_end_read。 */
 	if (!(fault & (VM_FAULT_RETRY | VM_FAULT_COMPLETED)))
 		vma_end_read(vma);
 
@@ -718,6 +845,8 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 		mm_flags |= FAULT_FLAG_TRIED;
 
 	/* Quick path to respond to signals */
+	/* MM core 已设置 pending signal 时不再解释其他 fault 位，内核态则走 no_context。 */
+	/* pending signal 优先结束重试；内核 fault 仍不能直接返回用户式结果。 */
 	if (fault_signal_pending(fault, regs)) {
 		if (!user_mode(regs))
 			goto no_context;
@@ -726,6 +855,7 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 lock_mmap:
 
 retry:
+	/* slow path 返回时持 mmap read lock；VMA grow-down 等查找也在 helper 内完成。 */
 	vma = lock_mm_and_find_vma(mm, addr, regs);
 	if (unlikely(!vma)) {
 		fault = 0;
@@ -751,6 +881,7 @@ retry:
 	fault = handle_mm_fault(vma, addr, mm_flags, regs);
 
 	/* Quick path to respond to signals */
+	/* 锁定慢路径也优先响应 MM core 设置的 signal；用户态直接返回，内核态需终结。 */
 	if (fault_signal_pending(fault, regs)) {
 		if (!user_mode(regs))
 			goto no_context;
@@ -758,6 +889,7 @@ retry:
 	}
 
 	/* The fault is fully completed (including releasing mmap lock) */
+	/* COMPLETED 明确表示 MM core 已释放 mmap_lock，本函数不得再次 unlock。 */
 	if (fault & VM_FAULT_COMPLETED)
 		return 0;
 
@@ -769,6 +901,7 @@ retry:
 
 done:
 	/* Handle the "normal" (no error) case first. */
+	/* 成功包括 minor/major 统计位，只要无 VM_FAULT_ERROR 就可重试原指令。 */
 	if (likely(!(fault & VM_FAULT_ERROR)))
 		return 0;
 
@@ -778,6 +911,7 @@ bad_area:
 	 * If we are in kernel mode at this point, we have no context to
 	 * handle this fault with.
 	 */
+	/* bad_area 到此已不持 VMA/mmap 锁；kernel mode 统一转 no_context。 */
 	if (!user_mode(regs))
 		goto no_context;
 
@@ -787,6 +921,7 @@ bad_area:
 		 * userspace (which will retry the fault, or kill us if we got
 		 * oom-killed).
 		 */
+		/* OOM killer 决定杀谁；当前任务若存活，返回 EL0 后会重新 fault。 */
 		pagefault_out_of_memory();
 		return 0;
 	}
@@ -798,6 +933,7 @@ bad_area:
 		 * We had some memory, but were unable to successfully fix up
 		 * this page fault.
 		 */
+		/* SIGBUS 表示地址存在但后端无法提供页，区别于无映射 SIGSEGV。 */
 		arm64_force_sig_fault(SIGBUS, BUS_ADRERR, far, inf->name);
 	} else if (fault & (VM_FAULT_HWPOISON_LARGE | VM_FAULT_HWPOISON)) {
 		unsigned int lsb;
@@ -820,7 +956,9 @@ bad_area:
 		 * 6. T1   : reaches here, sees vma_pkey(vma)=5, when we really
 		 *	     faulted on a pte with its pkey=4.
 		 */
+		/* pkey 只能报告加锁检查时 VMA 的当前值，竞态下不保证等于 fault 瞬间 PTE。 */
 		/* Something tried to access memory that out of memory map */
+		/* bad_area 表示地址不在合法映射或权限不符，按 pkey/普通 SEGV 分别编码。 */
 		if (si_code == SEGV_PKUERR)
 			arm64_force_sig_fault_pkey(far, inf->name, pkey);
 		else
@@ -830,10 +968,12 @@ bad_area:
 	return 0;
 
 no_context:
+	/* 所有无法安全睡眠/无用户上下文/内核错误汇聚到架构修复或 oops。 */
 	__do_kernel_fault(addr, esr, regs);
 	return 0;
 }
 
+/* TTBR0 translation fault 可由用户 MM 补页；TTBR1/空洞地址直接 bad_area。 */
 static int __kprobes do_translation_fault(unsigned long far,
 					  unsigned long esr,
 					  struct pt_regs *regs)
@@ -847,6 +987,7 @@ static int __kprobes do_translation_fault(unsigned long far,
 	return 0;
 }
 
+/* compat 用户可尝试软件未对齐修复；其他情况按 BUS_ADRALN/bad kernel fault。 */
 static int do_alignment_fault(unsigned long far, unsigned long esr,
 			      struct pt_regs *regs)
 {
@@ -857,11 +998,18 @@ static int do_alignment_fault(unsigned long far, unsigned long esr,
 	return 0;
 }
 
+/* fault_info 中无专用恢复的占位 handler，返回 1 请求 do_mem_abort 默认终结。 */
 static int do_bad(unsigned long far, unsigned long esr, struct pt_regs *regs)
 {
+	/* 返回 1 由统一分发器视为未处理；字符串是 fault_info 的默认诊断类别。 */
 	return 1; /* "fault" */
 }
 
+/*
+ * 同步外部异常/内存 ECC 处理。用户态先让 APEI firmware-first 认领并延迟
+ * task_work；否则按 FnV 决定 si_addr 是否可信，去除 UNKNOWN tag，taint
+ * MACHINE_CHECK 后通知 SIGBUS/架构 die。返回 0 表示已完成分发。
+ */
 static int do_sea(unsigned long far, unsigned long esr, struct pt_regs *regs)
 {
 	const struct fault_info *inf;
@@ -874,6 +1022,7 @@ static int do_sea(unsigned long far, unsigned long esr, struct pt_regs *regs)
 		 * APEI claimed this as a firmware-first notification.
 		 * Some processing deferred to task_work before ret_to_user().
 		 */
+		/* APEI=0 表示已认领而非失败，不能再重复发信号。 */
 		return 0;
 	}
 
@@ -885,6 +1034,7 @@ static int do_sea(unsigned long far, unsigned long esr, struct pt_regs *regs)
 		 * UNKNOWN for synchronous external aborts. Mask them out now
 		 * so that userspace doesn't see them.
 		 */
+		/* FnV=1 时整个 FAR 无效，向用户报告 0 而非猜测地址。 */
 		siaddr  = untagged_addr(far);
 	}
 	add_taint(TAINT_MACHINE_CHECK, LOCKDEP_STILL_OK);
@@ -893,6 +1043,10 @@ static int do_sea(unsigned long far, unsigned long esr, struct pt_regs *regs)
 	return 0;
 }
 
+/*
+ * 修正同步 MTE fault FAR 高 tag 位的架构 UNKNOWN 语义。无 MTE_FAR 能力时
+ * 仅保留定义的逻辑 tag、其余取 untagged 地址；随后走 bad_area 发 MTESERR。
+ */
 static int do_tag_check_fault(unsigned long far, unsigned long esr,
 			      struct pt_regs *regs)
 {
@@ -902,6 +1056,7 @@ static int do_tag_check_fault(unsigned long far, unsigned long esr,
 	 * address if ARM64_MTE_FAR isn't supported.
 	 * Otherwise, bits 63:60 of FAR_EL1 are not UNKNOWN.
 	 */
+	/* 旧 CPU 用 untagged 地址补齐 UNKNOWN 高 nibble，同时保留真正的 MTE logical tag。 */
 	if (!cpus_have_cap(ARM64_MTE_FAR))
 		far = (__untagged_addr(far) & ~MTE_TAG_MASK) | (far & MTE_TAG_MASK);
 
@@ -909,6 +1064,10 @@ static int do_tag_check_fault(unsigned long far, unsigned long esr,
 	return 0;
 }
 
+/*
+ * 以 6-bit FSC 为索引的完整 dispatch table。每项绑定 handler、默认 signal、
+ * si_code 与诊断名；数组位置就是硬件 ABI，unknown/reserved 项也必须占位。
+ */
 static const struct fault_info fault_info[] = {
 	{ do_bad,		SIGKILL, SI_KERNEL,	"ttbr address size fault"	},
 	{ do_bad,		SIGKILL, SI_KERNEL,	"level 1 address size fault"	},
@@ -976,6 +1135,11 @@ static const struct fault_info fault_info[] = {
 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 63"			},
 };
 
+/*
+ * memory abort 公共入口。按 FSC 调 handler；返回 0 即恢复/信号已处理。非零
+ * 时 kernel 直接 oops，user 使用表中 signal/code 并只暴露 untagged FAR。
+ * NOKPROBE 防止 kprobe 递归插桩异常总入口。
+ */
 void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
 {
 	const struct fault_info *inf = esr_to_fault_info(esr);
@@ -992,10 +1156,12 @@ void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
 	 * have been defined as UNKNOWN. Therefore we only expose the untagged
 	 * address to the signal handler.
 	 */
+	/* 未识别 FSC 的 FAR tag 位可能 UNKNOWN，默认通知必须使用 addr。 */
 	arm64_notify_die(inf->name, regs, inf->sig, inf->code, addr, esr);
 }
 NOKPROBE_SYMBOL(do_mem_abort);
 
+/* SP/PC 对齐异常固定映射为 SIGBUS/BUS_ADRALN；同样禁止 kprobe。 */
 void do_sp_pc_abort(unsigned long addr, unsigned long esr, struct pt_regs *regs)
 {
 	arm64_notify_die("SP/PC alignment exception", regs, SIGBUS, BUS_ADRALN,
@@ -1005,6 +1171,11 @@ NOKPROBE_SYMBOL(do_sp_pc_abort);
 
 /*
  * Used during anonymous page fault handling.
+ */
+/*
+ * 为匿名 fault 分配 order-0 可移动零 folio。VMA 有 VM_MTE 时附加 ZEROTAGS，
+ * 让分配器一次完成数据清零和 tag 初始化，避免 DC ZVA+STGM 两遍。返回 folio
+ * 或 NULL，所有权按 vma_alloc_folio 契约交 fault 路径。
  */
 struct folio *vma_alloc_zeroed_movable_folio(struct vm_area_struct *vma,
 						unsigned long vaddr)
@@ -1016,12 +1187,18 @@ struct folio *vma_alloc_zeroed_movable_folio(struct vm_area_struct *vma,
 	 * point of allocation and page zeroing as this is usually faster than
 	 * separate DC ZVA and STGM.
 	 */
+	/* 合并数据与 tag 初始化减少一次遍历；分配器返回前已建立“零数据+有效 tag”状态。 */
 	if (vma->vm_flags & VM_MTE)
 		flags |= __GFP_ZEROTAGS;
 
 	return vma_alloc_folio(flags, 0, vma, vaddr);
 }
 
+/*
+ * 初始化连续 numpages 页的 MTE tags，可选同时清数据。无 MTE 返回 clear_pages，
+ * 告诉调用者是否仍需普通 clear_highpage；有 MTE 则逐页取得 tagging 状态，
+ * 执行 tag-only 或 data+tag 清理并置 page flag，最终 false 表示无需再清。
+ */
 bool tag_clear_highpages(struct page *page, int numpages, bool clear_pages)
 {
 	/*
@@ -1029,10 +1206,12 @@ bool tag_clear_highpages(struct page *page, int numpages, bool clear_pages)
 	 * get_huge_zero_folio() unconditionally passes __GFP_ZEROTAGS and
 	 * post_alloc_hook() will invoke tag_clear_highpages().
 	 */
+	/* huge zero folio 即使无 MTE 也请求 ZEROTAGS，因此必须明确退回数据清零责任。 */
 	if (!system_supports_mte())
 		return clear_pages;
 
 	/* Newly allocated pages, shouldn't have been tagged yet */
+	/* try_page_mte_tagging 取得每页首次 tag 初始化权；命中旧状态说明生命周期异常。 */
 	for (int i = 0; i < numpages; i++, page++) {
 		WARN_ON_ONCE(!try_page_mte_tagging(page));
 		if (clear_pages)
