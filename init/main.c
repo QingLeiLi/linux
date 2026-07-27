@@ -1432,6 +1432,7 @@ void start_kernel(void)
 	/* 标记 boot CPU 为在线状态，初始化 CPU 位图 */
 	boot_cpu_init();
 
+	// @todo
 	/* 初始化高端内存（highmem）的页地址哈希表（32位系统需要） */
 	/*
 		背景：highmem 问题
@@ -1594,6 +1595,7 @@ void start_kernel(void)
 	*/
 	static_call_init();
 
+	// @todo
 	/* LSM（Linux 安全模块，如 SELinux）早期初始化 */
 	// 初始化 lockdown，进行内核完整性保护
 	early_security_init();
@@ -1688,6 +1690,7 @@ void start_kernel(void)
 	/* 分配内核日志缓冲区（dmesg 的存储区域） */
 	setup_log_buf(0);
 
+	// @todo
 	/* VFS 缓存早期初始化（dcache/inode cache 的哈希表，需要大量内存） */
 	vfs_caches_init_early();
 

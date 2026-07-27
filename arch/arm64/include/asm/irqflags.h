@@ -1,5 +1,28 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
+ * arm64 IRQ flags 架构原语学习导读
+ *
+ * 中文学习注释模型：OpenAI GPT-5.4（2026-07-27）。
+ *
+ * 本头文件实现 include/linux/irqflags.h 所依赖的 arch_local_irq_*：
+ * - 普通系统以 PSTATE.DAIF 的 I/F mask 控制 IRQ；
+ * - 启用并实际支持 priority masking 时，以 GICv3 ICC_PMR_EL1 区分
+ *   普通 IRQ 与更高优先级 pseudo-NMI。
+ *
+ * system_uses_irq_prio_masking() 在系统能力确定后选择统一运行模式，因此
+ * 同一份 flags 始终由匹配的 DAIF 或 PMR helper 保存、判断和恢复。
+ * flags 是当前 CPU 的不透明寄存器快照，不能跨 CPU 或跨模式解释。
+ *
+ * local disable 只关闭当前 CPU 的普通 IRQ 接收窗口，不形成跨 CPU
+ * mutual exclusion。barrier() 约束编译器跨越 IRQ 边界重排，但不是
+ * SMP 内存屏障；需要设备/CPU 可见性顺序的调用者仍须使用 dmb/dsb 等
+ * 与具体共享协议匹配的屏障。
+ *
+ * PMR 写入开中断方向时通过 pmr_sync() 保证优先级屏蔽变化已被 PE/GIC
+ * 观察；支持 relaxed sync 的 CPU 可由 alternatives 把重同步序列优化掉。
+ * 代价是 pseudo-NMI 模式的 save/restore 比直接 DAIF 指令更复杂。
+ */
+/*
  * Copyright (C) 2012 ARM Ltd.
  */
 #ifndef __ASM_IRQFLAGS_H
@@ -19,6 +42,29 @@
  * flags. Keeping to this order makes it easier for entry.S to know which
  * exceptions should be unmasked.
  */
+/*
+ * 中文对译：
+ * AArch64 在 DAIF 中保存 Debug、Asynchronous SError、IRQ 和 FIQ 四类
+ * 异常的屏蔽标志，并按 D、A、I、F 顺序管理。屏蔽 Debug 会连带屏蔽
+ * 其他异常；屏蔽 SError 会屏蔽 IRQ/FIQ 但不屏蔽 Debug；IRQ 与 FIQ
+ * 总是一起开关且不改变 D/A。固定顺序让 entry.S 容易判断应恢复哪些
+ * 异常。
+ *
+ * 修正与版本补充：
+ * - `msr daifset/daifclr, #3` 中的 #3 是指令立即数里选择 I/F 的编码，
+ *   不是 arch_local_save_flags() 返回值的 bit1/bit0；保存后的 PSTATE
+ *   快照应使用 PSR_I_BIT/PSR_F_BIT（分别位于 bit7/bit6）解释。
+ * - GIC 优先级数值越小优先级越高。当前定义中 IRQON
+ *   (GICV3_PRIO_UNMASKED=0xe0) 数值大于 IRQOFF
+ *   (GICV3_PRIO_IRQ=0xc0)，所以 IRQON 更宽松、IRQOFF 更严格；不能把
+ *   “阈值高低”直接等同于寄存器数值高低。
+ * - 当前 GICv3 实现按 running priority 识别 pseudo-NMI，并进入
+ *   generic_handle_domain_nmi()；它不是简单地把所有 pseudo-NMI 描述
+ *   为 FIQ。DAIF 与 PMR 会在 entry/irqchip 代码中协同管理。
+ * - barrier() 是编译器屏障，不独自保证其他 CPU 或设备已经观察到写入。
+ *   pmr_sync() 保证 PMR 更新生效；pending IRQ 在旧阈值下至多延后投递，
+ *   不应描述为硬件把中断永久“漏掉”。
+ */
 
 /*
  * __daif_local_irq_enable - 通过 DAIF 寄存器开启中断（传统路径）
@@ -27,10 +73,20 @@
  * 置 1 表示屏蔽，清 0 表示允许。daifclr 是只写寄存器，写入哪些位
  * 就清零哪些位，不影响其余位（D、A 保持不变）。
  */
+/*
+ * 修正说明：这里的 bit1/bit0 是 daifclr 指令立即数选择 I/F 的编码，
+ * 不是读取 DAIF 后 flags 的实际位号；寄存器快照应按 PSR_I_BIT 和
+ * PSR_F_BIT 解释。
+ */
 static __always_inline void __daif_local_irq_enable(void)
 {
 	/* 编译器屏障：禁止编译器将临界区内的内存访问重排到开中断指令之后，
 	 * 确保临界区的所有操作对后续中断处理程序可见。 */
+	/*
+	 * 修正说明：barrier() 只保证编译器不跨越此处重排，不是硬件发布
+	 * 屏障；“可见”仅指当前编译单元的顺序，跨 CPU/设备协议仍需专用
+	 * 内存屏障。
+	 */
 	barrier();
 	/* daifclr, #3 = 0b0011：同时清零 I(bit1) 和 F(bit0)，
 	 * 一次指令开启 IRQ 和 FIQ，MSR 对当前 CPU 立即生效。 */
@@ -49,6 +105,12 @@ static __always_inline void __daif_local_irq_enable(void)
  *   GIC_PRIO_IRQOFF = 优先级阈值高  → 普通中断被 GIC 拦截（关中断状态）
  * 伪 NMI 使用的 FIQ 优先级始终高于 IRQOFF 阈值，因此无论 PMR 如何设置
  * 都能穿透到达 CPU，实现"不可屏蔽"语义。
+ */
+/*
+ * 修正说明：当前 GICv3 priority masking 通过更高优先级中断和 running
+ * priority 识别 pseudo-NMI，并不应笼统等同于 FIQ。IRQON=0xe0 比
+ * IRQOFF=0xc0 数值更大、允许范围更宽；此处“阈值低/高”应理解为屏蔽
+ * 严格程度，而不是 PMR 寄存器数值。
  */
 static __always_inline void __pmr_local_irq_enable(void)
 {
@@ -69,6 +131,10 @@ static __always_inline void __pmr_local_irq_enable(void)
 	 * 执行，导致本应触发的中断被漏掉（GIC 仍按旧阈值过滤）。
 	 * 关中断路径（__pmr_local_irq_disable）无需此调用，因为收紧阈值即使
 	 * 有短暂窗口也不会导致额外中断提前到达。 */
+	/*
+	 * 修正说明：pmr_sync() 保证优先级屏蔽更新已经生效；在旧阈值仍
+	 * 有效的短窗口中，pending IRQ 会延后而非永久“漏掉”。
+	 */
 	pmr_sync();
 	/* 编译器屏障：禁止编译器将开中断之后的代码提前到屏蔽窗口内。 */
 	barrier();
@@ -103,6 +169,10 @@ static __always_inline void arch_local_irq_enable(void)
  *   F(bit0) - FIQ
  * daifset 是只写寄存器，写入哪些位就将那些位置 1（屏蔽对应异常），
  * 不影响 D、A 位，符合文件头注释中描述的"按 DAIF 顺序操作"的原则。
+ */
+/*
+ * 修正说明：#3 是 daifset 立即数字段对 I/F 的选择编码；读取到的 DAIF
+ * 快照仍使用架构定义的 PSR_I_BIT/PSR_F_BIT 位号。
  */
 static __always_inline void __daif_local_irq_disable(void)
 {
@@ -151,6 +221,11 @@ static __always_inline void __daif_local_irq_disable(void)
 
 		编译器不是被迫"关注顺序"，而是被迫放弃它关于内存状态的所有缓存推断，从而不敢做跨越屏障的重排。
 	*/
+	/*
+	 * 修正说明：上述示例只描述编译器优化边界。barrier() 不刷新 cache、
+	 * 不向其他 CPU 发布写入，也不替代 dmb/dsb；硬件内存顺序必须由
+	 * 被保护数据的并发协议另行保证。
+	 */
 	barrier();
 	/* daifset, #3 = 0b0011：同时将 I(bit1) 和 F(bit0) 置 1，
 	 * 一次指令屏蔽 IRQ 和 FIQ。MSR 写 DAIF 对当前 CPU 立即生效，
@@ -172,6 +247,11 @@ static __always_inline void __daif_local_irq_disable(void)
  * 与 __pmr_local_irq_enable() 不同，此路径不需要 pmr_sync()：
  * 关中断是收紧阈值，即使 GIC 有短暂窗口尚未感知新阈值，也不会导致
  * 额外中断提前到达；开中断才需要等 GIC 确认，防止中断被漏送。
+ */
+/*
+ * 修正说明：priority masking 不应简单描述为“用 FIQ 模拟 NMI”；当前
+ * irq-gic-v3 依据优先级识别并走 NMI domain。同步的目的也是保证 PMR
+ * 新值生效，未满足新阈值的 pending 中断会延后处理而非永久丢失。
  */
 static __always_inline void __pmr_local_irq_disable(void)
 {
@@ -348,6 +428,11 @@ static __always_inline bool arch_irqs_disabled(void)
  * 注意：读取和写入之间不是原子的，但在单 CPU 上下文中这不是问题，
  * 因为中断尚未关闭时不会有其他路径修改当前 CPU 的 DAIF。
  */
+/*
+ * 修正说明：save 与 disable 是有确定顺序的两条本地操作，不是单条原子
+ * read-modify-write。二者之间可以发生一次 IRQ；异常返回会恢复被打断
+ * 的 PSTATE，随后 disable 仍建立临界区，因此保存的入口状态保持有效。
+ */
 static __always_inline unsigned long __daif_local_irq_save(void)
 {
 	/* 先保存当前 DAIF 值，此时中断可能是开启的。 */
@@ -439,6 +524,10 @@ static __always_inline void __pmr_local_irq_restore(unsigned long flags)
 	 * restore 可能是从 IRQOFF 恢复到 IRQON（即开中断），
 	 * 此时必须同步，确保 GIC 重新开始投递中断后 CPU 不会漏掉已排队的中断。
 	 * 若 restore 的目标是 IRQOFF（嵌套关中断场景），sync 虽多余但无害。 */
+	/*
+	 * 修正说明：同步保证恢复后的 PMR 状态已生效；已 pending 的中断不会
+	 * 因缺少同步永久消失，但 CPU 可能在旧屏蔽状态仍有效时继续执行。
+	 */
 	pmr_sync();
 	/* 编译器屏障：防止 restore 之后的代码提前到临界区内。 */
 	barrier();
@@ -462,3 +551,4 @@ static __always_inline void arch_local_irq_restore(unsigned long flags)
 }
 
 #endif /* __ASM_IRQFLAGS_H */
+/* 结束 __ASM_IRQFLAGS_H 头文件防重复包含范围。 */
