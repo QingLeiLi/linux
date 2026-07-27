@@ -14,6 +14,18 @@
  * 并撤销镜像 VA 映射，但保留 VA 洞以满足 kallsyms/module 布局约束。
  */
 /*
+ * 补充说明：
+ *
+ * 中文学习注释生成模型：OpenAI GPT-5 Codex（2026-07-27）。
+ * 源码分析基线：doc/lql 分支，commit f8f7ac7435bf。
+ * 宏观学习入口：doc/09 linux-memory-management-internals.md。
+ *
+ * 本文件不建立最终线性页表，页表映射由 mmu.c 完成；它负责先把固件 RAM
+ * 描述裁成“CPU 能寻址且 linear map 能覆盖”的集合，再按顺序把所有权从
+ * memblock 早期分配器交给 NUMA/伙伴分配器。正常路径无运行期并发，主要
+ * 正确性来自单位换算、exclusive 边界和不可交换的初始化阶段。
+ */
+/*
  * Based on arch/arm/mm/init.c
  *
  * Copyright (C) 1995-2005 Russell King
@@ -122,6 +134,12 @@ phys_addr_t __ro_after_init arm64_dma_phys_limit;
  * 无配置/无有效参数时空操作；crash_size/base/low_size 单位字节，high 表示
  * 可放高端。预留必须早于标准资源树发布，失败由通用解析/日志策略处理。
  */
+/*
+ * 契约补充：由 bootmem_init() 在 boot CPU 的 __init 单线程上下文调用，
+ * 无入参、无直接返回值。局部 size/base 均为物理字节数/地址，ret 仅承接
+ * parse errno；解析失败不改变 memblock，成功后预留区所有权交给 crash
+ * kernel，后续资源树据此标记。helper 可能修改 memblock，但不睡眠。
+ */
 static void __init arch_reserve_crashkernel(void)
 {
 	unsigned long long low_size = 0;
@@ -142,6 +160,13 @@ static void __init arch_reserve_crashkernel(void)
 }
 
 /* 把 zone 物理上限裁到实际 DRAM 的 exclusive 末端，避免减一时越界。 */
+/*
+ * max_zone_phys - 计算不超过实际 DRAM 的 zone 物理开区间上界。
+ *
+ * zone_limit 是候选物理字节地址上界；__init 纯计算、不睡眠。返回
+ * min(zone_limit, DRAM 最后一字节+1)，无全局副作用。memblock 至少含
+ * 有效 DRAM 是调用前置条件。
+ */
 static phys_addr_t __init max_zone_phys(phys_addr_t zone_limit)
 {
 	return min(zone_limit, memblock_end_of_DRAM() - 1) + 1;
@@ -150,6 +175,12 @@ static phys_addr_t __init max_zone_phys(phys_addr_t zone_limit)
 /*
  * 向通用 page allocator 输出各 zone 的最大 PFN（exclusive）。数组由调用者
  * 提供；DMA/DMA32 按构建配置填充，NORMAL 总到 max_pfn。只读全局边界。
+ */
+/*
+ * 契约补充：max_zone_pfns 是通用 free-area 初始化提供的非 NULL 输出数组，
+ * 调用前由调用者拥有，函数只写已编译 zone 槽且不保留指针。boot CPU
+ * __init 上下文、不睡眠、无返回值；dma32_phys_limit 单位物理字节，
+ * PFN_DOWN 后所有输出单位为 exclusive PFN。
  */
 void __init arch_zone_limits_init(unsigned long *max_zone_pfns)
 {
@@ -169,6 +200,11 @@ void __init arch_zone_limits_init(unsigned long *max_zone_pfns)
  * 综合 ACPI IORT、DT dma-ranges、32-bit 设备传统约束与 RAM 末端，确定
  * zone_dma_limit/arm64_dma_phys_limit。没有 DMA zone 时退到整个 PHYS_MASK
  * 可寻址范围。启动串行，无返回。
+ */
+/*
+ * 契约补充：由 bootmem_init() 在 CMA 预留前调用；无入参、无直接返回。
+ * ACPI/DT limit 和 dma32 limit 均为物理字节开区间上界。成功后
+ * arm64_dma_phys_limit 非零并冻结，供 zone、CMA、SWIOTLB 共同读取。
  */
 static void __init dma_limits_init(void)
 {
@@ -204,6 +240,11 @@ static void __init dma_limits_init(void)
  * 判断 pfn 是否对应 linear map 可访问的 memblock memory。先 PFN->PA->PFN
  * 回验防止超宽 bogus PFN 在移位时截断产生假阳性；返回 1/0，不取得 page 引用。
  */
+/*
+ * 契约补充：pfn 是绝对物理页帧号，不是相对 PHYS_PFN_OFFSET 的索引。
+ * 运行期查询可在原子上下文调用，不睡眠；只读初始化后稳定的 memblock
+ * memory 类型。返回 1 表示可由 linear map 访问，0 表示越界、hole 或 NOMAP。
+ */
 int pfn_is_map_memory(unsigned long pfn)
 {
 	phys_addr_t addr = PFN_PHYS(pfn);
@@ -224,6 +265,14 @@ static phys_addr_t memory_limit __ro_after_init = PHYS_ADDR_MAX;
  * Limit the memory size that was specified via FDT.
  */
 /* 解析 mem=<size>，向下页对齐后发布 memory_limit；缺参数返回 1，成功 0。 */
+/*
+ * early_mem - 处理 early_param 的 mem= 字符串。
+ *
+ * p 是启动命令行缓冲区中的借用、可推进指针，非 NULL 时由 memparse()
+ * 读取但本函数不保留。boot CPU 早期上下文、不睡眠。返回 1 表示缺少
+ * 参数，返回 0 表示已把字节限制向下页对齐并写入 memory_limit；
+ * 无资源回滚。
+ */
 static int __init early_mem(char *p)
 {
 	if (!p)
@@ -241,6 +290,16 @@ early_param("mem", early_mem);
  * PA 位宽、linear VA 窗口和 mem= 限制之外区间，选择对齐 memstart_addr，
  * 必要时重新加入 kernel/initrd，最后保留镜像并扫描 DT reserved-memory。
  * 成功后所有保留 RAM 均能由 __phys_to_virt 覆盖。
+ */
+/*
+ * 契约补充：由 setup_arch() 在 boot CPU、memblock 可修改而伙伴分配器尚未
+ * 启动时调用；无入参/返回且不睡眠。linear_region_size 单位字节，是当前
+ * PAGE_END 与实际 vabits 起点间可用窗口。函数原地修改 memblock.memory/
+ * reserved、memstart_addr 和 initrd VA；memblock helper 失败由启动期
+ * panic/告警策略处理，没有可返回给调用者的部分成功状态。
+ *
+ * 阶段顺序为：PA 位宽裁剪 -> 选择/移动 linear 基址 -> mem= 裁剪并恢复
+ * kernel/initrd -> 预留正在使用的镜像 -> 接纳 DT reserved-memory。
  */
 void __init arm64_memblock_init(void)
 {
@@ -366,6 +425,12 @@ void __init arm64_memblock_init(void)
  * early memtest，再发布 min/max PFN；KVM hyp 和 DMA limit 必须早于 CMA，
  * crashkernel 必须早于资源树。无返回，严重子系统失败由各 helper panic/降级。
  */
+/*
+ * 契约补充：调用时 arm64_memblock_init() 已完成；boot CPU __init 上下文，
+ * 无入参/返回。min/max 是 DRAM 的 inclusive/exclusive PFN 边界。成功后
+ * min/max_pfn、NUMA、KVM hyp、DMA limit、CMA 和 crashkernel 预留均已
+ * 建立，下一步可初始化 zone/伙伴分配器。
+ */
 void __init bootmem_init(void)
 {
 	unsigned long min, max;
@@ -400,6 +465,13 @@ void __init bootmem_init(void)
 }
 
 /* 把静态 empty_zero_page 的镜像物理地址转换为全局 struct page。 */
+/*
+ * arch_setup_zero_pages - 发布架构共享零页的 struct page 指针。
+ *
+ * 无入参/返回；boot CPU __init 上下文、不睡眠。empty_zero_page 是链接器
+ * 镜像对象，先用 __pa_symbol() 得物理地址，再从 vmemmap 取借用 page；
+ * 不增加页引用，该静态页生命周期覆盖整个内核运行。
+ */
 void __init arch_setup_zero_pages(void)
 {
 	__zero_page = phys_to_page(__pa_symbol(empty_zero_page));
@@ -409,6 +481,12 @@ void __init arch_setup_zero_pages(void)
  * 伙伴分配器前配置 SWIOTLB 与页表布局编译期约束。RAM 超 DMA limit 或 Realm
  * 强制 bounce；小系统仅为 unaligned kmalloc bounce 缩小 buffer。函数还在
  * 极小大页系统默认开启 overcommit，避免页粒度导致可用内存无法启动。
+ */
+/*
+ * 契约补充：伙伴分配器正式发布前在 boot CPU 调用，无入参/返回。
+ * flags 是 SWIOTLB 初始化策略位图，swiotlb 表示是否需要启用 bounce。
+ * 函数可分配 SWIOTLB 早期内存并产生日志，但不进入普通可睡眠分配路径。
+ * 完成后页表层数不变量已由 BUILD_BUG_ON 证明，SWIOTLB 策略已固定。
  */
 void __init arch_mm_preinit(void)
 {
@@ -466,6 +544,13 @@ void __init arch_mm_preinit(void)
 bool page_alloc_available __ro_after_init;
 
 /* 发布 page allocator 可用，并让 SWIOTLB 根据最终 direct-map 属性更新缓冲区。 */
+/*
+ * mem_init - arm64 伙伴分配器发布后的架构收尾。
+ *
+ * 无入参/返回；启动单线程上下文。先把 page_alloc_available 置 true，
+ * 再让 SWIOTLB 按最终内存属性更新已分配缓冲区；发布后早期架构代码可以
+ * 选择普通页分配器。该状态只发生一次 false->true 转换。
+ */
 void __init mem_init(void)
 {
 	page_alloc_available = true;
@@ -476,6 +561,12 @@ void __init mem_init(void)
  * 释放内核 __init 物理页并撤销其镜像虚拟映射。lm_alias 取得线性别名交给
  * free_reserved_area，填 poison 后归伙伴；随后 vunmap 原 kernel image VA，
  * 但保留 VA 区域不供模块复用，避免 kallsyms 对地址归属产生歧义。
+ */
+/*
+ * 契约补充：由通用 init 释放阶段调用，无入参/返回。lm_init_begin/end 是
+ * 同一 __init 镜像物理页的 linear-map 别名，均为借用地址。函数先把物理页
+ * 交给伙伴分配器，再撤销 image alias 页表；跨过 free_reserved_area()
+ * 后这些内容不可再访问，且没有失败回滚。
  */
 void free_initmem(void)
 {
@@ -497,6 +588,12 @@ void free_initmem(void)
 }
 
 /* panic/oops 诊断打印 mem= 限制，默认状态明确输出 none。 */
+/*
+ * dump_mem_limit - 在 panic notifier 中输出最终 mem= 策略。
+ *
+ * 无入参/返回；panic 原子上下文，不可睡眠。只读 __ro_after_init 的
+ * memory_limit，通过 pr_emerg 输出 MiB 或 none，无 ownership 副作用。
+ */
 void dump_mem_limit(void)
 {
 	if (memory_limit != PHYS_ADDR_MAX) {
@@ -518,6 +615,16 @@ static u64 module_plt_base __ro_after_init = 0;
 /*
  * 从所有能完整包住 [start,end) 的 size 窗口中随机选择页对齐基址。区间
  * 已不小于窗口返回 0 表示无解；否则返回 start 向下随机 0..max_pgoff 页。
+ */
+/*
+ * 学习契约：
+ * - size、start、end 都是字节单位的内核虚拟地址量，调用者保证
+ *   start < end，并且边界已按页对齐；
+ * - 候选窗口写作 [base, base + size)，要覆盖目标区间就必须满足
+ *   end - size <= base <= start。这里把可向低地址移动的距离换算成页数，
+ *   再均匀抽取一个偏移；
+ * - 0 是“没有可行窗口”的哨兵值，不是可供模块分配的有效基址。
+ *   函数只做算术和随机数读取，不预留虚拟地址，也不建立页表。
  */
 static u64 __init random_bounding_box(u64 size, u64 start, u64 end)
 {
@@ -556,6 +663,18 @@ static u64 __init random_bounding_box(u64 size, u64 start, u64 end)
  * 根据 kernel image 尺寸与 KASLR 选择 128MiB direct CALL26 窗口和 2GiB
  * PREL32/PLT 窗口。返回 0；基址为 0 表示对应策略不可用。128M 窗口被
  * 强制选为 2G 子集，简化模块同时满足数据重定位和代码分支的证明。
+ */
+/*
+ * 学习契约：
+ * - 仅在 init 阶段由 execmem_arch_setup() 调用，此时 _text/_end 和
+ *   kaslr_enabled() 已稳定，尚未有模块依赖这两个全局窗口；
+ * - 输出写入 __ro_after_init 的 module_direct_base/module_plt_base。
+ *   本函数不分配模块地址；稍后的 execmem 分配器才在这些边界内取区间；
+ * - KASLR 关闭时窗口锚定 kernel_end，便于得到确定边界；KASLR 开启时
+ *   随机化可行窗口。内核过大或配置要求完整随机化时，direct 窗口可以
+ *   留空，调用者据此接受 PLT 路径；
+ * - 当前实现没有可传播的运行期错误，始终返回 0。真正的“不适用”通过
+ *   基址 0 编码，而不是 errno。
  */
 static int __init module_init_limits(void)
 {
@@ -608,6 +727,18 @@ static struct execmem_info execmem_info __ro_after_init;
  * 构造 arm64 execmem 分配策略并返回静态对象。模块优先 128MiB 免 PLT 区，
  * 失败退 2GiB PLT 区；kprobe/BPF 使用整个 vmalloc，但分别 ROX/可写初始属性。
  * 返回指针永久有效，无分配失败；alignment=1 表示无额外架构对齐约束。
+ */
+/*
+ * 学习契约：
+ * - 在通用 execmem 初始化期间调用一次；返回值指向本文件静态对象，
+ *   调用者只借用该描述，不负责释放；
+ * - EXECMEM_DEFAULT 的 PAGE_KERNEL 表示模块装载时先可写，最终权限收紧由
+ *   模块加载流程负责。KPROBES 直接要求 ROX，而 BPF 仍需写入生成的指令；
+ * - start/end 都是半开虚拟地址区间。direct 范围是首选，PLT 范围仅在
+ *   首选分配失败时作为 fallback；不存在 direct 范围时，PLT 范围升为
+ *   主范围；
+ * - 此函数只发布地址和属性策略，不分配页、不修改页表，也不接管后来
+ *   execmem 对象或可执行内存的生命周期。
  */
 struct execmem_info __init *execmem_arch_setup(void)
 {
