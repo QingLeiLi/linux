@@ -2112,6 +2112,14 @@ static void vmstat_shepherd(struct work_struct *w);
 
 static DECLARE_DEFERRABLE_WORK(shepherd, vmstat_shepherd);
 
+/*
+ * vmstat_flush_workqueue() - 排空承载 per-CPU vmstat 更新的专用 workqueue。
+ *
+ * 入参：无；返回：无直接返回值。flush_workqueue() 可能睡眠，返回时调用前排入
+ * mm_percpu_wq 的 work 已完成，但 deferrable shepherd 或返回后新入队工作不因
+ * 此永久停止。housekeeping_update() 用它划清旧 unbound affinity 工作与新
+ * DOMAIN 掩码传播的边界，避免 vmstat worker 在 pool 重配期间仍依赖旧目标。
+ */
 void vmstat_flush_workqueue(void)
 {
 	flush_workqueue(mm_percpu_wq);

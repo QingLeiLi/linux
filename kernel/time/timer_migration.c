@@ -1596,13 +1596,33 @@ static void tmigr_cpu_unisolate(struct work_struct *ignored)
  * back to the hierarchy.
  * Functions to isolate/unisolate need to be called locally and can sleep.
  */
+/*
+ * tmigr_isolated_exclude_cpumask() - 让 timer migration 层次跟随隔离 CPU 集合。
+ *
+ * @exclude_cpumask 是 cpuset/启动初始化构造的借用输入掩码，表示应排除出 timer
+ * migration hierarchy 的 CPU；函数不修改、不保存也不释放它。
+ * 调用者位于可睡眠进程上下文。函数分配每 CPU work 和临时 cpumask，持有
+ * cpus_read_lock 稳定 online 集合，并把 isolate/unisolate 操作投递到目标 CPU
+ * 本地执行后逐项 flush，因此返回前所有成功调度的状态转换均已完成。
+ *
+ * 返回 0 表示层次已与新集合收敛；临时对象分配失败返回 -ENOMEM，且失败发生在
+ * 任何 CPU 状态变化前。__free cleanup 属性保证所有 return 都自动释放 works
+ * 和 cpumask；它只结构化 ownership，不改变 work 必须先 flush 的同步要求。
+ */
 int tmigr_isolated_exclude_cpumask(struct cpumask *exclude_cpumask)
 {
+	/*
+	 * 变量地图：
+	 *   works   每个 CPU 一个同步 work，离开作用域时 free_percpu；
+	 *   cpumask 当前阶段需要发生状态转换的在线 CPU 临时集合；
+	 *   cpu     遍历目标 CPU 编号。
+	 */
 	struct work_struct __percpu *works __free(free_percpu) =
 		alloc_percpu(struct work_struct);
 	cpumask_var_t cpumask __free(free_cpumask_var) = CPUMASK_VAR_NULL;
 	int cpu;
 
+	/* 两次分配都在修改全局 timer migration 状态前完成，失败可干净返回。 */
 	if (!works)
 		return -ENOMEM;
 	if (!alloc_cpumask_var(&cpumask, GFP_KERNEL))
@@ -1612,10 +1632,20 @@ int tmigr_isolated_exclude_cpumask(struct cpumask *exclude_cpumask)
 	 * First set previously isolated CPUs as available (unisolate).
 	 * This cpumask contains only CPUs that switched to available now.
 	 */
+	/*
+	 * 第一阶段先把“旧策略排除、但新策略不再排除”的在线 CPU 恢复为 available。
+	 * 临时 cpumask 只包含本次刚转为可用的 CPU。先 unisolate 再 isolate 可使层次
+	 * 在过渡中拥有更多而非更少迁移目标，降低暂时无可用 migrator 的风险。
+	 */
+	/*
+	 * scope guard 在函数退出时自动 cpus_read_unlock()；该读锁稳定 cpu_online_mask
+	 * 并阻止目标 CPU 在本地 work 执行/flush 期间被并发下线。
+	 */
 	guard(cpus_read_lock)();
 	cpumask_andnot(cpumask, cpu_online_mask, exclude_cpumask);
 	cpumask_andnot(cpumask, cpumask, tmigr_available_cpumask);
 
+	/* 每个状态操作必须在对应 CPU 本地执行，先全部排队再统一等待以允许并行推进。 */
 	for_each_cpu(cpu, cpumask) {
 		struct work_struct *work = per_cpu_ptr(works, cpu);
 
@@ -1630,11 +1660,22 @@ int tmigr_isolated_exclude_cpumask(struct cpumask *exclude_cpumask)
 	 * This cpumask contains only CPUs that switched to not available now.
 	 * There cannot be overlap with the newly available ones.
 	 */
+	/*
+	 * 第二阶段再把“新策略要求排除、当前仍 available”的 CPU 隔离。该集合与
+	 * 上一阶段刚恢复的集合按定义不重叠；再与 KERNEL_NOISE housekeeper 相交，
+	 * 只处理 timer migration 逻辑实际认为可承接内核噪声的 CPU。
+	 */
 	cpumask_and(cpumask, exclude_cpumask, tmigr_available_cpumask);
 	cpumask_and(cpumask, cpumask, housekeeping_cpumask(HK_TYPE_KERNEL_NOISE));
 	/*
 	 * Handle this here and not in the cpuset code because exclude_cpumask
 	 * might include also the tick CPU if included in isolcpus.
+	 */
+	/*
+	 * 这项处理放在 timer migration 内而非 cpuset：exclude_cpumask 也可能包含
+	 * isolcpus 指定的 tick_do_timer_cpu。该 CPU 代表 full-dynticks CPU 承担
+	 * timekeeping 等 housekeeping，在 nohz_full 启用时不可下线，也不能从迁移
+	 * 层次排除。当前实现找到它后从本批次清除并停止搜索。
 	 */
 	for_each_cpu(cpu, cpumask) {
 		if (!tick_nohz_cpu_hotpluggable(cpu)) {
@@ -1643,6 +1684,7 @@ int tmigr_isolated_exclude_cpumask(struct cpumask *exclude_cpumask)
 		}
 	}
 
+	/* 与恢复阶段相同，本地执行 isolate，并在返回前等待每个 work 完成。 */
 	for_each_cpu(cpu, cpumask) {
 		struct work_struct *work = per_cpu_ptr(works, cpu);
 
@@ -1655,6 +1697,14 @@ int tmigr_isolated_exclude_cpumask(struct cpumask *exclude_cpumask)
 	return 0;
 }
 
+/*
+ * tmigr_init_isolation() - 启动后把 boot-time DOMAIN 隔离同步到 timer hierarchy。
+ *
+ * late_initcall 调用，无参数。先启用 timer migration 自身的 isolated static key；
+ * 若 HK_TYPE_DOMAIN 未配置则无需构造排除集合。配置存在时用
+ * possible_mask - DOMAIN 得到隔离 CPU，并复用运行期更新函数。
+ * 返回 0、-ENOMEM 或下层错误；临时 cpumask 由 __free 自动释放。
+ */
 static int __init tmigr_init_isolation(void)
 {
 	cpumask_var_t cpumask __free(free_cpumask_var) = CPUMASK_VAR_NULL;
@@ -1669,6 +1719,10 @@ static int __init tmigr_init_isolation(void)
 	cpumask_andnot(cpumask, cpu_possible_mask, housekeeping_cpumask(HK_TYPE_DOMAIN));
 
 	/* Protect against RCU torture hotplug testing */
+	/*
+	 * 即使是启动初始化也走带 cpus_read_lock 和本地 work flush 的公共路径，以防
+	 * RCU torture 等测试在 late_initcall 阶段并发触发 CPU hotplug。
+	 */
 	return tmigr_isolated_exclude_cpumask(cpumask);
 }
 late_initcall(tmigr_init_isolation);

@@ -1835,7 +1835,7 @@ void start_kernel(void)
 	/* 初始化早期跟踪（trace_printk 从此可用） */
 	early_trace_init();
 
-	/*
+	/* @todo
 	 * ── 第四批：调度器初始化 ──────────────────────────────────────
 	 * 必须在任何中断（包括时钟中断）启动前初始化调度器。
 	 * SMP 完整拓扑在 smp_init() 时才建立，但此时调度器已可工作。
@@ -1911,6 +1911,13 @@ void start_kernel(void)
 		"housekeeping CPU"就是剩余的非隔离 CPU，负责承担所有内核杂务：
 		定时器处理、RCU 回调、工作队列、内核线程、中断亲和等。
 	*/
+	/*
+	 * 进入 housekeeping_init() 时，nohz_full=/isolcpus= 的 __setup handler
+	 * 已把各类 housekeeping 补集存入 memblock cpumask；此处启用查询 static key，
+	 * 为 full-nohz 分配远端调度 tick 状态，并把掩码迁移到可由 kfree 回收的 slab
+	 * 存储。调用必须早于 workqueue_init_early()：后续 workqueue/kthread/timer
+	 * 初始化会直接查询这些掩码，不能看到只解析了一半的隔离策略。
+	 */
 	housekeeping_init();
 
 	/*

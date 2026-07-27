@@ -7135,14 +7135,39 @@ static int workqueue_apply_unbound_cpumask(const cpumask_var_t unbound_cpumask)
  *
  * Return: 0 on success and -errno on failure.
  */
+/*
+ * workqueue_unbound_housekeeping_update() - 把新 DOMAIN 掩码传播给 unbound WQ。
+ *
+ * @hk 是 kernel/sched/isolation.c 持有的新 housekeeping cpumask 借用指针，
+ * 只读、不可为 NULL，函数不保存或释放它。调用者已发布全局 DOMAIN 掩码，并在
+ * 调用前排空若干依赖旧策略的专用 workqueue。
+ *
+ * 函数可睡眠：会 GFP_KERNEL 分配临时 cpumask、获取 wq_pool_mutex，并可能通过
+ * workqueue_apply_unbound_cpumask() 重建/切换 worker-pool 属性。成功返回 0；
+ * 分配或应用失败返回负 errno。失败不会修改 wq_isolated_cpumask，现有 pool
+ * 状态由下层 apply 的提交/清理协议保持可用。
+ *
+ * 有效 affinity = 用户/启动参数请求的 wq_requested_unbound_cpumask ∩ 新 @hk。
+ * 若交集为空，为避免 unbound work 无 CPU 可执行，退化回 requested 集合；这时
+ * 隔离偏好让位于系统活性。
+ */
 int workqueue_unbound_housekeeping_update(const struct cpumask *hk)
 {
+	/*
+	 * cpumask 是本次计算的临时有效集合；ret 保存 apply 结果。临时对象始终由
+	 * 本函数释放，不会发布给 worker-pool。
+	 */
 	cpumask_var_t cpumask;
 	int ret = 0;
 
+	/* 分配失败发生在加锁和全局状态变化前，可直接把 -ENOMEM 交还调用者。 */
 	if (!zalloc_cpumask_var(&cpumask, GFP_KERNEL))
 		return -ENOMEM;
 
+	/*
+	 * wq_pool_mutex 串行化 unbound cpumask、pool 属性和 worker 绑定变更；
+	 * 持锁区可睡眠，不能从原子上下文调用。
+	 */
 	mutex_lock(&wq_pool_mutex);
 
 	/*
@@ -7151,15 +7176,29 @@ int workqueue_unbound_housekeeping_update(const struct cpumask *hk)
 	 * HK_TYPE_DOMAIN house keeping mask and rewritten
 	 * by any subsequent write to workqueue/cpumask sysfs file.
 	 */
+	/*
+	 * 如果交集为空，操作将回退到 wq_requested_unbound_cpumask。该请求掩码最初
+	 * 是 HK_TYPE_DOMAIN housekeeping 集合，之后可由 workqueue/cpumask sysfs
+	 * 写入覆盖。回退确保至少保留用户请求的可执行目标，但可能暂时跨越新 HK 边界。
+	 */
 	if (!cpumask_and(cpumask, wq_requested_unbound_cpumask, hk))
 		cpumask_copy(cpumask, wq_requested_unbound_cpumask);
+	/*
+	 * 掩码无变化时跳过昂贵的 pool 属性更新；变化时下层先准备所有 apply context，
+	 * 再统一提交，失败则清理临时 context 并保留可用旧配置。
+	 */
 	if (!cpumask_equal(cpumask, wq_unbound_cpumask))
 		ret = workqueue_apply_unbound_cpumask(cpumask);
 
 	/* Save the current isolated cpumask & export it via sysfs */
+	/*
+	 * 保存当前 isolated 掩码并通过 sysfs 导出。只有 apply 成功后才更新，保证
+	 * 用户看到的 wq_isolated_cpumask 与实际生效的 unbound pool 策略一致。
+	 */
 	if (!ret)
 		cpumask_andnot(wq_isolated_cpumask, cpu_possible_mask, hk);
 
+	/* 发布/回退决策完成后解锁，并结束临时 cpumask 的 ownership。 */
 	mutex_unlock(&wq_pool_mutex);
 	free_cpumask_var(cpumask);
 	return ret;

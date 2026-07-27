@@ -620,19 +620,47 @@ void __tick_nohz_task_switch(void)
 }
 
 /* Get the boot-time nohz CPU list from the kernel parameters. */
+/*
+ * 从内核参数取得启动期 nohz CPU 列表。housekeeping_setup() 传入的是
+ * non-housekeeping/full-dynticks CPU 集合，而不是它的补集。
+ */
+/*
+ * tick_nohz_full_setup() - 保存启动参数指定的 full-nohz CPU 集合。
+ *
+ * @cpumask 是命令行解析器持有的临时借用掩码；本函数复制内容，不保存该指针，
+ * 所以调用者返回后可释放 bootmem 临时对象。函数在 early boot、无并发读者时
+ * 调用并标记 __init；分配接口按启动期规则处理失败。
+ *
+ * 返回：无直接返回值。成功后 tick_nohz_full_mask 拥有独立 bootmem 存储，
+ * tick_nohz_full_running 发布“full dynticks 已配置”的状态，后续 tick 初始化、
+ * CPU hotplug 和任务切换路径据此启用相应协议。
+ */
 void __init tick_nohz_full_setup(cpumask_var_t cpumask)
 {
+	/* 先分配并完整复制掩码，最后置 running，避免消费者观察到未初始化列表。 */
 	alloc_bootmem_cpumask_var(&tick_nohz_full_mask);
 	cpumask_copy(tick_nohz_full_mask, cpumask);
 	tick_nohz_full_running = true;
 }
 
+/*
+ * tick_nohz_cpu_hotpluggable() - 判断 CPU 是否允许因 hotplug 下线。
+ *
+ * @cpu 为纯输入 CPU 编号。full-nohz 未启用或 CPU 不是当前 tick_do_timer_cpu 时
+ * 返回 true；否则返回 false。tick_do_timer_cpu 代表 full-dynticks CPU 承担
+ * timekeeping、unbound timer/workqueue 等职责，必须保持在线。
+ * READ_ONCE 取得单次标量快照，但不固定后续状态；调用者仍处于 hotplug 协议中。
+ */
 bool tick_nohz_cpu_hotpluggable(unsigned int cpu)
 {
 	/*
 	 * The 'tick_do_timer_cpu' CPU handles housekeeping duty (unbound
 	 * timers, workqueues, timekeeping, ...) on behalf of full dynticks
 	 * CPUs. It must remain online when nohz full is enabled.
+	 */
+	/*
+	 * tick_do_timer_cpu 代表 full-dynticks CPU 承担 housekeeping 职责，包括
+	 * unbound timer、workqueue 和 timekeeping；nohz full 启用时它必须保持在线。
 	 */
 	if (tick_nohz_full_running && READ_ONCE(tick_do_timer_cpu) == cpu)
 		return false;

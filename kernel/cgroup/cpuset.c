@@ -113,6 +113,24 @@ static const char * const perr_strings[] = {
  * small pieces of code, such as when reading out possibly multi-word
  * cpumasks and nodemasks.
  */
+/*
+ * cpuset 锁协议与 housekeeping 更新的关系：
+ *
+ * 修改 cpuset 外部可见状态时，锁顺序是 cpuset_top_mutex → CPU hotplug lock
+ * → cpuset_mutex → callback_lock。callback_lock 是 raw spinlock，持有期间既不能
+ * 睡眠分配，也不能调用可能回入 cpuset 的路径。
+ *
+ * isolated partition 变化后，housekeeping_update() 会 synchronize_rcu()、
+ * flush 多个 workqueue 并迁移 kthread/timer 状态，明显可能睡眠。若仍持有
+ * cpus_read_lock 或 cpuset_mutex 调用，下游 worker/热插拔路径可能反向等待这些
+ * 锁而死锁。因此提交路径只保留最外层 cpuset_top_mutex 来串行化普通控制文件
+ * 写者，先释放 hotplug/cpuset 内层锁，再进入 housekeeping 更新。
+ *
+ * cpuset_top_mutex 不冻结 CPU hotplug；热插拔路径使用 cpus_write_lock 加
+ * cpuset_mutex 维持自身一致性。读取外部字段可持 cpuset_mutex 或 callback_lock，
+ * 修改则遵循完整协议。task_struct 的 mems_allowed/mempolicy 另由 task 的
+ * alloc_lock 保护，不能把 cpuset 全局锁误当作任务字段的唯一保护。
+ */
 
 static DEFINE_MUTEX(cpuset_top_mutex);
 static DEFINE_MUTEX(cpuset_mutex);
@@ -1341,15 +1359,35 @@ static bool prstate_housekeeping_conflict(int prstate, struct cpumask *new_cpus)
  * then do a cpuset_full_unlock().
  * This should be called at the end of cpuset operation.
  */
+/*
+ * cpuset_update_sd_hk_unlock() - 在 cpuset 操作尾部重建调度域、传播 HK 并解锁。
+ *
+ * 调用者进入时持有 cpuset_top_mutex、cpus_read_lock 和 cpuset_mutex；
+ * 函数无参数、无直接返回值，并通过 __releases 标注承诺释放两个 mutex
+ * （cpus_read_lock 也由路径配套释放）。若 force_sd_rebuild 置位，先让调度域
+ * 与已提交 cpuset CPU 状态一致；若 update_housekeeping 置位，再复制稳定的
+ * isolated_cpus 快照并在只持顶层串行锁时调用 housekeeping_update()。
+ *
+ * housekeeping_update() 的 errno 只通过 WARN 暴露，因为 cpuset 状态和调度域
+ * 已经提交，不能在这里简单回滚整个分区事务。无 HK 更新时走统一 full unlock。
+ */
 static void cpuset_update_sd_hk_unlock(void)
 	__releases(&cpuset_mutex)
 	__releases(&cpuset_top_mutex)
 {
 	/* force_sd_rebuild will be cleared in rebuild_sched_domains_locked() */
+	/*
+	 * force_sd_rebuild 会在 rebuild_sched_domains_locked() 内清除。必须先重建
+	 * 调度域，再传播 housekeeping 缓存，避免消费者基于旧 domain 拓扑继续工作。
+	 */
 	if (force_sd_rebuild)
 		rebuild_sched_domains_locked();
 
 	if (update_housekeeping) {
+		/*
+		 * isolated_hk_cpus 是专门传给可能睡眠更新路径的稳定副本；先清 pending
+		 * 标志并复制，后面释放 cpuset_mutex 后不再直接读取可变 isolated_cpus。
+		 */
 		update_housekeeping = false;
 		cpumask_copy(isolated_hk_cpus, isolated_cpus);
 
@@ -1358,11 +1396,18 @@ static void cpuset_update_sd_hk_unlock(void)
 		 * cpus_read_lock and cpuset_mutex. Only cpuset_top_mutex
 		 * is still being held for mutual exclusion.
 		 */
+		/*
+		 * 调用 housekeeping_update() 时不再持有 cpus_read_lock 和
+		 * cpuset_mutex，只保留 cpuset_top_mutex 做写者互斥。这样下游 flush
+		 * 的 workqueue 可以自由经过 CPU hotplug/cpuset 路径，不形成锁反转。
+		 */
 		mutex_unlock(&cpuset_mutex);
 		cpus_read_unlock();
 		WARN_ON_ONCE(housekeeping_update(isolated_hk_cpus));
+		/* HK 发布与下游传播均已结束，最后释放本次 cpuset 操作的顶层串行锁。 */
 		mutex_unlock(&cpuset_top_mutex);
 	} else {
+		/* 没有动态 HK 工作时，由公共 helper 按常规逆序释放完整锁组。 */
 		cpuset_full_unlock();
 	}
 }
@@ -3965,6 +4010,13 @@ static void cpuset_handle_hotplug(void)
 	 * the work again before the hk_sd_workfn() is invoked to process the
 	 * previously queued work. Since hk_sd_workfn() doesn't use the work
 	 * item at all, this is not a problem.
+	 */
+	/*
+	 * 调度域变化必须立即反映 CPU hotplug 结果，所以直接重建。isolated partition
+	 * 的 HK 更新则可稍后由 system_dfl_wq 合并执行；WORK_STRUCT_PENDING_BIT 避免
+	 * 同一 work 在 pending 状态重复入队。workfn 不读取 work 私有载荷，而是重新
+	 * 在锁内读取当前全局状态，因此即使 dequeue 与再次 queue 交错，也不会使用
+	 * 过期的 isolated CPU 快照。
 	 */
 	if (force_sd_rebuild)
 		rebuild_sched_domains_cpuslocked();

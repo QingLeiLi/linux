@@ -931,6 +931,18 @@ static int kthreads_update_affinity(bool force)
  * Returns 0 if successful, -ENOMEM if temporary mask couldn't
  * be allocated or -EINVAL in case of internal error.
  */
+/*
+ * kthreads_update_housekeeping() - cpuset 隔离变化后重算 kthread 亲和性。
+ *
+ * cpuset 把新 HK_TYPE_DOMAIN 掩码发布并更新 unbound workqueue/timer migration
+ * 后调用这里。入参：无。函数在可睡眠进程上下文运行；下层会分配临时 cpumask、
+ * 遍历受管理 kthread 并调用 set_cpus_allowed_ptr()。
+ *
+ * force=true 表示即使 CPU online 集合没有变化，也必须按新 housekeeping 策略
+ * 重算。带 preferred_affinity 或 NUMA node 偏好的线程优先保留仍有效的偏好；
+ * 偏好与在线 housekeeper 无交集时回退到 housekeeping 集合。
+ * 返回 0 成功，临时分配失败返回 -ENOMEM，内部亲和性错误返回 -EINVAL。
+ */
 int kthreads_update_housekeeping(void)
 {
 	return kthreads_update_affinity(true);
@@ -942,6 +954,11 @@ int kthreads_update_housekeeping(void)
  * by select_fallback_rq() which default re-affines to
  * housekeepers from other nodes in case the preferred
  * affinity doesn't apply anymore.
+ */
+/*
+ * CPU 上线时按线程偏好重新计算亲和性；CPU 下线则由 select_fallback_rq()
+ * 把失去有效偏好的线程回退到其他节点的 housekeeper。@cpu 是 hotplug 回调提供
+ * 的新上线 CPU 编号，本薄包装不直接使用它，因为下层读取完整 online 集合。
  */
 static int kthreads_online_cpu(unsigned int cpu)
 {

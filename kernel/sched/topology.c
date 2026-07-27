@@ -2530,15 +2530,42 @@ void sched_domains_numa_masks_clear(unsigned int cpu)
  *
  * returns: cpu, or nr_cpu_ids when nothing found.
  */
+/*
+ * sched_numa_find_closest() - 从候选掩码中按 NUMA 距离选择靠近基准 CPU 的目标。
+ *
+ * @cpus：候选 CPU 的只读借用掩码，不可为 NULL，函数不保存或修改它；
+ * @cpu：距离计算的基准 CPU，必须是可映射到 NUMA node 的有效编号。
+ * 调用者包括 housekeeping_any_cpu()，后者用它优先把可迁移内核工作留在邻近
+ * NUMA 范围，再退化到全局在线 housekeeper 选择。
+ *
+ * 函数不睡眠、无状态副作用。返回找到的 CPU 编号；若 NUMA masks 尚未发布或
+ * 所有距离层次都与 @cpus 无交集，返回 nr_cpu_ids 哨兵。返回的是瞬时选择，
+ * 不获取 CPU hotplug 引用，调用者仍负责后续投递竞态。
+ */
 int sched_numa_find_closest(const struct cpumask *cpus, int cpu)
 {
+	/*
+	 * 变量地图：
+	 *   i     从近到远遍历 NUMA 距离层级；
+	 *   j     基准 CPU 所在 node；
+	 *   found 最终 CPU，初始 nr_cpu_ids 表示未找到；
+	 *   masks RCU 发布的 [distance level][node] CPU 掩码表借用指针。
+	 */
 	int i, j = cpu_to_node(cpu), found = nr_cpu_ids;
 	struct cpumask ***masks;
 
+	/*
+	 * sched_domains_numa_masks 可在拓扑重建时替换。RCU 读锁保证 masks 及其层级
+	 * 数组在整个扫描期间不被释放；它不冻结 @cpus，后者的稳定性由调用者保证。
+	 */
 	rcu_read_lock();
 	masks = rcu_dereference(sched_domains_numa_masks);
 	if (!masks)
 		goto unlock;
+	/*
+	 * 距离层级按由近到远排列。每层从调用者候选和该 node 距离掩码的交集中
+	 * distribute 选择，避免总压到第一个 CPU；首次命中即是最近可用层级。
+	 */
 	for (i = 0; i < sched_domains_numa_levels; i++) {
 		if (!masks[i][j])
 			break;
@@ -2549,6 +2576,7 @@ int sched_numa_find_closest(const struct cpumask *cpus, int cpu)
 		}
 	}
 unlock:
+	/* 到达此处时 found 已是有效 CPU 或保持哨兵；先结束 RCU 生命周期再返回编号。 */
 	rcu_read_unlock();
 
 	return found;

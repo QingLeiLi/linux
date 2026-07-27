@@ -429,6 +429,14 @@ static int pci_call_probe(struct pci_driver *drv, struct pci_dev *dev,
 	return error;
 }
 
+/*
+ * pci_probe_flush_workqueue() - 等待所有已排队 PCI 异步 probe 完成。
+ *
+ * 入参：无；返回：无直接返回值。函数可睡眠，返回时 pci_probe_wq 中调用前已经
+ * 排队的 probe work 均已完成。housekeeping_update() 在改变 unbound workqueue
+ * 允许 CPU 之前调用它，避免仍按旧亲和性执行的 PCI probe 跨越策略切换窗口。
+ * 本函数不销毁队列，也不阻止返回后新的 probe 再次入队。
+ */
 void pci_probe_flush_workqueue(void)
 {
 	flush_workqueue(pci_probe_wq);

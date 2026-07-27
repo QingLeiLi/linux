@@ -5939,6 +5939,17 @@ static void sched_tick_stop(int cpu)
 }
 #endif /* CONFIG_HOTPLUG_CPU */
 
+/*
+ * sched_tick_offload_init() - 为 full-nohz CPU 初始化远端调度 tick 存储。
+ *
+ * housekeeping_init() 在 HK_TYPE_KERNEL_NOISE 已配置时调用。入参：无。
+ * 函数处于启动期并标记 __init，不存在并发启动/停止 tick_work；alloc_percpu()
+ * 为每个 possible CPU 建立 struct tick_work，后续 sched_tick_start/stop 路径
+ * 使用它在 housekeeper 上代替隔离 CPU 执行必要调度 tick。
+ *
+ * 返回 0 表示初始化完成。分配失败通过 BUG_ON 终止启动而不是返回 -ENOMEM，
+ * 因为继续运行会让已承诺的 nohz_full 调度记账缺少必需状态。
+ */
 int __init sched_tick_offload_init(void)
 {
 	tick_work_cpu = alloc_percpu(struct tick_work);

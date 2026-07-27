@@ -5503,6 +5503,14 @@ void mem_cgroup_sk_uncharge(const struct sock *sk, unsigned int nr_pages)
 	refill_stock(memcg, nr_pages);
 }
 
+/*
+ * mem_cgroup_flush_workqueue() - 排空 memcg 专用异步工作队列。
+ *
+ * 入参：无；返回：无直接返回值。可睡眠，返回只保证 flush 边界前排入 memcg_wq
+ * 的 work 已完成，不销毁队列。housekeeping_update() 在调整 unbound workqueue
+ * housekeeping 掩码前调用，防止旧亲和性下尚未完成的 memcg 工作与 pool 切换
+ * 交错；之后新工作仍可正常入队并采用更新后的有效 affinity。
+ */
 void mem_cgroup_flush_workqueue(void)
 {
 	flush_workqueue(memcg_wq);

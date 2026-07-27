@@ -1,5 +1,45 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
+ * Maple Tree 源码学习地图
+ *
+ * 中文学习注释模型：OpenAI GPT-5.4（2026-07-27）。
+ *
+ * Maple Tree 是“无符号索引范围 -> entry”的有序映射，VMA Maple Tree 是
+ * 最重要的使用者之一。调用者通常不直接操作节点，而是通过两层接口：
+ *
+ *   简单接口：mtree_load/store/insert/erase/find/destroy
+ *       自动取得 tree lock，适合一次性操作。
+ *
+ *   状态接口：MA_STATE + mas_walk/find/next/store/erase/nomem
+ *       保存当前位置，可在一次锁定中连续遍历或修改，也能在释放锁后
+ *       pause/restart。VMA 等复杂调用者主要依赖这一层。
+ *
+ * 本文件可分为五段：
+ *
+ *   1. 节点编码、parent/slot/pivot/gap 辅助函数；
+ *   2. 写路径的 copy、spanning、split、rebalance 算法；
+ *   3. 查找、正反向遍历和空洞分配；
+ *   4. 对外 API、预分配/ENOMEM 重试、复制与销毁；
+ *   5. dump/validate 调试设施。
+ *
+ * 学习重点是 API 的区间语义、ma_state 状态机、内部/外部锁、RCU 节点
+ * 生命周期、预分配与失败重试、pause/resume 和销毁边界。节点分裂、
+ * 合并、重平衡、pivot/slot 搬运属于通用范围树实现细节：这些函数只
+ * 说明目的、入口状态、结果和副作用，不展开具体树算法。
+ *
+ * 最重要的不变量：
+ *
+ *   - 区间端点是闭区间；mas->index/last 同时描述当前位置和返回范围；
+ *   - entry 必须先完整写入新节点，再用 RCU 可见的指针替换旧节点；
+ *   - 被摘除节点先标 dead，RCU reader 发现后重走，内存等待 grace
+ *     period 后才能释放；
+ *   - 普通写操作必须持 tree write lock，外部锁模式由调用者负责；
+ *   - 允许睡眠的分配通常在锁外完成，mas_nomem() 把 -ENOMEM 状态转成
+ *     “补充节点后重试”的协议；
+ *   - ma_state 是游标/事务上下文，不持有 entry 的引用，调用者仍负责
+ *     entry 对象本身的生命周期。
+ */
+/*
  * Maple Tree implementation
  * Copyright (c) 2018-2022 Oracle Corporation
  * Authors: Liam R. Howlett <liam@infradead.org>
@@ -7,6 +47,7 @@
  * Copyright (c) 2023 ByteDance
  * Author: Peng Zhang <zhangpeng.00@bytedance.com>
  */
+/* Maple Tree 实现及版权、作者信息；许可证与署名保持原样。 */
 
 /*
  * DOC: Interesting implementation details of the Maple Tree
@@ -51,6 +92,25 @@
  * the entire data set, or one half of the tree, or the middle half of the tree.
  *
  */
+/*
+ * Maple Tree 节点同时保存 slots（子节点或叶子 entry）和 pivots（范围的
+ * 闭区间上界）。dense 节点的 pivot 可由槽位和节点最小值隐式推导。
+ *
+ * 传统 B-tree 把分隔值称为 key；这里使用 pivot，强调它划分的是范围。
+ * pivot 可以与 entry 表示的值域一起出现在子树中，而普通 B-tree key
+ * 通常只属于一个固定位置。同索引 slot 的 pivot 包含在该 slot 范围内。
+ *
+ * 上图展示 range64 节点布局：slot 0 的最小值和最后 slot 的最大值由
+ * 父节点/根边界隐含，中间 pivot 给出前一 slot 的最大索引。内部节点
+ * slot 指向子节点，叶节点 slot 保存调用者 entry。
+ *
+ * offset 表示当前关注的 slot。每个 offset 都有 slot，但最后 offset
+ * 的 pivot 来自父节点；根节点则以 ULONG_MAX 作为隐含最大值。
+ *
+ * 范围语义使写路径比普通 B-tree 更复杂：一次 store 不只是增删一个
+ * key，它可能覆盖整棵树、半棵树或树中间的大范围。后续 spanning/copy
+ * 代码正是为保持这些闭区间边界而存在。
+ */
 
 
 #include <linux/maple_tree.h>
@@ -75,17 +135,33 @@
  *
  * Userland doesn't know about %px so also use %p there.
  */
+/*
+ * 内核指针哈希会把带 tag 的节点指针打印成无关数值，使树 dump 无法
+ * 对照 parent/child。DEBUG_VM_MAPLE_TREE 调试构建允许用 %px 绕过哈希；
+ * 普通内核保持 %p，避免泄露地址。用户态测试环境不认识 %px，也使用 %p。
+ */
 #if defined(__KERNEL__) && defined(CONFIG_DEBUG_VM_MAPLE_TREE)
 #define PTR_FMT "%px"
 #else
 #define PTR_FMT "%p"
 #endif
 
+/*
+ * 根 parent、ma_state 标志和编码转换宏：
+ *
+ * 节点指针利用对齐留下的低位编码 node type、root/null 等元数据。
+ * 这些宏只做位级视图转换，不取得节点引用。解码后的裸指针只能在 tree
+ * lock 或 RCU 读侧及相应 dead-node 重试协议内使用。
+ */
 #define MA_ROOT_PARENT 1
 
 /*
  * Maple state flags
  * * MA_STATE_PREALLOC		- Preallocated nodes, WARN_ON allocation
+ */
+/*
+ * ma_state 标志：MA_STATE_PREALLOC 表示调用者承诺所需节点已经预分配；
+ * 后续若仍尝试动态分配，WARN 用来暴露预估或调用协议错误。
  */
 #define MA_STATE_PREALLOC	1
 
@@ -96,6 +172,10 @@
 static struct kmem_cache *maple_node_cache;
 
 #ifdef CONFIG_DEBUG_MAPLE_TREE
+/*
+ * 调试模式为每种节点类型提供可表示的最大索引，用于验证 pivot/范围
+ * 不越过类型上限；生产构建不保留该表。
+ */
 static const unsigned long mt_max[] = {
 	[maple_dense]		= MAPLE_NODE_SLOTS,
 	[maple_leaf_64]		= ULONG_MAX,
@@ -106,6 +186,7 @@ static const unsigned long mt_max[] = {
 #define mt_node_max(x) mt_max[mte_node_type(x)]
 #endif
 
+/* 每种节点 union 布局可用的 slot 数；copy 是写事务的临时三槽节点。 */
 static const unsigned char mt_slots[] = {
 	[maple_dense]		= MAPLE_NODE_SLOTS,
 	[maple_leaf_64]		= MAPLE_RANGE64_SLOTS,
@@ -115,6 +196,7 @@ static const unsigned char mt_slots[] = {
 };
 #define mt_slot_count(x) mt_slots[mte_node_type(x)]
 
+/* 每种节点布局显式存储的 pivot 数；dense 的 pivot 全部隐含。 */
 static const unsigned char mt_pivots[] = {
 	[maple_dense]		= 0,
 	[maple_leaf_64]		= MAPLE_RANGE64_SLOTS - 1,
@@ -124,6 +206,10 @@ static const unsigned char mt_pivots[] = {
 };
 #define mt_pivot_count(x) mt_pivots[mte_node_type(x)]
 
+/*
+ * 非根节点维持占用率时所需最少 slot 数。split/rebalance 用它判断应从
+ * sibling 借数据、合并还是拆分；copy 值不应进入普通平衡判断。
+ */
 static const unsigned char mt_min_slots[] = {
 	[maple_dense]		= MAPLE_NODE_SLOTS / 2,
 	[maple_leaf_64]		= (MAPLE_RANGE64_SLOTS / 2) - 2,
@@ -134,26 +220,56 @@ static const unsigned char mt_min_slots[] = {
 #define mt_min_slot_count(x) mt_min_slots[mte_node_type(x)]
 
 /* Functions */
+/*
+ * mt_alloc_one() - 从 Maple 节点 slab cache 分配一个节点。
+ *
+ * @gfp 由调用者上下文决定能否睡眠。返回新节点或 NULL；尚未加入树，
+ * 所有权归调用者，失败由 ma_state 转成 -ENOMEM/重试协议。
+ */
 static inline struct maple_node *mt_alloc_one(gfp_t gfp)
 {
 	return kmem_cache_alloc(maple_node_cache, gfp);
 }
 
+/*
+ * mt_free_bulk() - 批量归还尚不需 RCU 延迟的节点。
+ *
+ * @size 是 nodes 数量，@nodes 是调用者持有的节点指针数组。释放后这些
+ * 裸指针失效；调用者必须保证节点从未发布或 grace period 已满足。
+ */
 static inline void mt_free_bulk(size_t size, void __rcu **nodes)
 {
 	kmem_cache_free_bulk(maple_node_cache, size, (void **)nodes);
 }
 
+/*
+ * mt_return_sheaf() - 把未消费的 slab sheaf 归还节点 cache。
+ *
+ * sheaf 是预取节点容器，调用后所有权转给 slab；GFP_NOWAIT 保证清理
+ * 不因归还动作睡眠或触发新分配。
+ */
 static void mt_return_sheaf(struct slab_sheaf *sheaf)
 {
 	kmem_cache_return_sheaf(maple_node_cache, GFP_NOWAIT, sheaf);
 }
 
+/*
+ * mt_get_sheaf() - 预取 @count 个 Maple 节点形成 sheaf。
+ *
+ * 允许按 @gfp 睡眠；成功返回由 ma_state 持有的容器，失败返回 NULL。
+ * 预取发生在持树锁之前，避免写临界区内阻塞内存回收。
+ */
 static struct slab_sheaf *mt_get_sheaf(gfp_t gfp, int count)
 {
 	return kmem_cache_prefill_sheaf(maple_node_cache, gfp, count);
 }
 
+/*
+ * mt_refill_sheaf() - 将现有/空 sheaf 补到 @size 个预分配节点。
+ *
+ * @sheaf 是输入输出 ownership 指针，成功后供后续写事务逐个消费；
+ * 返回 slab helper 的 0/负 errno。分配属性由 @gfp 决定。
+ */
 static int mt_refill_sheaf(gfp_t gfp, struct slab_sheaf **sheaf,
 		unsigned int size)
 {
@@ -167,12 +283,25 @@ static int mt_refill_sheaf(gfp_t gfp, struct slab_sheaf **sheaf,
  * The maple tree uses the parent pointer to indicate this node is no longer in
  * use and will be freed.
  */
+/*
+ * ma_free_rcu() - 在 RCU 回调阶段释放一个 Maple 节点。
+ *
+ * @node 已从树摘除并把 parent 设成指向自身的 dead 标记。WARN 验证该
+ * 生命周期状态，kfree_rcu() 保证此前取得旧节点的 RCU reader 退出后
+ * 才把内存归还。无返回值，不释放叶子 entry。
+ */
 static void ma_free_rcu(struct maple_node *node)
 {
 	WARN_ON(node->parent != ma_parent_ptr(node));
 	kfree_rcu(node, rcu);
 }
 
+/*
+ * mt_set_height() - 原地更新 tree flags 中的高度字段。
+ *
+ * @height 必须不超过 MAPLE_HEIGHT_MAX；保留其他属性位。调用者持写锁，
+ * 通常在根扩展/收缩后调用。无失败返回，越界是内部算法错误。
+ */
 static void mt_set_height(struct maple_tree *mt, unsigned char height)
 {
 	unsigned int new_flags = mt->ma_flags;
@@ -183,16 +312,19 @@ static void mt_set_height(struct maple_tree *mt, unsigned char height)
 	mt->ma_flags = new_flags;
 }
 
+/* 返回 @mas 所属树当前高度；只读派生值，不改变游标或 ownership。 */
 static unsigned int mas_mt_height(struct ma_state *mas)
 {
 	return mt_height(mas->tree);
 }
 
+/* 取得 tree flags 中除高度以外的持久属性，如 alloc-range/外部锁/RCU。 */
 static inline unsigned int mt_attr(struct maple_tree *mt)
 {
 	return mt->ma_flags & ~MT_FLAGS_HEIGHT_MASK;
 }
 
+/* 从低位 tag 解码节点类型；返回值只描述布局，不验证节点生命周期。 */
 static __always_inline enum maple_type mte_node_type(
 		const struct maple_enode *entry)
 {
@@ -200,16 +332,19 @@ static __always_inline enum maple_type mte_node_type(
 		MAPLE_NODE_TYPE_MASK;
 }
 
+/* dense 与 leaf_64 之前的枚举值采用隐式连续 slot 语义。 */
 static __always_inline bool ma_is_dense(const enum maple_type type)
 {
 	return type < maple_leaf_64;
 }
 
+/* 判断节点类型是否直接保存调用者 entry，而不是子节点指针。 */
 static __always_inline bool ma_is_leaf(const enum maple_type type)
 {
 	return type < maple_range_64;
 }
 
+/* encoded node 版本的叶节点判断；不解引用 slot 内容。 */
 static __always_inline bool mte_is_leaf(const struct maple_enode *entry)
 {
 	return ma_is_leaf(mte_node_type(entry));
@@ -219,48 +354,71 @@ static __always_inline bool mte_is_leaf(const struct maple_enode *entry)
  * We also reserve values with the bottom two bits set to '10' which are
  * below 4096
  */
+/*
+ * Maple Tree 不能直接存储 XArray internal 编码中低于 4096 且低两位为
+ * `10` 的保留值，因为这些值会与节点/错误 tag 冲突。
+ */
+/*
+ * mt_is_reserved() - 判断调用者 entry 是否落入 Maple 保留编码区。
+ *
+ * 纯值检查、无锁无副作用。公开 store/insert API 会拒绝这种 entry，
+ * 防止把普通值误解为内部节点或状态。
+ */
 static __always_inline bool mt_is_reserved(const void *entry)
 {
 	return ((unsigned long)entry < MAPLE_RESERVED_RANGE) &&
 		xa_is_internal(entry);
 }
 
+/*
+ * mas_set_err() - 把 ma_state 转为终止错误状态。
+ *
+ * @err 是负 errno；同时编码进 mas->node 并设置 ma_error。之后调用者可
+ * 用 mas_is_err()/mas_err() 识别，mas_nomem() 只对 -ENOMEM 提供重试。
+ */
 static __always_inline void mas_set_err(struct ma_state *mas, long err)
 {
 	mas->node = MA_ERROR(err);
 	mas->status = ma_error;
 }
 
+/* 判断游标当前是否以 ma_root 状态直接指向根 entry。 */
 static __always_inline bool mas_is_ptr(const struct ma_state *mas)
 {
 	return mas->status == ma_root;
 }
 
+/* 判断游标是否尚未开始任何 walk，下一次操作需从根定位。 */
 static __always_inline bool mas_is_start(const struct ma_state *mas)
 {
 	return mas->status == ma_start;
 }
 
+/* 判断游标是否处于无有效节点/entry 的 ma_none 状态。 */
 static __always_inline bool mas_is_none(const struct ma_state *mas)
 {
 	return mas->status == ma_none;
 }
 
+/* 判断遍历是否被 mas_pause() 暂停，恢复时必须重新定位。 */
 static __always_inline bool mas_is_paused(const struct ma_state *mas)
 {
 	return mas->status == ma_pause;
 }
 
+/* 判断正向遍历是否已经越过 ULONG_MAX 上界。 */
 static __always_inline bool mas_is_overflow(struct ma_state *mas)
 {
 	return mas->status == ma_overflow;
 }
 
+/* 判断反向遍历是否已经越过索引 0 下界。 */
 static inline bool mas_is_underflow(struct ma_state *mas)
 {
 	return mas->status == ma_underflow;
 }
 
+/* 清除 encoded pointer 低位 tag，取得裸 maple_node；不增加引用。 */
 static __always_inline struct maple_node *mte_to_node(
 		const struct maple_enode *entry)
 {
@@ -272,6 +430,12 @@ static __always_inline struct maple_node *mte_to_node(
  * @entry: The maple encoded node
  *
  * Return: a maple topiary pointer
+ */
+/*
+ * mte_to_mat() - 把 encoded node 解码为 dead-list 使用的 topiary 视图。
+ *
+ * @entry 必须是已摘除并可复用 union 的节点。返回借用裸指针，不取得
+ * 生命周期引用；仅写侧销毁路径可使用。
  */
 static inline struct maple_topiary *mte_to_mat(const struct maple_enode *entry)
 {
@@ -285,6 +449,12 @@ static inline struct maple_topiary *mte_to_mat(const struct maple_enode *entry)
  *
  * Return: the maple node (not encoded - bare pointer).
  */
+/*
+ * mas_mn() - 取得 ma_state 当前 encoded node 的裸 maple_node。
+ *
+ * 返回值受 tree lock/RCU 与 dead-node 重试协议约束，不能在保护范围外
+ * 长期保存；函数不改变 mas。
+ */
 static inline struct maple_node *mas_mn(const struct ma_state *mas)
 {
 	return mte_to_node(mas->node);
@@ -294,19 +464,31 @@ static inline struct maple_node *mas_mn(const struct ma_state *mas)
  * mte_set_node_dead() - Set a maple encoded node as dead.
  * @mn: The maple encoded node.
  */
+/*
+ * mte_set_node_dead() - 把已摘除节点发布为 dead。
+ *
+ * parent=self 是 reader 可检测的哨兵；随后的 smp_wmb() 与
+ * ma_dead_node() 的 smp_rmb() 配对，确保 reader 一旦看到 dead，也不会
+ * 把此前读取的旧 slot/pivot 当作稳定结果，而会从根重走。
+ */
 static inline void mte_set_node_dead(struct maple_enode *mn)
 {
 	mte_to_node(mn)->parent = ma_parent_ptr(mte_to_node(mn));
 	smp_wmb(); /* Needed for RCU */
+	/* RCU 读者依赖该写屏障在 dead 标记后丢弃旧节点快照。 */
 }
 
 /* Bit 1 indicates the root is a node */
+/* 根指针 bit 1 表示 ma_root 保存的是 encoded node，而非直接 entry。 */
 #define MAPLE_ROOT_NODE			0x02
 /* maple_type stored bit 3-6 */
+/* encoded node 的 bit 3～6 保存 maple_type。 */
 #define MAPLE_ENODE_TYPE_SHIFT		0x03
 /* Bit 2 means a NULL somewhere below */
+/* bit 2 表示该子树仍可能包含 NULL gap，供 allocation tree 剪枝。 */
 #define MAPLE_ENODE_NULL		0x04
 
+/* 把对齐节点指针与 type/null tag 合成为树内 encoded node。 */
 static inline struct maple_enode *mt_mk_node(const struct maple_node *node,
 					     enum maple_type type)
 {
@@ -314,53 +496,69 @@ static inline struct maple_enode *mt_mk_node(const struct maple_node *node,
 			(type << MAPLE_ENODE_TYPE_SHIFT) | MAPLE_ENODE_NULL);
 }
 
+/*
+ * ma_init_slot() - 初始化尚未暴露给 reader 的 slot。
+ *
+ * RCU_INIT_POINTER 不提供发布屏障；原英文警告强调只能用于新节点或私有
+ * slot。若 slot 已可见，写侧必须使用正确的 RCU 替换/屏障协议。
+ */
 static inline void ma_init_slot(void __rcu **slot, const struct maple_node *mn,
 				const enum maple_type mt)
 {
 	/* WARNING: this is unsafe if the slot is exposed to readers. */
+	/* 警告：已发布 slot 不能使用无发布语义的 RCU_INIT_POINTER。 */
 	RCU_INIT_POINTER(*slot, (void *)mt_mk_node(mn, mt));
 }
 
+/* 在 encoded node 上增加“root is node”标记，形成 ma_root 存储值。 */
 static inline void *mte_mk_root(const struct maple_enode *node)
 {
 	return (void *)((unsigned long)node | MAPLE_ROOT_NODE);
 }
 
+/* 清除根专用标记，恢复普通 encoded node 视图。 */
 static inline void *mte_safe_root(const struct maple_enode *node)
 {
 	return (void *)((unsigned long)node & ~MAPLE_ROOT_NODE);
 }
 
+/* 清除 NULL-subtree 标记，表示该 encoded node 的覆盖范围已满。 */
 static inline void __maybe_unused *mte_set_full(const struct maple_enode *node)
 {
 	return (void *)((unsigned long)node & ~MAPLE_ENODE_NULL);
 }
 
+/* 设置 NULL-subtree 标记，表示该节点下仍可能找到空洞。 */
 static inline void __maybe_unused *mte_clear_full(const struct maple_enode *node)
 {
 	return (void *)((unsigned long)node | MAPLE_ENODE_NULL);
 }
 
+/* 查询 encoded node 是否带有“子树含 NULL”提示位。 */
 static inline bool __maybe_unused mte_has_null(const struct maple_enode *node)
 {
 	return (unsigned long)node & MAPLE_ENODE_NULL;
 }
 
+/* 通过 parent 低位判断裸节点是否为根；调用者保证节点仍存活。 */
 static __always_inline bool ma_is_root(struct maple_node *node)
 {
 	return ((unsigned long)node->parent & MA_ROOT_PARENT);
 }
 
+/* encoded node 版本的根判断，不改变指针或状态。 */
 static __always_inline bool mte_is_root(const struct maple_enode *node)
 {
 	return ma_is_root(mte_to_node(node));
 }
 
+/* 判断游标当前边界是否覆盖整个索引空间 [0, ULONG_MAX]。 */
 static inline bool mas_is_root_limits(const struct ma_state *mas)
 {
 	return !mas->min && mas->max == ULONG_MAX;
 }
 
+/* 判断 tree 是否启用 allocation-range gap 元数据和空洞搜索语义。 */
 static __always_inline bool mt_is_alloc(struct maple_tree *mt)
 {
 	return (mt->ma_flags & MT_FLAGS_ALLOC_RANGE);
@@ -386,6 +584,12 @@ static __always_inline bool mt_is_alloc(struct maple_tree *mt)
  *  0b010 : 32 bit values, type in 0-2, slot in 3-7
  *  0b110 : 64 bit values, type in 0-2, slot in 3-7
  */
+/*
+ * Parent 指针编码说明：除 root 外，节点至少 256 字节对齐，低位可同时
+ * 保存 parent type 和 child 所在 slot。32/64 位布局的 slot 用 5 bit；
+ * 16 位布局需 6 bit，因此借用 type 的最后一位区分解释方式。后续 helper
+ * 只负责解码/编码这一实现细节，调用者通常无需掌握具体 bit 位置。
+ */
 
 #define MAPLE_PARENT_ROOT		0x01
 
@@ -404,9 +608,16 @@ static __always_inline bool mt_is_alloc(struct maple_tree *mt)
  * @parent: The parent pointer cast as an unsigned long
  * Return: The shift into that pointer to the star to of the slot
  */
+/*
+ * mte_parent_shift() - 根据 parent 编码选择 child-slot 字段的右移量。
+ *
+ * 这是 parent 位域的纯解码 helper：16B 布局与其他布局占用的低位不同，
+ * 返回值只供相邻的 mask/slot helper 使用。
+ */
 static inline unsigned long mte_parent_shift(unsigned long parent)
 {
 	/* Note bit 1 == 0 means 16B */
+	/* bit 1 为 0 表示 16B 布局，其 slot 字段从 bit 2 开始。 */
 	if (likely(parent & MAPLE_PARENT_NOT_RANGE16))
 		return MAPLE_PARENT_SLOT_SHIFT;
 
@@ -418,9 +629,11 @@ static inline unsigned long mte_parent_shift(unsigned long parent)
  * @parent: The parent pointer cast as an unsigned long.
  * Return: The slot mask for that parent.
  */
+/* mte_parent_slot_mask() - 返回与 parent 布局匹配的 child-slot 位掩码。 */
 static inline unsigned long mte_parent_slot_mask(unsigned long parent)
 {
 	/* Note bit 1 == 0 means 16B */
+	/* 与 mte_parent_shift() 使用同一个布局判据，二者必须成对。 */
 	if (likely(parent & MAPLE_PARENT_NOT_RANGE16))
 		return MAPLE_PARENT_SLOT_MASK;
 
@@ -433,6 +646,12 @@ static inline unsigned long mte_parent_slot_mask(unsigned long parent)
  * @mas: The maple state
  * @enode: The maple_enode to extract the parent's enum
  * Return: The node->parent maple_type
+ */
+/*
+ * mas_parent_type() - 从 child->parent 的低位还原父节点类型。
+ *
+ * 根没有普通 parent 编码，遇到它说明调用路径不合法。range_64 与
+ * arange_64 共用位型，最终类型还要结合整棵树是否启用 allocation 模式。
  */
 static inline
 enum maple_type mas_parent_type(struct ma_state *mas, struct maple_enode *enode)
@@ -447,6 +666,7 @@ enum maple_type mas_parent_type(struct ma_state *mas, struct maple_enode *enode)
 	p_type &= ~mte_parent_slot_mask(p_type);
 	switch (p_type) {
 	case MAPLE_PARENT_RANGE64: /* or MAPLE_PARENT_ARANGE64 */
+		/* allocation tree 与普通 range_64 共用此 parent 位型。 */
 		if (mt_is_alloc(mas->tree))
 			return maple_arange_64;
 		return maple_range_64;
@@ -464,6 +684,13 @@ enum maple_type mas_parent_type(struct ma_state *mas, struct maple_enode *enode)
  *
  * Slot number is encoded in the enode->parent bit 3-6 or 2-6, depending on the
  * parent type.
+ */
+/*
+ * mas_set_parent() - 写入父指针，并把 child 在父节点中的 slot 一并编码。
+ *
+ * 这是结构修改时必须维护的反向关系。父节点地址先清除自身 node tag，
+ * 再拼入父类型和 slot；若此处编码错误，向上回溯和重平衡会走错分支。
+ * 本函数只做树算法的链接维护，调用者负责写锁和节点尚可写。
  */
 static inline
 void mas_set_parent(struct ma_state *mas, struct maple_enode *enode,
@@ -491,6 +718,7 @@ void mas_set_parent(struct ma_state *mas, struct maple_enode *enode,
 	}
 
 	val &= ~MAPLE_NODE_MASK; /* Clear all node metadata in parent */
+	/* 清除父 enode 的类型/NULL 等 tag，只保留对齐后的真实地址。 */
 	val |= (slot << shift) | type;
 	mte_to_node(enode)->parent = ma_parent_ptr(val);
 }
@@ -500,6 +728,11 @@ void mas_set_parent(struct ma_state *mas, struct maple_enode *enode,
  * @enode: The encoded maple node.
  *
  * Return: The slot in the parent node where @enode resides.
+ */
+/*
+ * mte_parent_slot() - 解出 enode 在父节点中的 slot 序号。
+ *
+ * 根没有父 slot，约定返回 0；普通节点根据 parent 的布局选择 shift。
  */
 static __always_inline
 unsigned int mte_parent_slot(const struct maple_enode *enode)
@@ -513,6 +746,10 @@ unsigned int mte_parent_slot(const struct maple_enode *enode)
 	 * Okay to use MAPLE_PARENT_16B_SLOT_MASK as the last bit will be lost
 	 * by shift if the parent shift is MAPLE_PARENT_SLOT_SHIFT
 	 */
+	/*
+	 * 可统一使用较宽的 16B mask：非 16B 布局多取到的最低位会在更大的
+	 * 右移量下自然丢弃，不会污染结果。
+	 */
 	return (val & MAPLE_PARENT_16B_SLOT_MASK) >> mte_parent_shift(val);
 }
 
@@ -522,6 +759,7 @@ unsigned int mte_parent_slot(const struct maple_enode *enode)
  *
  * Return: The parent maple node.
  */
+/* mte_parent() - 清除 parent 低位元数据，返回父节点裸指针。 */
 static __always_inline
 struct maple_node *mte_parent(const struct maple_enode *enode)
 {
@@ -535,11 +773,19 @@ struct maple_node *mte_parent(const struct maple_enode *enode)
  *
  * Return: true if dead, false otherwise.
  */
+/*
+ * ma_dead_node() - 判断 RCU reader 手中的节点是否已被写侧摘除。
+ *
+ * 写侧用 parent=self 标记 dead，并在 mte_set_node_dead() 中执行 wmb。
+ * 这里先执行 rmb，禁止此前对 slot/pivot 的读取越过 dead 检查；若返回
+ * true，reader 不能继续相信该节点内容，必须从稳定入口重新 walk。
+ */
 static __always_inline bool ma_dead_node(const struct maple_node *node)
 {
 	struct maple_node *parent;
 
 	/* Do not reorder reads from the node prior to the parent check */
+	/* 不允许此前的节点字段读取被重排到 parent/dead 检查之后。 */
 	smp_rmb();
 	parent = (void *)((unsigned long) node->parent & ~MAPLE_NODE_MASK);
 	return (parent == node);
@@ -551,6 +797,7 @@ static __always_inline bool ma_dead_node(const struct maple_node *node)
  *
  * Return: true if dead, false otherwise.
  */
+/* mte_dead_node() - encoded-node 包装；dead 协议见 ma_dead_node()。 */
 static __always_inline bool mte_dead_node(const struct maple_enode *enode)
 {
 	struct maple_node *node;
@@ -567,6 +814,12 @@ static __always_inline bool mte_dead_node(const struct maple_enode *enode)
  * In the event of a dead node, this array may be %NULL
  *
  * Return: A pointer to the maple node pivots
+ */
+/*
+ * ma_pivots() - 按节点类型取得 pivot 数组。
+ *
+ * 这是布局选择 helper；dense 节点没有 pivot。dead 节点的 union 可能
+ * 已被销毁链复用，调用者必须先满足锁/RCU 存活条件。
  */
 static inline unsigned long *ma_pivots(struct maple_node *node,
 					   enum maple_type type)
@@ -591,6 +844,12 @@ static inline unsigned long *ma_pivots(struct maple_node *node,
  * @type: the node type
  *
  * Return: A pointer to the maple node gaps
+ */
+/*
+ * ma_gaps() - 按节点类型取得“最大空洞”元数据数组。
+ *
+ * 只有 allocation-range 节点和临时 copy 节点具有 gap 数组；普通
+ * range/leaf/dense 返回 NULL。
  */
 static inline unsigned long *ma_gaps(struct maple_node *node,
 				     enum maple_type type)
@@ -618,6 +877,11 @@ static inline unsigned long *ma_gaps(struct maple_node *node,
  * Return: The pivot at @piv within the limit of the @pivots array, @mas->max
  * otherwise.
  */
+/*
+ * mas_safe_pivot() - 读取 pivot；越过真实 pivot 数组时用节点上界代替。
+ *
+ * 这使最后一个 slot 也能统一表示为闭区间，其右边界就是 mas->max。
+ */
 static __always_inline unsigned long
 mas_safe_pivot(const struct ma_state *mas, unsigned long *pivots,
 	       unsigned char piv, enum maple_type type)
@@ -636,6 +900,11 @@ mas_safe_pivot(const struct ma_state *mas, unsigned long *pivots,
  *
  * Return: The minimum range value that is contained in @offset.
  */
+/*
+ * mas_safe_min() - 计算 offset 对应 slot 的闭区间左端点。
+ *
+ * 非首 slot 为前一 pivot + 1；首 slot 继承当前节点的 mas->min。
+ */
 static inline unsigned long
 mas_safe_min(struct ma_state *mas, unsigned long *pivots, unsigned char offset)
 {
@@ -651,6 +920,7 @@ mas_safe_min(struct ma_state *mas, unsigned long *pivots, unsigned char offset)
  * @piv: The pivot offset
  * @val: The value of the pivot
  */
+/* mte_set_pivot() - 按节点布局写指定 pivot；仅供持写锁的树算法使用。 */
 static inline void mte_set_pivot(struct maple_enode *mn, unsigned char piv,
 				unsigned long val)
 {
@@ -680,6 +950,7 @@ static inline void mte_set_pivot(struct maple_enode *mn, unsigned char piv,
  *
  * Return: A pointer to the maple node slots
  */
+/* ma_slots() - 按节点类型选择其 RCU slot 数组；不读取任何 slot。 */
 static inline void __rcu **ma_slots(struct maple_node *mn, enum maple_type mt)
 {
 	switch (mt) {
@@ -697,24 +968,46 @@ static inline void __rcu **ma_slots(struct maple_node *mn, enum maple_type mt)
 	return NULL;
 }
 
+/*
+ * mt_write_locked() - 供 lockdep/RCU protected 检查判断写侧保护是否成立。
+ *
+ * external-lock 树把判断委托给调用者配置的锁；普通树检查内部 ma_lock。
+ * 这只是调试断言，不会真正获取锁。
+ */
 static inline bool mt_write_locked(const struct maple_tree *mt)
 {
 	return mt_external_lock(mt) ? mt_write_lock_is_held(mt) :
 		lockdep_is_held(&mt->ma_lock);
 }
 
+/*
+ * mt_locked() - 判断当前上下文是否满足读或写访问所需的锁条件。
+ *
+ * 与 mt_write_locked() 一样只做 lockdep 条件表达，不改变锁状态。
+ */
 static __always_inline bool mt_locked(const struct maple_tree *mt)
 {
 	return mt_external_lock(mt) ? mt_lock_is_held(mt) :
 		lockdep_is_held(&mt->ma_lock);
 }
 
+/*
+ * mt_slot() - 在 RCU 或已持锁条件下解引用一个已发布 slot。
+ *
+ * rcu_dereference_check() 同时保留依赖顺序，并允许 lockdep 认可持锁读。
+ * 返回 entry 为借用值；树不替调用者管理 entry 对象生命周期。
+ */
 static __always_inline void *mt_slot(const struct maple_tree *mt,
 		void __rcu **slots, unsigned char offset)
 {
 	return rcu_dereference_check(slots[offset], mt_locked(mt));
 }
 
+/*
+ * mt_slot_locked() - 写锁已持有时读取 slot。
+ *
+ * protected 版本省去 reader 侧屏障，但要求 mt_write_locked() 为真。
+ */
 static __always_inline void *mt_slot_locked(struct maple_tree *mt,
 		void __rcu **slots, unsigned char offset)
 {
@@ -728,6 +1021,7 @@ static __always_inline void *mt_slot_locked(struct maple_tree *mt,
  *
  * Return: The entry stored in @slots at the @offset.
  */
+/* mas_slot_locked() - ma_state 包装；写锁前提与 mt_slot_locked() 相同。 */
 static __always_inline void *mas_slot_locked(struct ma_state *mas,
 		void __rcu **slots, unsigned char offset)
 {
@@ -742,6 +1036,12 @@ static __always_inline void *mas_slot_locked(struct ma_state *mas,
  *
  * Return: The entry stored in @slots at the @offset
  */
+/*
+ * mas_slot() - 通过 ma_state 在 RCU/锁保护下读取已发布 slot。
+ *
+ * “not holding write lock”不等于无保护；调用者仍须处于 RCU 读段或持有
+ * Maple 锁，具体条件由 mt_slot() 的 check 验证。
+ */
 static __always_inline void *mas_slot(struct ma_state *mas, void __rcu **slots,
 		unsigned char offset)
 {
@@ -754,11 +1054,18 @@ static __always_inline void *mas_slot(struct ma_state *mas, void __rcu **slots,
  *
  * Return: The pointer to the root of the tree
  */
+/*
+ * mas_root() - 在 RCU/锁保护下读取树根。
+ *
+ * 根可能是直接 entry，也可能是带 tag 的 encoded node，调用者随后必须
+ * 结合 mte_is_node()/ma_state 状态解释。返回值不取得所有权。
+ */
 static __always_inline void *mas_root(struct ma_state *mas)
 {
 	return rcu_dereference_check(mas->tree->ma_root, mt_locked(mas->tree));
 }
 
+/* mt_root_locked() - 写锁已持有时读取根，供结构修改路径使用。 */
 static inline void *mt_root_locked(struct maple_tree *mt)
 {
 	return rcu_dereference_protected(mt->ma_root, mt_write_locked(mt));
@@ -770,11 +1077,17 @@ static inline void *mt_root_locked(struct maple_tree *mt)
  *
  * Return: The pointer to the root of the tree
  */
+/* mas_root_locked() - ma_state 包装；不获取锁，仅断言写锁条件。 */
 static inline void *mas_root_locked(struct ma_state *mas)
 {
 	return mt_root_locked(mas->tree);
 }
 
+/*
+ * ma_meta() - 按节点布局定位 metadata。
+ *
+ * 纯布局 helper；调用者已保证该类型确实支持 meta 字段。
+ */
 static inline struct maple_metadata *ma_meta(struct maple_node *mn,
 					     enum maple_type mt)
 {
@@ -793,6 +1106,7 @@ static inline struct maple_metadata *ma_meta(struct maple_node *mn,
  * @offset: The offset of the highest sub-gap in this node.
  * @end: The end of the data in this node.
  */
+/* ma_set_meta() - 同时记录最大 gap 的 slot 和最后一个有效 slot。 */
 static inline void ma_set_meta(struct maple_node *mn, enum maple_type mt,
 			       unsigned char offset, unsigned char end)
 {
@@ -807,6 +1121,12 @@ static inline void ma_set_meta(struct maple_node *mn, enum maple_type mt,
  * @mt: The maple tree
  * @mn: The maple node
  * @type: The maple node type
+ */
+/*
+ * mt_clear_meta() - 在布局确实带 metadata 时将其清零。
+ *
+ * range_64 的末尾空间可能保存正常子节点而非 metadata，因而先通过
+ * pivot/slot 判别；不能无条件覆盖 union 尾部。调用者须持写锁。
  */
 static inline void mt_clear_meta(struct maple_tree *mt, struct maple_node *mn,
 				  enum maple_type type)
@@ -823,9 +1143,11 @@ static inline void mt_clear_meta(struct maple_tree *mt, struct maple_node *mn,
 			slots = mn->mr64.slot;
 			next = mt_slot_locked(mt, slots,
 					      MAPLE_RANGE64_SLOTS - 1);
+			/* 此布局没有可写 metadata，尾部可能仍是节点 slot。 */
 			if (unlikely((mte_to_node(next) &&
 				      mte_node_type(next))))
 				return; /* no metadata, could be node */
+			/* 返回表示尾部不是 metadata，它可能仍保存普通节点。 */
 		}
 		fallthrough;
 	case maple_arange_64:
@@ -844,6 +1166,7 @@ static inline void mt_clear_meta(struct maple_tree *mt, struct maple_node *mn,
  * @mn: The maple node
  * @mt: The maple node type
  */
+/* ma_meta_end() - 读取 metadata 中最后一个有效 slot 的下标。 */
 static inline unsigned char ma_meta_end(struct maple_node *mn,
 					enum maple_type mt)
 {
@@ -856,6 +1179,7 @@ static inline unsigned char ma_meta_end(struct maple_node *mn,
  * ma_meta_gap() - Get the largest gap location of a node from the metadata
  * @mn: The maple node
  */
+/* ma_meta_gap() - 返回 allocation 节点中最大 gap 所在的 slot。 */
 static inline unsigned char ma_meta_gap(struct maple_node *mn)
 {
 	return mn->ma64.meta.gap;
@@ -867,6 +1191,7 @@ static inline unsigned char ma_meta_gap(struct maple_node *mn)
  * @mt: The maple node type
  * @offset: The location of the largest gap.
  */
+/* ma_set_meta_gap() - 更新最大 gap 的位置缓存，不修改 gap 数值本身。 */
 static inline void ma_set_meta_gap(struct maple_node *mn, enum maple_type mt,
 				   unsigned char offset)
 {
@@ -882,6 +1207,12 @@ static inline void ma_set_meta_gap(struct maple_node *mn, enum maple_type mt,
  * @dead_enode: the node to be marked as dead and added to the tail of the list
  *
  * Add the @dead_enode to the linked list in @mat.
+ */
+/*
+ * mat_add() - 将已摘除子树加入待销毁链表。
+ *
+ * 节点先发布为 dead，随后其 union 才能复用为 next 指针；链表保持
+ * head/tail，稍后由 mas_mat_destroy() 按树的 RCU 模式回收。
  */
 static inline void mat_add(struct ma_topiary *mat,
 			   struct maple_enode *dead_enode)
@@ -907,6 +1238,12 @@ static void mt_destroy_walk(struct maple_enode *enode, struct maple_tree *mt,
  *
  * Destroy walk a dead list.
  */
+/*
+ * mas_mat_destroy() - 销毁 topiary 中记录的所有 dead 子树。
+ *
+ * 非 RCU 树可在 destroy walk 中立即释放；RCU 树先拆解子树，再把根节点
+ * 交给 call_rcu()，确保并发 reader 的宽限期结束后才归还 slab。
+ */
 static void mas_mat_destroy(struct ma_state *mas, struct ma_topiary *mat)
 {
 	struct maple_enode *next;
@@ -927,6 +1264,12 @@ static void mas_mat_destroy(struct ma_state *mas, struct ma_topiary *mat)
  * @mas: the maple state.
  *
  * Note: Not RCU safe, only use in write side or debug code.
+ */
+/*
+ * mas_descend() - 沿 mas->offset 指定的 slot 下探一级并收窄节点边界。
+ *
+ * 先由相邻 pivot 计算 child 的闭区间 [min,max]，再读取 slot。该 helper
+ * 不包含 dead-node 重试，不能单独用于无锁 RCU walk，只供写侧或调试。
  */
 static inline void mas_descend(struct ma_state *mas)
 {
@@ -955,12 +1298,23 @@ static inline void mas_descend(struct ma_state *mas)
  * May find a dead node which will cause a premature return.
  * Return: 1 on dead node, 0 otherwise
  */
+/*
+ * mas_ascend() - 上溯到父节点，并重建父节点覆盖的完整 [min,max]。
+ *
+ * parent 编码只给出直接 slot；若 child 位于边缘，还需继续向祖先查找
+ * 隐含的左右边界。两次 dead 检查防止 RCU 修改期间接受不一致的祖先链。
+ * 返回 1 表示途中发现 dead，调用者应从根重走；0 表示 mas 已指向父层。
+ */
 static int mas_ascend(struct ma_state *mas)
 {
 	struct maple_enode *p_enode; /* parent enode. */
+	/* p_enode 保存直接父节点的 encoded 形式。 */
 	struct maple_enode *a_enode; /* ancestor enode. */
+	/* a_enode 保存当前检查祖先的 encoded 形式。 */
 	struct maple_node *a_node; /* ancestor node. */
+	/* a_node 是上述祖先的裸指针。 */
 	struct maple_node *p_node; /* parent node. */
+	/* p_node 是直接父节点裸指针。 */
 	unsigned char a_slot;
 	enum maple_type a_type;
 	unsigned long min, max;
@@ -982,6 +1336,7 @@ static int mas_ascend(struct ma_state *mas)
 	a_enode = mt_mk_node(p_node, a_type);
 
 	/* Check to make sure all parent information is still accurate */
+	/* 解码后再次读取 parent，确认没有在并发替换中跨越两个版本。 */
 	if (p_node != mte_parent(mas->node))
 		return 1;
 
@@ -1000,6 +1355,10 @@ static int mas_ascend(struct ma_state *mas)
 	 * !mas->offset implies that parent node min == mas->min.
 	 * mas->offset > 0 implies that we need to walk up to find the
 	 * implied pivot min.
+	 */
+	/*
+	 * child 位于父 slot 0 时继承父下界；否则父下界要继续向上找到前一
+	 * pivot。右边界同理，直到两侧都确定或到达根。
 	 */
 	if (!mas->offset) {
 		min = mas->min;
@@ -1049,6 +1408,12 @@ static int mas_ascend(struct ma_state *mas)
  *
  * Return: A pointer to a maple node.
  */
+/*
+ * mas_pop_node() - 从 ma_state 的预分配池取一个已清零节点。
+ *
+ * 优先消费单节点 mas->alloc，再从 sheaf 取；这里使用 GFP_NOWAIT，因为
+ * 可能已处于树写锁内，真正可能睡眠的分配应在 mas_alloc_nodes() 完成。
+ */
 static __always_inline struct maple_node *mas_pop_node(struct ma_state *mas)
 {
 	struct maple_node *ret;
@@ -1073,6 +1438,13 @@ out:
  * mas_alloc_nodes() - Allocate nodes into a maple state
  * @mas: The maple state
  * @gfp: The GFP Flags
+ */
+/*
+ * mas_alloc_nodes() - 按 node_request 为即将进行的写操作准备节点。
+ *
+ * 单节点请求走 mas->alloc；多节点请求创建或补充 sheaf。成功后把
+ * node_request 清零；任一分配失败都把 mas 转为 -ENOMEM 错误状态，
+ * 由上层 mas_nomem() 在释放锁后按给定 gfp 补充并重试。
  */
 static inline void mas_alloc_nodes(struct ma_state *mas, gfp_t gfp)
 {
@@ -1126,6 +1498,12 @@ error:
 	mas_set_err(mas, -ENOMEM);
 }
 
+/*
+ * mas_empty_nodes() - 释放 ma_state 尚未消费的全部预分配资源。
+ *
+ * 这是结束/取消预分配事务时的所有权收口：同时清空 request、sheaf 和
+ * 单节点缓存，避免状态复用时泄漏。
+ */
 static inline void mas_empty_nodes(struct ma_state *mas)
 {
 	mas->node_request = 0;
@@ -1148,6 +1526,12 @@ static inline void mas_empty_nodes(struct ma_state *mas)
  * Uses rcu free if necessary, pushes @used back on the maple state allocations
  * otherwise.
  */
+/*
+ * mas_free() - 回收一个已从树结构摘除的 encoded node。
+ *
+ * 当前实现统一交给 ma_free_rcu()；调用者必须已完成发布新结构和 dead
+ * 标记，不能用它释放仍可从根到达的节点。
+ */
 static inline void mas_free(struct ma_state *mas, struct maple_enode *used)
 {
 	ma_free_rcu(mte_to_node(used));
@@ -1166,6 +1550,13 @@ static inline void mas_free(struct ma_state *mas, struct maple_enode *used)
  * - If it's a single entry:    The entry & mas->status == ma_root
  * - If it's a tree:            NULL & mas->status == ma_active
  */
+/*
+ * mas_start() - 把 ma_start 游标初始化为当前根的三种形态之一。
+ *
+ * 空树变为 ma_none；直接根 entry 变为 ma_root；节点树变为 ma_active。
+ * RCU reader 若根节点已 dead 会在 retry 处重新读取根。返回非 NULL 只
+ * 表示 index==0 命中了直接根 entry；其他结果由 mas->status 区分。
+ */
 static inline struct maple_enode *mas_start(struct ma_state *mas)
 {
 	if (likely(mas_is_start(mas))) {
@@ -1178,6 +1569,7 @@ retry:
 		mas->depth = 0;
 		root = mas_root(mas);
 		/* Tree with nodes */
+		/* 多节点树：去掉 root 专用 tag，让 mas->node 保存普通 enode。 */
 		if (likely(xa_is_node(root))) {
 			mas->depth = 0;
 			mas->status = ma_active;
@@ -1191,6 +1583,7 @@ retry:
 
 		mas->node = NULL;
 		/* empty tree */
+		/* 空树没有可遍历节点，offset 置为哨兵值。 */
 		if (unlikely(!root)) {
 			mas->status = ma_none;
 			mas->offset = MAPLE_NODE_SLOTS;
@@ -1198,10 +1591,12 @@ retry:
 		}
 
 		/* Single entry tree */
+		/* 高度为 0 的树直接在 ma_root 保存覆盖索引 0 的 entry。 */
 		mas->status = ma_root;
 		mas->offset = MAPLE_NODE_SLOTS;
 
 		/* Single entry tree. */
+		/* 直接根 entry 只覆盖索引 0，其他 index 视为未命中。 */
 		if (mas->index > 0)
 			return NULL;
 
@@ -1220,6 +1615,13 @@ retry:
  *
  * Uses metadata to find the end of the data when possible.
  * Return: The zero indexed last slot with data (may be null).
+ */
+/*
+ * ma_data_end() - 求节点最后一个有语义的 slot 下标。
+ *
+ * 优先使用 metadata；若最末 pivot 已显式占用，则根据它是否等于节点
+ * 上界区分“最后 slot”与“数组完全占满”。返回位置的 entry 可能是
+ * NULL。
  */
 static __always_inline unsigned char ma_data_end(struct maple_node *node,
 		enum maple_type type, unsigned long *pivots, unsigned long max)
@@ -1251,6 +1653,12 @@ static __always_inline unsigned char ma_data_end(struct maple_node *node,
  *
  * Return: The zero indexed last slot with data (may be null).
  */
+/*
+ * mas_data_end() - ma_state 版本的数据尾位置查询。
+ *
+ * 与 ma_data_end() 的布局规则一致，但增加 dead-node 防御；发现 dead
+ * 时返回 0，真正的 reader 路径随后仍需按协议重新 walk。
+ */
 static inline unsigned char mas_data_end(struct ma_state *mas)
 {
 	enum maple_type type;
@@ -1277,6 +1685,12 @@ static inline unsigned char mas_data_end(struct ma_state *mas)
 	return mt_pivots[type];
 }
 
+/*
+ * wr_mas_setup() - 从 ma_state 构造当前节点的写侧缓存视图。
+ *
+ * 缓存 node/type/pivot/slot 以及当前 slot 的闭区间，减少后续写算法的
+ * 重复解码；不移动游标。
+ */
 static inline
 void wr_mas_setup(struct ma_wr_state *wr_mas, struct ma_state *mas)
 {
@@ -1289,6 +1703,11 @@ void wr_mas_setup(struct ma_wr_state *wr_mas, struct ma_state *mas)
 				       wr_mas->type);
 }
 
+/*
+ * wr_mas_ascend() - 写状态上溯一级并重新建立节点、边界和末尾缓存。
+ *
+ * 属于重平衡内部机械步骤；调用者负责写锁以及 mas_ascend() 的前提。
+ */
 static inline
 void wr_mas_ascend(struct ma_wr_state *wr_mas)
 {
@@ -1299,10 +1718,17 @@ void wr_mas_ascend(struct ma_wr_state *wr_mas)
 	mas->end = ma_data_end(wr_mas->node, wr_mas->type, wr_mas->pivots,
 			       mas->max);
 	/* Careful, this may be wrong.. */
+	/* 该临时 end_piv 取当前 range 上界，后续算法仍会按实际布局修正。 */
 	wr_mas->end_piv = wr_mas->r_max;
 	wr_mas->offset_end = mas->offset;
 }
 
+/*
+ * ma_leaf_max_gap() - 扫描叶节点，计算其中最长的连续 NULL 索引区间。
+ *
+ * dense 节点按连续空 slot 计数；range 节点用相邻 pivot 之差计算。
+ * 这是 allocation tree 的元数据维护算法，调用者无需依赖扫描细节。
+ */
 static inline unsigned long ma_leaf_max_gap(struct maple_node *mn,
 		enum maple_type mt, unsigned long min, unsigned long max,
 		unsigned long *pivots, void __rcu **slots)
@@ -1332,6 +1758,7 @@ static inline unsigned long ma_leaf_max_gap(struct maple_node *mn,
 	 * Check the first implied pivot optimizes the loop below and slot 1 may
 	 * be skipped if there is a gap in slot 0.
 	 */
+	/* 单独处理首个隐含区间，既得到左端 gap，也能减少主循环分支。 */
 	if (likely(!slots[0])) {
 		max_gap = pivots[0] - min + 1;
 		i = 2;
@@ -1340,11 +1767,13 @@ static inline unsigned long ma_leaf_max_gap(struct maple_node *mn,
 	}
 
 	/* reduce max_piv as the special case is checked before the loop */
+	/* 末端隐含区间在循环外处理，因此主循环的 pivot 上界减一。 */
 	max_piv = ma_data_end(mn, mt, pivots, max) - 1;
 	/*
 	 * Check end implied pivot which can only be a gap on the right most
 	 * node.
 	 */
+	/* 只有整棵树最右节点才能出现一直延伸到 ULONG_MAX 的隐含尾 gap。 */
 	if (unlikely(max == ULONG_MAX) && !slots[max_piv + 1]) {
 		gap = ULONG_MAX - pivots[max_piv];
 		if (gap > max_gap)
@@ -1356,6 +1785,7 @@ static inline unsigned long ma_leaf_max_gap(struct maple_node *mn,
 
 	for (; i <= max_piv; i++) {
 		/* data == no gap. */
+		/* 非 NULL slot 表示该闭区间已被占用，不贡献空洞。 */
 		if (likely(slots[i]))
 			continue;
 
@@ -1365,6 +1795,7 @@ static inline unsigned long ma_leaf_max_gap(struct maple_node *mn,
 			max_gap = gap;
 
 		/* There cannot be two gaps in a row. */
+		/* 规范化表示会合并相邻 NULL range，因此跳过下一位置。 */
 		i++;
 	}
 	return max_gap;
@@ -1376,6 +1807,7 @@ static inline unsigned long ma_leaf_max_gap(struct maple_node *mn,
  *
  * Return: The maximum gap in the leaf.
  */
+/* mas_leaf_max_gap() - 从游标取得叶布局后调用 ma_leaf_max_gap()。 */
 static inline unsigned long mas_leaf_max_gap(struct ma_state *mas)
 {
 	enum maple_type mt;
@@ -1402,6 +1834,11 @@ static inline unsigned long mas_leaf_max_gap(struct ma_state *mas)
  *
  * Return: The maximum gap value
  */
+/*
+ * ma_max_gap() - 扫描非叶节点的 gap 数组，并返回最大值及其 slot。
+ *
+ * 仅是 allocation-tree 元数据归约，不涉及树形修改。
+ */
 static inline unsigned long
 ma_max_gap(struct maple_node *node, unsigned long *gaps, enum maple_type mt,
 	    unsigned char *off)
@@ -1426,6 +1863,11 @@ ma_max_gap(struct maple_node *node, unsigned long *gaps, enum maple_type mt,
  * @mas: The maple state.
  *
  * Return: The gap value.
+ */
+/*
+ * mas_max_gap() - 返回当前子树可提供的最大空洞。
+ *
+ * 叶节点现算；arange 内部节点直接使用 meta.gap 指向的缓存值。
  */
 static inline unsigned long mas_max_gap(struct ma_state *mas)
 {
@@ -1453,6 +1895,12 @@ static inline unsigned long mas_max_gap(struct ma_state *mas)
  *
  * Set the parent gap then continue to set the gap upwards, using the metadata
  * of the parent to see if it is necessary to check the node above.
+ */
+/*
+ * mas_parent_gap() - 更新父节点对应 child 的 gap，并按需向根传播。
+ *
+ * 若修改项不影响父节点最大值即可停止；若替换了原最大项，则重扫本层
+ * 选出新最大值。只有每层“本子树最大 gap”发生变化时才继续上溯。
  */
 static inline void mas_parent_gap(struct ma_state *mas, unsigned char offset,
 		unsigned long new)
@@ -1493,6 +1941,7 @@ ascend:
 		return;
 
 	/* Go to the parent node. */
+	/* 本层聚合值改变，转到祖父层更新代表本节点的那个 slot。 */
 	pnode = mte_parent(penode);
 	pmt = mas_parent_type(mas, penode);
 	pgaps = ma_gaps(pnode, pmt);
@@ -1504,6 +1953,11 @@ ascend:
 /*
  * mas_update_gap() - Update a nodes gaps and propagate up if necessary.
  * @mas: the maple state.
+ */
+/*
+ * mas_update_gap() - 重算当前节点的最大 gap，并在值改变时更新祖先。
+ *
+ * 非 allocation tree 或根节点无需维护父级摘要。
  */
 static inline void mas_update_gap(struct ma_state *mas)
 {
@@ -1533,6 +1987,11 @@ static inline void mas_update_gap(struct ma_state *mas)
  * @mas: the maple state (for the tree)
  * @parent: the maple encoded node containing the children.
  */
+/*
+ * mas_adopt_children() - 为新内部节点的全部 child 重写 parent/slot 编码。
+ *
+ * 只做结构链接修复；用于 copy/split 后的新节点发布前。
+ */
 static inline void mas_adopt_children(struct ma_state *mas,
 		struct maple_enode *parent)
 {
@@ -1556,6 +2015,13 @@ static inline void mas_adopt_children(struct ma_state *mas,
  * @mas: the maple state with the new node
  * @old_enode: The old maple encoded node to replace.
  * @new_height: if we are inserting a root node, update the height of the tree
+ */
+/*
+ * mas_put_in_tree() - 原子发布替代节点，再把旧节点标记为 dead。
+ *
+ * 根替换同时更新 parent=root 和树高；非根替换通过父 slot 的
+ * rcu_assign_pointer() 发布。发布顺序保证 reader 先能从根到达新节点，
+ * 随后旧节点的 dead 标志迫使仍握有旧路径的 reader 重走。须持写锁。
  */
 static inline void mas_put_in_tree(struct ma_state *mas,
 		struct maple_enode *old_enode, char new_height)
@@ -1587,6 +2053,12 @@ static inline void mas_put_in_tree(struct ma_state *mas,
  * @old_enode: The old maple encoded node.
  * @new_height: The new height of the tree as a result of the operation
  */
+/*
+ * mas_replace_node() - 发布新节点并回收被替换节点。
+ *
+ * RCU 可见性与 dead 顺序由 mas_put_in_tree() 完成；之后旧节点已不可从
+ * 根到达，才可交给 mas_free() 延迟回收。
+ */
 static inline void mas_replace_node(struct ma_state *mas,
 		struct maple_enode *old_enode, unsigned char new_height)
 	__must_hold(mas->tree->ma_lock)
@@ -1599,6 +2071,12 @@ static inline void mas_replace_node(struct ma_state *mas,
  * mas_find_child() - Find a child who has the parent @mas->node.
  * @mas: the maple state with the parent.
  * @child: the maple state to store the child.
+ */
+/*
+ * mas_find_child() - 在父节点 slots 中寻找仍以当前节点为 parent 的 child。
+ *
+ * 找到时填充独立 child 状态，并推进父 mas->offset 便于继续枚举。主要
+ * 服务 topiary 替换后的新旧子树识别，属于结构整理内部算法。
  */
 static inline bool mas_find_child(struct ma_state *mas, struct ma_state *child)
 	__must_hold(mas->tree->ma_lock)
@@ -1636,6 +2114,7 @@ static inline bool mas_find_child(struct ma_state *mas, struct ma_state *child)
  * @mt: The maple type
  * @end: The node end
  */
+/* mas_leaf_set_meta() - 叶节点未占满时记录 data-end；占满时无需 metadata。 */
 static inline void mas_leaf_set_meta(struct maple_node *node,
 		enum maple_type mt, unsigned char end)
 {
@@ -1649,11 +2128,13 @@ static inline void mas_leaf_set_meta(struct maple_node *node,
  *
  * Return: True if there is a previous sibling, false otherwise.
  */
+/* mas_prev_sibling() - 将游标移到同一父节点的前一个 child。 */
 static inline bool mas_prev_sibling(struct ma_state *mas)
 {
 	unsigned int p_slot = mte_parent_slot(mas->node);
 
 	/* For root node, p_slot is set to 0 by mte_parent_slot(). */
+	/* root 没有兄弟，mte_parent_slot() 对它约定返回 0。 */
 	if (!p_slot)
 		return false;
 
@@ -1669,6 +2150,7 @@ static inline bool mas_prev_sibling(struct ma_state *mas)
  *
  * Return: true if there is a next sibling, false otherwise.
  */
+/* mas_next_sibling() - 将游标移到同一父节点的后一个 child。 */
 static inline bool mas_next_sibling(struct ma_state *mas)
 {
 	MA_STATE(parent, mas->tree, mas->index, mas->last);
@@ -1695,6 +2177,12 @@ static inline bool mas_next_sibling(struct ma_state *mas)
  *
  * Uses mas_slot_locked() and does not need to worry about dead nodes.
  */
+/*
+ * mas_wr_node_walk() - 在当前写锁保护节点内定位 mas->index 所属 slot。
+ *
+ * 更新 offset、命中闭区间和 data-end 缓存；由于写锁排除了结构替换，
+ * 不需要 dead-node 重试。具体 pivot 扫描属于树内部实现。
+ */
 static inline void mas_wr_node_walk(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
@@ -1720,10 +2208,14 @@ static inline void mas_wr_node_walk(struct ma_wr_state *wr_mas)
 	wr_mas->offset_end = mas->offset = offset;
 }
 
+/*
+ * rebalance_sib() - 为重平衡选择相邻兄弟，优先右邻以便把数据向左归并。
+ */
 static inline void rebalance_sib(struct ma_state *parent, struct ma_state *sib)
 {
 	*sib = *parent;
 	/* Prioritize move right to pull data left */
+	/* 优先右移选择兄弟，使后续搬运方向稳定为“从右向左”。 */
 	if (sib->offset < sib->end)
 		sib->offset++;
 	else
@@ -1733,6 +2225,12 @@ static inline void rebalance_sib(struct ma_state *parent, struct ma_state *sib)
 	sib->end = mas_data_end(sib);
 }
 
+/*
+ * spanning_sib() - 为跨多个节点的写入寻找范围外最近邻节点。
+ *
+ * 同时向上寻找共同祖先，再下降到左/右邻分支；这是重平衡的树形定位
+ * 细节，调用者只关心 nneighbour 是否得到可借用的相邻节点。
+ */
 static inline
 void spanning_sib(struct ma_wr_state *l_wr_mas,
 		struct ma_wr_state *r_wr_mas, struct ma_state *nneighbour)
@@ -1778,6 +2276,11 @@ void spanning_sib(struct ma_wr_state *l_wr_mas,
  *
  * The node will either be RCU freed or pushed back on the maple state.
  */
+/*
+ * mas_topiary_node() - 将 topiary walk 中不再使用的单个节点标 dead 并回收。
+ *
+ * ma_none 表示该槽没有节点。回收仍遵循 ma_free_rcu() 的宽限期规则。
+ */
 static inline void mas_topiary_node(struct ma_state *mas,
 		struct ma_state *tmp_mas, bool in_rcu)
 {
@@ -1811,6 +2314,14 @@ static inline void mas_topiary_node(struct ma_state *mas,
  * @new_height: The new height of the tree as a result of the operation
  *
  */
+/*
+ * mas_topiary_replace() - 发布最多三叉的新局部树，并清理被覆盖的旧子树。
+ *
+ * 第一阶段发布新根并逐层修复新 child 的 parent；第二阶段遍历旧局部树：
+ * 完全落入写入区间的子树加入 topiary 整体销毁，边界上的节点逐个回收。
+ * 最后由 mas_mat_destroy() 按 RCU 模式处理整棵 dead 子树。循环的三路
+ * 细节属于 Maple 重构算法，学习时重点把握“先发布、再标死、后回收”。
+ */
 static inline void mas_topiary_replace(struct ma_state *mas,
 		struct maple_enode *old_enode, unsigned char new_height)
 {
@@ -1820,9 +2331,11 @@ static inline void mas_topiary_replace(struct ma_state *mas,
 	int i, n;
 
 	/* Place data in tree & then mark node as old */
+	/* 先让新结构从根可达，再使旧节点进入 reader 可检测的 dead 状态。 */
 	mas_put_in_tree(mas, old_enode, new_height);
 
 	/* Update the parent pointers in the tree */
+	/* 新建局部树的 child 仍带临时 parent，逐层改成正式父节点和 slot。 */
 	tmp[0] = *mas;
 	tmp[0].offset = 0;
 	tmp[1].status = ma_none;
@@ -1853,6 +2366,7 @@ static inline void mas_topiary_replace(struct ma_state *mas,
 	}
 
 	/* Collect the old nodes that need to be discarded */
+	/* 区分可整棵销毁的覆盖子树与仍需继续检查的边界节点。 */
 	if (mte_is_leaf(old_enode))
 		return mas_free(mas, old_enode);
 
@@ -1913,6 +2427,12 @@ static inline void mas_topiary_replace(struct ma_state *mas,
  * @d_start: The start location in the destination node
  * @d_mt: The destination maple node type
  */
+/*
+ * node_copy() - 将一段 slot/pivot/gap 从源布局复制到目标布局。
+ *
+ * 若 copy 临时节点中的 child 被放入正式内部节点，还会修正其 parent。
+ * 返回复制段的右边界；具体数组边界处理属于节点重排实现。
+ */
 static inline
 unsigned long node_copy(struct ma_state *mas, struct maple_node *src,
 	unsigned char start, unsigned char size, unsigned long s_max,
@@ -1967,6 +2487,11 @@ unsigned long node_copy(struct ma_state *mas, struct maple_node *src,
  * @mt: The maple node type
  * @end: The end of the used area
  */
+/*
+ * node_finalise() - 清零目标节点未使用区域并重建 end/max-gap metadata。
+ *
+ * 新节点发布前必须消除旧数据残留，避免 reader 把未使用 slot 当成内容。
+ */
 static inline
 void node_finalise(struct maple_node *node, enum maple_type mt,
 		   unsigned char end)
@@ -2006,6 +2531,12 @@ void node_finalise(struct maple_node *node, enum maple_type mt,
 		ma_set_meta(node, mt, gap_slot, end - 1);
 }
 
+/*
+ * mtree_range_walk() - 从当前节点继续下探，定位 index 所在的叶 range。
+ *
+ * 成功时更新 mas 的叶节点、slot 及命中闭区间；若途中发现 dead 节点，
+ * 重置 mas 并返回 NULL，交由上层从根重试。
+ */
 static inline void *mtree_range_walk(struct ma_state *mas)
 {
 	unsigned long *pivots;
@@ -2073,6 +2604,12 @@ dead_node:
  *
  * Updates gap as necessary.
  */
+/*
+ * mas_wmb_replace() - 将 maple_copy 产生的新局部树发布到正式树。
+ *
+ * mas_topiary_replace() 负责 RCU 发布/dead/回收；随后更新 gap，并重新
+ * walk 到写入后的 range，使调用者的 ma_state 与新树一致。
+ */
 static inline void mas_wmb_replace(struct ma_state *mas, struct maple_copy *cp)
 {
 	struct maple_enode *old_enode;
@@ -2080,6 +2617,7 @@ static inline void mas_wmb_replace(struct ma_state *mas, struct maple_copy *cp)
 	old_enode = mas->node;
 	mas->node = mt_slot_locked(mas->tree, cp->slot, 0);
 	/* Insert the new data in the tree */
+	/* 把 cp->slot[0] 指向的新局部树作为旧节点的正式替代者。 */
 	mas_topiary_replace(mas, old_enode, cp->height);
 	if (!mte_is_leaf(mas->node))
 		mas_update_gap(mas);
@@ -2096,6 +2634,12 @@ static inline void mas_wmb_replace(struct ma_state *mas, struct maple_copy *cp)
  * @l_wr_mas: The left write state of the spanning store
  * @r_wr_mas: The right write state of the spanning store
  */
+/*
+ * cp_leaf_init() - 在私有 maple_copy 中拼出叶层待写 range。
+ *
+ * 最多保留左残段、新 entry、右残段三项；copy 尚未发布，因此可使用
+ * RCU_INIT_POINTER。后续 copy/split 算法会把这些项分配到正式节点。
+ */
 static inline void cp_leaf_init(struct maple_copy *cp,
 		struct ma_state *mas, struct ma_wr_state *l_wr_mas,
 		struct ma_wr_state *r_wr_mas)
@@ -2107,9 +2651,14 @@ static inline void cp_leaf_init(struct maple_copy *cp,
 	 * to not expose the maple_copy node to any readers.  Exposure may
 	 * result in buggy code when a compiler reorders the instructions.
 	 */
+	/*
+	 * 警告：RCU_INIT_POINTER() 没有发布语义，cp 在全部字段完成前绝不能
+	 * 暴露给 reader，否则编译器重排可能让 reader 观察到半初始化内容。
+	 */
 
 	cp->height = 1;
 	/* Create entries to insert including split entries to left and right */
+	/* 按需形成左残段、新写入段、右残段。 */
 	if (l_wr_mas->r_min < mas->index) {
 		end++;
 		RCU_INIT_POINTER(cp->slot[0], l_wr_mas->content);
@@ -2139,18 +2688,27 @@ static inline void cp_leaf_init(struct maple_copy *cp,
  *
  * cp->data is a size (not indexed by 0).
  */
+/* cp_data_calc() - 统计重排后的 entry 数量；cp->data 是数量而非下标。 */
 static inline void cp_data_calc(struct maple_copy *cp,
 		struct ma_wr_state *l_wr_mas, struct ma_wr_state *r_wr_mas)
 {
 
 	/* Add 1 every time for the 0th element */
+	/* offset 是零基下标，换算为数量时隐含包含第 0 项。 */
 	cp->data = l_wr_mas->mas->offset;
 	/* Add the new data and any partial overwrites */
+	/* 加入新 entry 以及两侧可能保留的部分旧 range。 */
 	cp->data += cp->end + 1;
 	/* Data from right (offset + 1 to end), +1 for zero */
+	/* 再计入右端命中 slot 之后直到 data-end 的旧数据。 */
 	cp->data += r_wr_mas->mas->end - r_wr_mas->offset_end;
 }
 
+/*
+ * data_fits() - 判断当前重排数据与 sibling 合并后能否装入两个节点。
+ *
+ * 有意预留一个空 slot 以减少反复插入/删除造成的 split 抖动。
+ */
 static bool data_fits(struct ma_state *sib, struct ma_state *mas,
 		struct maple_copy *cp)
 {
@@ -2183,12 +2741,21 @@ static bool data_fits(struct ma_state *sib, struct ma_state *mas,
 	 * (this case), it is always possible to shift the spilt by one - again
 	 * because there is at least one slot free by the below checking.
 	 */
+	/*
+	 * 这里有意采用严格小于而不是小于等于：保留一个 slot 可降低连续
+	 * 增删时的结构抖动，也给叶节点末端不能落 NULL 的调整留出空间。
+	 */
 	if (new_data < space)
 		return true;
 
 	return false;
 }
 
+/*
+ * push_data_sib() - 尝试选择可吸收/分担本次数据的左或右 sibling。
+ *
+ * 成功时 sib 描述所选兄弟；失败以 sib->end=0 表示。属于重平衡策略。
+ */
 static inline void push_data_sib(struct maple_copy *cp, struct ma_state *mas,
 		struct ma_state *sib, struct ma_state *parent)
 {
@@ -2203,6 +2770,7 @@ static inline void push_data_sib(struct maple_copy *cp, struct ma_state *mas,
 		mas_descend(sib);
 		sib->end = mas_data_end(sib);
 		if (data_fits(sib, mas, cp))	/* Push left */
+			/* 左兄弟有容量，可把待重排数据向左分担。 */
 			return;
 
 		*sib = *parent;
@@ -2215,6 +2783,7 @@ static inline void push_data_sib(struct maple_copy *cp, struct ma_state *mas,
 	mas_descend(sib);
 	sib->end = mas_data_end(sib);
 	if (data_fits(sib, mas, cp))		/* Push right*/
+		/* 左侧不可用时尝试让右兄弟参与重排。 */
 		return;
 
 no_push:
@@ -2231,6 +2800,12 @@ no_push:
  * Note: @cp->data is a size and not indexed by 0. @sib->end may be set to 0 to
  * indicate it will not be used.
  *
+ */
+/*
+ * rebalance_data() - 为单节点写入决定是否需要 sibling 参与重平衡。
+ *
+ * 数据过多时尝试向兄弟分流，过少时尝试合并；cp->data 最终表示所有
+ * 参与源的 entry 总数，sib->end==0 表示无需兄弟。
  */
 static inline void rebalance_data(struct maple_copy *cp,
 		struct ma_wr_state *wr_mas, struct ma_state *sib,
@@ -2267,6 +2842,11 @@ use_sib:
  * Note: @cp->data is a size and not indexed by 0. @sib->end may be set to 0 to
  * indicate it will not be used.
  */
+/*
+ * spanning_data() - 统计跨节点写入的数据量，必要时纳入相邻 sibling。
+ *
+ * 只负责源数据规模/参与者选择，不执行复制或发布。
+ */
 static inline void spanning_data(struct maple_copy *cp,
 		struct ma_wr_state *l_wr_mas, struct ma_wr_state *r_wr_mas,
 		struct ma_state *sib)
@@ -2287,10 +2867,17 @@ static inline void spanning_data(struct maple_copy *cp,
  * @mas: The maple state
  * @mt: The source node type
  */
+/*
+ * dst_setup() - 按 entry 数量决定生成一、二或三个目标节点并预取节点。
+ *
+ * 叶节点还要避开以 NULL 结束的不合法切分点；具体 split 位置是 B-tree
+ * 实现细节，学习时关注目标节点都来自此前的 mas 预分配池。
+ */
 static inline
 void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
 {
 	/* Data is 1 indexed, every src has +1 added.  */
+	/* cp->data 表示数量，后续 split 字段才使用零基下标。 */
 
 	if (cp->data <= mt_slots[mt]) {
 		cp->split = cp->data - 1;
@@ -2314,6 +2901,7 @@ void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
 		 * Leaf nodes are a bit tricky because we cannot assume the data
 		 * can fit due to the NULL limitation on node ends.
 		 */
+		/* 叶节点边界不能以可合并 NULL 结束，必要时微调切分位置。 */
 		off = cp->split;
 		for (s = 0; s < cp->s_count; s++) {
 			unsigned char s_off;
@@ -2341,6 +2929,7 @@ void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
 	}
 
 	/* No other choice but to 3-way split the data */
+	/* 两个节点仍无法满足容量/NULL 边界约束时才使用三路切分。 */
 	cp->split = (cp->data + 2) / 3;
 	cp->d_count = 3;
 
@@ -2351,6 +2940,7 @@ node_setup:
 	}
 }
 
+/* append_mas_cp() - 把 ma_state 描述的一段现有节点登记为 copy 源。 */
 static inline void append_mas_cp(struct maple_copy *cp,
 	struct ma_state *mas, unsigned char start, unsigned char end)
 {
@@ -2373,6 +2963,7 @@ static inline void append_mas_cp(struct maple_copy *cp,
 	cp->s_count++;
 }
 
+/* append_wr_mas_cp() - 把写状态中的一段 slot 登记为 copy 源。 */
 static inline void append_wr_mas_cp(struct maple_copy *cp,
 	struct ma_wr_state *wr_mas, unsigned char start, unsigned char end)
 {
@@ -2391,6 +2982,7 @@ static inline void append_wr_mas_cp(struct maple_copy *cp,
 	cp->s_count++;
 }
 
+/* init_cp_src() - 把 cp 自身新构造的叶数据登记为一个 copy 源。 */
 static inline void init_cp_src(struct maple_copy *cp)
 {
 	cp->src[cp->s_count].node = ma_mnode_ptr(cp);
@@ -2410,6 +3002,12 @@ static inline void init_cp_src(struct maple_copy *cp)
  *
  * Note: @sib->end == 0 indicates no sibling will be used.
  */
+/*
+ * multi_src_setup() - 按最终顺序组装左旧数据、新数据、右旧数据和
+ * 兄弟源段。
+ *
+ * 这里只登记源区间，真正的数据搬运由 cp_data_write() 完成。
+ */
 static inline
 void multi_src_setup(struct maple_copy *cp, struct ma_wr_state *l_wr_mas,
 		struct ma_wr_state *r_wr_mas, struct ma_state *sib)
@@ -2419,6 +3017,7 @@ void multi_src_setup(struct maple_copy *cp, struct ma_wr_state *l_wr_mas,
 		append_mas_cp(cp, sib, 0, sib->end);
 
 	/* Copy left 0 - offset */
+	/* 保留写入起点之前未被覆盖的左侧内容。 */
 	if (l_wr_mas->mas->offset) {
 		unsigned char off = l_wr_mas->mas->offset - 1;
 
@@ -2429,6 +3028,7 @@ void multi_src_setup(struct maple_copy *cp, struct ma_wr_state *l_wr_mas,
 	init_cp_src(cp);
 
 	/* Copy right either from offset or offset + 1 pending on r_max */
+	/* 保留写入终点之后未被覆盖的右侧内容。 */
 	if (r_wr_mas->mas->end != r_wr_mas->offset_end)
 		append_wr_mas_cp(cp, r_wr_mas, r_wr_mas->offset_end + 1,
 			       r_wr_mas->mas->end);
@@ -2437,6 +3037,12 @@ void multi_src_setup(struct maple_copy *cp, struct ma_wr_state *l_wr_mas,
 		append_mas_cp(cp, sib, 0, sib->end);
 }
 
+/*
+ * cp_data_write() - 依次把登记的源段分发到一个或多个目标节点。
+ *
+ * 每个目标完成后调用 node_finalise() 建立 metadata；这是纯节点布局和
+ * 切分实现，调用者只需知道 cp->dst[] 最终成为可发布的新局部树。
+ */
 static inline
 void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 {
@@ -2453,6 +3059,7 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 	data_offset = 0;
 	s = d = 0;
 	/* Readability help */
+	/* 缓存当前源/目标字段，减少下方双层搬运循环的视觉噪声。 */
 	src = cp->src[s].node;
 	dst = cp->dst[d].node;
 	s_offset = cp->src[s].start;
@@ -2483,6 +3090,7 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 			s_offset += size;
 			if (s_offset > src_end) {
 				/* This source is exhausted */
+				/* 当前源段已复制完，切换到登记的下一源段。 */
 				s++;
 				if (s >= cp->s_count) {
 					cp->dst[d].max = d_max;
@@ -2490,6 +3098,7 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 					return;
 				}
 				/* Reset local src */
+				/* 刷新局部源缓存，继续填充同一目标节点。 */
 				src = cp->src[s].node;
 				s_offset = cp->src[s].start;
 				src_end = cp->src[s].end;
@@ -2504,6 +3113,7 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 		split = cp->split;
 		cp->dst[d].max = d_max;
 		/* Handle null entries */
+		/* 调整切分，避免非最右目标节点以 NULL range 结束。 */
 		if (cp->dst[d].max != ULONG_MAX &&
 		    !ma_slots(dst, d_mt)[dst_offset - 1]) {
 			if (s_offset == cp->src[s].start) {
@@ -2517,6 +3127,7 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 				s_offset--;
 			}
 			/* Set dst max and clear pivot */
+			/* 回退一个 slot，并把前一 pivot 作为目标真实上界。 */
 			split++;
 			data_offset--;
 			dst_offset--;
@@ -2525,6 +3136,7 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 
 		node_finalise(dst, d_mt, dst_offset);
 		++d; /* Next destination */
+		/* 当前目标已完成，转到下一个新节点。 */
 		if (d == cp->d_count - 1)
 			split = cp->data - data_offset;
 
@@ -2544,6 +3156,11 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
  * @max: The maximum value represented
  * @mas: The maple state
  */
+/*
+ * cp_dst_to_slots() - 把本层目标节点编码为上一层待插入的 slots。
+ *
+ * 同时填写各目标覆盖上界和 gap 摘要，是自底向上 split 的层间交接。
+ */
 static inline void cp_dst_to_slots(struct maple_copy *cp, unsigned long min,
 		unsigned long max, struct ma_state *mas)
 {
@@ -2560,6 +3177,10 @@ static inline void cp_dst_to_slots(struct maple_copy *cp, unsigned long min,
 		 * documentation.  Since these are new nodes, there are no
 		 * read-side operations that can view them until they are
 		 * inserted into the tree after an rcu_assign_pointer() call.
+		 */
+		/*
+		 * 这些目标节点仍是私有节点，正式 rcu_assign_pointer() 发布前
+		 * 没有 reader，因而 ma_init_slot() 的无屏障初始化是安全的。
 		 */
 		ma_init_slot(&cp->slot[d], mn, mt);
 		cp->pivot[d] = slot_max;
@@ -2587,6 +3208,7 @@ static inline void cp_dst_to_slots(struct maple_copy *cp, unsigned long min,
 	cp->max = max;
 }
 
+/* cp_is_new_root() - 判断重排结果是否覆盖全树并可直接成为新根。 */
 static inline bool cp_is_new_root(struct maple_copy *cp, struct ma_state *mas)
 {
 	if (cp->min || cp->max != ULONG_MAX)
@@ -2611,6 +3233,7 @@ static inline bool cp_is_new_root(struct maple_copy *cp, struct ma_state *mas)
 		 * read-side operations that can view it until it is insert into
 		 * the tree after an rcu_assign_pointer() call.
 		 */
+		/* 新根尚未发布，全部字段就绪后才由 RCU 根指针对外可见。 */
 		ma_init_slot(&cp->slot[0], cp->dst[0].node, mt);
 		cp->height++;
 	}
@@ -2624,6 +3247,7 @@ static inline bool cp_is_new_root(struct maple_copy *cp, struct ma_state *mas)
 	return true;
 }
 
+/* cp_converged() - 判断跨节点重排的左右路径是否已汇合到同一父层。 */
 static inline bool cp_converged(struct maple_copy *cp, struct ma_state *mas,
 				struct ma_state *sib)
 {
@@ -2644,6 +3268,11 @@ static inline bool cp_converged(struct maple_copy *cp, struct ma_state *mas,
  *
  * Returns: True if another iteration is necessary.
  */
+/*
+ * spanning_ascend() - 跨节点写完成一层后，准备是否继续向父层重构。
+ *
+ * true 表示本层新节点还要作为父层输入；false 表示已成新根或路径汇合。
+ */
 static bool spanning_ascend(struct maple_copy *cp, struct ma_state *mas,
 			    struct ma_wr_state *l_wr_mas, struct ma_wr_state *r_wr_mas,
 			    struct ma_state *sib)
@@ -2660,6 +3289,7 @@ static bool spanning_ascend(struct maple_copy *cp, struct ma_state *mas,
 		return false;
 
 	/* Converged and has a single destination */
+	/* 左右路径汇合且仅产出一个节点时，本层重构已经完成。 */
 	if ((cp->d_count == 1) &&
 	    (l_wr_mas->mas->node == r_wr_mas->mas->node)) {
 		cp->dst[0].node->parent = ma_parent_ptr(mas_mn(mas)->parent);
@@ -2672,6 +3302,7 @@ static bool spanning_ascend(struct maple_copy *cp, struct ma_state *mas,
 	return true;
 }
 
+/* copy_tree_location() - 复制游标的树位置字段，不改变目标查询范围。 */
 static inline
 void copy_tree_location(const struct ma_state *src, struct ma_state *dst)
 {
@@ -2690,6 +3321,9 @@ void copy_tree_location(const struct ma_state *src, struct ma_state *dst)
  * Return: True if there another rebalancing operation on the next level is
  * needed, false otherwise.
  */
+/*
+ * rebalance_ascend() - 判断节点合并后父层是否也因少一个 child 而需重平衡。
+ */
 static inline bool rebalance_ascend(struct maple_copy *cp,
 		struct ma_wr_state *wr_mas, struct ma_state *sib,
 		struct ma_state *parent)
@@ -2702,6 +3336,7 @@ static inline bool rebalance_ascend(struct maple_copy *cp,
 		min = mas->min;
 		max = mas->max;
 	} else if (sib->min > mas->max) { /* Move right succeeded */
+		/* 使用了右兄弟，重构范围的右端扩展到 sibling 上界。 */
 		min = mas->min;
 		max = sib->max;
 		wr_mas->offset_end = parent->offset + 1;
@@ -2729,6 +3364,11 @@ static inline bool rebalance_ascend(struct maple_copy *cp,
  * mas_root_expand() - Expand a root to a node
  * @mas: The maple state
  * @entry: The entry to store into the tree
+ */
+/*
+ * mas_root_expand() - 将高度 0 的直接根 entry 扩展为叶节点。
+ *
+ * 新节点同时容纳旧根和新 range，设置 root parent/树高后以 RCU 语义发布。
  */
 static inline void mas_root_expand(struct ma_state *mas, void *entry)
 {
@@ -2764,6 +3404,7 @@ static inline void mas_root_expand(struct ma_state *mas, void *entry)
 	mt_set_height(mas->tree, 1);
 	ma_set_meta(node, maple_leaf_64, 0, slot);
 	/* swap the new root into the tree */
+	/* 所有字段就绪后一次性发布新根。 */
 	rcu_assign_pointer(mas->tree->ma_root, mte_mk_root(mas->node));
 }
 
@@ -2774,6 +3415,11 @@ static inline void mas_root_expand(struct ma_state *mas, void *entry)
  *
  * There is no root node now and we are storing a value into the root - this
  * function either assigns the pointer or expands into a node.
+ */
+/*
+ * mas_store_root() - 处理空树或直接根 entry 上的写入。
+ *
+ * 可继续由索引 0 的直接 entry 表示时替换 ma_root，否则扩展为首个叶节点。
  */
 static inline void mas_store_root(struct ma_state *mas, void *entry)
 {
@@ -2800,6 +3446,7 @@ static inline void mas_store_root(struct ma_state *mas, void *entry)
  *
  * Return: True if this is a spanning write, false otherwise.
  */
+/* mas_is_span_wr() - 判断写入范围是否越过当前叶节点，需要局部树重构。 */
 static bool mas_is_span_wr(struct ma_wr_state *wr_mas)
 {
 	unsigned long max = wr_mas->r_max;
@@ -2808,6 +3455,7 @@ static bool mas_is_span_wr(struct ma_wr_state *wr_mas)
 	void *entry = wr_mas->entry;
 
 	/* Contained in this pivot, fast path */
+	/* last 尚未越过当前 pivot，写入完全位于当前 range 内。 */
 	if (last < max)
 		return false;
 
@@ -2822,6 +3470,10 @@ static bool mas_is_span_wr(struct ma_wr_state *wr_mas)
 		 * The last entry of leaf node cannot be NULL unless it is the
 		 * rightmost node (writing ULONG_MAX), otherwise it spans slots.
 		 */
+		/*
+		 * 除最右叶外，叶节点末 range 不能为 NULL；写 NULL 会与下一节点
+		 * 的空洞合并，因此必须按 spanning store 处理。
+		 */
 		if (entry || last == ULONG_MAX)
 			return false;
 	}
@@ -2830,6 +3482,7 @@ static bool mas_is_span_wr(struct ma_wr_state *wr_mas)
 	return true;
 }
 
+/* mas_wr_walk_descend() - 写侧下探一级并刷新 wr_mas 的布局缓存。 */
 static inline void mas_wr_walk_descend(struct ma_wr_state *wr_mas)
 {
 	wr_mas->type = mte_node_type(wr_mas->mas->node);
@@ -2837,6 +3490,7 @@ static inline void mas_wr_walk_descend(struct ma_wr_state *wr_mas)
 	wr_mas->slots = ma_slots(wr_mas->node, wr_mas->type);
 }
 
+/* mas_wr_walk_traverse() - 在当前写节点定位 index 后继续向目标叶层下探。 */
 static inline void mas_wr_walk_traverse(struct ma_wr_state *wr_mas)
 {
 	wr_mas->mas->max = wr_mas->r_max;
@@ -2852,6 +3506,11 @@ static inline void mas_wr_walk_traverse(struct ma_wr_state *wr_mas)
  * Uses mas_slot_locked() and does not need to worry about dead nodes.
  *
  * Return: True if it's contained in a node, false on spanning write.
+ */
+/*
+ * mas_wr_walk() - 在写锁下定位 store 的目标叶节点和命中区间。
+ *
+ * false 表示写入跨越当前节点；true 表示 wr_mas 已具备局部写入信息。
  */
 static bool mas_wr_walk(struct ma_wr_state *wr_mas)
 {
@@ -2872,6 +3531,7 @@ static bool mas_wr_walk(struct ma_wr_state *wr_mas)
 
 		if (ma_is_root(mas_mn(mas))) {
 			/* root needs more than 2 entries to be sufficient + 1 */
+			/* 根超过两个 entry 才为上层重构提供足够余量。 */
 			if (mas->end > 2)
 				wr_mas->sufficient_height = 1;
 		} else if (mas->end > mt_min_slots[wr_mas->type] + 1)
@@ -2883,6 +3543,7 @@ static bool mas_wr_walk(struct ma_wr_state *wr_mas)
 	return true;
 }
 
+/* mas_wr_walk_index() - 为 spanning store 从当前位置定位一个端点。 */
 static void mas_wr_walk_index(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
@@ -2900,6 +3561,9 @@ static void mas_wr_walk_index(struct ma_wr_state *wr_mas)
  * mas_extend_spanning_null() - Extend a store of a %NULL to include surrounding %NULLs.
  * @l_wr_mas: The left maple write state
  * @r_wr_mas: The right maple write state
+ */
+/*
+ * mas_extend_spanning_null() - 将跨节点 NULL 写入与相邻 NULL ranges 合并。
  */
 static inline void mas_extend_spanning_null(struct ma_wr_state *l_wr_mas,
 					    struct ma_wr_state *r_wr_mas)
@@ -2938,6 +3602,9 @@ static inline void mas_extend_spanning_null(struct ma_wr_state *l_wr_mas,
 	}
 }
 
+/*
+ * mas_state_walk() - 从 ma_state 当前状态执行精确 index 查找；dead 时重置。
+ */
 static inline void *mas_state_walk(struct ma_state *mas)
 {
 	void *entry;
@@ -2961,6 +3628,7 @@ static inline void *mas_state_walk(struct ma_state *mas)
  * Note: Leaves mas in undesirable state.
  * Return: The entry for @mas->index or %NULL on dead node.
  */
+/* mtree_lookup_walk() - 简单 API 从根执行精确查找的内部 walk。 */
 static inline void *mtree_lookup_walk(struct ma_state *mas)
 {
 	unsigned long *pivots;
@@ -3005,6 +3673,12 @@ static void mte_destroy_walk(struct maple_enode *, struct maple_tree *);
  *
  * Only valid when the index == 0 and the last == ULONG_MAX
  */
+/*
+ * mas_new_root() - 用覆盖完整索引空间的 entry 重建整棵树。
+ *
+ * entry==NULL 时清空树；否则创建单叶根覆盖 [0, ULONG_MAX]。新根发布后
+ * 才销毁旧根子树，保证并发 reader 始终能从根到达一个完整版本。
+ */
 static inline void mas_new_root(struct ma_state *mas, void *entry)
 {
 	struct maple_enode *root = mas_root_locked(mas);
@@ -3044,6 +3718,12 @@ done:
  * span.
  * @wr_mas: The maple write state
  */
+/*
+ * mas_wr_spanning_store() - 完成跨多个叶节点的 range store。
+ *
+ * 分别定位左右边界，以私有 copy 数据自底向上生成新局部树，最后统一
+ * 发布。重点是节点预分配、发布前不可见、发布后旧子树延迟回收。
+ */
 static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 {
 	struct maple_copy cp;
@@ -3051,6 +3731,7 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	struct ma_state sib;
 
 	/* Left and Right side of spanning store */
+	/* 左右端各使用一个写状态，分别保留未覆盖的边界数据。 */
 	MA_STATE(r_mas, NULL, 0, 0);
 	MA_WR_STATE(r_wr_mas, &r_mas, wr_mas->entry);
 
@@ -3066,6 +3747,10 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	 * a rebalance is required for the operation to complete and an overflow
 	 * of data may happen.
 	 */
+	/*
+	 * spanning store 会复制左右边界路径，将旧残段和新 entry 合并为
+	 * 1～3 个节点；末 slot 写 NULL 也可能因合并和容量变化进入此路径。
+	 */
 	mas = wr_mas->mas;
 	trace_ma_op(TP_FCT, mas);
 
@@ -3075,14 +3760,17 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	 * Node rebalancing may occur due to this store, so there may be three new
 	 * entries per level plus a new root.
 	 */
+	/* 最坏每层需要三个新节点，并可能额外创建一个新根。 */
 
 	/*
 	 * Set up right side.  Need to get to the next offset after the spanning
 	 * store to ensure it's not NULL and to combine both the next node and
 	 * the node with the start together.
 	 */
+	/* 右游标走到写入范围之后，以便保留并合并紧邻的右侧数据。 */
 	r_mas = *mas;
 	/* Avoid overflow, walk to next slot in the tree. */
+	/* last==ULONG_MAX 时禁止加一，完整范围由后续特例处理。 */
 	if (r_mas.last + 1)
 		r_mas.last++;
 
@@ -3092,6 +3780,7 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	r_wr_mas.end_piv = r_wr_mas.r_max;
 
 	/* Set up left side. */
+	/* 左游标定位写入起点所在节点。 */
 	mas_wr_walk_index(wr_mas);
 
 	if (!wr_mas->entry) {
@@ -3100,6 +3789,7 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	}
 
 	/* expanding NULLs may make this cover the entire range */
+	/* NULL 合并可能把删除扩大为整个索引空间。 */
 	if (!mas->index && r_mas.last == ULONG_MAX) {
 		mas_set_range(mas, 0, ULONG_MAX);
 		return mas_new_root(mas, wr_mas->entry);
@@ -3122,6 +3812,11 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
  *
  * Attempts to reuse the node, but may allocate.
  */
+/*
+ * mas_wr_node_store() - 在单个叶节点中重建写入后的 slot/pivot 序列。
+ *
+ * RCU 树从预分配池取新节点再替换；非 RCU 树可用临时节点组装后写回。
+ */
 static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 {
 	unsigned char dst_offset, offset_end;
@@ -3139,13 +3834,16 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	offset_end = wr_mas->offset_end;
 	node_pivots = mt_pivots[wr_mas->type];
 	/* Assume last adds an entry */
+	/* 先按右端新增一个 range 估算 data-end，随后修正边界重合。 */
 	new_end = mas->end + 1 - offset_end + mas->offset;
 	if (mas->last == wr_mas->end_piv) {
 		offset_end++; /* don't copy this offset */
+		/* 写入恰好覆盖该 slot 右界，右侧复制从下一 slot 开始。 */
 		new_end--;
 	}
 
 	/* set up node. */
+	/* RCU 树用新节点替换；非 RCU 树可在临时副本完成后原地写回。 */
 	if (in_rcu) {
 		newnode = mas_pop_node(mas);
 	} else {
@@ -3157,12 +3855,14 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	dst_pivots = ma_pivots(newnode, wr_mas->type);
 	dst_slots = ma_slots(newnode, wr_mas->type);
 	/* Copy from start to insert point */
+	/* 复制写入起点之前未变化的 slots/pivots。 */
 	if (mas->offset) {
 		memcpy(dst_pivots, wr_mas->pivots, sizeof(unsigned long) * mas->offset);
 		memcpy(dst_slots, wr_mas->slots, sizeof(void __rcu *) * mas->offset);
 	}
 
 	/* Handle insert of new range starting after old range */
+	/* 写入从旧 range 中部开始时先保留其左侧残段。 */
 	if (wr_mas->r_min < mas->index) {
 		rcu_assign_pointer(dst_slots[mas->offset], wr_mas->content);
 		dst_pivots[mas->offset++] = mas->index - 1;
@@ -3170,6 +3870,7 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	}
 
 	/* Store the new entry and range end. */
+	/* 写入新 entry，并以 mas->last 作为闭区间右界。 */
 	if (mas->offset < node_pivots)
 		dst_pivots[mas->offset] = mas->last;
 	rcu_assign_pointer(dst_slots[mas->offset], wr_mas->entry);
@@ -3178,11 +3879,13 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	 * this range wrote to the end of the node or it overwrote the rest of
 	 * the data
 	 */
+	/* 若覆盖到节点末端，已没有右侧旧内容需要复制。 */
 	if (offset_end > mas->end)
 		goto done;
 
 	dst_offset = mas->offset + 1;
 	/* Copy to the end of node if necessary. */
+	/* 复制写入终点之后仍保留的 slots/pivots。 */
 	copy_size = mas->end - offset_end + 1;
 	memcpy(dst_slots + dst_offset, wr_mas->slots + offset_end,
 	       sizeof(void __rcu *) * copy_size);
@@ -3211,6 +3914,11 @@ done:
  * mas_wr_slot_store: Attempt to store a value in a slot.
  * @wr_mas: the maple write state
  */
+/*
+ * mas_wr_slot_store() - 布局允许时直接调整当前节点的少量 slots。
+ *
+ * 仅用于分类阶段已证明不需要重建或 split 的受限写入。
+ */
 static inline void mas_wr_slot_store(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
@@ -3224,13 +3932,16 @@ static inline void mas_wr_slot_store(struct ma_wr_state *wr_mas)
 	if (wr_mas->offset_end - offset == 1) {
 		if (mas->index == wr_mas->r_min) {
 			/* Overwriting the range and a part of the next one */
+			/* 覆盖完整当前 range 以及下一 range 的一部分。 */
 			rcu_assign_pointer(slots[offset], wr_mas->entry);
 			wr_mas->pivots[offset] = mas->last;
 		} else {
 			/* Overwriting a part of the range and the next one */
+			/* 保留当前 range 左段，新 entry 放到后一 slot。 */
 			rcu_assign_pointer(slots[offset + 1], wr_mas->entry);
 			wr_mas->pivots[offset] = mas->index - 1;
 			mas->offset++; /* Keep mas accurate. */
+			/* 游标跟随新 entry 所在 slot。 */
 		}
 	} else {
 		WARN_ON_ONCE(mt_in_rcu(mas->tree));
@@ -3238,11 +3949,13 @@ static inline void mas_wr_slot_store(struct ma_wr_state *wr_mas)
 		 * Expand the range, only partially overwriting the previous and
 		 * next ranges
 		 */
+		/* 两侧旧 range 都有残段，展开成左残段/新段/右残段。 */
 		gap |= !mt_slot_locked(mas->tree, slots, offset + 2);
 		rcu_assign_pointer(slots[offset + 1], wr_mas->entry);
 		wr_mas->pivots[offset] = mas->index - 1;
 		wr_mas->pivots[offset + 1] = mas->last;
 		mas->offset++; /* Keep mas accurate. */
+		/* 游标跟随中间的新 entry。 */
 	}
 
 	trace_ma_write(TP_FCT, mas, 0, wr_mas->entry);
@@ -3254,15 +3967,20 @@ static inline void mas_wr_slot_store(struct ma_wr_state *wr_mas)
 		mas_update_gap(mas);
 }
 
+/*
+ * mas_wr_extend_null() - 将节点内 NULL 写入与左右相邻 NULL range 合并。
+ */
 static inline void mas_wr_extend_null(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
 
 	if (!wr_mas->slots[wr_mas->offset_end]) {
 		/* If this one is null, the next and prev are not */
+		/* 当前目标 slot 已空，可把删除右界扩展到整个 NULL range。 */
 		mas->last = wr_mas->end_piv;
 	} else {
 		/* Check next slot(s) if we are overwriting the end */
+		/* 写到旧 range 末端时，检查后一 range 是否也是 NULL。 */
 		if ((mas->last == wr_mas->end_piv) &&
 		    (mas->end != wr_mas->offset_end) &&
 		    !wr_mas->slots[wr_mas->offset_end + 1]) {
@@ -3277,9 +3995,11 @@ static inline void mas_wr_extend_null(struct ma_wr_state *wr_mas)
 
 	if (!wr_mas->content) {
 		/* If this one is null, the next and prev are not */
+		/* 起点所在 range 已空，可向左吸收完整 NULL range。 */
 		mas->index = wr_mas->r_min;
 	} else {
 		/* Check prev slot if we are overwriting the start */
+		/* 写入从旧 range 左界开始时，再检查前一 range 是否为 NULL。 */
 		if (mas->index == wr_mas->r_min && mas->offset &&
 		    !wr_mas->slots[mas->offset - 1]) {
 			mas->offset--;
@@ -3290,6 +4010,7 @@ static inline void mas_wr_extend_null(struct ma_wr_state *wr_mas)
 	}
 }
 
+/* mas_wr_end_piv() - 定位写入 last 所在 slot，并缓存它的右边界。 */
 static inline void mas_wr_end_piv(struct ma_wr_state *wr_mas)
 {
 	while ((wr_mas->offset_end < wr_mas->mas->end) &&
@@ -3302,6 +4023,7 @@ static inline void mas_wr_end_piv(struct ma_wr_state *wr_mas)
 		wr_mas->end_piv = wr_mas->mas->max;
 }
 
+/* mas_wr_new_end() - 预测写入后节点最后有效 slot 的下标。 */
 static inline unsigned char mas_wr_new_end(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
@@ -3325,6 +4047,11 @@ static inline unsigned char mas_wr_new_end(struct ma_wr_state *wr_mas)
  * by readers while the node contents may be updated which could result in
  * inaccurate information.
  */
+/*
+ * mas_wr_append() - 在非 RCU 模式利用节点尾部空间原地追加 range。
+ *
+ * RCU reader 可能缓存 data-end，因此 RCU 树禁用此优化。
+ */
 static inline void mas_wr_append(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
@@ -3341,17 +4068,20 @@ static inline void mas_wr_append(struct ma_wr_state *wr_mas)
 	if (new_end == end + 1) {
 		if (mas->last == wr_mas->r_max) {
 			/* Append to end of range */
+			/* 新 entry 接在旧 range 之后。 */
 			rcu_assign_pointer(slots[new_end], wr_mas->entry);
 			wr_mas->pivots[end] = mas->index - 1;
 			mas->offset = new_end;
 		} else {
 			/* Append to start of range */
+			/* 新 entry 覆盖旧 range 前部，旧内容移到新增尾 slot。 */
 			rcu_assign_pointer(slots[new_end], wr_mas->content);
 			wr_mas->pivots[end] = mas->last;
 			rcu_assign_pointer(slots[end], wr_mas->entry);
 		}
 	} else {
 		/* Append to the range without touching any boundaries. */
+		/* 在旧 range 中间插入，产生左右两个残段。 */
 		rcu_assign_pointer(slots[new_end], wr_mas->content);
 		wr_mas->pivots[end + 1] = mas->last;
 		rcu_assign_pointer(slots[end + 1], wr_mas->entry);
@@ -3375,6 +4105,7 @@ static inline void mas_wr_append(struct ma_wr_state *wr_mas)
  * Return: true if another split operation on the next level is needed, false
  * otherwise
  */
+/* split_ascend() - 将本层 split 结果接入父层，并判断是否继续上溯。 */
 static inline bool split_ascend(struct maple_copy *cp,
 		struct ma_wr_state *wr_mas, struct ma_state *sib,
 		struct ma_state *parent)
@@ -3384,14 +4115,17 @@ static inline bool split_ascend(struct maple_copy *cp,
 
 	mas = wr_mas->mas;
 	min = mas->min; /* push right, or normal split */
+	/* 普通 split 或使用右兄弟时左界不变。 */
 	max = mas->max;
 	wr_mas->offset_end = parent->offset;
 	if (sib->end) {
 		if (sib->max < mas->min) {
 			min = sib->min; /* push left */
+			/* 使用左兄弟时重构范围向左扩展。 */
 			parent->offset--;
 		} else {
 			max = sib->max; /* push right */
+			/* 使用右兄弟时重构范围向右扩展。 */
 			wr_mas->offset_end++;
 		}
 	}
@@ -3420,6 +4154,7 @@ static inline bool split_ascend(struct maple_copy *cp,
  * indicate it will not be used.
  *
  */
+/* split_data() - 计算 split 数据量，并尝试借用 sibling 降低节点数量。 */
 static inline void split_data(struct maple_copy *cp,
 		struct ma_wr_state *wr_mas, struct ma_state *sib,
 		struct ma_state *parent)
@@ -3438,6 +4173,10 @@ static inline void split_data(struct maple_copy *cp,
 /*
  * mas_wr_split() - Expand one node into two
  * @wr_mas: The write maple state
+ */
+/*
+ * mas_wr_split() - 叶节点容量不足时自底向上 split，直到父层可容纳或
+ * 新建根。
  */
 static void mas_wr_split(struct ma_wr_state *wr_mas)
 {
@@ -3472,6 +4211,10 @@ static void mas_wr_split(struct ma_wr_state *wr_mas)
  * Rebalance is different than a spanning store in that the write state is
  * already at the leaf node that's being altered.
  */
+/*
+ * mas_wr_rebalance() - 节点占用不足时向兄弟借数据或合并，并按需向
+ * 父层传播。
+ */
 static void mas_wr_rebalance(struct ma_wr_state *wr_mas)
 {
 	struct ma_state parent;
@@ -3487,6 +4230,10 @@ static void mas_wr_rebalance(struct ma_wr_state *wr_mas)
 	 * is also examined and rebalanced if it is insufficient.  Every level
 	 * tries to combine the data in the same way.  If one node contains the
 	 * entire range of the tree, then that node is used as a new root node.
+	 */
+	/*
+	 * 优先与右兄弟平衡，否则使用左兄弟；若两节点合并为一，
+	 * 父层少一个 child，可能继续向上收缩，直至单节点成为新根。
 	 */
 
 	mas = wr_mas->mas;
@@ -3510,6 +4257,11 @@ static void mas_wr_rebalance(struct ma_wr_state *wr_mas)
 /*
  * mas_wr_store_entry() - Internal call to store a value
  * @wr_mas: The maple write state
+ */
+/*
+ * mas_wr_store_entry() - 按 store_type 分派精确替换、重建、split 或根操作。
+ *
+ * 进入这里时写锁与预分配条件应已满足。
  */
 static inline void mas_wr_store_entry(struct ma_wr_state *wr_mas)
 {
@@ -3550,6 +4302,9 @@ static inline void mas_wr_store_entry(struct ma_wr_state *wr_mas)
 	}
 }
 
+/*
+ * mas_wr_prealloc_setup() - 规范化预分配阶段的游标并取得当前位置 content。
+ */
 static inline void mas_wr_prealloc_setup(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
@@ -3576,6 +4331,7 @@ static inline void mas_wr_prealloc_setup(struct ma_wr_state *wr_mas)
 	 * writes within this node.  This is to stop partial walks in
 	 * mas_prealloc() from being reset.
 	 */
+	/* 预分配允许节点内跨 range，只有越过节点边界才重置游标。 */
 	if (mas->last > mas->max)
 		goto reset;
 
@@ -3600,6 +4356,12 @@ set_content:
  * @entry: The entry to store into the tree
  *
  * Return: Number of nodes required for preallocation.
+ */
+/*
+ * mas_prealloc_calc() - 由树高和 store_type 计算最坏节点需求。
+ *
+ * spanning 每层最多三个、split/rebalance 每层最多两个；结果写入
+ * mas->node_request。
  */
 static inline void mas_prealloc_calc(struct ma_wr_state *wr_mas, void *entry)
 {
@@ -3657,6 +4419,9 @@ static inline void mas_prealloc_calc(struct ma_wr_state *wr_mas, void *entry)
  *
  * Return: the type of store needed for the operation
  */
+/*
+ * mas_wr_store_type() - 根据边界、写后容量和 RCU 模式选择互斥写策略。
+ */
 static inline enum store_type mas_wr_store_type(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
@@ -3669,6 +4434,7 @@ static inline enum store_type mas_wr_store_type(struct ma_wr_state *wr_mas)
 		return wr_spanning_store;
 
 	/* At this point, we are at the leaf node that needs to be altered. */
+	/* 已定位叶节点，现在可按写后容量选择具体策略。 */
 	mas_wr_end_piv(wr_mas);
 	if (!wr_mas->entry)
 		mas_wr_extend_null(wr_mas);
@@ -3681,6 +4447,7 @@ static inline enum store_type mas_wr_store_type(struct ma_wr_state *wr_mas)
 
 	new_end = mas_wr_new_end(wr_mas);
 	/* Potential spanning rebalance collapsing a node */
+	/* 写后低于最小占用：非根需要重平衡，根节点可直接重建。 */
 	if (new_end < mt_min_slots[wr_mas->type]) {
 		if (!mte_is_root(mas->node))
 			return  wr_rebalance;
@@ -3706,6 +4473,11 @@ static inline enum store_type mas_wr_store_type(struct ma_wr_state *wr_mas)
  * @entry: The entry that will be stored
  *
  */
+/*
+ * mas_wr_preallocate() - 完成 walk/策略分类并以 NOWAIT 尝试备齐节点。
+ *
+ * 失败转为 -ENOMEM，公开路径随后可在锁外通过 mas_nomem(gfp) 补充。
+ */
 static inline void mas_wr_preallocate(struct ma_wr_state *wr_mas, void *entry)
 {
 	struct ma_state *mas = wr_mas->mas;
@@ -3727,6 +4499,12 @@ static inline void mas_wr_preallocate(struct ma_wr_state *wr_mas, void *entry)
  * Return: %NULL or the contents that already exists at the requested index
  * otherwise.  The maple state needs to be checked for error conditions.
  */
+/*
+ * mas_insert() - 只在目标闭区间全为空时写入 entry。
+ *
+ * 先定位并预分配；任何已有 entry、跨节点覆盖或超出当前空洞都会设置
+ * -EEXIST。成功返回原内容（应为 NULL）；-ENOMEM 等错误保存在 mas。
+ */
 static inline void *mas_insert(struct ma_state *mas, void *entry)
 {
 	MA_WR_STATE(wr_mas, mas, entry);
@@ -3745,6 +4523,11 @@ static inline void *mas_insert(struct ma_state *mas, void *entry)
 	 * is when inserting at the end of a node (appending).  When done
 	 * carefully, appending can reuse the node in place.
 	 */
+	/*
+	 * 插入可能新增 0/1/2 个 pivot：恰好填满 gap 只换 slot；贴邻旧 range
+	 * 需一个边界；位于 gap 中间需 start-1/end 两个边界。RCU 模式通常
+	 * copy-and-replace，只有经过证明的末端追加才可能原地完成。
+	 */
 	wr_mas.content = mas_start(mas);
 	if (wr_mas.content)
 		goto exists;
@@ -3754,10 +4537,12 @@ static inline void *mas_insert(struct ma_state *mas, void *entry)
 		return NULL;
 
 	/* spanning writes always overwrite something */
+	/* insert 不允许覆盖；跨节点写天然意味着范围内已有结构。 */
 	if (mas->store_type == wr_spanning_store)
 		goto exists;
 
 	/* At this point, we are at the leaf node that needs to be altered. */
+	/* 非根操作已到目标叶，继续核验整个 range 都是 NULL。 */
 	if (mas->store_type != wr_new_root && mas->store_type != wr_store_root) {
 		wr_mas.offset_end = mas->offset;
 		wr_mas.end_piv = wr_mas.r_max;
@@ -3788,6 +4573,13 @@ exists:
  * Return: 0 if the allocation succeeded without wrapping, 1 if the
  * allocation succeeded after wrapping, or -EBUSY if there are no
  * free entries.
+ */
+/*
+ * mas_alloc_cyclic() - 在 allocation tree 中循环寻找一个空索引并插入。
+ *
+ * 先从 max(range_lo,*next) 搜索，失败且起点高于 range_lo 时回绕。返回
+ * 0 表示未回绕，1 表示回绕，负值表示无空间或分配/状态错误。写入成功
+ * 后更新 *startp 和 *next；ULONG_MAX+1 回零时记录 WRAPPED 标志。
  */
 int mas_alloc_cyclic(struct ma_state *mas, unsigned long *startp,
 		void *entry, unsigned long range_lo, unsigned long range_hi,
@@ -3827,6 +4619,9 @@ int mas_alloc_cyclic(struct ma_state *mas, unsigned long *startp,
 }
 EXPORT_SYMBOL(mas_alloc_cyclic);
 
+/*
+ * mas_rewalk() - 将游标重置到 index 并反复从根定位，避开 dead 版本。
+ */
 static __always_inline void mas_rewalk(struct ma_state *mas, unsigned long index)
 {
 retry:
@@ -3836,6 +4631,11 @@ retry:
 		goto retry;
 }
 
+/*
+ * mas_rewalk_if_dead() - 检测 reader 节点版本，dead 时从保存索引重走。
+ *
+ * 返回 true 表示调用者局部指针/offset 已全部失效，必须重新开始循环。
+ */
 static __always_inline bool mas_rewalk_if_dead(struct ma_state *mas,
 		struct maple_node *node, const unsigned long index)
 {
@@ -3856,6 +4656,11 @@ static __always_inline bool mas_rewalk_if_dead(struct ma_state *mas,
  * The prev node value will be mas->node[mas->offset] or the status will be
  * ma_none.
  * Return: 1 if the node is dead, 0 otherwise.
+ */
+/*
+ * mas_prev_node() - 上溯寻找前一分支，再下降到同层最右节点。
+ *
+ * 0 表示成功或已 underflow；1 表示遇到 dead，调用者须从保存点重走。
  */
 static int mas_prev_node(struct ma_state *mas, unsigned long min)
 {
@@ -3880,6 +4685,7 @@ static int mas_prev_node(struct ma_state *mas, unsigned long min)
 			goto no_entry;
 
 		/* Walk up. */
+		/* 当前分支无前项，向上寻找存在左兄弟的祖先。 */
 		if (unlikely(mas_ascend(mas)))
 			return 1;
 		offset = mas->offset;
@@ -3936,6 +4742,12 @@ no_entry:
  * @empty: Can be empty
  *
  * Return: The entry in the previous slot which is possibly NULL
+ */
+/*
+ * mas_prev_slot() - 在 [min,当前位置) 内向前移动一个 range/非空 entry。
+ *
+ * empty=false 跳过 NULL ranges；true 则每个 range 都可返回。每次使用
+ * node 字段后检查 dead，发现并发替换即从 save_point 重走。
  */
 static void *mas_prev_slot(struct ma_state *mas, unsigned long min, bool empty)
 {
@@ -4020,6 +4832,11 @@ underflow:
  * overflowed.
  * Return: 1 on dead node, 0 otherwise.
  */
+/*
+ * mas_next_node() - 上溯寻找后一分支，再下降到同层最左节点。
+ *
+ * 0 表示成功或已 overflow；1 表示 RCU walk 遇到 dead，需重新定位。
+ */
 static int mas_next_node(struct ma_state *mas, struct maple_node *node,
 		unsigned long max)
 {
@@ -4042,6 +4859,7 @@ static int mas_next_node(struct ma_state *mas, struct maple_node *node,
 			goto overflow;
 
 		/* Walk up. */
+		/* 当前分支无后项，向上寻找存在右兄弟的祖先。 */
 		if (unlikely(mas_ascend(mas)))
 			return 1;
 
@@ -4107,6 +4925,12 @@ overflow:
  *
  * Return: The entry in the next slot which is possibly NULL
  */
+/*
+ * mas_next_slot() - 在 (当前位置,max] 内后移一个 range/非空 entry。
+ *
+ * empty=false 跳过 NULL；true 允许返回 NULL range。更新后的 index/last
+ * 始终描述返回 range；并发 dead 节点通过 save_point 重走。
+ */
 static void *mas_next_slot(struct ma_state *mas, unsigned long max, bool empty)
 {
 	void __rcu **slots;
@@ -4134,6 +4958,7 @@ retry:
 			goto retry;
 
 		if (pivot >= max) { /* Was at the limit, next will extend beyond */
+			/* 当前 range 已触及调用者上界，继续将越界。 */
 			mas->status = ma_overflow;
 			return NULL;
 		}
@@ -4200,6 +5025,12 @@ again:
  * Return: True if found in a leaf, false otherwise.
  *
  */
+/*
+ * mas_rev_awalk() - 利用 gap 摘要从高地址向低地址寻找给定大小的空洞。
+ *
+ * 叶层命中返回 true；内部层选择候选 child 后返回 false 继续下降，根中
+ * 无空间则把 mas 置为 -EBUSY。只在写锁保护的 allocation API 中使用。
+ */
 static bool mas_rev_awalk(struct ma_state *mas, unsigned long size,
 		unsigned long *gap_min, unsigned long *gap_max)
 {
@@ -4216,6 +5047,7 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size,
 
 	if (ma_is_dense(type)) {
 		/* dense nodes. */
+		/* dense 节点的每个索引隐式对应一个 slot，无需 pivot/gap。 */
 		mas->offset = (unsigned char)(mas->index - mas->min);
 		return true;
 	}
@@ -4226,6 +5058,7 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size,
 	offset = mas->offset;
 	min = mas_safe_min(mas, pivots, offset);
 	/* Skip out of bounds. */
+	/* 从高端跳过完全位于 mas->last 之外的 slots。 */
 	while (mas->last < min)
 		min = mas_safe_min(mas, pivots, --offset);
 
@@ -4243,6 +5076,7 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size,
 
 			if (!gaps) {
 				/* Skip the next slot, it cannot be a gap. */
+				/* 相邻 NULL 会合并，下一 slot 不会再是 gap。 */
 				if (offset < 2)
 					goto ascend;
 
@@ -4272,6 +5106,7 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size,
 	}
 
 	/* descend, only happens under lock. */
+	/* allocation 查询持写锁，可直接沿候选 child 下探。 */
 	mas->node = mas_slot(mas, slots, offset);
 	mas->min = min;
 	mas->max = max;
@@ -4287,6 +5122,11 @@ no_space:
 	return false;
 }
 
+/*
+ * mas_anode_descend() - 正向 allocation walk 在当前节点选择可容纳 size 的 slot。
+ *
+ * 叶层找到 gap 返回 true；内部节点更新 mas 指向候选 child 并返回 false。
+ */
 static inline bool mas_anode_descend(struct ma_state *mas, unsigned long size)
 {
 	enum maple_type type = mte_node_type(mas->node);
@@ -4313,6 +5153,7 @@ static inline bool mas_anode_descend(struct ma_state *mas, unsigned long size)
 		pivot = mas_safe_pivot(mas, pivots, offset, type);
 
 		/* Not within lower bounds */
+		/* 当前 slot 完全位于搜索下界之前，跳到下一 slot。 */
 		if (mas->index > pivot)
 			goto next_slot;
 
@@ -4356,6 +5197,13 @@ next_slot:
  *
  * Return: the entry at the location or %NULL.
  */
+/*
+ * mas_walk() - 精确查找 mas->index，并把 index/last 扩展为完整命中 range。
+ *
+ * 可从 start 或 active 状态调用；RCU dead 节点由内部循环重试。空树返回
+ * NULL 且范围为 [0,ULONG_MAX]；直接根 entry 仅覆盖索引 0。调用者须持
+ * RCU 读锁或 Maple 写锁，返回 entry 只是借用指针。
+ */
 void *mas_walk(struct ma_state *mas)
 {
 	void *entry;
@@ -4385,6 +5233,7 @@ retry:
 }
 EXPORT_SYMBOL_GPL(mas_walk);
 
+/* mas_rewind_node() - allocation 反向 walk 上溯到存在前一 sibling 的祖先。 */
 static inline bool mas_rewind_node(struct ma_state *mas)
 {
 	unsigned char slot;
@@ -4410,6 +5259,7 @@ static inline bool mas_rewind_node(struct ma_state *mas)
  *
  * Return: true if there is another node, false otherwise.
  */
+/* mas_skip_node() - allocation 正向 walk 上溯并跳到尚未检查的后一 sibling。 */
 static inline bool mas_skip_node(struct ma_state *mas)
 {
 	if (mas_is_err(mas))
@@ -4438,6 +5288,12 @@ static inline bool mas_skip_node(struct ma_state *mas)
  *
  * Search between @mas->index and @mas->last for a gap of @size.
  */
+/*
+ * mas_awalk() - 在 [mas->index,mas->last] 内正向搜索至少 size 的 gap。
+ *
+ * 依赖 allocation tree 的逐层最大-gap 摘要剪枝；成功停在叶 gap，失败
+ * 以 -EBUSY 结束。
+ */
 static inline void mas_awalk(struct ma_state *mas, unsigned long size)
 {
 	struct maple_enode *last = NULL;
@@ -4448,6 +5304,10 @@ static inline void mas_awalk(struct ma_state *mas, unsigned long size)
 	 * go back to parent (ascend)
 	 * no gap found. (return, error == -EBUSY)
 	 * found the gap. (return)
+	 */
+	/*
+	 * 每轮只会：下降候选 child、上溯换 sibling、以 -EBUSY 失败，或在
+	 * 叶层命中 gap。last 防止无候选时重复处理同一节点。
 	 */
 	while (!mas_is_err(mas) && !mas_anode_descend(mas, size)) {
 		if (last == mas->node)
@@ -4466,6 +5326,9 @@ static inline void mas_awalk(struct ma_state *mas, unsigned long size)
  * @size: The size of the gap
  * @fwd: Searching forward or back
  */
+/*
+ * mas_sparse_area() - 空树/直接根形态下计算可用 gap 的边界特例。
+ */
 static inline int mas_sparse_area(struct ma_state *mas, unsigned long min,
 				unsigned long max, unsigned long size, bool fwd)
 {
@@ -4475,6 +5338,7 @@ static inline int mas_sparse_area(struct ma_state *mas, unsigned long min,
 		 * At this time, min is increased, we need to recheck whether
 		 * the size is satisfied.
 		 */
+		/* 跳过保留的索引 0 后，需重新确认剩余窗口仍容纳 size。 */
 		if (min > max || max - min + 1 < size)
 			return -EBUSY;
 	}
@@ -4498,6 +5362,12 @@ static inline int mas_sparse_area(struct ma_state *mas, unsigned long min,
  * @max: The highest value of the range
  * @size: The size needed
  */
+/*
+ * mas_empty_area() - 在 [min,max] 正向寻找至少 size 个连续空索引。
+ *
+ * 仅用于 MT_FLAGS_ALLOC_RANGE 树并要求写锁。成功返回 0，mas->index/last
+ * 描述所选空洞；无空间返回 -EBUSY，无效范围返回 -EINVAL。
+ */
 int mas_empty_area(struct ma_state *mas, unsigned long min,
 		unsigned long max, unsigned long size)
 {
@@ -4520,10 +5390,12 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
 		return -EBUSY;
 
 	/* Empty set */
+	/* 空树或直接根的特例无需 gap 元数据 walk。 */
 	if (mas_is_none(mas) || mas_is_ptr(mas))
 		return mas_sparse_area(mas, min, max, size, true);
 
 	/* The start of the window can only be within these values */
+	/* 成功候选起点必须同时满足请求下界和叶 gap 左界。 */
 	mas->index = min;
 	mas->last = max;
 	mas_awalk(mas, size);
@@ -4552,6 +5424,11 @@ EXPORT_SYMBOL_GPL(mas_empty_area);
  * @max: The highest value of the range
  * @size: The size needed
  */
+/*
+ * mas_empty_area_rev() - 在 [min,max] 反向寻找最高地址的 size 大小空洞。
+ *
+ * 锁、状态和错误约定与 mas_empty_area() 相同。
+ */
 int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
 		unsigned long max, unsigned long size)
 {
@@ -4577,6 +5454,7 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
 
 
 	/* The start of the window can only be within these values. */
+	/* 反向候选还需保证整个 size 区间不越过请求上界。 */
 	mas->index = min;
 	mas->last = max;
 
@@ -4596,6 +5474,7 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
 		return -EBUSY;
 
 	/* Trim the upper limit to the max. */
+	/* 将叶 gap 的右端裁剪到调用者给定 max。 */
 	if (max < mas->last)
 		mas->last = max;
 
@@ -4615,6 +5494,11 @@ EXPORT_SYMBOL_GPL(mas_empty_area_rev);
  *
  * Return: The number of leaves marked as dead.
  */
+/*
+ * mte_dead_leaves() - 标记当前 dead 节点下仍连接的叶 child，并收集裸指针。
+ *
+ * 返回可批量释放的叶节点数；只供 destroy walk 使用。
+ */
 static inline
 unsigned char mte_dead_leaves(struct maple_enode *enode, struct maple_tree *mt,
 			      void __rcu **slots)
@@ -4629,6 +5513,7 @@ unsigned char mte_dead_leaves(struct maple_enode *enode, struct maple_tree *mt,
 		type = mte_node_type(entry);
 		node = mte_to_node(entry);
 		/* Use both node and type to catch LE & BE metadata */
+		/* 同存节点和类型，兼容大小端布局下 metadata 的复用。 */
 		if (!node || !type)
 			break;
 
@@ -4646,6 +5531,9 @@ unsigned char mte_dead_leaves(struct maple_enode *enode, struct maple_tree *mt,
  * @offset: The starting offset
  *
  * Note: This can only be used from the RCU callback context.
+ */
+/*
+ * mte_dead_walk() - RCU callback 中沿 destroy 时保存的父链下降到下一叶层。
  */
 static void __rcu **mte_dead_walk(struct maple_enode **enode, unsigned char offset)
 {
@@ -4670,6 +5558,11 @@ static void __rcu **mte_dead_walk(struct maple_enode **enode, unsigned char offs
  * @head: The RCU head that's within the node.
  *
  * Note: This can only be used from the RCU callback context.
+ */
+/*
+ * mt_free_walk() - RCU 宽限期结束后，按已改写的 destroy 链后序释放子树。
+ *
+ * 只能在 RCU callback 上下文运行；此时 reader 已不会再持有这些节点。
  */
 static void mt_free_walk(struct rcu_head *head)
 {
@@ -4711,6 +5604,11 @@ free_leaf:
 	kfree(node);
 }
 
+/*
+ * mte_destroy_descend() - destroy 写侧下探，并把节点改写为 callback 可遍历格式。
+ *
+ * 每个节点先标 dead，再保存原 type、父节点和 slot；之后 union 可安全复用。
+ */
 static inline void __rcu **mte_destroy_descend(struct maple_enode **enode,
 	struct maple_tree *mt, struct maple_enode *prev, unsigned char offset)
 {
@@ -4741,6 +5639,12 @@ static inline void __rcu **mte_destroy_descend(struct maple_enode **enode,
 	return slots;
 }
 
+/*
+ * mt_destroy_walk() - 后序拆解一棵已不可达子树。
+ *
+ * free=true 立即批量释放；false 只建立 dead/callback 遍历信息并清理会被
+ * union 覆盖的 metadata，实际释放留给 mt_free_walk()。
+ */
 static void mt_destroy_walk(struct maple_enode *enode, struct maple_tree *mt,
 			    bool free)
 {
@@ -4804,6 +5708,11 @@ free_leaf:
  *
  * Must hold the write lock.
  */
+/*
+ * mte_destroy_walk() - 按树的 RCU 模式选择立即销毁或 call_rcu 延迟销毁。
+ *
+ * 调用者必须持写锁，且 enode 已从正式树结构摘除。
+ */
 static inline void mte_destroy_walk(struct maple_enode *enode,
 				    struct maple_tree *mt)
 {
@@ -4817,6 +5726,7 @@ static inline void mte_destroy_walk(struct maple_enode *enode,
 	}
 }
 /* Interface */
+/* 以下进入面向调用者的 ma_state 与 mtree 简单接口。 */
 
 /**
  * mas_store() - Store an @entry.
@@ -4826,6 +5736,13 @@ static inline void mte_destroy_walk(struct maple_enode *enode,
  * The @mas->index and @mas->last is used to set the range for the @entry.
  *
  * Return: the first entry between mas->index and mas->last or %NULL.
+ */
+/*
+ * mas_store() - 在 mas 的闭区间 [index,last] 写入或清除 entry。
+ *
+ * 这是已持写锁路径；允许覆盖多个旧 ranges。它先分类写策略，以 NOWAIT
+ * 消费/尝试节点预分配，缺内存时把错误留在 mas 供 mas_nomem() 处理。
+ * 返回写入前命中的第一个 entry；完成后释放未消费的预分配节点。
  */
 void *mas_store(struct ma_state *mas, void *entry)
 {
@@ -4849,6 +5766,10 @@ void *mas_store(struct ma_state *mas, void *entry)
 	 * can overwrite entries.  Although this seems simple enough, one may
 	 * want to examine what happens if a single store operation was to
 	 * overwrite multiple entries within a self-balancing B-Tree.
+	 */
+	/*
+	 * store 与 insert 的关键差异是允许覆盖；单次 range store 可能替换
+	 * 多个旧 ranges，因此可能触发跨节点重构而不只是一次 slot 赋值。
 	 */
 	mas_wr_prealloc_setup(&wr_mas);
 	mas->store_type = mas_wr_store_type(&wr_mas);
@@ -4881,6 +5802,12 @@ EXPORT_SYMBOL_GPL(mas_store);
  *
  * Return: 0 on success, -EINVAL on invalid request, -ENOMEM if memory could not
  * be allocated.
+ */
+/*
+ * mas_store_gfp() - 带完整内存重试协议的 range store。
+ *
+ * 可睡眠分配通过 mas_nomem(gfp) 在适当锁外完成；NULL 写入可能规范化
+ * mas 的范围，因此重试前恢复原 index/last。返回 0 或负 errno。
  */
 int mas_store_gfp(struct ma_state *mas, void *entry, gfp_t gfp)
 {
@@ -4915,6 +5842,12 @@ EXPORT_SYMBOL_GPL(mas_store_gfp);
  * @mas: The maple state
  * @entry: The entry to store.
  */
+/*
+ * mas_store_prealloc() - 消费 mas_preallocate() 准备的节点完成确定性写入。
+ *
+ * 调用者必须保持同一写入范围/entry 语义并持写锁；此阶段不应再发生
+ * -ENOMEM。完成后 mas_destroy() 清除 PREALLOC 标记及剩余资源。
+ */
 void mas_store_prealloc(struct ma_state *mas, void *entry)
 {
 	MA_WR_STATE(wr_mas, mas, entry);
@@ -4927,6 +5860,7 @@ void mas_store_prealloc(struct ma_state *mas, void *entry)
 	mas_wr_walk_descend(&wr_mas);
 	if (mas->store_type != wr_spanning_store) {
 		/* set wr_mas->content to current slot */
+		/* 复用预分配定位，只补齐当前旧 entry 和右边界缓存。 */
 		wr_mas.content = mas_slot_locked(mas, wr_mas.slots, mas->offset);
 		mas_wr_end_piv(&wr_mas);
 	}
@@ -4946,6 +5880,12 @@ EXPORT_SYMBOL_GPL(mas_store_prealloc);
  * @gfp: The GFP_FLAGS to use for allocations.
  *
  * Return: 0 on success, -ENOMEM if memory could not be allocated.
+ */
+/*
+ * mas_preallocate() - 在真正持锁写入前，为指定 store 备齐最坏所需节点。
+ *
+ * 成功设置 MA_STATE_PREALLOC，随后用 mas_store_prealloc() 消费；失败会
+ * 清理资源、重置游标并返回 -ENOMEM。未消费的预分配须用 mas_destroy()。
  */
 int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
 {
@@ -4982,6 +5922,12 @@ EXPORT_SYMBOL_GPL(mas_preallocate);
  * the right if necessary.  Frees any allocated nodes associated with this maple
  * state.
  */
+/*
+ * mas_destroy() - 结束 ma_state 的预分配生命周期。
+ *
+ * 清除 PREALLOC 并释放所有未消费节点；不销毁 Maple Tree，也不释放树中
+ * entry。可用于成功写入后的收尾或取消 mas_preallocate()。
+ */
 void mas_destroy(struct ma_state *mas)
 {
 	mas->mas_flags &= ~MA_STATE_PREALLOC;
@@ -4989,6 +5935,7 @@ void mas_destroy(struct ma_state *mas)
 }
 EXPORT_SYMBOL_GPL(mas_destroy);
 
+/* mas_may_activate() - 根据保存的 node 和范围判断游标能否恢复 active。 */
 static void mas_may_activate(struct ma_state *mas)
 {
 	if (!mas->node) {
@@ -5000,6 +5947,12 @@ static void mas_may_activate(struct ma_state *mas)
 	}
 }
 
+/*
+ * mas_next_setup() - 统一处理 mas_next* 进入时的状态机和边界。
+ *
+ * 返回 true 表示答案/终止状态已在 entry/mas 中确定；false 表示可进入
+ * active 节点的 fast path。pause/none 会从根重新定位。
+ */
 static bool mas_next_setup(struct ma_state *mas, unsigned long max,
 		void **entry)
 {
@@ -5023,10 +5976,12 @@ static bool mas_next_setup(struct ma_state *mas, unsigned long max,
 		break;
 	case ma_overflow:
 		/* Overflowed before, but the max changed */
+		/* 调用者扩大 max 后，旧 overflow 不再必然终止。 */
 		mas_may_activate(mas);
 		break;
 	case ma_underflow:
 		/* The user expects the mas to be one before where it is */
+		/* 从反向 underflow 切回正向时，先恢复当前位置再 walk。 */
 		mas_may_activate(mas);
 		*entry = mas_walk(mas);
 		if (*entry)
@@ -5039,6 +5994,7 @@ static bool mas_next_setup(struct ma_state *mas, unsigned long max,
 	}
 
 	if (likely(mas_is_active(mas))) /* Fast path */
+		/* active 游标已有稳定节点位置，可直接进入 next_slot。 */
 		return false;
 
 	if (mas_is_ptr(mas)) {
@@ -5070,6 +6026,12 @@ static bool mas_next_setup(struct ma_state *mas, unsigned long max,
  *
  * Return: The next entry or %NULL
  */
+/*
+ * mas_next() - 返回当前位置之后、起点不超过 max 的下一个非 NULL entry。
+ *
+ * 成功更新 mas->index/last 为 entry 的完整 range；要求 RCU 读锁或写锁。
+ * 返回 NULL 也可能只是未找到，需结合 mas 状态/边界理解。
+ */
 void *mas_next(struct ma_state *mas, unsigned long max)
 {
 	void *entry = NULL;
@@ -5078,6 +6040,8 @@ void *mas_next(struct ma_state *mas, unsigned long max)
 		return entry;
 
 	/* Retries on dead nodes handled by mas_next_slot */
+	/* dead-node 检测与从根重走由 slot helper 完成。 */
+	/* slot helper 内部保存位置并在发现 dead 时从根重走。 */
 	return mas_next_slot(mas, max, false);
 }
 EXPORT_SYMBOL_GPL(mas_next);
@@ -5093,6 +6057,11 @@ EXPORT_SYMBOL_GPL(mas_next);
  *
  * Return: The next entry or %NULL
  */
+/*
+ * mas_next_range() - 前进到下一 range，包括值为 NULL 的 range。
+ *
+ * 与 mas_next() 的差异是不会跳过空洞，适合检查完整区间布局。
+ */
 void *mas_next_range(struct ma_state *mas, unsigned long max)
 {
 	void *entry = NULL;
@@ -5101,6 +6070,7 @@ void *mas_next_range(struct ma_state *mas, unsigned long max)
 		return entry;
 
 	/* Retries on dead nodes handled by mas_next_slot */
+	/* dead-node 检测与从根重走由 slot helper 完成。 */
 	return mas_next_slot(mas, max, true);
 }
 EXPORT_SYMBOL_GPL(mas_next_range);
@@ -5117,6 +6087,12 @@ EXPORT_SYMBOL_GPL(mas_next_range);
  *
  * Return: The entry higher than @index or %NULL if nothing is found.
  */
+/*
+ * mt_next() - 自带短 RCU 读段的简单“下一非空 entry”查询。
+ *
+ * RCU 锁在返回前已释放，只保护查找过程；返回对象若可能并发释放，
+ * 调用者必须另有生命周期保证。复杂迭代应使用 ma_state API。
+ */
 void *mt_next(struct maple_tree *mt, unsigned long index, unsigned long max)
 {
 	void *entry = NULL;
@@ -5129,6 +6105,11 @@ void *mt_next(struct maple_tree *mt, unsigned long index, unsigned long max)
 }
 EXPORT_SYMBOL_GPL(mt_next);
 
+/*
+ * mas_prev_setup() - 统一处理 mas_prev* 的状态转换和下界。
+ *
+ * 返回 true 表示已得到答案或到达 underflow；false 可进入 prev_slot。
+ */
 static bool mas_prev_setup(struct ma_state *mas, unsigned long min, void **entry)
 {
 	if (unlikely(mas->index <= min)) {
@@ -5148,10 +6129,12 @@ static bool mas_prev_setup(struct ma_state *mas, unsigned long min, void **entry
 		break;
 	case ma_underflow:
 		/* underflowed before but the min changed */
+		/* 调用者降低 min 后，旧 underflow 可能重新变得可搜索。 */
 		mas_may_activate(mas);
 		break;
 	case ma_overflow:
 		/* User expects mas to be one after where it is */
+		/* 从正向 overflow 切到反向时先恢复保存位置。 */
 		mas_may_activate(mas);
 		*entry = mas_walk(mas);
 		if (*entry)
@@ -5179,6 +6162,7 @@ static bool mas_prev_setup(struct ma_state *mas, unsigned long min, void **entry
 	if (mas_is_none(mas)) {
 		if (mas->index) {
 			/* Walked to out-of-range pointer? */
+			/* 高度 0 的直接根仅位于索引 0，回退时单独返回它。 */
 			mas->index = mas->last = 0;
 			mas->status = ma_root;
 			*entry = mas_root(mas);
@@ -5200,6 +6184,11 @@ static bool mas_prev_setup(struct ma_state *mas, unsigned long min, void **entry
  * searchable nodes.
  *
  * Return: the previous value or %NULL.
+ */
+/*
+ * mas_prev() - 返回当前位置之前、终点不低于 min 的前一个非 NULL entry。
+ *
+ * 成功后 index/last 描述完整 range；要求 RCU 读锁或写锁。
  */
 void *mas_prev(struct ma_state *mas, unsigned long min)
 {
@@ -5224,6 +6213,9 @@ EXPORT_SYMBOL_GPL(mas_prev);
  *
  * Return: the previous value or %NULL.
  */
+/*
+ * mas_prev_range() - 后退到上一 range，包括值为 NULL 的 range。
+ */
 void *mas_prev_range(struct ma_state *mas, unsigned long min)
 {
 	void *entry = NULL;
@@ -5246,6 +6238,11 @@ EXPORT_SYMBOL_GPL(mas_prev_range);
  * See also: Documentation/core-api/maple_tree.rst
  *
  * Return: The entry before @index or %NULL if nothing is found.
+ */
+/*
+ * mt_prev() - 自带短 RCU 读段的简单“前一非空 entry”查询。
+ *
+ * 返回指针在函数返回后不再受此 RCU 读段保护。
  */
 void *mt_prev(struct maple_tree *mt, unsigned long index, unsigned long min)
 {
@@ -5272,6 +6269,12 @@ EXPORT_SYMBOL_GPL(mt_prev);
  * iterator may be more appropriate.
  *
  */
+/*
+ * mas_pause() - 在迭代中释放锁/RCU 前使游标失效，并保留续迭代边界。
+ *
+ * 重新获得保护后，下一次 find 会从 mas->last+1（反向为 index-1）从根
+ * 定位，避免使用可能已被替换的 node 指针。
+ */
 void mas_pause(struct ma_state *mas)
 {
 	mas->status = ma_pause;
@@ -5286,6 +6289,11 @@ EXPORT_SYMBOL_GPL(mas_pause);
  * @entry: Pointer to the entry
  *
  * Returns: True if entry is the answer, false otherwise.
+ */
+/*
+ * mas_find_setup() - 为正向 find 处理首次调用、续迭代、pause 和越界状态。
+ *
+ * true 表示 entry/终止条件已确定；false 表示应调用 mas_next_slot()。
  */
 static __always_inline bool mas_find_setup(struct ma_state *mas, unsigned long max, void **entry)
 {
@@ -5312,6 +6320,7 @@ static __always_inline bool mas_find_setup(struct ma_state *mas, unsigned long m
 		break;
 	case ma_underflow:
 		/* mas is pointing at entry before unable to go lower */
+		/* 反向搜索留下的 underflow 状态切回正向搜索。 */
 		if (unlikely(mas->index >= max)) {
 			mas->status = ma_overflow;
 			return true;
@@ -5339,6 +6348,7 @@ static __always_inline bool mas_find_setup(struct ma_state *mas, unsigned long m
 
 	if (mas_is_start(mas)) {
 		/* First run or continue */
+		/* 首次或 pause 后先精确 walk 当前起点。 */
 		if (mas->index > max)
 			return true;
 
@@ -5378,6 +6388,12 @@ ptr_out_of_range:
  *
  * Return: The entry or %NULL.
  */
+/*
+ * mas_find() - 首次查找 index 处或其后的非 NULL entry，后续继续向后。
+ *
+ * 返回 entry 时更新完整 range；要求 RCU 读锁或写锁。为便于迭代，内部
+ * next_slot 的 overflow 会被恢复为 active，调用者以 NULL 判断本次结束。
+ */
 void *mas_find(struct ma_state *mas, unsigned long max)
 {
 	void *entry = NULL;
@@ -5388,6 +6404,7 @@ void *mas_find(struct ma_state *mas, unsigned long max)
 	/* Retries on dead nodes handled by mas_next_slot */
 	entry = mas_next_slot(mas, max, false);
 	/* Ignore overflow */
+	/* find 以 NULL 表示本轮无结果，不把内部 overflow 暴露为持久状态。 */
 	mas->status = ma_active;
 	return entry;
 }
@@ -5405,6 +6422,11 @@ EXPORT_SYMBOL_GPL(mas_find);
  *
  * Return: The entry or %NULL.
  */
+/*
+ * mas_find_range() - 正向取得下一 range，不跳过 NULL ranges。
+ *
+ * 适合需要观察空洞和已占用区间连续布局的调用者。
+ */
 void *mas_find_range(struct ma_state *mas, unsigned long max)
 {
 	void *entry = NULL;
@@ -5413,6 +6435,7 @@ void *mas_find_range(struct ma_state *mas, unsigned long max)
 		return entry;
 
 	/* Retries on dead nodes handled by mas_next_slot */
+	/* dead-node 检测与从根重走由 slot helper 完成。 */
 	return mas_next_slot(mas, max, true);
 }
 EXPORT_SYMBOL_GPL(mas_find_range);
@@ -5424,6 +6447,9 @@ EXPORT_SYMBOL_GPL(mas_find_range);
  * @entry: Pointer to the entry
  *
  * Returns: True if entry is the answer, false otherwise.
+ */
+/*
+ * mas_find_rev_setup() - 为反向 find 规范化 pause/none/overflow 等状态。
  */
 static bool mas_find_rev_setup(struct ma_state *mas, unsigned long min,
 		void **entry)
@@ -5450,6 +6476,7 @@ static bool mas_find_rev_setup(struct ma_state *mas, unsigned long min,
 		mas->status = ma_start;
 		break;
 	case ma_overflow: /* user expects the mas to be one after where it is */
+		/* 从正向迭代切回反向时，当前位置语义在命中项之后。 */
 		if (unlikely(mas->index <= min)) {
 			mas->status = ma_underflow;
 			return true;
@@ -5458,6 +6485,7 @@ static bool mas_find_rev_setup(struct ma_state *mas, unsigned long min,
 		mas->status = ma_active;
 		break;
 	case ma_underflow: /* user expects the mas to be one before where it is */
+		/* 旧 underflow 表示游标位于反向搜索下界之前。 */
 		if (unlikely(mas->index <= min))
 			return true;
 
@@ -5471,6 +6499,7 @@ static bool mas_find_rev_setup(struct ma_state *mas, unsigned long min,
 
 	if (mas_is_start(mas)) {
 		/* First run or continue */
+		/* 首次或恢复后先精确定位当前反向起点。 */
 		if (mas->index < min)
 			return true;
 
@@ -5487,6 +6516,7 @@ static bool mas_find_rev_setup(struct ma_state *mas, unsigned long min,
 		 * Walked to the location, and there was nothing so the previous
 		 * location is 0.
 		 */
+		/* 高度 0 树的唯一候选是索引 0 的直接根 entry。 */
 		mas->last = mas->index = 0;
 		mas->status = ma_root;
 		*entry = mas_root(mas);
@@ -5517,6 +6547,11 @@ none:
  *
  * Return: The entry or %NULL.
  */
+/*
+ * mas_find_rev() - 首次查找 index 处或其前的非 NULL entry，后续继续向前。
+ *
+ * 要求 RCU 读锁或写锁；成功后 index/last 描述完整命中 range。
+ */
 void *mas_find_rev(struct ma_state *mas, unsigned long min)
 {
 	void *entry = NULL;
@@ -5525,6 +6560,7 @@ void *mas_find_rev(struct ma_state *mas, unsigned long min)
 		return entry;
 
 	/* Retries on dead nodes handled by mas_prev_slot */
+	/* dead-node 检测与反向重走由 prev_slot helper 完成。 */
 	return mas_prev_slot(mas, min, false);
 
 }
@@ -5543,6 +6579,9 @@ EXPORT_SYMBOL_GPL(mas_find_rev);
  *
  * Return: The entry or %NULL.
  */
+/*
+ * mas_find_range_rev() - 反向取得上一 range，包括值为 NULL 的 range。
+ */
 void *mas_find_range_rev(struct ma_state *mas, unsigned long min)
 {
 	void *entry = NULL;
@@ -5551,6 +6590,7 @@ void *mas_find_range_rev(struct ma_state *mas, unsigned long min)
 		return entry;
 
 	/* Retries on dead nodes handled by mas_prev_slot */
+	/* dead-node 检测与反向重走由 prev_slot helper 完成。 */
 	return mas_prev_slot(mas, min, true);
 }
 EXPORT_SYMBOL_GPL(mas_find_range_rev);
@@ -5565,6 +6605,13 @@ EXPORT_SYMBOL_GPL(mas_find_range_rev);
  * erases that range.
  *
  * Return: the entry that was erased or %NULL, @mas->index and @mas->last are updated.
+ */
+/*
+ * mas_erase() - 查找 mas->index 所在 range，并清除整个 range。
+ *
+ * 要求写锁。若命中，mas->index/last 会扩展到完整旧 range；删除通过
+ * NULL store 实现。mas_nomem() 可能临时释放内部锁，故重试时恢复原索引
+ * 并重新查找，以免删除锁外变化后的错误 range。
  */
 void *mas_erase(struct ma_state *mas)
 {
@@ -5581,10 +6628,12 @@ write_retry:
 		return NULL;
 
 	/* Must reset to ensure spanning writes of last slot are detected */
+	/* 从根重新分类删除，确保末 slot 的 NULL 合并被识别为 spanning 写。 */
 	mas_reset(mas);
 	mas_wr_preallocate(&wr_mas, NULL);
 	if (mas_nomem(mas, GFP_KERNEL)) {
 		/* in case the range of entry changed when unlocked */
+		/* 锁外分配期间树可能变化，不能沿用旧 range 边界。 */
 		mas->index = mas->last = index;
 		goto write_retry;
 	}
@@ -5605,6 +6654,14 @@ EXPORT_SYMBOL_GPL(mas_erase);
  * @mas: The maple state
  * @gfp: The GFP_FLAGS to use for allocations
  * Return: true on allocation, false otherwise.
+ */
+/*
+ * mas_nomem() - 处理 ma_state 的 -ENOMEM，并告诉调用者是否应重试。
+ *
+ * 仅在 mas->node 编码为 -ENOMEM 时工作。允许阻塞且使用内部锁的树会先
+ * 解锁再分配，避免睡眠持锁；external-lock 树不能由 Maple 擅自释放锁，
+ * 因而在当前锁条件下尝试。成功取得 alloc/sheaf 后恢复 ma_start 并返回
+ * true；false 表示没有 -ENOMEM 或补充仍失败。调用者进入时必须持写锁。
  */
 bool mas_nomem(struct ma_state *mas, gfp_t gfp)
 	__must_hold(mas->tree->ma_lock)
@@ -5627,6 +6684,12 @@ bool mas_nomem(struct ma_state *mas, gfp_t gfp)
 	return true;
 }
 
+/*
+ * maple_tree_init() - 启动期创建全局 maple_node slab cache。
+ *
+ * 节点按自身大小对齐以保留低位指针编码；SLAB_PANIC 表示该基础设施
+ * 无法建立时系统不能继续启动。sheaf_capacity 为批量预分配提供容量。
+ */
 void __init maple_tree_init(void)
 {
 	struct kmem_cache_args args = {
@@ -5661,6 +6724,12 @@ void __init maple_tree_init(void)
  * @index: The index to load
  *
  * Return: the entry or %NULL
+ */
+/*
+ * mtree_load() - 简单精确查询 API，自行建立并释放 RCU 读段。
+ *
+ * dead 节点会从根重试；xa_zero 内部值对外规范化为 NULL。函数返回后
+ * RCU 保护已经结束，entry 对象的后续存活必须由调用者另行保证。
  */
 void *mtree_load(struct maple_tree *mt, unsigned long index)
 {
@@ -5704,6 +6773,12 @@ EXPORT_SYMBOL(mtree_load);
  * Return: 0 on success, -EINVAL on invalid request, -ENOMEM if memory could not
  * be allocated.
  */
+/*
+ * mtree_store_range() - 自动加写锁，在闭区间 [index,last] 存储 entry。
+ *
+ * 拒绝 XArray 高级内部编码和反向范围；允许 entry==NULL 表示清除。返回
+ * 0、-EINVAL 或 -ENOMEM。
+ */
 int mtree_store_range(struct maple_tree *mt, unsigned long index,
 		unsigned long last, void *entry, gfp_t gfp)
 {
@@ -5735,6 +6810,7 @@ EXPORT_SYMBOL(mtree_store_range);
  * Return: 0 on success, -EINVAL on invalid request, -ENOMEM if memory could not
  * be allocated.
  */
+/* mtree_store() - mtree_store_range() 的单索引便利包装。 */
 int mtree_store(struct maple_tree *mt, unsigned long index, void *entry,
 		 gfp_t gfp)
 {
@@ -5755,6 +6831,11 @@ EXPORT_SYMBOL(mtree_store);
  *
  * Return: 0 on success, -EEXISTS if the range is occupied, -EINVAL on invalid
  * request, -ENOMEM if memory could not be allocated.
+ */
+/*
+ * mtree_insert_range() - 仅当闭区间 [first,last] 全为空时自动加锁插入。
+ *
+ * 内存不足时 mas_nomem() 可能锁外分配并重试；已有内容返回 -EEXIST。
  */
 int mtree_insert_range(struct maple_tree *mt, unsigned long first,
 		unsigned long last, void *entry, gfp_t gfp)
@@ -5793,6 +6874,7 @@ EXPORT_SYMBOL(mtree_insert_range);
  * Return: 0 on success, -EEXISTS if the range is occupied, -EINVAL on invalid
  * request, -ENOMEM if memory could not be allocated.
  */
+/* mtree_insert() - mtree_insert_range() 的单索引便利包装。 */
 int mtree_insert(struct maple_tree *mt, unsigned long index, void *entry,
 		 gfp_t gfp)
 {
@@ -5800,6 +6882,13 @@ int mtree_insert(struct maple_tree *mt, unsigned long index, void *entry,
 }
 EXPORT_SYMBOL(mtree_insert);
 
+/*
+ * mtree_alloc_range() - 正向寻找 [min,max] 中 size 大小的空洞并原子插入。
+ *
+ * 仅适用于 MT_FLAGS_ALLOC_RANGE 树。mas_nomem() 可能释放锁，因此每次
+ * 补充内存后必须重新找空洞，不能假定此前候选仍空闲。成功写回
+ * *startp。
+ */
 int mtree_alloc_range(struct maple_tree *mt, unsigned long *startp,
 		void *entry, unsigned long size, unsigned long min,
 		unsigned long max, gfp_t gfp)
@@ -5824,6 +6913,7 @@ retry:
 	 * mas_nomem() may release the lock, causing the allocated area
 	 * to be unavailable, so try to allocate a free area again.
 	 */
+	/* 锁外分配使候选 gap 失去保留语义，重试必须从 gap 搜索开始。 */
 	if (mas_nomem(&mas, gfp))
 		goto retry;
 
@@ -5862,6 +6952,11 @@ EXPORT_SYMBOL(mtree_alloc_range);
  * allocated, -EINVAL if @mt cannot be used, or -EBUSY if there are no
  * free entries.
  */
+/*
+ * mtree_alloc_cyclic() - 自动加锁的循环单 ID 分配接口。
+ *
+ * 从 *next 开始，必要时回绕 range_lo；返回 0 表示未回绕，1 表示回绕。
+ */
 int mtree_alloc_cyclic(struct maple_tree *mt, unsigned long *startp,
 		void *entry, unsigned long range_lo, unsigned long range_hi,
 		unsigned long *next, gfp_t gfp)
@@ -5882,6 +6977,11 @@ int mtree_alloc_cyclic(struct maple_tree *mt, unsigned long *startp,
 }
 EXPORT_SYMBOL(mtree_alloc_cyclic);
 
+/*
+ * mtree_alloc_rrange() - 从高地址向低地址找 size 大小空洞并原子插入。
+ *
+ * 约束和锁外内存重试规则与 mtree_alloc_range() 相同。
+ */
 int mtree_alloc_rrange(struct maple_tree *mt, unsigned long *startp,
 		void *entry, unsigned long size, unsigned long min,
 		unsigned long max, gfp_t gfp)
@@ -5906,6 +7006,7 @@ retry:
 	 * mas_nomem() may release the lock, causing the allocated area
 	 * to be unavailable, so try to allocate a free area again.
 	 */
+	/* 补充内存后重做反向 gap 搜索，避免使用已被并发占用的范围。 */
 	if (mas_nomem(&mas, gfp))
 		goto retry;
 
@@ -5931,6 +7032,11 @@ EXPORT_SYMBOL(mtree_alloc_rrange);
  *
  * Return: The entry stored at the @index or %NULL
  */
+/*
+ * mtree_erase() - 自动加写锁，删除 index 所在的整个 stored range。
+ *
+ * 返回被删除 entry 或 NULL；它不是只清除单个 index。
+ */
 void *mtree_erase(struct maple_tree *mt, unsigned long index)
 {
 	void *entry = NULL;
@@ -5955,6 +7061,11 @@ EXPORT_SYMBOL(mtree_erase);
  * reverse order of mas_dup_build(). There is no need to hold the source tree
  * lock at this time.
  */
+/*
+ * mas_dup_free() - 复制失败时按构建逆序释放尚未发布的新树。
+ *
+ * 新树仍为私有，无需源树锁或 RCU 延迟；mas->node 标识失败位置。
+ */
 static void mas_dup_free(struct ma_state *mas)
 {
 	struct maple_node *node;
@@ -5963,6 +7074,7 @@ static void mas_dup_free(struct ma_state *mas)
 	unsigned char count, i;
 
 	/* Maybe the first node allocation failed. */
+	/* 首节点都未分配时没有任何部分树需要回收。 */
 	if (mas_is_none(mas))
 		return;
 
@@ -6000,6 +7112,11 @@ static void mas_dup_free(struct ma_state *mas)
  * Copy @mas->node to @new_mas->node, set @parent to be the parent of
  * @new_mas->node. If memory allocation fails, @mas is set to -ENOMEM.
  */
+/*
+ * mas_copy_node() - 完整复制源节点，并把新节点 parent 改为新树中的父节点。
+ *
+ * entry 值和 pivot/gap 按位复制；节点地址与 parent 链不能沿用源树。
+ */
 static inline void mas_copy_node(struct ma_state *mas, struct ma_state *new_mas,
 		struct maple_pnode *parent)
 {
@@ -6008,8 +7125,10 @@ static inline void mas_copy_node(struct ma_state *mas, struct ma_state *new_mas,
 	unsigned long val;
 
 	/* Copy the node completely. */
+	/* 先复制布局内容，随后覆盖所有与树拓扑相关的地址字段。 */
 	memcpy(new_node, node, sizeof(struct maple_node));
 	/* Update the parent node pointer. */
+	/* 保留 parent 低位的类型/slot 编码，只替换裸父地址。 */
 	val = (unsigned long)node->parent & MAPLE_NODE_MASK;
 	new_node->parent = ma_parent_ptr(val | (unsigned long)parent);
 }
@@ -6023,6 +7142,12 @@ static inline void mas_copy_node(struct ma_state *mas, struct ma_state *new_mas,
  * This function allocates child nodes for @new_mas->node during the duplication
  * process. If memory allocation fails, @mas is set to -ENOMEM.
  */
+/*
+ * mas_dup_alloc() - 为新内部节点的每个 child 预分配对应新节点。
+ *
+ * 新树尚未发布，无 reader，因此可用 RCU_INIT_POINTER；child 的类型 tag
+ * 从源 slot 保留，裸地址换为新分配节点。
+ */
 static inline void mas_dup_alloc(struct ma_state *mas, struct ma_state *new_mas,
 		gfp_t gfp)
 {
@@ -6035,6 +7160,7 @@ static inline void mas_dup_alloc(struct ma_state *mas, struct ma_state *new_mas,
 	unsigned long val;
 
 	/* Allocate memory for child nodes. */
+	/* 一次准备当前内部节点的全部 child，失败由上层逆序清理。 */
 	type = mte_node_type(mas->node);
 	new_slots = ma_slots(new_node, type);
 	count = mas->node_request = mas_data_end(mas) + 1;
@@ -6052,6 +7178,10 @@ static inline void mas_dup_alloc(struct ma_state *mas, struct ma_state *new_mas,
 		 * tree until after the rcu_assign_pointer() call in
 		 * mas_dup_build().
 		 */
+	/*
+	 * 警告：RCU_INIT_POINTER 只因新树尚不可达而安全；最终 ma_root 的
+	 * rcu_assign_pointer() 发布之前，任何 reader 都不能看到这些 slots。
+	 */
 		RCU_INIT_POINTER(new_slots[i],
 				 ma_mnode_ptr((unsigned long)mas_pop_node(mas) |
 					      val));
@@ -6070,6 +7200,13 @@ static inline void mas_dup_alloc(struct ma_state *mas, struct ma_state *new_mas,
  *
  * Note that the attributes of the two trees need to be exactly the same, and the
  * new tree needs to be empty, otherwise -EINVAL will be set in @mas.
+ */
+/*
+ * mas_dup_build() - 以 DFS 前序复制整棵树，并一次性发布新树根。
+ *
+ * 源/目标属性必须相同且目标为空。构建期间目标完全私有；失败让 new_mas
+ * 指向最后位置供 mas_dup_free() 清理，成功仅在所有节点完成后发布根。
+ * entry 指针仅复制，不克隆 entry 对象或转移其所有权。
  */
 static inline void mas_dup_build(struct ma_state *mas, struct ma_state *new_mas,
 		gfp_t gfp)
@@ -6106,6 +7243,7 @@ static inline void mas_dup_build(struct ma_state *mas, struct ma_state *new_mas,
 		mas_copy_node(mas, new_mas, parent);
 		if (!mte_is_leaf(mas->node)) {
 			/* Only allocate child nodes for non-leaf nodes. */
+			/* 内部节点先建好全部新 child，再继续深度优先复制。 */
 			mas_dup_alloc(mas, new_mas, gfp);
 			if (unlikely(mas_is_err(mas)))
 				goto empty_mas;
@@ -6114,16 +7252,19 @@ static inline void mas_dup_build(struct ma_state *mas, struct ma_state *new_mas,
 			 * This is the last leaf node and duplication is
 			 * completed.
 			 */
+			/* 到达最右叶且上界为 ULONG_MAX，整树复制完成。 */
 			if (mas->max == ULONG_MAX)
 				goto done;
 
 			/* This is not the last leaf node and needs to go up. */
+			/* 上溯到仍有未复制 sibling 的祖先。 */
 			do {
 				mas_ascend(mas);
 				mas_ascend(new_mas);
 			} while (mas->offset == mas_data_end(mas));
 
 			/* Move to the next subtree. */
+			/* 源树与新树游标同步转到下一子树。 */
 			mas->offset++;
 			new_mas->offset++;
 		}
@@ -6136,9 +7277,11 @@ static inline void mas_dup_build(struct ma_state *mas, struct ma_state *new_mas,
 	}
 done:
 	/* Specially handle the parent of the root node. */
+	/* 新根 parent 必须编码目标 tree，而不是复制来的源 tree。 */
 	mte_to_node(root)->parent = ma_parent_ptr(mas_tree_parent(new_mas));
 set_new_tree:
 	/* Make them the same height */
+	/* 复制包括高度和持久属性，之后才以 RCU 语义发布完整根。 */
 	new_mas->tree->ma_flags = mas->tree->ma_flags;
 	rcu_assign_pointer(new_mas->tree->ma_root, root);
 empty_mas:
@@ -6165,6 +7308,12 @@ empty_mas:
  * Return: 0 on success, -ENOMEM if memory could not be allocated, -EINVAL If
  * the attributes of the two trees are different or the new tree is not an empty
  * tree.
+ */
+/*
+ * __mt_dup() - 不代管锁的整树复制接口。
+ *
+ * 调用者必须同时稳定源树并独占空目标树。成功只复制树节点和 entry
+ * 指针；失败返回 -EINVAL/-ENOMEM，后者会清理部分目标树。
  */
 int __mt_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp)
 {
@@ -6203,6 +7352,11 @@ EXPORT_SYMBOL(__mt_dup);
  * the attributes of the two trees are different or the new tree is not an empty
  * tree.
  */
+/*
+ * mtree_dup() - 自动按嵌套顺序锁住目标和源树后复制整树。
+ *
+ * 目标必须为空且属性与源相同；entry 对象本身仍由外部管理。
+ */
 int mtree_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp)
 {
 	int ret = 0;
@@ -6230,6 +7384,13 @@ EXPORT_SYMBOL(mtree_dup);
  *
  * Note: Does not handle locking.
  */
+/*
+ * __mt_destroy() - 已持写锁时清空树并回收全部节点。
+ *
+ * 先把 ma_root 发布为 NULL，使新 reader 看见空树；旧节点随后按 RCU
+ * 模式立即或延迟销毁。保留树的持久属性 flags，树对象可继续复用。
+ * 只释放 Maple 节点，不释放存储的 entry 对象。
+ */
 void __mt_destroy(struct maple_tree *mt)
 {
 	void *root = mt_root_locked(mt);
@@ -6247,6 +7408,11 @@ EXPORT_SYMBOL_GPL(__mt_destroy);
  * @mt: The maple tree
  *
  * Frees all resources used by the tree.  Handles locking.
+ */
+/*
+ * mtree_destroy() - 自动加写锁的整树销毁包装。
+ *
+ * 销毁后树为空且可复用；entry 生命周期仍由调用者负责。
  */
 void mtree_destroy(struct maple_tree *mt)
 {
@@ -6271,6 +7437,13 @@ EXPORT_SYMBOL(mtree_destroy);
  * single index or a range if indices.
  *
  * Return: The entry at or after the @index or %NULL
+ */
+/*
+ * mt_find() - 从 *index 起向后查找非 NULL entry，并推进迭代位置。
+ *
+ * 成功把 *index 更新为命中 range 的 last+1，便于循环；若 last 为
+ * ULONG_MAX，加一回零。内部 RCU 只保护查找，返回指针的后续存活需外部
+ * 保证。xa_zero 对外按 NULL 处理。
  */
 void *mt_find(struct maple_tree *mt, unsigned long *index, unsigned long max)
 {
@@ -6332,6 +7505,11 @@ EXPORT_SYMBOL(mt_find);
  *
  * Return: The entry at or after the @index or %NULL
  */
+/*
+ * mt_find_after() - mt_find() 的防回绕包装；*index==0 时停止迭代。
+ *
+ * 用于上一命中位于 ULONG_MAX、last+1 回绕为 0 的场景。
+ */
 void *mt_find_after(struct maple_tree *mt, unsigned long *index,
 		    unsigned long max)
 {
@@ -6350,6 +7528,7 @@ EXPORT_SYMBOL_GPL(maple_tree_tests_passed);
 
 #ifndef __KERNEL__
 extern void kmem_cache_set_non_kernel(struct kmem_cache *, unsigned int);
+/* mt_set_non_kernel() - 用户态 Maple 测试桩：配置模拟 slab 行为。 */
 void mt_set_non_kernel(unsigned int val)
 {
 	kmem_cache_set_non_kernel(maple_node_cache, val);
@@ -6357,41 +7536,48 @@ void mt_set_non_kernel(unsigned int val)
 
 extern void kmem_cache_set_callback(struct kmem_cache *cachep,
 		void (*callback)(void *));
+/* mt_set_callback() - 用户态测试桩：安装节点分配回调。 */
 void mt_set_callback(void (*callback)(void *))
 {
 	kmem_cache_set_callback(maple_node_cache, callback);
 }
 
 extern void kmem_cache_set_private(struct kmem_cache *cachep, void *private);
+/* mt_set_private() - 用户态测试桩：为模拟 slab 设置私有数据。 */
 void mt_set_private(void *private)
 {
 	kmem_cache_set_private(maple_node_cache, private);
 }
 
 extern unsigned long kmem_cache_get_alloc(struct kmem_cache *);
+/* mt_get_alloc_size() - 用户态测试桩：读取模拟缓存分配规模。 */
 unsigned long mt_get_alloc_size(void)
 {
 	return kmem_cache_get_alloc(maple_node_cache);
 }
 
 extern void kmem_cache_zero_nr_tallocated(struct kmem_cache *);
+/* mt_zero_nr_tallocated() - 用户态测试桩：清零累计分配计数。 */
 void mt_zero_nr_tallocated(void)
 {
 	kmem_cache_zero_nr_tallocated(maple_node_cache);
 }
 
 extern unsigned int kmem_cache_nr_tallocated(struct kmem_cache *);
+/* mt_nr_tallocated() - 用户态测试桩：读取累计分配计数。 */
 unsigned int mt_nr_tallocated(void)
 {
 	return kmem_cache_nr_tallocated(maple_node_cache);
 }
 
 extern unsigned int kmem_cache_nr_allocated(struct kmem_cache *);
+/* mt_nr_allocated() - 用户态测试桩：读取当前未释放节点数。 */
 unsigned int mt_nr_allocated(void)
 {
 	return kmem_cache_nr_allocated(maple_node_cache);
 }
 
+/* mt_cache_shrink() - 用户态测试配置下无需收缩真实内核 slab。 */
 void mt_cache_shrink(void)
 {
 }
@@ -6404,6 +7590,9 @@ void mt_cache_shrink(void)
  * possibility of an out of memory even due to kmem_cache objects remaining
  * around for longer than usual.
  */
+/*
+ * mt_cache_shrink() - 测试专用：主动收缩 maple_node slab，降低 OOM 干扰。
+ */
 void mt_cache_shrink(void)
 {
 	kmem_cache_shrink(maple_node_cache);
@@ -6412,6 +7601,7 @@ void mt_cache_shrink(void)
 EXPORT_SYMBOL_GPL(mt_cache_shrink);
 
 #endif /* not defined __KERNEL__ */
+/* 上述两个分支分别服务非内核测试桩与真实内核 slab。 */
 /*
  * mas_get_slot() - Get the entry in the maple state node stored at @offset.
  * @mas: The maple state
@@ -6419,6 +7609,7 @@ EXPORT_SYMBOL_GPL(mt_cache_shrink);
  *
  * Return: The entry stored at @offset.
  */
+/* mas_get_slot() - 调试遍历中读取当前节点指定 slot 的 enode。 */
 static inline struct maple_enode *mas_get_slot(struct ma_state *mas,
 		unsigned char offset)
 {
@@ -6427,6 +7618,10 @@ static inline struct maple_enode *mas_get_slot(struct ma_state *mas,
 }
 
 /* Depth first search, post-order */
+/* 调试遍历采用深度优先后序，便于逐节点验证父子关系。 */
+/*
+ * mas_dfs_postorder() - 将调试游标推进到 DFS 后序中的下一个节点。
+ */
 static void mas_dfs_postorder(struct ma_state *mas, unsigned long max)
 {
 
@@ -6458,6 +7653,7 @@ static void mas_dfs_postorder(struct ma_state *mas, unsigned long max)
 static void mt_dump_node(const struct maple_tree *mt, void *entry,
 		unsigned long min, unsigned long max, unsigned int depth,
 		enum mt_dump_format format);
+/* mt_dump_range() - 按十六/十进制格式输出一个闭区间及树深缩进。 */
 static void mt_dump_range(unsigned long min, unsigned long max,
 			  unsigned int depth, enum mt_dump_format format)
 {
@@ -6478,6 +7674,7 @@ static void mt_dump_range(unsigned long min, unsigned long max,
 	}
 }
 
+/* mt_dump_entry() - 输出叶 entry 的区间、编码种类和值。 */
 static void mt_dump_entry(void *entry, unsigned long min, unsigned long max,
 			  unsigned int depth, enum mt_dump_format format)
 {
@@ -6494,6 +7691,7 @@ static void mt_dump_entry(void *entry, unsigned long min, unsigned long max,
 		pr_cont(PTR_FMT "\n", entry);
 }
 
+/* mt_dump_range64() - 递归输出 range_64/leaf_64 节点的 slots 与 pivots。 */
 static void mt_dump_range64(const struct maple_tree *mt, void *entry,
 		unsigned long min, unsigned long max, unsigned int depth,
 		enum mt_dump_format format)
@@ -6547,6 +7745,7 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
 	}
 }
 
+/* mt_dump_arange64() - 输出 allocation 节点的 gap/meta 后递归打印 children。 */
 static void mt_dump_arange64(const struct maple_tree *mt, void *entry,
 	unsigned long min, unsigned long max, unsigned int depth,
 	enum mt_dump_format format)
@@ -6606,6 +7805,7 @@ static void mt_dump_arange64(const struct maple_tree *mt, void *entry,
 	}
 }
 
+/* mt_dump_node() - 按节点类型分派具体调试输出格式。 */
 static void mt_dump_node(const struct maple_tree *mt, void *entry,
 		unsigned long min, unsigned long max, unsigned int depth,
 		enum mt_dump_format format)
@@ -6641,6 +7841,11 @@ static void mt_dump_node(const struct maple_tree *mt, void *entry,
 	}
 }
 
+/*
+ * mt_dump() - 从根输出整棵 Maple Tree 的结构化调试信息。
+ *
+ * 只读但要求调用者提供 RCU/锁保护；不应用于正常数据访问。
+ */
 void mt_dump(const struct maple_tree *mt, enum mt_dump_format format)
 {
 	void *entry = rcu_dereference_check(mt->ma_root, mt_locked(mt));
@@ -6659,6 +7864,9 @@ EXPORT_SYMBOL_GPL(mt_dump);
 /*
  * Calculate the maximum gap in a node and check if that's what is reported in
  * the parent (unless root).
+ */
+/*
+ * 重新计算节点最大 gap，并验证 allocation metadata 及父 slot 摘要一致。
  */
 static void mas_validate_gaps(struct ma_state *mas)
 {
@@ -6751,6 +7959,9 @@ counted:
 	}
 }
 
+/*
+ * mas_validate_parent_slot() - 验证 child 的 parent/slot 反向编码唯一且准确。
+ */
 static void mas_validate_parent_slot(struct ma_state *mas)
 {
 	struct maple_node *parent;
@@ -6770,6 +7981,7 @@ static void mas_validate_parent_slot(struct ma_state *mas)
 	MT_BUG_ON(mas->tree, mas_mn(mas) == parent);
 
 	/* Check prev/next parent slot for duplicate node entry */
+	/* 扫描父节点所有 slots，确保同一 child 没有被重复引用。 */
 
 	for (i = 0; i < mt_slots[p_type]; i++) {
 		node = mas_slot(mas, slots, i);
@@ -6786,6 +7998,9 @@ static void mas_validate_parent_slot(struct ma_state *mas)
 	}
 }
 
+/*
+ * mas_validate_child_slot() - 验证内部节点每个 child 都反向指回正确父/slot。
+ */
 static void mas_validate_child_slot(struct ma_state *mas)
 {
 	enum maple_type type = mte_node_type(mas->node);
@@ -6829,6 +8044,10 @@ static void mas_validate_child_slot(struct ma_state *mas)
  * Validate all pivots are within mas->min and mas->max, check metadata ends
  * where the maximum ends and ensure there is no slots or pivots set outside of
  * the end of the data.
+ */
+/*
+ * 验证 pivot 单调且位于节点边界内，metadata end 与真实尾 slot 一致，
+ * data-end 之后的 slots/pivots 均为空。
  */
 static void mas_validate_limits(struct ma_state *mas)
 {
@@ -6898,6 +8117,7 @@ static void mas_validate_limits(struct ma_state *mas)
 	}
 }
 
+/* mt_validate_nulls() - 验证规范化树中不存在相邻的两个 NULL ranges。 */
 static void mt_validate_nulls(struct maple_tree *mt)
 {
 	void *entry, *last = (void *)1;
@@ -6940,6 +8160,11 @@ static void mt_validate_nulls(struct maple_tree *mt)
  * 1. The limits (pivots are within mas->min to mas->max)
  * 2. The gap is correctly set in the parents
  */
+/*
+ * mt_validate() - 持写锁遍历全树，验证边界、容量、父子链接和 gap 摘要。
+ *
+ * 这是 DEBUG_MAPLE_TREE 的主动一致性检查，失败通过 WARN/BUG 报告。
+ */
 void mt_validate(struct maple_tree *mt)
 	__must_hold(mas->tree->ma_lock)
 {
@@ -6973,6 +8198,7 @@ void mt_validate(struct maple_tree *mt)
 }
 EXPORT_SYMBOL_GPL(mt_validate);
 
+/* mas_dump() - 输出 ma_state 状态机、写策略、范围和预分配信息。 */
 void mas_dump(const struct ma_state *mas)
 {
 	pr_err("MAS: tree=" PTR_FMT " enode=" PTR_FMT " ",
@@ -7048,6 +8274,7 @@ void mas_dump(const struct ma_state *mas)
 }
 EXPORT_SYMBOL_GPL(mas_dump);
 
+/* mas_wr_dump() - 输出 ma_wr_state 的节点布局和命中边界缓存。 */
 void mas_wr_dump(const struct ma_wr_state *wr_mas)
 {
 	pr_err("WR_MAS: node=" PTR_FMT " r_min=%lx r_max=%lx\n",
@@ -7059,3 +8286,4 @@ void mas_wr_dump(const struct ma_wr_state *wr_mas)
 EXPORT_SYMBOL_GPL(mas_wr_dump);
 
 #endif /* CONFIG_DEBUG_MAPLE_TREE */
+/* CONFIG_DEBUG_MAPLE_TREE 调试实现到此结束。 */
