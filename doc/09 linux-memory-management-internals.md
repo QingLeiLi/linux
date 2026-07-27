@@ -1,7 +1,10 @@
 # Linux 内存管理内部实现
 
-> 适用内核版本：v7.2-rc1（基于当前仓库 `a14c021eef14`）  
+> 适用内核版本：v7.2-rc1（基于当前仓库 `5f1d3c45f80d`）
 > 核心源码：`mm/`、`include/linux/mm*.h`、`include/linux/mmzone.h`、`arch/*/mm/`
+>
+> 启动初始化主线：`mm/mm_init.c`、`mm/memblock.c`、`mm/sparse.c`、
+> `mm/sparse-vmemmap.c`、`mm/page_alloc.c`、`mm/memory_hotplug.c`
 
 ---
 
@@ -658,26 +661,789 @@ GUP 必须处理 fault、COW、权限、huge page、迁移和退出竞态。拿�
 
 ## 17. 启动阶段内存管理
 
-正常 buddy、slab 和 vmalloc 建立前，内核仍需要分配页表、数据结构和保留固件区域，因此使用
-memblock 管理早期物理内存：
+### 17.1 为什么不能一开始就使用伙伴系统
 
-```
-固件/设备树/EFI 提供 memory map
-  → memblock_add()      标记可用 RAM
-  → memblock_reserve()  保留内核镜像、initrd、页表等
-  → 建立体系结构内核页表和 direct map
-  → sparse/vmemmap 初始化 struct page
-  → free_area_init() 建 node/zone/buddy
-  → 把未保留 memblock 页释放给 buddy
-  → slab/vmalloc 等正常分配器上线
-  → 释放可回收的 init 内存
+机器刚进入内核时，固件、设备树或 EFI 只能告诉内核“哪些物理地址可能是 RAM”。此时还没有
+可工作的伙伴系统，因为伙伴系统本身依赖以下元数据：
+
+- 每个 NUMA node 的 `pg_data_t`；
+- 每个 node 内各个 `struct zone` 的 PFN 边界；
+- 每个 zone 的 `free_area[order]` 链表和锁；
+- 每个物理页对应的 `struct page`；
+- pageblock 的迁移类型；
+- zonelist 和 per-CPU pageset。
+
+这些对象又需要内存才能建立。若要求伙伴系统分配自己的元数据，就会出现循环依赖：
+
+```text
+要分配 struct page / zone 元数据
+  → 需要页分配器
+  → 页分配器要先读取 struct page / zone
+  → 元数据尚不存在
 ```
 
-SPARSEMEM 把物理地址空间分 section 管理，支持稀疏地址和内存热插拔；`vmemmap` 用虚拟连续
-区域映射 `struct page` 数组，避免要求描述符自身物理连续。
+Linux 用 memblock 打破循环。memblock 只维护少量物理区间，算法不适合长期高频分配，但在
+页分配器尚不存在时已经足够：
+
+```text
+memblock.memory
+  固件确认的 RAM 区间
+
+memblock.reserved
+  内核镜像、DTB、initrd、早期页表、CMA、crashkernel 等不可交给 buddy 的区间
+
+可移交页
+  memory - reserved
+```
+
+贯穿本章的问题是：
+
+> 一段固件报告的 RAM，经过哪些状态和发布边界，才会成为
+> `alloc_pages()` 可以返回的物理页？
+
+答案不是“注册到 memblock 后立即可用”，而是先建立描述它的全部元数据，最后才一次或分批
+移交给 buddy。
+
+### 17.2 完整阶段地图
+
+当前源码的主调用阶段是：
+
+```text
+start_kernel()
+  → setup_arch()
+      → arm64_memblock_init()
+          建立 memblock.memory / memblock.reserved
+          建立内核镜像、DTB、initrd 等保留关系
+      → bootmem_init()
+          确定 min/max PFN、NUMA、DMA zone、CMA、crashkernel
+  → mm_core_init_early()
+      → hugetlb_cma_reserve()
+      → hugetlb_bootmem_alloc()
+      → free_area_init()
+          arch zone 边界
+          sparse/vmemmap backing
+          ZONE_MOVABLE
+          pgdat/zone/free_area
+          struct page 基态
+  → mm_core_init()
+      → build_all_zonelists()
+      → page allocator CPU hotplug/per-CPU 基础设施
+      → 调试和安全元数据
+      → memblock_free_all()          关键所有权移交
+      → arch mem_init()
+      → kmem_cache_init()            SLUB 上线
+      → vmalloc_init()
+  → padata_init()
+  → page_alloc_init_late()
+      → 完成 deferred struct page
+      → 丢弃 memblock 私有元数据
+      → page_ext/sysctl 等晚期收尾
+```
+
+这里有三个容易混淆的时间点：
+
+| 时间点 | 已经具备 | 仍然不能假设 |
+|--------|----------|--------------|
+| `setup_arch()` 后 | memblock 物理区间、早期页表、架构 PFN/NUMA 信息 | buddy、slab、vmalloc 可用 |
+| `mm_core_init_early()` 后 | pgdat/zone/memmap 和空 buddy 容器 | 所有普通 RAM 已进入 free list |
+| `memblock_free_all()` 后 | buddy 已接收普通空闲页，slab 可以随后建立 | deferred 高端 `struct page` 已全部完成 |
+| `page_alloc_init_late()` 后 | deferred 页、最终统计、page_ext 和 memblock 清理完成 | memblock 仍可作为普通分配器使用 |
+
+所以“buddy 数据结构初始化完成”和“物理页已经交给 buddy”是两个不同事件。
+
+### 17.3 四类核心对象与三个页数
+
+#### 17.3.1 `pg_data_t`：一个 NUMA node 的内存管理根
+
+`struct pglist_data` 定义于 `include/linux/mmzone.h`，常通过 `pg_data_t` 使用。它拥有：
+
+```text
+pg_data_t
+├── node_id
+├── node_start_pfn
+├── node_spanned_pages
+├── node_present_pages
+├── node_zones[MAX_NR_ZONES]
+├── node_zonelists[]
+├── kswapd / kcompactd 状态与等待队列
+├── node 级 lruvec
+└── deferred init 边界 first_deferred_pfn
+```
+
+`pg_data_t` 是 node 的长期对象。启动时由架构、静态数组或早期分配提供，本文件主要负责填充；
+memoryless node 也可能拥有 `pg_data_t`，但其 zone 容量为零，之后热添加内存时再重建内部状态。
+
+#### 17.3.2 `struct zone`：地址能力与分配策略边界
+
+zone 不是“任意大小的内存池”。它首先表达物理地址能力：
+
+- `ZONE_DMA`、`ZONE_DMA32`：满足受限设备的 DMA 地址范围；
+- `ZONE_NORMAL`：内核通常可以直接映射的普通内存；
+- `ZONE_HIGHMEM`：32 位等平台无法永久直接映射的高端内存；
+- `ZONE_MOVABLE`：尽量只容纳可迁移页，提高热拔除和连续分配成功率；
+- `ZONE_DEVICE`：由设备内存映射管理的特殊页。
+
+每个 zone 内部才有伙伴系统的 `free_area[]`、zone lock、watermark、per-CPU pageset 和
+pageblock 元数据。
+
+#### 17.3.3 `struct page`：PFN 的软件描述符
+
+`struct page` 不是物理页内容，而是内核用来管理该页的元数据。对 PFN `pfn`，内存模型提供：
+
+```text
+pfn_to_page(pfn)   PFN → 描述符
+page_to_pfn(page)  描述符 → PFN
+```
+
+`__init_single_page()` 建立 flags 中的 node/zone/section 链接、引用基态、mapcount、链表和调试
+状态。此时 page 只是“描述符有效且尚未空闲”，并不意味着它已经进入伙伴 free list。
+
+#### 17.3.4 pageblock：迁移和反碎片粒度
+
+伙伴系统以 order 管理连续块，迁移和隔离则以更粗的 pageblock 管理。一个 pageblock 保存
+`MIGRATE_MOVABLE`、`MIGRATE_UNMOVABLE`、`MIGRATE_RECLAIMABLE`、`MIGRATE_CMA` 等类型。
+
+pageblock 类型不是页的所有权；它是对分配器的放置提示和迁移约束。错误地让大量不可移动对象
+散入 MOVABLE/CMA pageblock，会使内存热拔除、THP 和高阶连续分配更容易失败。
+
+#### 17.3.5 `spanned`、`present` 与 `managed`
+
+这三个计数不能混用：
+
+```text
+spanned_pages
+  zone_start_pfn 到 zone_end_pfn 的地址跨度，包含物理洞
+
+present_pages
+  span 中实际存在并归属该 zone 的物理页
+  = spanned_pages - absent_pages
+
+managed_pages
+  当前真正由 buddy 管理的 present 页
+  通常不含仍被固件、内核镜像、早期元数据等保留的页
+```
+
+例子：
+
+```text
+zone PFN span             0x10000 pages
+其中物理洞               0x02000 pages
+present_pages            0x0e000 pages
+其中启动保留             0x01000 pages
+最终 managed_pages       0x0d000 pages
+```
+
+`free_area_init_core()` 会先用启动容量建立 zone 基线；`memblock_free_all()` 在真正移交前调用
+`reset_all_zones_managed_pages()` 清零，再由 `__free_pages_core()` 按实际释放页累加。
+因此最终 managed 数来自真实移交结果，而不是简单复制 present。
+
+### 17.4 从固件内存图到 memblock
+
+不同架构获得 RAM 的方式不同：
+
+```text
+x86       EFI/e820
+arm64     DT / ACPI
+其他架构  固件或平台表
+```
+
+以 arm64 为例，`setup_arch()` 中的 `arm64_memblock_init()` 整理物理内存并建立早期保留关系，
+随后 `bootmem_init()` 完成：
+
+```text
+min_low_pfn / max_pfn
+  DRAM 的 PFN 边界
+
+arch_numa_init()
+  为 memblock ranges 建立 nid
+
+dma_limits_init()
+  决定 ZONE_DMA / ZONE_DMA32 上界
+
+dma_contiguous_reserve()
+  在正确 DMA 地址范围内预留 CMA
+
+arch_reserve_crashkernel()
+  在资源树建立前锁定 crash kernel 内存
+```
+
+顺序会影响正确性。例如 CMA 必须在 DMA 物理上界确定后选址，否则可能预留到设备不能访问的
+高地址；crashkernel 必须在标准资源登记前保留，否则同一地址可能被当成普通 RAM 使用。
+
+memblock 的 range 描述物理地址，不等于 zone。zone 要到架构上界、NUMA 和 movable 策略都
+确定后才能计算。
+
+### 17.5 `mm_core_init_early()`：先预留，再建立分配器骨架
+
+`mm_core_init_early()` 位于 `setup_arch()` 之后：
+
+```text
+mm_core_init_early()
+  → hugetlb_cma_reserve()
+      为 gigantic HugeTLB 预留 CMA 区域
+  → hugetlb_bootmem_alloc()
+      用 memblock 分配 buddy 无法保证得到的巨大连续页
+  → free_area_init()
+      建立通用物理页管理骨架
+```
+
+gigantic hugepage 的 order 可能超过伙伴系统最大 order。若等 buddy 上线后再申请，大块连续
+物理内存可能已经被切碎，所以必须先于普通页移交完成预留。
+
+#### 17.5.1 `free_area_init()` 的六个阶段
+
+```text
+阶段 1：架构 zone 上界与内存模型 backing
+  arch_zone_limits_init(max_zone_pfn)
+  sparse_init()
+
+阶段 2：ZONE_MOVABLE
+  find_zone_movable_pfns_for_nodes()
+
+阶段 3：输出 zone/node 范围并建立 subsection map
+  sparse_init_subsection_map()
+
+阶段 4：全局不变量
+  mminit_verify_pageflags_layout()
+  setup_nr_node_ids()
+  set_pageblock_order()
+
+阶段 5：逐 node 初始化
+  free_area_init_node()
+    → calculate_node_totalpages()
+    → alloc_node_mem_map()          FLATMEM
+    → free_area_init_core()
+    → lru_gen_init_pgdat()
+
+阶段 6：页描述符和最终边界
+  sparse_vmemmap_init_nid_late()
+  calc_nr_kernel_pages()
+  memmap_init()
+  set_high_memory()
+```
+
+这一阶段建立的是“空的分配器容器”：
+
+```text
+zone->free_area[order] 链表已经初始化
+zone lock / seqlock / waitqueue 已经初始化
+struct page 基础状态已经建立
+
+但是：
+普通空闲页尚未批量挂入 free_area[]
+```
+
+这种“先构造、后发布”避免其他 CPU 或子系统拿到元数据尚不完整的页。
+
+### 17.6 zone 边界、空洞与 `ZONE_MOVABLE`
+
+#### 17.6.1 架构 zone 是全局候选范围
+
+`arch_zone_limits_init()` 只给出每种 zone 的最大 PFN。例如 arm64 根据 DMA mask 与 DRAM
+末端填写 DMA、DMA32 和 NORMAL 上界。`free_area_init()` 再把相邻上界转换成：
+
+```text
+arch_zone_lowest_possible_pfn[zone]
+arch_zone_highest_possible_pfn[zone]
+```
+
+这是“理论上可能属于该 zone 的全局范围”，不表示每个 node 在其中都有 RAM。
+
+#### 17.6.2 每 node 的真实容量
+
+`get_pfn_range_for_nid()` 从 memblock ranges 求 node 的最小包围区间。对每个 zone：
+
+```text
+zone_spanned_pages_in_node()
+  架构 zone ∩ node span ∩ movable 策略
+
+zone_absent_pages_in_node()
+  物理洞 + mirror 策略排除页
+
+present_pages
+  spanned - absent
+```
+
+物理洞仍属于 span，但没有可分配页。这样 zone 可以用一个连续 PFN 范围表示，同时通过
+`pfn_valid()`、memblock 和 present 计数跳过不存在的 RAM。
+
+#### 17.6.3 `kernelcore=` 与 `movablecore=`
+
+`ZONE_MOVABLE` 没有固定的架构地址窗口。启动参数可以指定：
+
+```text
+kernelcore=<size|percent>
+  至少保留多少内存给不可迁移内核分配
+
+movablecore=<size|percent>
+  希望划出多少内存用于可迁移分配
+
+kernelcore=mirror
+  把固件标记的镜像内存优先留给不可迁移内核分配
+
+movable_node
+  倾向把 hotpluggable memblock ranges 划入 movable
+```
+
+`find_zone_movable_pfns_for_nodes()` 尽量把 kernelcore 均匀分布到可用 node。容量小的 node
+可能先耗尽，剩余 kernelcore 再由其他 node 承担，所以不同 node 的
+`zone_movable_pfn[nid]` 可以不同。
+
+`ZONE_MOVABLE` 提高热拔除和连续分配成功率，但不是绝对保证。长期 pin、启动期 memblock
+分配、内存洞、hwpoison、offline 页和 memmap-on-memory 都可能形成不能正常迁移的例外。
+
+### 17.7 SPARSEMEM、vmemmap 与 `struct page`
+
+#### 17.7.1 为什么不能简单分配一个巨大数组
+
+若物理地址空间稀疏，按最大 PFN 分配平坦 `struct page` 数组会为不存在的洞浪费大量内存。
+SPARSEMEM 按 section 管理：
+
+```text
+物理地址空间
+  → section
+      → present / online 状态
+      → node id
+      → subsection map
+      → 对应的 struct page backing
+```
+
+`sparse_init()` 先调用 `memblocks_present()` 标记 present sections，再按 node 聚合 section，
+由 `sparse_init_nid()` 建立 backing 和 PFN→section 映射。
+
+#### 17.7.2 vmemmap 的作用
+
+SPARSEMEM_VMEMMAP 在内核虚拟地址中为 `struct page` 提供统一连续视图：
+
+```text
+vmemmap + pfn * sizeof(struct page)
+  → pfn 对应描述符
+```
+
+虚拟连续不要求描述符 backing 物理连续。它让 `pfn_to_page()` 接近固定地址算术，同时仍可只
+为实际存在的 section 建立页表和 backing。
+
+HugeTLB 和 ZONE_DEVICE 还会优化 vmemmap：多个 compound tail PFN 可复用少量描述符页。
+`compound_nr_pages()` 和 `vmemmap_populate_compound_pages()` 必须对同一种几何达成一致，
+否则初始化代码可能访问根本没有独立 backing 的 tail 描述符。
+
+#### 17.7.3 `memmap_init()` 的发布顺序
+
+`memmap_init()` 按 PFN 顺序遍历 memblock ranges，并让每个 zone 与 range 求交：
+
+```text
+memmap_init()
+  → memmap_init_zone_range()
+      → memmap_init_range()
+          → __init_single_page()
+          → 初始化 pageblock migratetype
+      → init_unavailable_range()
+          为有描述符 backing、但没有真实 RAM 的洞建立 Reserved 状态
+```
+
+顺序要求是：
+
+```text
+描述符 backing 存在
+  → struct page 基础字段有效
+  → pageblock 类型有效
+  → 页才有资格进入 buddy
+```
+
+如果先释放页再初始化描述符，buddy 在计算相邻块、读取 flags 或合并时可能访问未初始化
+`struct page`。
+
+### 17.8 `memblock_free_all()`：真正的所有权移交
+
+`mm_core_init()` 前半段先完成 zonelist、CPU hotplug、page_ext、KFENCE、KMSAN 等必须位于
+移交前的准备，然后执行：
+
+```text
+memblock_free_all()
+  → free_unused_memmap()
+  → reset_all_zones_managed_pages()
+  → memblock_clear_kho_scratch_only()
+  → free_low_memory_core_early()
+      遍历 memory - reserved
+      → memblock_free_pages(pfn, order)
+          → __free_pages_core(page, order, MEMINIT_EARLY)
+  → totalram_pages_add(pages)
+```
+
+`__free_pages_core()` 完成关键状态转换：
+
+```text
+移交前：
+  struct page 已初始化
+  refcount 表示 allocated/not-free 基态
+  页不在 buddy free_area
+
+移交：
+  清除启动保留状态
+  refcount → 0
+  zone->managed_pages 增加
+  以尽可能大的 buddy block 加入 free_area
+
+移交后：
+  alloc_pages() 可以返回该页
+  其他 CPU/子系统可能立即修改其 flags、引用和内容
+```
+
+跨过这个边界后，memblock 不再拥有该空闲页。任何早期代码都不能继续把同一物理范围当作
+memblock 私有临时存储，否则会和正常分配者形成 use-after-free 或双重分配。
+
+`memblock_free_all()` 后，arm64 的 `mem_init()` 发布 `page_alloc_available=true`，随后
+`kmem_cache_init()` 建立 SLUB，`vmalloc_init()` 建立 vmalloc 管理结构。SLUB 如何从 buddy
+取得页并切成小对象，见 `doc/06 linux-slab-internals.md`。
+
+### 17.9 deferred struct page：为什么延迟，又如何保持安全
+
+大内存机器逐页初始化全部 `struct page` 会显著延长单核启动时间。启用
+`CONFIG_DEFERRED_STRUCT_PAGE_INIT` 时，最高 zone 的高 PFN 尾部可以延迟：
+
+```text
+早期 memmap_init()
+  → 低 zone 全部初始化
+  → 最高 zone 至少初始化一个 section
+  → 在 section 边界记录 pgdat->first_deferred_pfn
+  → 剩余尾部暂不触碰
+```
+
+低 zone 不能延迟，因为 DMA、DMA32 等地址受限启动分配没有替代来源。`early_page_ext`
+要求完整连续描述符时也会关闭 deferred。
+
+#### 17.9.1 按需增长
+
+后台 worker 启动前，分配器可能已需要更多页：
+
+```text
+get_page_from_freelist()
+  → 发现 deferred_pages static key 开启
+  → deferred_grow_zone(zone, order)
+      持 pgdat_resize_lock
+      按 section 初始化
+      立即释放其中 memblock free pages
+      推进 first_deferred_pfn
+```
+
+函数返回“确实推进过”不等于请求 order 一定能成功。新 section 内可能夹有 memblock 保留页，
+因此仍可能无法形成连续高阶块，调用者必须重新检查 free list。
+
+#### 17.9.2 后台并行完成
+
+`page_alloc_init_late()` 运行前，`padata_init()` 已经完成：
+
+```text
+page_alloc_init_late()
+  → 每个 N_MEMORY node 创建 pgdatinit<nid> kthread
+  → deferred_init_memmap()
+      绑定 node CPU mask
+      取得并关闭 first_deferred_pfn 的按需增长所有权
+      padata 按 section 切成不重叠任务
+      deferred_init_pages()
+      deferred_free_pages()
+  → atomic completion 等待所有 node
+  → static_branch_disable(&deferred_pages)
+```
+
+每个任务遵循“先初始化本 chunk 全部描述符，再释放页”。洞和 reserved 页的描述符已在早期
+建立，因而 `__free_one_page()` 查看潜在 buddy 时不会读到无效元数据。
+
+并发控制包括：
+
+- `pgdat_resize_lock`：按需 grow 与后台 worker 争夺 deferred 边界；
+- padata 不重叠 PFN chunk：避免两个 worker 初始化同一页；
+- `pgdat_init_n_undone` 与 completion：最后一个 node 唤醒启动线程；
+- `deferred_pages` static key：全部完成后永久移除分配热路径检查。
+
+### 17.10 `page_alloc_init_late()` 的收尾边界
+
+deferred worker 汇合后，内存总量和空闲量才最终稳定：
+
+```text
+page_alloc_init_late()
+  → mem_init_print_info()
+      打印最终 Memory: available/total
+  → buffer_init()
+  → memblock_discard()
+      丢弃 memblock 私有数组/backing
+  → shuffle_free_memory()
+      随机化每 node 的空闲链表
+  → set_zone_contiguous()
+      验证 zone 是否完全无物理洞
+  → page_ext_init()               deferred 情况
+  → page_alloc_sysctl_init()
+```
+
+`memblock_discard()` 是第二个重要生命周期边界：
+
+```text
+memblock_free_all()
+  释放 memblock 管理的普通空闲物理页
+
+memblock_discard()
+  释放 memblock 自身为 region 数组等私有元数据占用的内存
+```
+
+前者改变物理页所有权，后者销毁早期分配器自己的管理数据，不能混为同一步。
+
+### 17.11 memory hotplug 是启动流程的运行期镜像
+
+热添加内存不能重新执行整个启动序列，但要建立相同不变量：
+
+```text
+新 node 尚无内存
+  → hotadd_init_pgdat()
+      → free_area_init_core_hotplug(pgdat)
+          初始化 pgdat/zone 锁、等待队列和空计数
+      → build_all_zonelists(pgdat)
+
+添加 PFN range
+  → 建立 sparse section / vmemmap backing
+  → memmap_init_range(..., MEMINIT_HOTPLUG)
+      普通 hotplug page 初始标 PageOffline
+  → online_pages()
+      更新 zone span/present
+      → generic_online_page()
+          → __free_pages_core(..., MEMINIT_HOTPLUG)
+              清 PageOffline
+              managed_pages 增加
+              加入 buddy
+```
+
+启动路径与 hotplug 路径的共同不变量是：
+
+```text
+先有稳定拓扑和 struct page
+  → 再发布 present/managed 计数
+  → 最后让分配器能够取得该页
+```
+
+差异在于启动期大多单线程，而 hotplug 发生在运行期，必须使用 memory hotplug 锁、pgdat resize
+锁、zone span seqlock、CPU hotplug 与 notifier 协议，并具备失败回滚：
+
+```text
+online 失败
+  → MEM_CANCEL_ONLINE 通知
+  → 撤销 node first-memory 通知
+  → remove_pfn_range_from_zone()
+  → 页面保持 offline，不进入 buddy
+```
+
+### 17.12 并发、发布和失败模型
+
+#### 17.12.1 早期阶段为什么很多写入没有锁
+
+`free_area_init()` 大部分路径运行在 boot CPU、SMP 普通并发尚未开始的阶段。正确性来自调用
+顺序，而不是 zone lock：
+
+```text
+架构边界
+  → 对象分配
+  → 字段初始化
+  → free list 容器
+  → 页移交
+  → 并发分配者出现
+```
+
+“没有加锁”不代表这些字段运行期可以无锁修改。它表示对象尚未发布，没有竞态对手。
+
+#### 17.12.2 最重要的发布点
+
+| 发布点 | 发布前 | 发布后 |
+|--------|--------|--------|
+| `zone->initialized = 1` | zone 边界/free lists 正在构造 | hotplug/分配器可视其为已初始化 |
+| page 加入 `free_area` | 启动代码独占 page 元数据 | 任意分配者可能立即取得并复用 |
+| `node_set_state(N_MEMORY)` | node 可能只有占位 pgdat | node-state 遍历会访问该 node |
+| 关闭 `deferred_pages` | 分配路径可能触发 grow | 所有 struct page 必须已经有效 |
+| `memblock_discard()` | 仍可读取 memblock 私有结构 | 私有 backing 已可被其他对象复用 |
+
+#### 17.12.3 失败处理
+
+启动内存初始化的失败分两类：
+
+- 可降级：某些调试设施、优化或可选元数据失败后关闭功能并继续；
+- 不可恢复：`pgdat`、FLATMEM `mem_map`、pageblock usemap 等关键元数据分配失败会 panic。
+
+关键对象一旦部分发布，继续运行通常比停止更危险。例如没有 pageblock flags 时，buddy 无法
+维护迁移/隔离不变量；没有 memmap backing 时，任何 PFN 操作都可能越界。因此这些失败没有
+普通 errno 回滚。
+
+hotplug 不同：它是运行期操作，入口必须返回错误并把已更新的 zone/node 状态收敛回 offline，
+不能因为一条内存条上线失败就直接破坏现有系统。
+
+### 17.13 重要配置分支
+
+| 配置 | 初始化差异 |
+|------|------------|
+| `CONFIG_NUMA` | 按 node 建 pgdat、PFN→nid 缓存、NUMA zonelist 和 hashdist |
+| `CONFIG_FLATMEM` | 为 node 分配连续 `node_mem_map` |
+| `CONFIG_SPARSEMEM` | 以 section/subsection 建立稀疏 memmap |
+| `CONFIG_SPARSEMEM_VMEMMAP` | 用虚拟连续 vmemmap 映射描述符 backing |
+| `CONFIG_DEFERRED_STRUCT_PAGE_INIT` | 延迟最高 zone 的高端描述符并行初始化 |
+| `CONFIG_MEMORY_HOTPLUG` | 保留 `__meminit` 代码并支持 pgdat/zone 运行期重建 |
+| `kernelcore=` / `movablecore=` / `movable_node` | 通过启动策略动态切分 `ZONE_MOVABLE` |
+| `CONFIG_ZONE_DEVICE` | 建立 dev_pagemap、Reserved 设备页和特殊 compound 几何 |
+| `CONFIG_CMA` | pageblock 可标 MIGRATE_CMA，并维护 CMA 专项页数 |
+| `CONFIG_HIGHMEM` | `high_memory` 截到 HIGHMEM 边界，高端页需临时映射 |
+| `CONFIG_DEBUG_MEMORY_INIT` | 启用 page flags 布局和 zonelist 诊断 |
+
+阅读源码时必须先确认当前 `.config`。同一函数在不同配置下可能是完整实现、空 stub，甚至根本
+不参与构建。
+
+### 17.14 可运行的观察方法
+
+#### 17.14.1 启动日志
+
+```bash
+dmesg | grep -E \
+  'Zone ranges|Movable zone start|Early memory node ranges|Initmem setup|deferred pages|Memory:'
+```
+
+这些日志依次对应：
+
+```text
+Zone ranges
+  架构 zone 候选边界
+
+Movable zone start
+  每 node 动态 movable 起点
+
+Early memory node ranges
+  memblock 中实际 RAM 与 nid
+
+Initmem setup
+  pgdat/node span 初始化
+
+deferred pages initialised
+  后台 struct page 完成耗时
+
+Memory:
+  最终 buddy 可用量与内核/reserved/CMA 占用
+```
+
+启用 `CONFIG_DEBUG_MEMORY_INIT` 时可通过启动参数增加验证输出：
+
+```text
+mminit_loglevel=<level>
+```
+
+#### 17.14.2 运行期视图
+
+```bash
+cat /proc/zoneinfo
+cat /proc/buddyinfo
+cat /proc/pagetypeinfo
+cat /proc/meminfo
+numactl --hardware
+```
+
+- `/proc/zoneinfo`：检查 node/zone 的 present、managed、水位与 per-CPU 统计；
+- `/proc/buddyinfo`：检查各 order 当前空闲块数；
+- `/proc/pagetypeinfo`：检查 pageblock 迁移类型和碎片；
+- `/proc/meminfo`：检查最终总量、CMA、HugeTLB、Slab 等汇总；
+- `numactl --hardware`：从用户空间核对 node 容量和距离。
+
+不要用 `/proc/buddyinfo` 反推固件报告的全部 RAM。buddy 只显示已经 managed 且当前空闲的页，
+不包含物理洞、保留页、正在使用的页或尚未 online 的内存。
+
+### 17.15 推荐源码阅读顺序
+
+第一次阅读不建议直接从近八千行的 `mm/page_alloc.c` 开始。更容易形成闭环的顺序是：
+
+```text
+1. include/linux/mmzone.h
+   先理解 pg_data_t、zone、free_area、三个页数
+
+2. include/linux/memblock.h
+   理解 memory/reserved ranges 与迭代接口
+
+3. arch/arm64/mm/init.c
+   看架构如何给出 PFN、DMA zone、NUMA、CMA
+
+4. mm/mm_init.c
+   看通用对象构造、memmap、deferred 和阶段边界
+
+5. mm/sparse.c + mm/sparse-vmemmap.c
+   看 struct page backing 如何存在
+
+6. mm/memblock.c
+   重点看 memblock_free_all() 的所有权移交
+
+7. mm/page_alloc.c
+   从 __free_pages_core()、free_one_page()、rmqueue()、
+   get_page_from_freelist() 进入运行期 buddy
+
+8. mm/memory_hotplug.c
+   用 hot-add/online/offline 验证同一组不变量
+
+9. mm/page_ext.c + mm/vmstat.c
+   补充扩展元数据与统计发布
+```
+
+读完后应能回答：
+
+1. 为什么 `present_pages` 不能直接当成 `managed_pages`？
+2. 为什么先初始化 `struct page`，再把页放入 buddy？
+3. `memblock_free_all()` 和 `memblock_discard()` 分别释放什么？
+4. 为什么 deferred init 只能从最高 zone 的高端开始？
+5. `ZONE_MOVABLE` 为什么是动态边界，而不是架构固定地址段？
+6. 热添加页面为什么先是 `PageOffline`，之后才增加 managed 计数？
+7. 哪个时刻之后早期代码再访问 memblock 私有数据会成为生命周期错误？
+
+### 17.16 回到开头问题：一页 RAM 的状态变化
+
+一页普通 RAM 从固件描述到可分配页，可以压缩成：
+
+```text
+固件报告
+  物理地址存在，但通用 MM 尚不知道如何管理
+
+memblock.memory
+  早期分配器知道该范围是 RAM
+
+减去 memblock.reserved
+  判断它是否有资格在启动时移交
+
+sparse/vmemmap backing
+  pfn_to_page(pfn) 已有合法存储位置
+
+__init_single_page()
+  struct page 的 node/zone/refcount/mapcount 等基础状态有效
+
+pageblock 初始化
+  迁移类型和反碎片属性有效
+
+memblock_free_pages()
+  选择实际可释放的连续块
+
+__free_pages_core()
+  refcount → 0
+  managed_pages 增加
+  加入 buddy free_area
+
+alloc_pages()
+  该页第一次可能被普通运行期分配者取得
+```
+
+这一实现的主要权衡是：
+
+| 方案 | 收益 | 代价或退化条件 |
+|------|------|----------------|
+| memblock 早期区间分配 | 不依赖 `struct page` 和 buddy，可打破初始化循环 | 查询/插入不适合运行期高频使用，生命周期必须及时结束 |
+| node/zone 分层 | 满足 DMA、NUMA locality 和回收边界 | zonelist fallback、计数和热插拔状态更复杂 |
+| SPARSEMEM/vmemmap | 稀疏地址空间不必为所有洞分配完整描述符 | 需要 section、页表和 vmemmap backing 元数据 |
+| pageblock 迁移分类 | 降低不可移动页造成的长期外部碎片 | 类型只是启发式，pin 和启动保留仍可能破坏可迁移性 |
+| deferred struct page | 大内存机器更快进入可用启动阶段，并可并行初始化 | 分配热路径暂时多一个 grow 分支，需要严格区分可访问 PFN |
+| 关键元数据失败即 panic | 避免带着损坏的 PFN/zone 不变量继续运行 | 启动失败不可用普通 errno 回滚 |
+
+最重要的结论是：
+
+> 物理地址存在、`struct page` 存在、page 属于某个 zone，以及 page 已进入
+> buddy，是四个不同状态。源码中的初始化顺序就是在安全地跨越这些状态。
 
 启动日志中的 “Memory: available/total” 已扣除多类保留和内核占用，并不等于固件报告的全部
-DRAM；应结合 e820/EFI/DT、memblock、reserved-memory 和 CMA 信息分析。
+DRAM；应结合 EFI/e820/DT、memblock、reserved-memory、CMA、HugeTLB 和 deferred 状态分析。
 
 ---
 
@@ -758,6 +1524,13 @@ memcg 范围和任务状态等影响。
 | COW | `do_wp_page()` | `mm/memory.c` | 处理私有写保护 fault |
 | swap-in | `do_swap_page()` | `mm/memory.c` | 从 swap entry 恢复映射 |
 | 文件 fault | `filemap_fault()` | `mm/filemap.c` | 从 page cache 满足文件映射 fault |
+| MM 早期入口 | `mm_core_init_early()` | `mm/mm_init.c` | 巨页/CMA 预留并建立 node/zone/buddy 骨架 |
+| zone 初始化 | `free_area_init()` | `mm/mm_init.c` | 计算 zone、初始化 pgdat 和 struct page |
+| memmap 初始化 | `memmap_init_range()` | `mm/mm_init.c` | 建立 PFN 范围的 page 与 pageblock 基态 |
+| sparse 初始化 | `sparse_init()` | `mm/sparse.c` | 为 present sections 建立 memmap backing |
+| memblock 移交 | `memblock_free_all()` | `mm/memblock.c` | 把未保留物理页移交给 buddy |
+| deferred 收尾 | `page_alloc_init_late()` | `mm/mm_init.c` | 汇合 deferred page worker 并销毁早期状态 |
+| 热添加 node | `hotadd_init_pgdat()` | `mm/memory_hotplug.c` | 为 memoryless/offline node 重建 pgdat 与 zone |
 | 页分配 | `__alloc_pages_noprof()` | `mm/page_alloc.c` | 伙伴系统分配总入口 |
 | buddy 慢路 | `__alloc_pages_slowpath()` | `mm/page_alloc.c` | 回收、压缩、重试与 OOM |
 | 页释放 | `__free_pages()` | `mm/page_alloc.c` | 降引用并归还 buddy |
