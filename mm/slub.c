@@ -3361,13 +3361,42 @@ struct rcu_delayed_free {
  * - debug_check_no_obj_freed()
  * - __kcsan_check_access()
  */
+/*
+ * 中文翻译与补充：slab_free_hook() 是普通 slab 对象释放前的调试/记账关口。
+ *
+ * 入参：
+ *   @s: cache，借用，提供对象大小、RCU 类型和调试标志；
+ *   @x: 待释放对象地址，调用成功继续时仍由释放路径负责，若被 KFENCE 接管则所有权
+ *       转入 KFENCE；
+ *   @init: 是否按 init_on_free 等策略清理对象内容；
+ *   @after_rcu_delay: 当前释放是否已经过 RCU 延迟，用于判断 TYPESAFE_BY_RCU 对象
+ *       内容是否仍可被读侧访问。
+ *
+ * 返回：
+ *   true  表示对象可以继续进入普通 slab 释放/复用流程；
+ *   false 表示释放已被 KASAN quarantine、CONFIG_SLUB_RCU_DEBUG 或 KFENCE 延迟/接管，
+ *         调用者不能把对象立即放回普通 freelist。
+ *
+ * 原英文说明强调 kmalloc_nolock() 的非对称 hook：某些 alloc hook 没执行，但 free
+ * hook 仍必须能处理，例如 kfence_free() 要先判断对象是否来自 KFENCE pool，而不是
+ * 假设所有对象都按普通 slab 分配。
+ */
 static __always_inline
 bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
 		    bool after_rcu_delay)
 {
 	/* Are the object contents still accessible? */
+	/*
+	 * 中文翻译与补充：SLAB_TYPESAFE_BY_RCU 对象在 RCU 宽限期结束前可能仍被读侧
+	 * 按旧类型访问；若还没经过 after_rcu_delay，就不能把内容当作完全不可访问。
+	 * 这个布尔值决定后续 KCSAN/KASAN/RCU debug 是否可以立即破坏或检查对象内容。
+	 */
 	bool still_accessible = (s->flags & SLAB_TYPESAFE_BY_RCU) && !after_rcu_delay;
 
+	/*
+	 * 阶段 1：先清理与对象地址绑定的调试/泄漏检测状态。kmemleak/KMSAN 和对象
+	 * 调试不取得对象所有权，只记录“这个地址正进入释放协议”。
+	 */
 	kmemleak_free_recursive(x, s->flags);
 	kmsan_slab_free(s, x);
 
@@ -3377,16 +3406,31 @@ bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
 		debug_check_no_obj_freed(x, s->object_size);
 
 	/* Use KCSAN to help debug racy use-after-free. */
+	/*
+	 * 中文翻译与补充：若对象内容已经不应再被读侧访问，KCSAN 把释放视作一次写访问
+	 * 断言，帮助发现并发读写导致的 use-after-free。TYPESAFE_BY_RCU 且尚未过宽限期
+	 * 时跳过，因为那类读侧访问在协议内仍可能存在。
+	 */
 	if (!still_accessible)
 		__kcsan_check_access(x, s->object_size,
 				     KCSAN_ACCESS_WRITE | KCSAN_ACCESS_ASSERT);
 
+	/*
+	 * 阶段 2：KFENCE 必须早于普通 slab freelist 处理。若 @x 位于 KFENCE pool，
+	 * kfence_free() 会记录释放栈、保护对象页并接管生命周期；返回 false 阻止同一
+	 * 地址再进入普通 slab，避免 freelist 污染或 double free。
+	 */
 	if (kfence_free(x))
 		return false;
 
 	/*
 	 * Give KASAN a chance to notice an invalid free operation before we
 	 * modify the object.
+	 */
+	/*
+	 * 中文翻译与补充：KASAN 在对象内容被 init_on_free 或 freelist 指针改写前检查
+	 * invalid free/double free。若它决定 quarantine 或拒绝释放，返回 false 表示
+	 * 普通 slab 释放路径不能继续。
 	 */
 	if (kasan_slab_pre_free(s, x))
 		return false;
@@ -6190,23 +6234,57 @@ static __fastpath_inline void *slab_alloc_node(struct kmem_cache *s,
 		gfp_t gfpflags, int node, const struct slab_alloc_context *ac)
 {
 	void *object;
+	/*
+	 * 变量地图：
+	 *   @s        借用的 cache，可能被 slab_pre_alloc_hook() 因 fault injection 等
+	 *             原因改写为 NULL；
+	 *   @gfpflags 本次分配约束，原样传给 KFENCE、per-CPU sheaf 和慢路径；
+	 *   @node     NUMA 目标节点，影响普通 slab 路径，KFENCE 会拒绝无法满足的约束；
+	 *   @ac       分配上下文，ac->orig_size 是 kmalloc 用户实际请求大小；
+	 *   object    当前候选返回对象，可能来自 KFENCE、per-CPU sheaf 或慢路径。
+	 *
+	 * 返回 NULL 表示真正分配失败或 pre/post hook 拒绝；返回 non-NULL 后对象所有权
+	 * 交给调用者，后续释放必须重新经过 kfence_free()/slab_free_hook() 分流。
+	 */
 
+	/*
+	 * 阶段 1：分配前 hook 做 fault injection、might_alloc 和调试预处理。返回 NULL
+	 * 表示本次请求被主动失败，后续不能进入 KFENCE 或普通 slab 路径。
+	 */
 	s = slab_pre_alloc_hook(s, gfpflags);
 	if (unlikely(!s))
 		return NULL;
 
+	/*
+	 * 阶段 2：KFENCE 采样分配放在普通 fast path 之前。成功时 object 位于专用 pool，
+	 * 仍会继续执行 out 标签处的 post alloc hook，让 KASAN/kmemleak/memcg 等公共
+	 * 后处理看到同一个分配事件；失败 NULL 只表示“不采样”，不是 OOM。
+	 */
 	object = kfence_alloc(s, ac->orig_size, gfpflags);
 	if (unlikely(object))
 		goto out;
 
+	/*
+	 * 阶段 3：先走 per-CPU sheaf 快速路径，避免全局/节点级锁；返回 NULL 再退到
+	 * __slab_alloc_node() 慢路径，由 partial list 或伙伴系统补充对象。
+	 */
 	object = alloc_from_pcs(s, gfpflags, ac->alloc_flags, node);
 
 	if (unlikely(!object))
 		object = __slab_alloc_node(s, gfpflags, node, ac);
 
+	/*
+	 * 普通 slab 对象在 init_on_free 等配置下可能需要擦除 freepointer；KFENCE 对象
+	 * 已经在上面 goto out，因此不会被这里当作普通 slab 内嵌 freelist 指针处理。
+	 */
 	maybe_wipe_obj_freeptr(s, object);
 
 out:
+	/*
+	 * 阶段 4：统一后处理。无论对象来自 KFENCE 还是普通 slab，调用者都希望看到
+	 * 同一套 KASAN、zero-fill、kmemleak 和 memcg 语义；如果 post hook 失败，
+	 * object 会被清成 NULL 并由 hook/调用链负责相应清理。
+	 */
 	/*
 	 * In case this fails due to memcg_slab_post_alloc_hook(),
 	 * object is set to NULL
@@ -8050,6 +8128,11 @@ size_t ksize(const void *objp)
 	if (unlikely(ZERO_OR_NULL_PTR(objp)) || !kasan_check_byte(objp))
 		return 0;
 
+	/*
+	 * KFENCE 对象不遵循普通 slab 页内连续对象布局，不能直接交给 __ksize() 读取
+	 * slab metadata。kfence_ksize() 返回 non-0 时说明 @objp 属于 KFENCE pool，
+	 * 该大小是用户原始请求大小；返回 0 时再按普通 slab 对象计算真实可用大小。
+	 */
 	return kfence_ksize(objp) ?: __ksize(objp);
 }
 EXPORT_SYMBOL(ksize);
@@ -8092,6 +8175,22 @@ static void free_large_kmalloc(struct page *page, void *object)
  * Given an rcu_head embedded within an object obtained from kvmalloc at an
  * offset < 4k, free the object in question.
  */
+/*
+ * 中文翻译与补充：
+ *   kvfree_rcu_cb() 在 RCU 宽限期后释放通过 kvmalloc/kmalloc/slab 获得的对象。
+ *
+ * 入参：
+ *   @head: 嵌入在待释放对象内的 rcu_head，偏移小于 4KB；函数把它当作对象内部
+ *          地址使用，需要反推出真实分配起点。
+ *
+ * 返回：无直接返回值。副作用是根据对象来源调用 vfree()、free_large_kmalloc()
+ * 或 slab_free()，最终归还内存。
+ *
+ * KFENCE 相关重点：
+ *   普通 slab 对象可通过 slab 起始地址和 object size 反推出对象起点；KFENCE 每页
+ *   一个对象且可能放在页首或页尾，必须用 kfence_object_start() 读取 metadata 中
+ *   保存的真实起点，否则 slab_free() 会收到错误地址。
+ */
 void kvfree_rcu_cb(struct rcu_head *head)
 {
 	void *obj = head;
@@ -8099,7 +8198,19 @@ void kvfree_rcu_cb(struct rcu_head *head)
 	struct slab *slab;
 	struct kmem_cache *s;
 	void *slab_addr;
+	/*
+	 * 变量地图：
+	 *   obj       从 rcu_head 地址逐步归一化出的对象起点；
+	 *   page      obj 所在页，用于区分 vmalloc、大 kmalloc 和 slab；
+	 *   slab      page 对应的 slab 描述，NULL 表示不是 slab 小对象；
+	 *   s         slab 所属 cache，供最终 slab_free() 使用；
+	 *   slab_addr slab 页起始对象区，用于普通 slab 地址反推。
+	 */
 
+	/*
+	 * 阶段 1：vmalloc/kvmalloc 的 vmalloc 分支。rcu_head 可位于对象内，因此先按页
+	 * 对齐回 vmalloc 分配起点，再调用 vfree()。
+	 */
 	if (is_vmalloc_addr(obj)) {
 		obj = (void *) PAGE_ALIGN_DOWN((unsigned long)obj);
 		vfree(obj);
@@ -8113,6 +8224,11 @@ void kvfree_rcu_cb(struct rcu_head *head)
 		 * rcu_head offset can be only less than page size so no need to
 		 * consider allocation order
 		 */
+		/*
+		 * 中文翻译与补充：rcu_head 偏移保证小于一页，所以大 kmalloc 对象只需向下
+		 * 页对齐就能回到分配起点，不必根据 order 跨多页反推。随后按大对象路径
+		 * 清理检测工具状态并归还伙伴系统页。
+		 */
 		obj = (void *) PAGE_ALIGN_DOWN((unsigned long)obj);
 		free_large_kmalloc(page, obj);
 		return;
@@ -8121,15 +8237,29 @@ void kvfree_rcu_cb(struct rcu_head *head)
 	s = slab->slab_cache;
 	slab_addr = slab_address(slab);
 
+	/*
+	 * 阶段 2：slab 小对象分支还要区分 KFENCE 与普通 slab 布局。is_kfence_address()
+	 * 只做地址范围分类，不解引用对象；确认是 KFENCE 后，必须让 metadata 给出真实
+	 * object start。
+	 */
 	if (is_kfence_address(obj)) {
 		obj = kfence_object_start(obj);
 	} else {
 		unsigned int idx = __obj_to_index(s, slab_addr, obj);
 
+		/*
+		 * 普通 slab 对象按固定 s->size 排列，idx 可由内部地址反推出槽位编号。
+		 * fixup_red_left() 再处理 redzone 左偏移，让最终 obj 回到 allocator 认识的
+		 * 对象地址。
+		 */
 		obj = slab_addr + s->size * idx;
 		obj = fixup_red_left(s, obj);
 	}
 
+	/*
+	 * 阶段 3：RCU 宽限期已结束，最终释放交给 slab_free()。若上面走 KFENCE 分支，
+	 * obj 已被修正为 KFENCE 对象起点，后续 kfence_free() 才能正确接管。
+	 */
 	slab_free(s, slab, obj, _RET_IP_);
 }
 
@@ -8967,10 +9097,22 @@ bool kmem_cache_alloc_bulk_noprof(struct kmem_cache *s, gfp_t flags,
 		.orig_size = s->object_size,
 		.alloc_flags = SLAB_ALLOC_DEFAULT,
 	};
+	/*
+	 * 变量地图：
+	 *   @s/@flags 与单对象分配相同，都是借用输入；
+	 *   @size     请求对象个数，函数内部可能临时减 1 给 KFENCE 对象预留槽位；
+	 *   @p        输出数组，成功时填满 size 个对象，失败时不向调用者留下部分成功；
+	 *   i         已从普通 bulk 路径取得的对象数；
+	 *   kfence_obj 本批次最多一个 KFENCE 采样对象，NULL 表示本批次未采样。
+	 */
 
 	if (!size)
 		return false;
 
+	/*
+	 * 阶段 1：分配前 hook 与单对象路径一致。若 hook 拒绝，@p 不被填充，调用者
+	 * 看到 false 后无需处理部分对象。
+	 */
 	s = slab_pre_alloc_hook(s, flags);
 	if (unlikely(!s))
 		return false;
@@ -8979,8 +9121,17 @@ bool kmem_cache_alloc_bulk_noprof(struct kmem_cache *s, gfp_t flags,
 	 * to make things simpler, only assume at most once kfence allocated
 	 * object per bulk allocation and choose its index randomly
 	 */
+	/*
+	 * 中文翻译与补充：为了让 bulk 分配仍保持简单的全或无语义，每批最多混入一个
+	 * KFENCE 对象，并在最后随机插入输出数组。这样既能让批量分配也被采样覆盖，
+	 * 又不用让 p[] 中多个 KFENCE 对象参与复杂的失败回滚和 post hook 处理。
+	 */
 	kfence_obj = kfence_alloc(s, s->object_size, flags);
 
+	/*
+	 * 如果请求只有一个对象且 KFENCE 成功接管，直接填 p[0] 并跳到统一 post hook。
+	 * 若请求多个对象，先把普通 bulk 需要填充的数量减一，保留一个位置给 kfence_obj。
+	 */
 	if (unlikely(kfence_obj)) {
 		if (unlikely(size == 1)) {
 			p[0] = kfence_obj;
@@ -8989,11 +9140,20 @@ bool kmem_cache_alloc_bulk_noprof(struct kmem_cache *s, gfp_t flags,
 		size--;
 	}
 
+	/*
+	 * 阶段 2：先从 per-CPU sheaf 批量取普通对象；数量不足再进入慢速 bulk 路径。
+	 * 注意这里的 size 可能已经扣除了 KFENCE 对象槽位。
+	 */
 	i = alloc_from_pcs_bulk(s, size, p);
 	if (i < size) {
 		/*
 		 * If we ran out of memory, don't bother with freeing back to
 		 * the percpu sheaves, we have bigger problems.
+		 */
+		/*
+		 * 中文翻译与补充：普通 bulk 慢路径失败时，本函数必须恢复“全或无”契约。
+		 * 已经取得的普通对象用 __kmem_cache_free_bulk() 释放；若此前已拿到 KFENCE
+		 * 对象，也必须用 __kfence_free() 归还，否则 pool 会泄漏一个采样槽位。
 		 */
 		if (unlikely(!__kmem_cache_alloc_bulk(s, flags, size - i,
 				p + i))) {
@@ -9005,6 +9165,11 @@ bool kmem_cache_alloc_bulk_noprof(struct kmem_cache *s, gfp_t flags,
 		}
 	}
 
+	/*
+	 * 阶段 3：把 KFENCE 对象随机插入 p[]。若随机 idx 不是末尾，先把原 idx 对象
+	 * 移到末尾，保持数组中所有普通对象不丢失；最后恢复 size，让 post hook 看到
+	 * 调用者请求的完整对象数。
+	 */
 	if (unlikely(kfence_obj)) {
 		int idx = get_random_u32_below(size + 1);
 
@@ -9017,6 +9182,11 @@ bool kmem_cache_alloc_bulk_noprof(struct kmem_cache *s, gfp_t flags,
 
 out:
 	/* memcg and kmem_cache debug support and memory initialization */
+	/*
+	 * 中文翻译与补充：统一执行 memcg、kmem_cache debug 和内存初始化后处理。
+	 * 返回 false 时 post hook 已负责必要回滚；返回 true 后 @p[0..size) 的对象
+	 * 所有权交给调用者。
+	 */
 	return likely(slab_post_alloc_hook(s, flags, size, p, &ac));
 }
 EXPORT_SYMBOL(kmem_cache_alloc_bulk_noprof);

@@ -2144,7 +2144,7 @@ void start_kernel(void)
 	/* 完成 slab 分配器的后期初始化（中断开启后才能完成的部分） */
 	kmem_cache_init_late();
 
-	/*
+	/* @todo
 	 * 初始化控制台（串口、framebuffer 等输出设备）。
 	 * 注意：此时 PCI 等总线还没初始化完成，console_init() 必须能处理这种情况。
 	 * 尽管如此，我们需要尽早有输出，方便调试启动问题。

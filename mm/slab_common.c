@@ -741,7 +741,16 @@ EXPORT_SYMBOL(kmem_buckets_create);
  */
 static void kmem_cache_release(struct kmem_cache *s)
 {
+	/*
+	 * 阶段 1：先让 KFENCE 扫描这个 cache 的专用池对象。KFENCE 对象不挂在普通
+	 * slab 列表上，若直接释放 cache，metadata->cache 可能变成悬空指针；这里把
+	 * 活动对象转成 zombie，并清理已 freed 对象对 @s 的借用。
+	 */
 	kfence_shutdown_cache(s);
+	/*
+	 * 阶段 2：再释放普通 cache 载体。支持 sysfs 的配置需要走 kobject 生命周期，
+	 * 否则直接释放 kmem_cache；这一步消耗 @s 的最终所有权。
+	 */
 	if (__is_defined(SLAB_SUPPORTS_SYSFS) && slab_state >= FULL)
 		sysfs_slab_release(s);
 	else
@@ -900,8 +909,17 @@ bool slab_is_available(void)
  */
 static void kmem_obj_info(struct kmem_obj_info *kpp, void *object, struct slab *slab)
 {
+	/*
+	 * KFENCE 对象使用专用 pool 和 metadata，不满足普通 slab 页内对象布局。必须
+	 * 先让 __kfence_obj_info() 尝试识别；返回 true 表示 @kpp 已被 KFENCE 填充，
+	 * 不能再落到 __kmem_obj_info() 用普通 slab 规则解释同一地址。
+	 */
 	if (__kfence_obj_info(kpp, object, slab))
 		return;
+	/*
+	 * 非 KFENCE 对象继续普通 slab 诊断路径。这里的 @object/@slab 仍是借用输入，
+	 * __kmem_obj_info() 只填充输出快照，不改变对象生命周期。
+	 */
 	__kmem_obj_info(kpp, object, slab);
 }
 
