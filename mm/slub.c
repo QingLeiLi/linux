@@ -10804,6 +10804,14 @@ static void validate_slab(struct kmem_cache *s, struct slab *slab,
 		return;
 
 	/* Now we know that a valid freelist exists */
+	/*
+	 * 中文翻译：现在已经确认存在一个有效的 freelist。
+	 *
+	 * 学习补充：check_slab() 验证 slab 元数据，on_freelist() 验证空闲链表。
+	 * 只有两者都通过后，__fill_map() 才能把 freelist 投影到 obj_map 位图。
+	 * 若跳过这个前提，后续按位图区分空闲/已分配对象会建立在
+	 * 损坏链表上。
+	 */
 	__fill_map(obj_map, s, slab);
 	for_each_object(p, s, addr, slab->objects) {
 		/* 在位图中 = 空闲对象，期望 RED_INACTIVE；否则 = 已分配，期望 RED_ACTIVE */
@@ -11031,6 +11039,15 @@ static int add_location(struct loc_track *t, struct kmem_cache *s,
 		/*
 		 * There is nothing at "end". If we end up there
 		 * we need to add something to before end.
+		 *
+		 * 中文翻译：end 位置没有元素；如果搜索落到 end，
+		 * 就需要在 end 之前插入新元素。
+		 *
+		 * 学习补充：loc_track 的有效区间是 [0, count)，end 初始等于
+		 * count，表示“插入到尾部”的哨兵位置，
+		 * 而不是可解引用元素。
+		 * 这里先拦住
+		 * pos == end，避免后面读取 t->loc[end] 越界。
 		 */
 		if (pos == end)
 			break;
@@ -11076,6 +11093,12 @@ static int add_location(struct loc_track *t, struct kmem_cache *s,
 
 	/*
 	 * Not found. Insert new tracking element.
+	 *
+	 * 中文翻译：没有找到匹配项，插入新的跟踪元素。
+	 *
+	 * 学习补充：到达这里说明二分搜索没有发现相同的
+	 * (addr, handle, waste) 聚合项。函数接下来要确保数组容量足够，
+	 * 再用 memmove 给新 location 腾位置。
 	 */
 	if (t->count >= t->max && !alloc_loc_track(t, 2 * t->max, GFP_ATOMIC))
 		return 0;
@@ -11165,6 +11188,22 @@ static ssize_t show_slab_objects(struct kmem_cache *s,
 	 * We don't really need mem_hotplug_lock (to hold off
 	 * slab_mem_going_offline_callback) here because slab's memory hot
 	 * unplug code doesn't destroy the kmem_cache->node[] data.
+	 *
+	 * 中文翻译：这里已经持有 kernfs_mutex，不能再获取 mem_hotplug_lock，
+	 * 否则会和已有锁顺序冲突：
+	 *
+	 * mem_hotplug_lock->slab_mutex->kernfs_mutex
+	 *
+	 * 实际上这里也不需要 mem_hotplug_lock 来阻止
+	 * slab_mem_going_offline_callback，因为 slab 的内存热拔除代码不会销毁
+	 * kmem_cache->node[] 数据。
+	 *
+	 * 学习补充：这是典型的“避免锁顺序反转”说明。
+	 * sysfs 读 slabinfo 时已在 kernfs 路径里，若再按热插拔路径的
+	 * 反方向拿锁，就可能和内存热插拔线程
+	 * 形成 ABBA 死锁。这里能省掉 mem_hotplug_lock 的依据是热拔除只改变
+	 * node 上的 slab 内容和状态，不释放 kmem_cache->node[]
+	 * 这个指针数组本身。
 	 */
 
 #ifdef CONFIG_SLUB_DEBUG

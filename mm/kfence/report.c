@@ -464,6 +464,13 @@ static void print_diff_canary(unsigned long address, size_t bytes_to_show,
 		else if (no_hash_pointers)
 			pr_cont(" 0x%02x", *cur);
 		else /* Do not leak kernel memory in non-debug builds. */
+			/*
+			 * 中文翻译：非调试构建中不要泄漏内核内存内容。
+			 *
+			 * 学习补充：这里不打印真实字节值，只用 "!" 表示
+			 * canary 损坏。这样既保留越界写定位信号，
+			 * 又避免把对象附近的内核数据写入日志。
+			 */
 			pr_cont(" !");
 	}
 	pr_cont(" ]");
