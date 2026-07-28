@@ -95,14 +95,35 @@ static __always_inline bool arch_in_rcu_eqs(void) { return false; }
  * done between establishing state and enabling interrupts. The caller must
  * enable interrupts before invoking syscall_enter_from_user_mode_work().
  */
+/*
+ * enter_from_user_mode() - 用户态 syscall/IRQ 进入后建立可插桩内核环境。
+ *
+ * 原文说明硬件入口已关闭 IRQ，但 tracing 仍把用户态视为 IRQ-on，NO_HZ_FULL
+ * 下 RCU 还可能处于 EQS。阶段依次为：让 lockdep 看到 IRQ-off、通过 Context
+ * Tracking 恢复 RCU watching、完成 IRQ-off trace。体系结构不可插桩代码以
+ * IRQ-off 调用，返回后 IRQ 仍关闭，但后续代码已可插桩。
+ * @regs: 借用的 current 寄存器帧，非空、无 ownership 转移；函数无直接
+ * 返回值、不睡眠。若架构还要在开 IRQ 前处理特殊工作，
+ * 必须先调用本接口。
+ */
 static __always_inline void enter_from_user_mode(struct pt_regs *regs)
 {
+	/*
+	 * 阶段 1：体系结构 hook 与 lockdep 先同步
+	 * “已经进入内核且 IRQ-off”。
+	 */
 	arch_enter_from_user_mode(regs);
 	lockdep_hardirqs_off(CALLER_ADDR0);
 
+	/*
+	 * 阶段 2：调试断言入口确实来自 USER，
+	 * 然后在任何 RCU 使用前恢复 KERNEL/
+	 * watching。状态错误只告警，实际 exit helper 仍按当前状态协议处理。
+	 */
 	CT_WARN_ON(__ct_state() != CT_STATE_USER);
 	user_exit_irqoff();
 
+	/* 阶段 3：RCU 已可用，开放插桩窗口修复寄存器与 IRQ trace 状态。 */
 	instrumentation_begin();
 	kmsan_unpoison_entry_regs(regs);
 	trace_hardirqs_off_finish();
@@ -264,15 +285,31 @@ static __always_inline void irqentry_exit_to_user_mode_prepare(struct pt_regs *r
  * non-instrumentable.
  * The caller has to invoke syscall_exit_to_user_mode_work() before this.
  */
+/*
+ * exit_to_user_mode() - 返回用户态前提交最终 IRQ/RCU/架构状态。
+ *
+ * 原文说明 syscall/IRQ 出口最终会开启 IRQ，但调用时仍 IRQ-off；阶段依次为
+ * 准备 IRQ-on trace/lockdep、Context Tracking 进入 USER/EQS、执行架构最后
+ * 防护（如推测执行缓解）、让 lockdep 发布 IRQ-on。体系结构不可插桩代码
+ * 调用，且用户返回工作必须已完成。
+ * 入参、返回均无；不睡眠、不转移 ownership。user_enter_irqoff() 之后不得
+ * 再调用会使用 RCU 的普通内核代码。
+ */
 static __always_inline void exit_to_user_mode(void)
 {
+	/* 阶段 1：仍 watching 时完成所有允许插桩的 IRQ-on 准备。 */
 	instrumentation_begin();
 	unwind_reset_info();
 	trace_hardirqs_on_prepare();
 	lockdep_hardirqs_on_prepare();
 	instrumentation_end();
 
+	/* 阶段 2：发布 USER/EQS，这是禁止后续普通 RCU 使用的边界。 */
 	user_enter_irqoff();
+	/*
+	 * 阶段 3：只剩体系结构不可插桩尾声，
+	 * 并使 lockdep 与用户态 IRQ-on 一致。
+	 */
 	arch_exit_to_user_mode();
 	lockdep_hardirqs_on(CALLER_ADDR0);
 }

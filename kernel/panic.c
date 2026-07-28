@@ -1119,12 +1119,27 @@ void __warn(const char *file, int line, void *caller, unsigned taint,
 
 #ifdef CONFIG_BUG
 #ifndef __WARN_FLAGS
+/*
+ * warn_slowpath_fmt() - 处理带源码位置、taint 和可选格式串的 WARN 慢路径。
+ *
+ * @file: 借用的静态文件名，可空性由 WARN 调用契约决定，不转移 ownership。
+ * @line: 源码行号；@taint: 要施加的内核 taint 位。
+ * @fmt: 借用的 printf 格式串，可为 NULL；其余可变参数只在本调用内消费。
+ * 函数可能运行在 RCU 未 watching 的异常上下文，因此最先调用
+ * warn_rcu_enter() 并在每个出口配对恢复。返回无直接结果；会打印、taint、
+ * trace，并可能触发 panic_on_warn，但不把参数引用留存到返回后。
+ */
 void warn_slowpath_fmt(const char *file, int line, unsigned taint,
 		       const char *fmt, ...)
 {
+	/*
+	 * rcu 是配对恢复令牌；args 只在 fmt 非空路径封装格式串与 va_list，
+	 * 生命周期不越过本函数。
+	 */
 	bool rcu = warn_rcu_enter();
 	struct warn_args args;
 
+	/* KUnit 抑制路径不打印，但仍必须恢复临时 watching 与抢占状态。 */
 	if (kunit_is_suppressed_warning(true)) {
 		warn_rcu_exit(rcu);
 		return;
@@ -1132,6 +1147,7 @@ void warn_slowpath_fmt(const char *file, int line, unsigned taint,
 
 	pr_warn(CUT_HERE);
 
+	/* 无格式串时直接走通用 __warn()，仍在返回前归还 RCU 修复令牌。 */
 	if (!fmt) {
 		__warn(file, line, __builtin_return_address(0), taint,
 		       NULL, NULL);
@@ -1139,6 +1155,7 @@ void warn_slowpath_fmt(const char *file, int line, unsigned taint,
 		return;
 	}
 
+	/* 有格式串时建立 va_list，__warn() 同步消费，随后立即 va_end。 */
 	args.fmt = fmt;
 	va_start(args.args, fmt);
 	__warn(file, line, __builtin_return_address(0), taint, NULL, &args);
@@ -1147,11 +1164,20 @@ void warn_slowpath_fmt(const char *file, int line, unsigned taint,
 }
 EXPORT_SYMBOL(warn_slowpath_fmt);
 #else
+/*
+ * __warn_printk() - __WARN_FLAGS 架构下打印 WARN 的可变参数正文。
+ *
+ * @fmt: 借用且非空的 printf 格式串；可变参数仅同步消费。
+ * 返回无直接结果。与完整慢路径相同，先用 warn_rcu_enter() 保证诊断打印
+ * 所依赖的 RCU 环境，所有早退和正常出口均调用 warn_rcu_exit()。
+ */
 void __warn_printk(const char *fmt, ...)
 {
+	/* rcu 是恢复令牌；args 是本栈帧内的可变参数游标。 */
 	bool rcu = warn_rcu_enter();
 	va_list args;
 
+	/* KUnit 抑制打印时也不能遗漏 RCU/抢占配对。 */
 	if (kunit_is_suppressed_warning(false)) {
 		warn_rcu_exit(rcu);
 		return;
@@ -1159,6 +1185,7 @@ void __warn_printk(const char *fmt, ...)
 
 	pr_warn(CUT_HERE);
 
+	/* 同步格式化输出后关闭 va_list，再恢复入口 RCU watching 状态。 */
 	va_start(args, fmt);
 	vprintk(fmt, args);
 	va_end(args);

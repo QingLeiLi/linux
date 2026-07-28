@@ -1149,18 +1149,65 @@ static int rcu_nocb_rdp_offload(struct rcu_data *rdp)
 }
 
 /* Common helper for CPU offload/deoffload operations. */
+/*
+ * rcu_nocb_cpu_toggle_offload() - 串行切换一个离线 CPU 的 RCU 回调执行模式。
+ *
+ * 调用关系：
+ *   rcu_nocb_cpu_offload()/rcu_nocb_cpu_deoffload()
+ *     -> 本函数
+ *       -> rcu_nocb_rdp_offload()/rcu_nocb_rdp_deoffload()
+ *
+ * @cpu：目标逻辑 CPU 编号；调用者必须传入有效的 possible CPU，函数借用其
+ *       per-CPU rcu_data，不取得长期引用。
+ * @offload：true 表示把回调交给 nocb kthread，false 表示恢复本 CPU 处理。
+ *
+ * 上下文与锁：
+ *   该路径取得 CPU hotplug 读锁和全局 nocb_mutex，并可能 park/unpark kthread、
+ *   等待回调 barrier/状态变化，因此只能在可睡眠的进程上下文调用。目标 CPU
+ *   必须离线；hotplug 读锁防止检查之后 CPU 状态在切换中途改变，nocb_mutex
+ *   则串行所有动态 offload/deoffload 并保护 rcu_nocb_mask 与队列归属一致。
+ *
+ * 返回：
+ *   0 表示目标原本就在所需状态，或切换及 cpumask 提交均成功；
+ *   -EINVAL 表示目标在线，或底层不具备重新 offload 所需的启动期结构；
+ *   其他负 errno 原样来自底层切换 helper。失败时不更新 rcu_nocb_mask，
+ *   调用者仍可把 CPU 视为保持原模式。
+ */
 static int rcu_nocb_cpu_toggle_offload(int cpu, bool offload)
 {
+	/*
+	 * 变量地图：
+	 *   rdp  目标 CPU 的 per-CPU RCU 状态借用指针；hotplug 读锁期间 CPU
+	 *        身份稳定，nocb_mutex 串行其中的回调归属转换。
+	 *   ret  当前切换结果；初始 0 同时覆盖“无需改变”的幂等快速路径。
+	 */
 	struct rcu_data *rdp = per_cpu_ptr(&rcu_data, cpu);
 	int ret = 0;
 
+	/*
+	 * 阶段 1：冻结 CPU 在线状态并串行 nocb 配置。
+	 *
+	 * 锁顺序固定为 cpus_read_lock() -> nocb_mutex；这样检查 cpu_online()
+	 * 和提交 rcu_nocb_mask 之间不会插入热插拔转换，多个管理请求也不会同时
+	 * 迁移同一回调队列。
+	 */
 	cpus_read_lock();
 	mutex_lock(&rcu_state.nocb_mutex);
 
 	/* Already in desired state, nothing to do. */
+	/*
+	 * 目标已经处于期望状态时直接进入统一解锁出口。该幂等成功不会重新 park
+	 * kthread、等待宽限期或改写 cpumask。
+	 */
 	if (rcu_rdp_is_offloaded(rdp) == offload)
 		goto out_unlock;
 
+	/*
+	 * 阶段 2：拒绝在线 CPU。
+	 *
+	 * 动态迁移会改写回调队列的消费者和 SEGCBLIST_OFFLOADED 状态；若 CPU
+	 * 仍可并发入队/执行回调，就无法建立单一所有者，因此返回 -EINVAL。
+	 */
 	if (cpu_online(cpu)) {
 		pr_info("NOCB: Cannot CB-%soffload online CPU %d\n",
 			offload ? "" : "de", rdp->cpu);
@@ -1168,6 +1215,13 @@ static int rcu_nocb_cpu_toggle_offload(int cpu, bool offload)
 		goto out_unlock;
 	}
 
+	/*
+	 * 阶段 3：完成队列/kthread 交接后再提交公开 cpumask。
+	 *
+	 * 底层 helper 会等待回调队列达到相应模式。只有其返回成功，才同步更新
+	 * rcu_nocb_mask；这保证其他按 mask 选择策略的读者不会看见尚未完成的
+	 * offload 状态。底层失败时 mask 保持原样。
+	 */
 	if (offload) {
 		ret = rcu_nocb_rdp_offload(rdp);
 		if (!ret)
@@ -1179,17 +1233,36 @@ static int rcu_nocb_cpu_toggle_offload(int cpu, bool offload)
 	}
 
 out_unlock:
+	/*
+	 * 统一出口：此时没有资源 ownership 交给调用者；逆序释放 nocb_mutex 和
+	 * hotplug 读锁，并把 0/负 errno 原样返回导出包装器。
+	 */
 	mutex_unlock(&rcu_state.nocb_mutex);
 	cpus_read_unlock();
 	return ret;
 }
 
+/*
+ * rcu_nocb_cpu_deoffload() - 把离线 @cpu 的回调处理恢复到非 nocb 模式。
+ *
+ * @cpu 是有效逻辑 CPU 编号，纯输入、无所有权变化。函数可能睡眠，锁与失败
+ * 语义由 rcu_nocb_cpu_toggle_offload() 统一处理。返回 0 表示已处于或成功
+ * 进入非卸载状态，负 errno 表示未切换；成功后 rcu_nocb_mask 中该 CPU 被清除。
+ */
 int rcu_nocb_cpu_deoffload(int cpu)
 {
 	return rcu_nocb_cpu_toggle_offload(cpu, false /* de-offload */);
 }
 EXPORT_SYMBOL_GPL(rcu_nocb_cpu_deoffload);
 
+/*
+ * rcu_nocb_cpu_offload() - 重新启用离线 @cpu 的 nocb 回调卸载。
+ *
+ * @cpu 是启动期曾配置过 nocb 基础设施的有效逻辑 CPU，纯输入。函数可能
+ * 睡眠；返回 0 表示已处于或成功进入卸载状态，-EINVAL 常表示 CPU 在线或
+ * 目标没有可复用的 nocb GP/kthread，其余错误来自底层。成功后才设置
+ * rcu_nocb_mask，回调处理责任转给 nocb kthread。
+ */
 int rcu_nocb_cpu_offload(int cpu)
 {
 	return rcu_nocb_cpu_toggle_offload(cpu, true /* offload */);

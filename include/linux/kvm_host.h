@@ -404,11 +404,22 @@ struct kvm_vcpu {
  * Start accounting time towards a guest.
  * Must be called before entering guest context.
  */
+/*
+ * guest_timing_enter_irqoff() - 在进入 vCPU 前把后续 CPU 时间归入 guest。
+ *
+ * 原文要求它先于 guest context 状态转换调用。入参、返回均无；调用者已关
+ * IRQ 且处于 KVM ioctl 运行路径。函数只切换 vtime 记账，不改变 RCU 状态
+ * 或对象 ownership，并把可插桩调用限制在 instrumentation 区间。
+ */
 static __always_inline void guest_timing_enter_irqoff(void)
 {
 	/*
 	 * This is running in ioctl context so its safe to assume that it's the
 	 * stime pending cputime to flush.
+	 */
+	/*
+	 * 原文说明当前位于 ioctl 上下文，可安全假定待冲刷的是 stime 系统态
+	 * CPU 时间；vtime helper 会在边界结清它，再开始 guest 时间记账。
 	 */
 	instrumentation_begin();
 	vtime_account_guest_enter();
@@ -423,6 +434,14 @@ static __always_inline void guest_timing_enter_irqoff(void)
  * (including IRQ flag tracing), or lockdep. All code in this period must be
  * non-instrumentable.
  */
+/*
+ * guest_context_enter_irqoff() - 把运行 vCPU 的 CPU 发布为 RCU EQS。
+ *
+ * 原文规定从本函数到配对 exit 之间不得直接或间接使用 RCU、tracing
+ * （包括 IRQ flag tracing）或 lockdep，所有代码必须不可插桩。
+ * 入参、返回均无；调用者关 IRQ。Context Tracking 当前 CPU active 时由其
+ * 完成 GUEST 转换，否则回退到 rcu_virt_note_context_switch()。
+ */
 static __always_inline void guest_context_enter_irqoff(void)
 {
 	/*
@@ -433,7 +452,17 @@ static __always_inline void guest_context_enter_irqoff(void)
 	 * one time slice). Lets treat guest mode as quiescent state, just like
 	 * we do with user-mode execution.
 	 */
+	/*
+	 * 原文说明 KVM 切换 guest 前不持有 RCU 保护数据的引用；从 RCU 看，
+	 * guest 类似用户态，而且可能持续一个时间片，
+	 * 因此可把它作为静止态，
+	 * 减少 RCU 为该 CPU 保持 tick 的需要。
+	 */
 	if (!context_tracking_guest_enter()) {
+		/*
+		 * false 表示本 CPU 未 active，
+		 * 兼容 helper 负责记录一次虚拟上下文切换。
+		 */
 		instrumentation_begin();
 		rcu_virt_note_context_switch();
 		instrumentation_end();
@@ -443,6 +472,12 @@ static __always_inline void guest_context_enter_irqoff(void)
 /*
  * Deprecated. Architectures should move to guest_timing_enter_irqoff() and
  * guest_state_enter_irqoff().
+ */
+/*
+ * guest_enter_irqoff() - 旧式“时间记账 + guest context”组合入口。
+ *
+ * 原文标为 deprecated，架构应拆分为 timing_enter 和 state_enter，以便正确
+ * 安排 lockdep/IRQ 状态。无入参、无返回；按顺序先切 vtime，再进入 RCU EQS。
  */
 static __always_inline void guest_enter_irqoff(void)
 {
@@ -467,14 +502,25 @@ static __always_inline void guest_enter_irqoff(void)
  *
  * Note: this is analogous to exit_to_user_mode().
  */
+/*
+ * guest_state_enter_irqoff() - 在真正运行 guest 前修正 IRQ/RCU/lockdep 状态。
+ *
+ * 原文说明 guest 将开启 IRQ，但调用时内核 IRQ 仍关闭；阶段依次是准备
+ * “IRQ on” trace/lockdep、进入 Context Tracking EQS、最终让 lockdep 认为
+ * IRQ 已开启。由体系结构不可插桩代码调用，且 timing_enter 必须已完成。
+ * 入参、返回均无；状态发布后到 guest exit 前受不可插桩协议约束。
+ */
 static __always_inline void guest_state_enter_irqoff(void)
 {
+	/* 阶段 1：在允许插桩窗口准备逻辑 IRQ-on 状态。 */
 	instrumentation_begin();
 	trace_hardirqs_on_prepare();
 	lockdep_hardirqs_on_prepare();
 	instrumentation_end();
 
+	/* 阶段 2：发布 GUEST/EQS；之后只允许不可插桩代码。 */
 	guest_context_enter_irqoff();
+	/* 阶段 3：使 lockdep 模型与 guest 即将开启 IRQ 的现实一致。 */
 	lockdep_hardirqs_on(CALLER_ADDR0);
 }
 
@@ -486,12 +532,20 @@ static __always_inline void guest_state_enter_irqoff(void)
  * (including IRQ flag tracing), or lockdep. All code in this period must be
  * non-instrumentable.
  */
+/*
+ * guest_context_exit_irqoff() - guest 退出后恢复内核 RCU watching。
+ *
+ * 原文再次强调 enter/exit 区间禁止 RCU、tracing、IRQ tracing 和 lockdep。
+ * 入参、返回均无，调用者关 IRQ且仍不可插桩；active CPU 由 Context Tracking
+ * 恢复，非 active CPU 在短暂插桩窗口调用兼容 RCU 虚拟切换通知。
+ */
 static __always_inline void guest_context_exit_irqoff(void)
 {
 	/*
 	 * Guest mode is treated as a quiescent state, see
 	 * guest_context_enter_irqoff() for more details.
 	 */
+	/* 原文说明 guest 被当作静止态，完整理由见配对 enter。 */
 	if (!context_tracking_guest_exit()) {
 		instrumentation_begin();
 		rcu_virt_note_context_switch();
@@ -503,10 +557,17 @@ static __always_inline void guest_context_exit_irqoff(void)
  * Stop accounting time towards a guest.
  * Must be called after exiting guest context.
  */
+/*
+ * guest_timing_exit_irqoff() - guest context 退出后结清 guest CPU 时间。
+ *
+ * 原文要求在退出 guest context 之后调用。无入参、无返回和 ownership；
+ * vtime helper 在 instrumentation 窗口把本次 guest 执行时间冲刷到账户。
+ */
 static __always_inline void guest_timing_exit_irqoff(void)
 {
 	instrumentation_begin();
 	/* Flush the guest cputime we spent on the guest */
+	/* 原文：冲刷刚刚在 guest 中消耗的 CPU 时间。 */
 	vtime_account_guest_exit();
 	instrumentation_end();
 }
@@ -515,14 +576,28 @@ static __always_inline void guest_timing_exit_irqoff(void)
  * Deprecated. Architectures should move to guest_state_exit_irqoff() and
  * guest_timing_exit_irqoff().
  */
+/*
+ * guest_exit_irqoff() - 旧式 guest context 与时间记账组合退出。
+ *
+ * 原文标为 deprecated，架构应改用 state_exit 后接 timing_exit。
+ * 无入参、无返回；顺序必须先恢复内核 RCU 环境，
+ * 再执行可插桩的 vtime 冲刷。
+ */
 static __always_inline void guest_exit_irqoff(void)
 {
 	guest_context_exit_irqoff();
 	guest_timing_exit_irqoff();
 }
 
+/*
+ * guest_exit() - 为仍在 IRQ-on 环境的旧调用点提供 guest 退出包装。
+ *
+ * 入参、返回均无；flags 只保存本地 IRQ 状态。临时关 IRQ 后执行完整 guest
+ * context/vtime 退出，再恢复调用前 IRQ 状态；不取得 vCPU 引用或转移所有权。
+ */
 static inline void guest_exit(void)
 {
+	/* flags 在 local_irq_save/restore 配对之间有效。 */
 	unsigned long flags;
 
 	local_irq_save(flags);

@@ -634,6 +634,16 @@ module_param(rcu_cpu_stall_suppress_at_boot, int, 0444);
  * poll_state_synchronize_rcu() as a cookie whose grace period has already
  * completed.
  */
+/*
+ * get_completed_synchronize_rcu() - 返回一个预先满足的轮询式宽限期 cookie。
+ *
+ * 入参：无。返回：RCU_GET_STATE_COMPLETED 哨兵；poll_state_synchronize_rcu()
+ * 等配套接口会无条件把它解释为“对应宽限期已经完成”。本函数不读取当前
+ * gp_seq、不启动或等待宽限期、不会睡眠，也不改变任何对象 ownership。
+ *
+ * 它适合把可选等待状态初始化为“无需等待”，让调用者复用统一 poll 路径；
+ * 返回值不是当前宽限期快照，不能用来推断系统实际推进到哪个序号。
+ */
 unsigned long get_completed_synchronize_rcu(void)
 {
 	return RCU_GET_STATE_COMPLETED;
