@@ -908,7 +908,7 @@ static bool timer_is_static_object(void *addr)
  * - an active object is initialized
  */
 /*
- * 中文说明：debugobjects 发现“仍 active 却重新初始化”时先同步删除，再把对象
+ * debugobjects 发现“仍 active 却重新初始化”时先同步删除，再把对象
  * 状态重置为 initialized。@state 是诊断状态；返回 true 表示修复已完成。
  * 该路径仅为错误恢复，不能成为正常同步手段。
  */
@@ -939,7 +939,7 @@ static void stub_timer(struct timer_list *unused)
  * - an unknown non-static object is activated
  */
 /*
- * 中文说明：激活未初始化对象时安装 stub 使后续执行可诊断；重复激活仅告警，
+ * 激活未初始化对象时安装 stub 使后续执行可诊断；重复激活仅告警，
  * 不擅自删除现有 timer。返回值表示 debugobjects 是否完成了修复。
  */
 static bool timer_fixup_activate(void *addr, enum debug_obj_state state)
@@ -964,7 +964,7 @@ static bool timer_fixup_activate(void *addr, enum debug_obj_state state)
  * - an active object is freed
  */
 /*
- * 中文说明：释放 active timer 是 UAF 风险，故先 timer_delete_sync() 等待回调
+ * 释放 active timer 是 UAF 风险，故先 timer_delete_sync() 等待回调
  * 结束，再把诊断对象标记 free。返回 true 表示危险状态已被收敛。
  */
 static bool timer_fixup_free(void *addr, enum debug_obj_state state)
@@ -985,7 +985,7 @@ static bool timer_fixup_free(void *addr, enum debug_obj_state state)
  * timer_fixup_assert_init is called when:
  * - an untracked/uninit-ed object is found
  */
-/* 中文说明：断言遇到未知对象时安装 stub 并初始化，避免带垃圾回调继续运行。 */
+/* 断言遇到未知对象时安装 stub 并初始化，避免带垃圾回调继续运行。 */
 static bool timer_fixup_assert_init(void *addr, enum debug_obj_state state)
 {
 	struct timer_list *timer = addr;
@@ -1291,7 +1291,7 @@ static inline void forward_timer_base(struct timer_base *base)
  * to wait until the migration is done.
  */
 /*
- * 中文说明：timer 不含稳定 base 指针，flags 的类别/CPU 位相当于散列键。
+ * timer 不含稳定 base 指针，flags 的类别/CPU 位相当于散列键。
  * 持有由该键选择的 base->lock 才能同时稳定 timer 归属和时间轮元数据。迁移者
  * 先设置 TIMER_MIGRATING，再换锁并发布新 CPU 位；查找者看到该位必须等待。
  */
@@ -1940,7 +1940,7 @@ static inline void timer_base_unlock_expiry(struct timer_base *base)
  * the waiter to acquire the lock and make progress.
  */
 /*
- * 中文说明：若有同步删除者等待 expiry_lock，callback 完成后主动释放并重取两
+ * 若有同步删除者等待 expiry_lock，callback 完成后主动释放并重取两
  * 把锁，让高优先级 waiter 获得运行机会。函数返回时恢复“expiry_lock 后
  * base->lock”的原持锁状态，不把所有权交给调用者。
  */
@@ -1967,7 +1967,7 @@ static void timer_sync_wait_running(struct timer_base *base)
  * function.
  */
 /*
- * 中文说明：RT 上 softirq 是可调度线程，忙等可能让删除者反而饿死执行 callback
+ * RT 上 softirq 是可调度线程，忙等可能让删除者反而饿死执行 callback
  * 的线程。非 IRQSAFE、非迁移 timer 通过 expiry_lock 睡眠等待一次回调临界区；
  * timer_waiters 通知 callback 端必须让锁。它可能睡眠。
  */
@@ -2281,7 +2281,7 @@ static void expire_timers(struct timer_base *base, struct hlist_head *head)
 		if (WARN_ON_ONCE(!fn)) {
 			/* Should never happen. Emphasis on should! */
 			/*
-			 * 中文说明：pending timer 理论上绝不应带 NULL callback；shutdown
+			 * pending timer 理论上绝不应带 NULL callback；shutdown
 			 * 与入队由同一锁串行。告警后清 running 标记，避免错误扩大。
 			 */
 			base->running_timer = NULL;
@@ -2577,7 +2577,7 @@ static unsigned long fetch_next_timer_interrupt(unsigned long basej, u64 basem,
 		 *   nextevt is max. one tick away.
 		 */
 		/*
-		 * 中文说明：远端调用者只代管 GLOBAL，故若错过的最早事件来自 GLOBAL，
+		 * 远端调用者只代管 GLOBAL，故若错过的最早事件来自 GLOBAL，
 		 * 必须同时写 global；本地调用者在此快速路径只看 local，不受影响。
 		 */
 		if (!local_first)
@@ -3035,7 +3035,7 @@ static void __run_timer_base(struct timer_base *base)
 {
 	/* Can race against a remote CPU updating next_expiry under the lock */
 	/*
-	 * 中文说明：远端写由 WRITE_ONCE 发布；读到旧值最多导致多拿一次锁，读到尚未
+	 * 远端写由 WRITE_ONCE 发布；读到旧值最多导致多拿一次锁，读到尚未
 	 * 到期值则后续 tick/唤醒会再检查，不用在每个 tick 强制锁住 base。
 	 */
 	if (time_before(jiffies, READ_ONCE(base->next_expiry)))
@@ -3062,7 +3062,7 @@ static void run_timer_base(int index)
  * This function runs timers and the timer-tq in bottom half context.
  */
 /*
- * 中文说明：TIMER_SOFTIRQ 的总入口。依次处理 LOCAL、GLOBAL、DEF，随后让 timer
+ * TIMER_SOFTIRQ 的总入口。依次处理 LOCAL、GLOBAL、DEF，随后让 timer
  * migration 执行本 CPU 代理的远端 global timer。softirq 上下文不可睡眠；
  * callback 的 IRQ 开关策略由 TIMER_IRQSAFE 决定。
  */
@@ -3082,7 +3082,7 @@ static __latent_entropy void run_timer_softirq(void)
  * Called by the local, per-CPU timer interrupt on SMP.
  */
 /*
- * 中文说明：本地 tick 硬中断的 timer 入口。先运行 hrtimer 队列，再无锁检查各
+ * 本地 tick 硬中断的 timer 入口。先运行 hrtimer 队列，再无锁检查各
  * 低精度 base 是否需要 raise TIMER_SOFTIRQ。这里不直接执行普通 callback，
  * 将较长工作推迟到底半部以缩短硬中断临界段。
  */
@@ -3230,7 +3230,7 @@ int timers_dead_cpu(unsigned int cpu)
 		 * takes two locks at once, deadlock is not possible.
 		 */
 	/*
-	 * 中文说明：CPU hotplug 锁排除了另一迁移者；普通 timer 路径一次只持一颗
+	 * CPU hotplug 锁排除了另一迁移者；普通 timer 路径一次只持一颗
 	 * base 锁，故此处特定双锁顺序不会与其形成 ABBA。
 	 */
 		raw_spin_lock_irq(&new_base->lock);

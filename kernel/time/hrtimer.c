@@ -193,7 +193,7 @@ static inline void hrtimer_schedule_hres_work(void) { }
  * Functions and macros which are different for UP/SMP systems are kept in a
  * single place
  */
-/* 中文说明：把 UP/SMP 差异集中在本段，后续启动、取消和执行路径保持同一协议。 */
+/* 把 UP/SMP 差异集中在本段，后续启动、取消和执行路径保持同一协议。 */
 #ifdef CONFIG_SMP
 /*
  * We require the migration_base for lock_hrtimer_base()/switch_hrtimer_base()
@@ -252,7 +252,7 @@ static struct hrtimer_clock_base *lock_hrtimer_base(const struct hrtimer *timer,
 			if (likely(base == timer->base))
 				return base;
 			/* The timer has migrated to another CPU: */
-			/* 中文说明：锁前后 base 不一致，释放旧锁并等待迁移者完成发布。 */
+			/* 锁前后 base 不一致，释放旧锁并等待迁移者完成发布。 */
 			raw_spin_unlock_irqrestore(&base->cpu_base->lock, *flags);
 		}
 		cpu_relax();
@@ -501,7 +501,7 @@ static void *hrtimer_debug_hint(void *addr)
  * fixup_init is called when:
  * - an active object is initialized
  */
-/* 中文说明：重新初始化 active timer 时先同步取消，再重置诊断状态；true 表示修复。 */
+/* 重新初始化 active timer 时先同步取消，再重置诊断状态；true 表示修复。 */
 static bool hrtimer_fixup_init(void *addr, enum debug_obj_state state)
 {
 	struct hrtimer *timer = addr;
@@ -521,7 +521,7 @@ static bool hrtimer_fixup_init(void *addr, enum debug_obj_state state)
  * - an active object is activated
  * - an unknown non-static object is activated
  */
-/* 中文说明：重复激活只告警，不擅自改变正在使用的 timer；返回 false 表示未修复。 */
+/* 重复激活只告警，不擅自改变正在使用的 timer；返回 false 表示未修复。 */
 static bool hrtimer_fixup_activate(void *addr, enum debug_obj_state state)
 {
 	switch (state) {
@@ -537,7 +537,7 @@ static bool hrtimer_fixup_activate(void *addr, enum debug_obj_state state)
  * fixup_free is called when:
  * - an active object is freed
  */
-/* 中文说明：释放 active timer 前同步取消 callback，防止容器释放后的 UAF。 */
+/* 释放 active timer 前同步取消 callback，防止容器释放后的 UAF。 */
 static bool hrtimer_fixup_free(void *addr, enum debug_obj_state state)
 {
 	struct hrtimer *timer = addr;
@@ -564,7 +564,7 @@ static enum hrtimer_restart stub_timer(struct hrtimer *unused)
  * hrtimer_fixup_assert_init is called when:
  * - an untracked/uninit-ed object is found
  */
-/* 中文说明：未知/未初始化对象被使用时安装 stub，保留可诊断且不会周期重启的状态。 */
+/* 未知/未初始化对象被使用时安装 stub，保留可诊断且不会周期重启的状态。 */
 static bool hrtimer_fixup_assert_init(void *addr, enum debug_obj_state state)
 {
 	struct hrtimer *timer = addr;
@@ -866,7 +866,7 @@ static inline ktime_t hrtimer_update_base(struct hrtimer_cpu_base *base)
  * asynchronously.
  */
 /*
- * 中文说明：每 CPU 异步切换 highres，故全局 static key 不能证明某个 CPU 已完成
+ * 每 CPU 异步切换 highres，故全局 static key 不能证明某个 CPU 已完成
  * clockevent setup。返回该 cpu_base 的真实状态；无配置时恒 0。
  */
 static inline int hrtimer_hres_active(struct hrtimer_cpu_base *cpu_base)
@@ -1042,7 +1042,7 @@ static void retrigger_next_event(void *arg)
 	 * must also be updated.
 	 */
 	/*
-	 * 中文说明：REALTIME/TAI/BOOTTIME 与 MONOTONIC 的 offset 可能因 settime 或
+	 * REALTIME/TAI/BOOTTIME 与 MONOTONIC 的 offset 可能因 settime 或
 	 * suspend 改变。必须先刷新 offset，再比较树的绝对期限；否则会按旧坐标编程。
 	 */
 	guard(raw_spinlock)(&base->lock);
@@ -1766,7 +1766,7 @@ static int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim, u64 delt
 	 * remote CPU and for local pinned timers.
 	 */
 	/*
-	 * 中文说明：同 CPU 首 timer 摘除后立刻重插时不应编程两次；保持 base 并在
+	 * 同 CPU 首 timer 摘除后立刻重插时不应编程两次；保持 base 并在
 	 * 最后强制重扫。远端 running/pinned 也必须保留 base。其余 timer 可迁到
 	 * NO_HZ 目标，迁移期间 queued 状态保持可见，防止对象被误释放。
 	 */
@@ -2090,7 +2090,7 @@ static void hrtimer_cpu_base_unlock_expiry(struct hrtimer_cpu_base *base)
  * allows the waiter to acquire the lock and make progress.
  */
 /*
- * 中文说明：若取消者在等 softirq_expiry_lock，callback 完成后释放并重取两锁，
+ * 若取消者在等 softirq_expiry_lock，callback 完成后释放并重取两锁，
  * 让 waiter 获得进度。函数返回时恢复锁状态；@flags 用于正确恢复 IRQ。
  */
 static void hrtimer_sync_wait_running(struct hrtimer_cpu_base *cpu_base, unsigned long flags)
@@ -2787,7 +2787,7 @@ retry:
 	 * spurious event.
 	 */
 	/*
-	 * 中文说明：中断处理本身消耗时间，下一期限可能在处理期间又过去。三次重试
+	 * 中断处理本身消耗时间，下一期限可能在处理期间又过去。三次重试
 	 * 兼容偶发抖动；仍失败则记录最大 hang 与次数，并用保护性延迟打破无限循环。
 	 */
 	now = hrtimer_update_base(cpu_base);
