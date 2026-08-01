@@ -1071,6 +1071,7 @@ void __init parse_early_param(void)
 }
 
 void __init __weak arch_post_acpi_subsys_init(void) { }
+/* 默认无操作；需要在 ACPI 子系统之后收尾的架构以强符号覆盖。 */
 
 // 空函数体——适用于不需要显式设置 CPU ID 的架构
 // 各架构按需提供强符号实现，链接时自动替换弱符号
@@ -1112,10 +1113,13 @@ void __init __weak thread_stack_cache_init(void)
 }
 #endif
 
+/* 为运行时代码修改准备架构设施；无需此能力的架构保留空实现。 */
 void __init __weak poking_init(void) { }
 
+/* 页表缓存的架构钩子；通用空实现让无专用缓存的架构无需条件分支。 */
 void __init __weak pgtable_cache_init(void) { }
 
+/* 异常/陷阱表架构钩子，真正实现通常由 arch 目录中的强符号替换。 */
 void __init __weak trap_init(void) { }
 
 bool initcall_debug;
@@ -2719,6 +2723,12 @@ void start_kernel(void)
 	cgroup_init();
 
 	/* 初始化任务统计接口（进程资源使用统计，供 /proc 使用） */
+	/*
+	 * 修正说明：taskstats 的用户接口主要是 Generic Netlink，不是 /proc。
+	 * 此早期入口只创建 TGID 统计 slab 和每 CPU listener 表；真正注册
+	 * Generic Netlink family 的 taskstats_init() 要等到 late_initcall，
+	 * 从而保证 delayacct 等统计生产者先完成初始化。
+	 */
 	taskstats_init_early();
 
 	/* 初始化延迟记账（记录进程等待调度、IO 等的时间） */
@@ -2968,18 +2978,21 @@ static void __init initcall_debug_enable(void)
 #else
 static inline void do_trace_initcall_start(initcall_t fn)
 {
+	/* 无 tracepoint 构建时仅在 initcall_debug 开启后直接调用 printk 观察器。 */
 	if (!initcall_debug)
 		return;
 	trace_initcall_start_cb(&initcall_calltime, fn);
 }
 static inline void do_trace_initcall_finish(initcall_t fn, int ret)
 {
+	/* 与 start 共享单槽时间戳，built-in initcall 串行执行保证不会相互覆盖。 */
 	if (!initcall_debug)
 		return;
 	trace_initcall_finish_cb(&initcall_calltime, fn, ret);
 }
 static inline void do_trace_initcall_level(const char *level)
 {
+	/* 直接记录分级边界；关闭调试时分支立即返回。 */
 	if (!initcall_debug)
 		return;
 	trace_initcall_level_cb(NULL, level);
@@ -3232,6 +3245,7 @@ static noinline void __init kernel_init_freeable(void);
 bool rodata_enabled __ro_after_init = true;
 
 #ifndef arch_parse_debug_rodata
+/* 架构未提供自定义 rodata 参数解析时，交回通用 on/off 解析。 */
 static inline bool arch_parse_debug_rodata(char *str) { return false; }
 #endif
 

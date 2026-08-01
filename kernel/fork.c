@@ -190,6 +190,7 @@ DEFINE_PER_CPU(unsigned long, process_counts) = 0;
 __cacheline_aligned DEFINE_RWLOCK(tasklist_lock);  /* outer */
 
 #ifdef CONFIG_PROVE_RCU
+/* lockdep/RCU 断言用辅助函数，只报告当前上下文是否持有 tasklist_lock。 */
 int lockdep_tasklist_lock_is_held(void)
 {
 	return lockdep_is_held(&tasklist_lock);
@@ -1031,6 +1032,7 @@ static inline void mm_free_id(struct mm_struct *mm)
 	ida_free(&mm_ida, id);
 }
 #else /* !CONFIG_MM_ID */
+/* 未启用硬件/子系统 mm ID 时保持跨配置调用点一致，不产生任何资源。 */
 static inline int mm_alloc_id(struct mm_struct *mm) { return 0; }
 static inline void mm_free_id(struct mm_struct *mm) {}
 #endif /* CONFIG_MM_ID */
@@ -1309,6 +1311,12 @@ static void mmdrop_async(struct mm_struct *mm)
  *    以便在 OOM 解除后统计内存释放情况。这里异步释放该 mm 引用，
  *    使用 async 版本是因为此处可能处于原子上下文（见 mmdrop_async 注释）。
  * 4. kmem_cache_free：将 signal_struct 归还 signal_cachep slab 缓存
+ */
+/*
+ * 修正说明：taskstats 数据不通过 /proc/PID/taskstats 导出，而通过 Generic
+ * Netlink 查询或退出通知导出。taskstats_tgid_free() 在 signal_struct 最后
+ * 一个引用消失后回收按需分配的 sig->stats；此时已无组内线程或 TGID
+ * 查询者能访问该对象，因此无需再取得 sighand->siglock。
  */
 static inline void free_signal_struct(struct signal_struct *sig)
 {
@@ -2183,6 +2191,17 @@ struct file *get_mm_exe_file(struct mm_struct *mm)
  * Returns %NULL if task's mm (if any) has no associated executable file or
  * this is a kernel thread with borrowed mm (see the comment above get_task_mm).
  * User must release file via fput().
+ */
+/*
+ * get_task_exe_file() - 稳定取得任务最后一次 exec 对应的 file 引用。
+ *
+ * @task: 借用的 task_struct，调用者必须保证其生命周期；函数不接管 task。
+ *
+ * 内核线程即使临时借用用户 mm 也没有自己的用户可执行映像，因此返回
+ * NULL。普通任务在 task_lock 下稳定读取 task->mm，再由 get_mm_exe_file()
+ * 通过 RCU 取得 exe_file 引用。成功返回持有引用，调用者必须 fput()；
+ * 无 mm/无 exe 或内核线程返回 NULL。函数不主动睡眠，返回后 taskstats
+ * 等调用者可在引用保护下读取 inode 与设备号。
  */
 struct file *get_task_exe_file(struct task_struct *task)
 {

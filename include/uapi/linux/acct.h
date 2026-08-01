@@ -103,6 +103,13 @@ struct acct_v3
 /*
  *  accounting flags
  */
+/*
+ * 这些位描述任务生命周期中发生过的记账事件，可组合存入 acct_v3::ac_flag
+ * 和 taskstats::ac_flag。AFORK 表示 fork 后尚未 exec，ASU 表示使用过超级
+ * 用户权限，ACOMPAT 是历史兼容模式，ACORE/AXSIG 分别表示产生 core 和
+ * 被信号终止；AGROUP 表示该退出记录来自线程组最后一个任务，taskstats
+ * 用户据此识别完整进程终结，而不是把每个线程退出都当成进程退出。
+ */
 				/* bit set when the process/task ... */
 #define AFORK		0x01	/* ... executed fork, but did not exec */
 #define ASU		0x02	/* ... used super-user privileges */
