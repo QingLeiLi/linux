@@ -129,6 +129,13 @@ void retire_userns_sysctls(struct user_namespace *ns)
 #endif
 }
 
+/*
+ * find_ucounts() - 在指定散列桶查找 (user namespace, uid) 计数对象。
+ *
+ * @ns、@uid 构成逻辑键；@hashent 是调用者已计算出的借用桶指针。函数用
+ * RCU 遍历 hlist_nulls，并以 rcuref_get() 把候选裸指针转换为持有引用；
+ * 对象若正在退出则继续视为未找到。成功返回持有引用，失败返回 NULL。
+ */
 static struct ucounts *find_ucounts(struct user_namespace *ns, kuid_t uid,
 				    struct hlist_nulls_head *hashent)
 {
@@ -145,6 +152,13 @@ static struct ucounts *find_ucounts(struct user_namespace *ns, kuid_t uid,
 	return NULL;
 }
 
+/*
+ * hlist_add_ucounts() - 把已初始化的 ucounts 发布到全局 RCU 散列表。
+ *
+ * @ucounts 由调用者独占并至少持有一个引用。ucounts_lock 的 irq-safe 写侧
+ * 与并发插入/删除串行化，hlist_nulls_add_head_rcu() 让无锁 RCU 查找者在
+ * 完整初始化后才能看到对象。返回：无直接返回值，不转移调用者引用。
+ */
 static void hlist_add_ucounts(struct ucounts *ucounts)
 {
 	struct hlist_nulls_head *hashent = ucounts_hashentry(ucounts->ns, ucounts->uid);
@@ -154,15 +168,31 @@ static void hlist_add_ucounts(struct ucounts *ucounts)
 	spin_unlock_irq(&ucounts_lock);
 }
 
+/*
+ * alloc_ucounts() - 取得或创建 (user namespace, uid) 的共享计数对象。
+ *
+ * @ns 是借用的 user namespace；@uid 是其中的内核 UID。函数可睡眠，成功
+ * 返回一份持有引用，失败返回 NULL。快速路径在 RCU 下复用现有对象；慢速
+ * 路径先锁外分配，再持 ucounts_lock 二次查找，解决两个创建者同时发现
+ * 缺项的竞态。只有真正发布的新对象才 get_user_ns()，该引用由 put_ucounts()
+ * 在最后一个 ucounts 引用消失时归还。
+ */
 struct ucounts *alloc_ucounts(struct user_namespace *ns, kuid_t uid)
 {
 	struct hlist_nulls_head *hashent = ucounts_hashentry(ns, uid);
 	struct ucounts *ucounts, *new;
 
+	/*
+	 * 无分配快速路径：查找成功已经取得可在 RCU 临界区外使用的引用。
+	 */
 	ucounts = find_ucounts(ns, uid, hashent);
 	if (ucounts)
 		return ucounts;
 
+	/*
+	 * 锁外分配避免在自旋锁临界区睡眠；零值为各资源计数
+	 * 提供初始状态。
+	 */
 	new = kzalloc_obj(*new);
 	if (!new)
 		return NULL;
@@ -171,6 +201,11 @@ struct ucounts *alloc_ucounts(struct user_namespace *ns, kuid_t uid)
 	new->uid = uid;
 	rcuref_init(&new->count, 1);
 
+	/*
+	 * 二次查找处理竞争创建者：若对方已发布相同键，就释放本地
+	 * 候选并返回对方对象；否则在同一锁内发布本对象并固定
+	 * owning user_ns。
+	 */
 	spin_lock_irq(&ucounts_lock);
 	ucounts = find_ucounts(ns, uid, hashent);
 	if (ucounts) {
@@ -185,6 +220,14 @@ struct ucounts *alloc_ucounts(struct user_namespace *ns, kuid_t uid)
 	return new;
 }
 
+/*
+ * put_ucounts() - 释放一份 ucounts 引用并在最后一次 put 时延迟销毁。
+ *
+ * @ucounts 必须非空且由调用者持有。rcuref_put() 未归零时无其他副作用；
+ * 归零时在 ucounts_lock 下从散列表摘除，归还 owning user_ns 引用，再用
+ * kfree_rcu() 等待既有查找者退出。返回：无直接返回值，调用后
+ * 不得再访问。
+ */
 void put_ucounts(struct ucounts *ucounts)
 {
 	unsigned long flags;
@@ -199,6 +242,14 @@ void put_ucounts(struct ucounts *ucounts)
 	}
 }
 
+/*
+ * atomic_long_inc_below() - 仅在当前计数严格小于上限时原子加一。
+ *
+ * @v 是并发共享计数；@u 是本次读取到的上限。cmpxchg 循环在竞争失败时把
+ * 最新旧值回填到 c 并重试，保证“检查上限与加一”不可分割。成功返回
+ * true，已达上限返回 false；函数不睡眠，也不提供上限配置本身的
+ * 稳定快照。
+ */
 static inline bool atomic_long_inc_below(atomic_long_t *v, long u)
 {
 	long c = atomic_long_read(v);
@@ -211,11 +262,20 @@ static inline bool atomic_long_inc_below(atomic_long_t *v, long u)
 	return true;
 }
 
+/*
+ * inc_ucount() - 为某类资源沿 user namespace 祖先链预留一个计数。
+ *
+ * @ns、@uid 选择起始 ucounts；@type 指定 UCOUNT_UTS_NAMESPACES 等资源。
+ * 函数可因 alloc_ucounts() 分配而睡眠。每层通过 READ_ONCE 读取独立上限并
+ * 原子加一；全部成功时返回起始 ucounts 的持有引用。任一层超限时，逆序
+ * 递减此前已成功层并 put 起始引用，返回 NULL，不留下部分预留。
+ */
 struct ucounts *inc_ucount(struct user_namespace *ns, kuid_t uid,
 			   enum ucount_type type)
 {
 	struct ucounts *ucounts, *iter, *bad;
 	struct user_namespace *tns;
+	/* iter 沿 owning user namespace 的 ucounts 链向上，bad 标记失败层。 */
 	ucounts = alloc_ucounts(ns, uid);
 	for (iter = ucounts; iter; iter = tns->ucounts) {
 		long max;
@@ -226,6 +286,7 @@ struct ucounts *inc_ucount(struct user_namespace *ns, kuid_t uid,
 	}
 	return ucounts;
 fail:
+	/* 失败层没有增加，故只回滚 [ucounts, bad) 已经成功的祖先段。 */
 	bad = iter;
 	for (iter = ucounts; iter != bad; iter = iter->ns->ucounts)
 		atomic_long_dec(&iter->ucount[type]);
@@ -234,6 +295,15 @@ fail:
 	return NULL;
 }
 
+/*
+ * dec_ucount() - 对称归还 inc_ucount() 成功预留的整条祖先链计数。
+ *
+ * @ucounts 是 inc_ucount() 返回的持有引用；@type 必须与增加时一致。函数
+ * 对每层执行“仅正值递减”，负结果表示引用/资源配对错误并触发
+ * 一次性警告；最后消费 ucounts 引用。返回：无直接返回值，当前原子
+ * 与 RCU 回收路径
+ * 不睡眠。
+ */
 void dec_ucount(struct ucounts *ucounts, enum ucount_type type)
 {
 	struct ucounts *iter;

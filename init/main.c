@@ -2126,9 +2126,11 @@ void start_kernel(void)
 	/* 初始化栈 canary（每个进程栈的保护值，检测栈溢出） */
 	boot_init_stack_canary();
 
+	// @todo
 	/* 初始化性能事件框架（perf，硬件性能计数器接口） */
 	perf_event_init();
 
+	// @todo
 	/* 初始化性能分析框架（profile，用于 oprofile 等工具） */
 	profile_init();
 
@@ -2145,6 +2147,7 @@ void start_kernel(void)
 	early_boot_irqs_disabled = false;
 	local_irq_enable();
 
+	// @todo
 	/* 完成 slab 分配器的后期初始化（中断开启后才能完成的部分） */
 	kmem_cache_init_late();
 
@@ -2181,6 +2184,7 @@ void start_kernel(void)
 	 * ── 第六批：各子系统完整初始化 ───────────────────────────────
 	 */
 
+	//  @todo
 	/* 为每个 CPU 分配页集合（用于加速页分配，减少全局锁争用） */
 	setup_per_cpu_pageset();
 
@@ -2317,6 +2321,7 @@ void start_kernel(void)
 
 		内核启动时不知道未来的工作负载，INTERLEAVE 策略可以将内核数据结构均匀散布到各 NUMA 节点，避免启动时所有内存都集中在 node 0，后续用户进程根据需要再通过 set_mempolicy(2) / mbind(2) 设置自己的策略。
 	*/
+	// @todo
 	numa_policy_init();
 
 	/* ACPI 早期初始化（解析 ACPI 表，发现设备拓扑） */
@@ -2631,6 +2636,7 @@ void start_kernel(void)
 	/* 初始化时间命名空间（容器内独立时钟偏移） */
 	time_ns_init();
 
+	// @todo
 	/* 初始化内核密钥系统（存储加密密钥、凭证等） */
 	key_init();
 

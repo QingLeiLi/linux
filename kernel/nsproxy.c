@@ -31,6 +31,12 @@
 
 static struct kmem_cache *nsproxy_cachep;
 
+/*
+ * 启动任务使用的永久 namespace 指针集合。count 的固定初始引用使该 nsproxy
+ * 本身长期存活；uts_ns 槽位指向 init_uts_ns。后续任务若共享全部 namespace，
+ * 只增加 nsproxy 引用；任一 namespace 被 clone/unshare/setns 替换时，外层
+ * 创建新的 nsproxy 并为每个槽位分别取得引用。
+ */
 struct nsproxy init_nsproxy = {
 	.count			= REFCOUNT_INIT(1),
 	.uts_ns			= &init_uts_ns,
@@ -64,6 +70,9 @@ static inline struct nsproxy *create_nsproxy(void)
 static inline void nsproxy_free(struct nsproxy *ns)
 {
 	put_mnt_ns(ns->mnt_ns);
+	/*
+	 * 释放 nsproxy 对 UTS 对象持有的普通引用，最后一份可触发 RCU 销毁。
+	 */
 	put_uts_ns(ns->uts_ns);
 	put_ipc_ns(ns->ipc_ns);
 	put_pid_ns(ns->pid_ns_for_children);
@@ -85,6 +94,22 @@ void deactivate_nsproxy(struct nsproxy *ns)
  * Return the newly created nsproxy.  Do not attach this to the task,
  * leave it to the caller to do proper locking and attach it to task.
  */
+/*
+ * 创建新 nsproxy 及其关联的全部 namespace。成功返回新 nsproxy，但不把它
+ * 安装到任务；调用者负责采用正确锁协议完成发布。
+ *
+ * create_new_namespaces() - 按 flags 构造一个事务性的 namespace 集合。
+ *
+ * @flags:   clone/unshare 请求位；每个 copy_* helper 据此选择共享或克隆。
+ * @tsk:     旧 namespace 来源任务，借用且其 nsproxy 在调用期间保持稳定。
+ * @user_ns: 新建 namespace 的 owning user namespace，借用且不可为空。
+ * @new_fs:  mount namespace 构造使用的 fs_struct，语义由 copy_mnt_ns() 负责。
+ *
+ * 函数在可睡眠进程上下文依次取得 mount、UTS、IPC、PID、cgroup、net 和 time
+ * namespace 引用。成功返回 refcount=1、但尚未发布也尚未取得 active
+ * 引用的 nsproxy；失败返回错误指针，并从失败点沿标签逆序 put 已成功的
+ * 槽位。这个私有构造阶段保证任何任务都看不到半初始化集合。
+ */
 static struct nsproxy *create_new_namespaces(u64 flags,
 	struct task_struct *tsk, struct user_namespace *user_ns,
 	struct fs_struct *new_fs)
@@ -103,8 +128,13 @@ static struct nsproxy *create_new_namespaces(u64 flags,
 		goto out_ns;
 	}
 
+	/*
+	 * UTS 阶段位于 mount 之后、IPC 之前。未请求 CLONE_NEWUTS 时取得旧对象
+	 * 的新普通引用；请求时克隆一致的 name 快照并计入 owning user 配额。
+	 */
 	new_nsp->uts_ns = copy_utsname(flags, user_ns, tsk->nsproxy->uts_ns);
 	if (IS_ERR(new_nsp->uts_ns)) {
+		/* UTS 失败时只有 mount 槽位已成功，out_uts 从那里开始回滚。 */
 		err = PTR_ERR(new_nsp->uts_ns);
 		goto out_uts;
 	}
@@ -154,6 +184,7 @@ out_cgroup:
 out_pid:
 	put_ipc_ns(new_nsp->ipc_ns);
 out_ipc:
+	/* IPC 之后的失败必须归还已经由 nsproxy 持有的 UTS 普通引用。 */
 	put_uts_ns(new_nsp->uts_ns);
 out_uts:
 	put_mnt_ns(new_nsp->mnt_ns);
@@ -242,20 +273,37 @@ out:
 	return err;
 }
 
+/*
+ * switch_task_namespaces() - 原子替换任务的整组 namespace 指针。
+ *
+ * @p:   目标任务，调用者保证 task_struct 存活；通常是 current。
+ * @new: 要安装的 nsproxy 持有引用，允许为 NULL 表示任务退出并脱离全部
+ *       namespace；成功后该引用由 @p 消费。
+ *
+ * 函数可睡眠。若 @new 非空，先为其每个 namespace 取得 active 引用，保证
+ * 发布给任务时对象在 namespace 树语义上活跃；随后用 task_lock 与远端
+ * utsns_get() 等读取者配对，原子交换 p->nsproxy。旧 nsproxy 在解锁后 put，
+ * 避免可能的递归回收扩大 task_lock 临界区。返回：无直接返回值；完成后
+ * @p 使用 @new，调用者不得再释放已转移的 nsproxy 引用。
+ */
 void switch_task_namespaces(struct task_struct *p, struct nsproxy *new)
 {
+	/* ns 暂存旧集合的持有引用，交换完成后在锁外释放。 */
 	struct nsproxy *ns;
 
 	might_sleep();
 
+	/* active 引用必须先于任务指针发布，防止观察者看到 inactive 对象。 */
 	if (new)
 		nsproxy_ns_active_get(new);
 
+	/* task_lock 使远端读取者只能看到完整旧指针或完整新指针。 */
 	task_lock(p);
 	ns = p->nsproxy;
 	p->nsproxy = new;
 	task_unlock(p);
 
+	/* 最后一个 nsproxy 引用会对称归还整组 namespace 的 active/普通引用。 */
 	if (ns)
 		put_nsproxy(ns);
 }
@@ -451,6 +499,11 @@ static int validate_nsset(struct nsset *nsset, struct pid *pid)
 	 * supported on this kernel. We don't report errors here
 	 * if a namespace is requested that isn't supported.
 	 */
+	/*
+	 * 安装所有请求的 namespace。调用者此前已确认本内核支持相应类型；
+	 * 对未构建类型的请求不会在这里再次报告错误。每个 install 回调只
+	 * 修改私有 nsset，任一失败都会放弃整项事务而不影响 current。
+	 */
 #ifdef CONFIG_USER_NS
 	if (flags & CLONE_NEWUSER) {
 		ret = validate_ns(nsset, &user_ns->ns);
@@ -467,6 +520,11 @@ static int validate_nsset(struct nsset *nsset, struct pid *pid)
 
 #ifdef CONFIG_UTS_NS
 	if (flags & CLONE_NEWUTS) {
+		/*
+		 * setns 请求 UTS 切换时，经 utsns_operations.install() 校验
+		 * 目标 owner 与事务凭据能力，并只改写尚未发布的 nsset->nsproxy
+		 * 槽位。
+		 */
 		ret = validate_ns(nsset, &nsp->uts_ns->ns);
 		if (ret)
 			goto out;
@@ -532,6 +590,21 @@ out:
  * exported anymore a simple commit handler for each namespace
  * should be added to ns_common.
  */
+/*
+ * 这里是 setns 事务的不可回滚点。目前只有少数 namespace 在提交时需要额外
+ * 工作，内容足够少，因此没有为 ns_common 增加独立 commit 回调；unshare
+ * 使用相同思路。若未来某类提交逻辑增长，或这里使用的 helper 不再
+ * 导出，应为每类 namespace 增加明确的 commit handler。
+ *
+ * commit_nsset() - 一次性发布已经全部验证成功的 namespace 集合。
+ *
+ * @nsset 是 prepare/validate 阶段构造的事务对象，借用且不可为空。函数只在
+ * 所有 install 回调成功后运行，可睡眠且无错误返回：依次提交可选凭据、
+ * mount 根/工作目录、IPC/time 附带状态，最后通过 switch_task_namespaces()
+ * 发布 nsproxy。成功后 nsproxy 所有权转给 current，并把槽位置 NULL，防止
+ * put_nsset() 在清理事务外壳时重复释放。UTS 没有额外 commit 动作，因为
+ * utsns_install() 已在私有 nsproxy 中完成引用替换。
+ */
 static void commit_nsset(struct nsset *nsset)
 {
 	unsigned flags = nsset->flags;
@@ -540,12 +613,19 @@ static void commit_nsset(struct nsset *nsset)
 #ifdef CONFIG_USER_NS
 	if (flags & CLONE_NEWUSER) {
 		/* transfer ownership */
+		/*
+		 * commit_creds() 消费准备好的凭据；清空指针避免事务清理
+		 * 重复 put。
+		 */
 		commit_creds(nsset_cred(nsset));
 		nsset->cred = NULL;
 	}
 #endif
 
 	/* We only need to commit if we have used a temporary fs_struct. */
+	/*
+	 * 只有组合切换曾创建临时 fs_struct；纯 mount setns 直接使用 current->fs。
+	 */
 	if ((flags & CLONE_NEWNS) && (flags & ~CLONE_NEWNS)) {
 		set_fs_root(me->fs, &nsset->fs->root);
 		set_fs_pwd(me->fs, &nsset->fs->pwd);
@@ -562,6 +642,10 @@ static void commit_nsset(struct nsset *nsset)
 #endif
 
 	/* transfer ownership */
+	/*
+	 * 把 nsproxy 持有引用与全部槽位转移给 current；其中包含已验证的 UTS
+	 * 引用。置 NULL 是事务所有权转移的显式标记。
+	 */
 	switch_task_namespaces(me, nsset->nsproxy);
 	nsset->nsproxy = NULL;
 }

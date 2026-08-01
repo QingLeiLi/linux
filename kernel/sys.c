@@ -1305,14 +1305,27 @@ SYSCALL_DEFINE0(setsid)
 	return ksys_setsid();
 }
 
+/*
+ * 所有 UTS namespace 的 name 字符串共用这一把读写信号量。uname、
+ * gethostname 与 clone_uts_ns() 持读锁取得完整快照；sethostname、
+ * setdomainname 和 UTS sysctl 写路径持写锁提交字符串。rwsem 可睡眠，
+ * 只保护字段内容与更新顺序，不承担 uts_namespace 对象生命周期管理。
+ */
 DECLARE_RWSEM(uts_sem);
 
 #ifdef COMPAT_UTS_MACHINE
+/*
+ * 某些体系结构为 32 位兼容 personality 提供不同的 machine 字符串。
+ * 宏在 uname 主结构已复制到用户态后，按 current personality 定点覆盖
+ * 用户缓冲区的 machine 字段。返回 0 表示无需覆盖或复制成功，非零是
+ * copy_to_user() 尚未复制的字节数，调用者统一转换为 -EFAULT。
+ */
 #define override_architecture(name) \
 	(personality(current->personality) == PER_LINUX32 && \
 	 copy_to_user(name->machine, COMPAT_UTS_MACHINE, \
 		      sizeof(COMPAT_UTS_MACHINE)))
 #else
+/* 当前体系结构没有兼容 machine 别名，所有 personality 都保留原字段。 */
 #define override_architecture(name)	0
 #endif
 
@@ -1322,17 +1335,44 @@ DECLARE_RWSEM(uts_sem);
  * And we map 4.x and later versions to 2.6.60+x, so 4.0/5.0/6.0/... would be
  * 2.6.60.
  */
+/*
+ * 兼容不能处理“Linux 3.0”的旧程序：3.x 映射为 2.6.40+x，例如 3.0
+ * 映射为 2.6.40；4.x 及后续主版本映射为 2.6.60+x，因此 4.0、5.0、
+ * 6.0 等都呈现为 2.6.60。该兼容视图只影响带 UNAME26 personality 的
+ * 当前调用者，不修改 namespace 内保存的真实 release。
+ *
+ * override_release() - 必要时覆盖用户 uname 缓冲区中的 release 字段。
+ *
+ * @release: 用户态 release 数组首地址，是借用的输出缓冲区；仅在 UNAME26
+ *           分支写入。
+ * @len:     该数组总容量，单位为字节；函数把它限制在 1..sizeof(buf)。
+ *
+ * 函数运行在系统调用进程上下文，可能因用户缺页而睡眠，不持 uts_sem；
+ * 主 uname 快照已先复制到用户态。无兼容请求或复制成功返回 0；
+ * 用户缓冲区不可写时返回 copy_to_user() 的非零“未复制字节数”，
+ * 由调用者转成 -EFAULT。
+ */
 static int override_release(char __user *release, size_t len)
 {
+	/* ret 只表达最终用户复制是否完整，默认无需覆盖即成功。 */
 	int ret = 0;
 
 	if (current->personality & UNAME26) {
+		/*
+		 * rest 扫描真实 UTS_RELEASE 的数字版本前缀；buf 是零初始化的
+		 * 内核中转区，ndots 识别第三个点，v 生成伪 2.6 子版本，copy
+		 * 同时承担格式化容量和最终复制长度计算。
+		 */
 		const char *rest = UTS_RELEASE;
 		char buf[65] = { 0 };
 		int ndots = 0;
 		unsigned v;
 		size_t copy;
 
+		/*
+		 * 跳过“主版本.次版本[.补丁]”的数字/点前缀，在第三个点或
+		 * rc、vendor 等非数字后缀前停止，以便把原后缀接到兼容版本。
+		 */
 		while (*rest) {
 			if (*rest == '.' && ++ndots >= 3)
 				break;
@@ -1340,6 +1380,10 @@ static int override_release(char __user *release, size_t len)
 				break;
 			rest++;
 		}
+		/*
+		 * 现代主版本统一伪装在 2.6.60 起点，真实 patchlevel 作为增量；
+		 * scnprintf() 返回不含 NUL 的实际长度，故用户复制还要加 1。
+		 */
 		v = LINUX_VERSION_PATCHLEVEL + 60;
 		copy = clamp_t(size_t, len, 1, sizeof(buf));
 		copy = scnprintf(buf, copy, "2.6.%u%s", v, rest);
@@ -1348,16 +1392,36 @@ static int override_release(char __user *release, size_t len)
 	return ret;
 }
 
+/*
+ * newuname() - 向当前任务返回现代 struct new_utsname 快照。
+ *
+ * @name 是用户态输出指针，不可写时返回 -EFAULT；内核不长期持有它。
+ * 函数可睡眠，入口不要求持锁。先在 uts_sem 读侧把 current UTS 的全部字段
+ * 复制到栈上，再释放锁后执行可能缺页的 copy_to_user()，从而缩短全局锁
+ * 临界区且避免在持锁时访问用户内存。随后按 personality 覆盖 release 或
+ * machine 的兼容视图。成功返回 0；任一用户复制失败返回 -EFAULT；不修改
+ * namespace 数据、引用或 current personality。
+ */
 SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 {
+	/* tmp 是锁内形成、锁外送往用户态的一致 UTS 值快照。 */
 	struct new_utsname tmp;
 
+	/*
+	 * utsname() 返回 current 对象中的借用指针；current 不会并发替换自己的
+	 * nsproxy，读锁只需防止名称写者产生撕裂快照。
+	 */
 	down_read(&uts_sem);
 	memcpy(&tmp, utsname(), sizeof(tmp));
 	up_read(&uts_sem);
+	/*
+	 * 用户复制放在锁外；失败时 namespace 完全未变，用户缓冲区
+	 * 可能部分写入。
+	 */
 	if (copy_to_user(name, &tmp, sizeof(tmp)))
 		return -EFAULT;
 
+	/* 兼容覆盖只修改调用者缓冲区，真实 release/machine 保持不变。 */
 	if (override_release(name->release, sizeof(name->release)))
 		return -EFAULT;
 	if (override_architecture(name))
@@ -1369,19 +1433,41 @@ SYSCALL_DEFINE1(newuname, struct new_utsname __user *, name)
 /*
  * Old cruft
  */
+/*
+ * 为仍保留旧 uname ABI 的体系结构提供历史兼容入口。这些接口属于
+ * 必须维护的旧包袱：新程序应使用 newuname，但内核不能破坏既有
+ * 二进制的结构布局。
+ */
+/*
+ * uname() - 返回 struct old_utsname 布局的当前 UTS 快照。
+ *
+ * @name 是不可为空的用户输出指针；NULL 或复制失败返回 -EFAULT。函数在
+ * uts_sem 读侧把现代结构的共同前缀复制到旧栈结构，锁外再写
+ * 用户缓冲区，
+ * 并应用 release/machine personality 覆盖。成功返回 0，不修改 UTS 状态；
+ * 可因用户缺页睡眠。该入口仅在 __ARCH_WANT_SYS_OLD_UNAME 配置下存在。
+ */
 SYSCALL_DEFINE1(uname, struct old_utsname __user *, name)
 {
+	/*
+	 * tmp 只包含旧 ABI 能表达的字段，是锁内一致、锁外使用的值副本。
+	 */
 	struct old_utsname tmp;
 
 	if (!name)
 		return -EFAULT;
 
+	/*
+	 * old_utsname 与 new_utsname 的共同字段位于兼容前缀，
+	 * 按旧结构大小复制。
+	 */
 	down_read(&uts_sem);
 	memcpy(&tmp, utsname(), sizeof(tmp));
 	up_read(&uts_sem);
 	if (copy_to_user(name, &tmp, sizeof(tmp)))
 		return -EFAULT;
 
+	/* 与 newuname 相同，兼容 personality 只覆盖用户态观察值。 */
 	if (override_release(name->release, sizeof(name->release)))
 		return -EFAULT;
 	if (override_architecture(name))
@@ -1389,15 +1475,34 @@ SYSCALL_DEFINE1(uname, struct old_utsname __user *, name)
 	return 0;
 }
 
+/*
+ * olduname() - 返回最早期 struct oldold_utsname 布局的 UTS 快照。
+ *
+ * @name 是不可为空的用户输出指针；成功返回 0，NULL 或用户复制/兼容覆盖
+ * 失败返回 -EFAULT。旧结构不包含 domainname，且字段长度更短，因此函数
+ * 先清零整个栈对象，再在 uts_sem 读侧逐字段复制 __OLD_UTS_LEN 字节；清零
+ * 保证未覆盖的尾部和终止位置不会泄漏栈内容。锁外复制可睡眠，
+ * 但不阻塞 UTS
+ * 写者，真实 namespace 内容始终不变。
+ */
 SYSCALL_DEFINE1(olduname, struct oldold_utsname __user *, name)
 {
+	/* tmp 是显式逐字段构造的旧 ABI 输出，不持有任何 namespace 指针。 */
 	struct oldold_utsname tmp;
 
 	if (!name)
 		return -EFAULT;
 
+	/*
+	 * 先清零再短拷贝，为旧定长字段提供确定尾部并避免未初始化
+	 * 数据外泄。
+	 */
 	memset(&tmp, 0, sizeof(tmp));
 
+	/*
+	 * 六字段现代对象只导出旧 ABI 支持的前五项，且在同一读锁
+	 * 快照内完成。
+	 */
 	down_read(&uts_sem);
 	memcpy(&tmp.sysname, &utsname()->sysname, __OLD_UTS_LEN);
 	memcpy(&tmp.nodename, &utsname()->nodename, __OLD_UTS_LEN);
@@ -1408,6 +1513,7 @@ SYSCALL_DEFINE1(olduname, struct oldold_utsname __user *, name)
 	if (copy_to_user(name, &tmp, sizeof(tmp)))
 		return -EFAULT;
 
+	/* 保持该旧 ABI 原有的 machine、release 覆盖顺序。 */
 	if (override_architecture(name))
 		return -EFAULT;
 	if (override_release(name->release, sizeof(name->release)))
@@ -1416,26 +1522,63 @@ SYSCALL_DEFINE1(olduname, struct oldold_utsname __user *, name)
 }
 #endif
 
+/*
+ * sethostname() - 修改 current UTS namespace 的 nodename。
+ *
+ * @name: 用户态输入缓冲区，借用且在本次调用中读取 @len 字节；len 为 0 时
+ *        可以不解引用。
+ * @len:  主机名字节数，不含隐含终止符；有效范围 0..__NEW_UTS_LEN。
+ *
+ * 调用者必须在当前 UTS namespace 的 owning user namespace 中拥有
+ * CAP_SYS_ADMIN，否则返回 -EPERM。长度非法返回 -EINVAL，用户读取失败返回
+ * -EFAULT，成功返回 0。函数先把用户输入复制到栈上，避免持 uts_sem 写锁
+ * 处理用户缺页；锁内一次性覆盖有效字节并清零剩余字段，保证 NUL
+ * 终止且不残留旧主机名尾部。通知在写锁释放前发出，使观察者唤醒后
+ * 看到已提交值。
+ * 本函数可睡眠，不改变 UTS 对象引用或 namespace 归属。
+ */
 SYSCALL_DEFINE2(sethostname, char __user *, name, int, len)
 {
+	/*
+	 * errno 保存统一出口结果；tmp 是最多 64 字节、不要求自带 NUL
+	 * 的输入副本。
+	 */
 	int errno;
 	char tmp[__NEW_UTS_LEN];
 
+	/*
+	 * 能力在目标 UTS 的 owner 中判断，容器 root 只能修改其有权
+	 * 管理的对象。
+	 */
 	if (!ns_capable(current->nsproxy->uts_ns->user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
 
+	/* 在任何用户内存访问前拒绝负长度和超过 ABI 上限的输入。 */
 	if (len < 0 || len > __NEW_UTS_LEN)
 		return -EINVAL;
 	errno = -EFAULT;
 	if (!copy_from_user(tmp, name, len)) {
+		/*
+		 * u 是锁内借用的当前 name；不得在可能切换 namespace 后
+		 * 长期保存。
+		 */
 		struct new_utsname *u;
 
+		/*
+		 * 把设备/环境标识混入随机池，但该输入本身不作为
+		 * 可信熵计数。
+		 */
 		add_device_randomness(tmp, len);
+		/*
+		 * 写锁同时排斥 uname/gethostname/clone 快照与其他名称写者。
+		 * memcpy 提交新前缀，memset 清除包括 NUL 在内的全部剩余空间。
+		 */
 		down_write(&uts_sem);
 		u = utsname();
 		memcpy(u->nodename, tmp, len);
 		memset(u->nodename + len, 0, sizeof(u->nodename) - len);
 		errno = 0;
+		/* 状态已完整提交；仍在锁内通知 proc/sys 轮询观察者。 */
 		uts_proc_notify(UTS_PROC_HOSTNAME);
 		up_write(&uts_sem);
 	}
@@ -1444,14 +1587,31 @@ SYSCALL_DEFINE2(sethostname, char __user *, name, int, len)
 
 #ifdef __ARCH_WANT_SYS_GETHOSTNAME
 
+/*
+ * gethostname() - 通过历史独立系统调用返回当前 UTS nodename。
+ *
+ * @name 是用户态输出缓冲区；@len 是其容量，单位为字节。负长度返回
+ * -EINVAL；用户写失败返回 -EFAULT；成功包括“缓冲区过短而截断”的情况，
+ * 均返回 0。函数在 uts_sem 读侧计算包含 NUL 的完整长度并复制到栈缓冲区，
+ * 但最多保留 @len 字节；因此截断结果按历史 ABI 允许不带 NUL。用户复制在
+ * 锁外进行，可睡眠且不会长时间阻塞 hostname 写者。
+ *
+ * 该入口仅由定义 __ARCH_WANT_SYS_GETHOSTNAME 的体系结构提供；其他体系结构
+ * 可通过 uname() 获得同一字段。
+ */
 SYSCALL_DEFINE2(gethostname, char __user *, name, int, len)
 {
+	/*
+	 * i 是实际返回字节数；u 是锁内借用指针；tmp 保存锁外
+	 * 用户复制快照。
+	 */
 	int i;
 	struct new_utsname *u;
 	char tmp[__NEW_UTS_LEN + 1];
 
 	if (len < 0)
 		return -EINVAL;
+	/* 读锁覆盖 strlen 与 memcpy，避免并发写入改变长度或复制内容。 */
 	down_read(&uts_sem);
 	u = utsname();
 	i = 1 + strlen(u->nodename);
@@ -1470,8 +1630,24 @@ SYSCALL_DEFINE2(gethostname, char __user *, name, int, len)
  * Only setdomainname; getdomainname can be implemented by calling
  * uname()
  */
+/*
+ * 这里只提供 setdomainname；getdomainname 可以通过 uname() 读取 domainname
+ * 字段实现。减少一个专用读取入口不会改变 UTS ABI，因为 new_utsname 已包含
+ * 同一份 NIS domain name。
+ *
+ * setdomainname() - 修改 current UTS namespace 的 domainname。
+ *
+ * @name: 用户态输入缓冲区，在调用期间借用并读取 @len 字节。
+ * @len:  域名字节数，不含隐含终止符；有效范围 0..__NEW_UTS_LEN。
+ *
+ * 权限、错误类别、可睡眠上下文和提交协议与 sethostname() 相同：要求在
+ * 当前 UTS owner 中具备 CAP_SYS_ADMIN；先在锁外复制用户数据并混入随机池，
+ * 再持 uts_sem 写锁覆盖字段、清零尾部并通知 UTS_PROC_DOMAINNAME。成功返回
+ * 0；权限、长度或用户指针错误分别返回 -EPERM、-EINVAL、-EFAULT。
+ */
 SYSCALL_DEFINE2(setdomainname, char __user *, name, int, len)
 {
+	/* errno 是统一出口状态；tmp 保存不要求 NUL 结尾的用户输入副本。 */
 	int errno;
 	char tmp[__NEW_UTS_LEN];
 
@@ -1482,9 +1658,15 @@ SYSCALL_DEFINE2(setdomainname, char __user *, name, int, len)
 
 	errno = -EFAULT;
 	if (!copy_from_user(tmp, name, len)) {
+		/* u 只在当前写锁临界区指向 current 的 name。 */
 		struct new_utsname *u;
 
+		/* 用户提供的环境标识只混入随机池，不被当作可信熵来源。 */
 		add_device_randomness(tmp, len);
+		/*
+		 * 与 hostname 写路径相同，完整提交并清除旧尾部后再通知
+		 * 观察者。
+		 */
 		down_write(&uts_sem);
 		u = utsname();
 		memcpy(u->domainname, tmp, len);

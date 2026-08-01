@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2025 Christian Brauner <brauner@kernel.org> */
+/*
+ * namespace 树索引实现导读
+ *
+ * 每个 namespace 同时可进入按类型红黑树、跨类型统一树和 owning user
+ * namespace 的子树，并在对应链表中支持顺序遍历。ns_tree_lock 的写侧
+ * 原子维护这些索引；RCU/seqcount 读者可能在摘除后短暂保留裸指针，所以
+ * UTS 等类型析构在 __ns_tree_remove() 后仍使用 kfree_rcu() 延迟释放。
+ */
 
 #include <linux/nstree.h>
 #include <linux/proc_ns.h>
@@ -19,6 +27,7 @@ DEFINE_LOCK_GUARD_0(ns_tree_locked_reader,
 		    read_sequnlock_excl(&ns_tree_lock))
 
 static struct ns_tree_root ns_unified_root = { /* protected by ns_tree_lock */
+	/* 跨类型统一根的红黑树与链表都由 ns_tree_lock 保护。 */
 	.ns_rb = RB_ROOT,
 	.ns_list_head = LIST_HEAD_INIT(ns_unified_root.ns_list_head),
 };
@@ -34,6 +43,7 @@ struct ns_tree_root net_ns_tree = {
 };
 EXPORT_SYMBOL_GPL(net_ns_tree);
 
+/* 所有已分配稳定 ns_id 的 UTS namespace 按 ID 排序的类型专用根。 */
 struct ns_tree_root uts_ns_tree = {
 	.ns_rb = RB_ROOT,
 	.ns_list_head = LIST_HEAD_INIT(uts_ns_tree.ns_list_head),
@@ -179,21 +189,32 @@ static int ns_id_cmp(u64 id_a, u64 id_b)
 	return 0;
 }
 
+/* 按类型树使用 ns_tree_node，从两个节点恢复 ns_common 后比较稳定 ns_id。 */
 static int ns_cmp(struct rb_node *a, const struct rb_node *b)
 {
 	return ns_id_cmp(node_to_ns(a)->ns_id, node_to_ns(b)->ns_id);
 }
 
+/* 统一树使用独立 ns_unified_node，避免同一 rb_node 同时挂入两棵树。 */
 static int ns_cmp_unified(struct rb_node *a, const struct rb_node *b)
 {
 	return ns_id_cmp(node_to_ns_unified(a)->ns_id, node_to_ns_unified(b)->ns_id);
 }
 
+/* owner 子树使用 ns_owner_node，按子 namespace 的全局 ns_id 排序。 */
 static int ns_cmp_owner(struct rb_node *a, const struct rb_node *b)
 {
 	return ns_id_cmp(node_to_ns_owner(a)->ns_id, node_to_ns_owner(b)->ns_id);
 }
 
+/*
+ * __ns_tree_add_raw() - 把已分配 ns_id 的 namespace 原子发布到全部索引。
+ *
+ * @ns 是调用者持有普通引用、字段已完全初始化且尚未入树的对象；@ns_tree
+ * 是其具体类型根。函数无返回值、不取得普通/active 引用。scope guard 在
+ * 函数离开时自动 write_sequnlock，与并发遍历/增删串行化。对象依次进入
+ * 每类型树、统一树和可选 owner 子树；重复 ID 或缺少 owner 回调触发警告。
+ */
 void __ns_tree_add_raw(struct ns_common *ns, struct ns_tree_root *ns_tree)
 {
 	struct rb_node *node;
@@ -201,15 +222,21 @@ void __ns_tree_add_raw(struct ns_common *ns, struct ns_tree_root *ns_tree)
 
 	VFS_WARN_ON_ONCE(!ns->ns_id);
 
+	/* guard 离开函数作用域时自动释放 ns_tree_lock 写锁。 */
 	guard(ns_tree_writer)();
 
 	/* Add to per-type tree and list */
+	/* 加入每类型红黑树及其同序链表；返回非空表示 ns_id 冲突。 */
 	node = ns_tree_node_add(&ns->ns_tree_node, ns_tree, ns_cmp);
 
 	/* Add to unified tree and list */
+	/*
+	 * 以独立节点加入跨类型统一索引，供 listns/handle 等通用遍历使用。
+	 */
 	ns_tree_node_add(&ns->ns_unified_node, &ns_unified_root, ns_cmp_unified);
 
 	/* Add to owner's tree if applicable */
+	/* 有操作表的类型还按 owning user namespace 建立子对象索引。 */
 	if (ops) {
 		struct user_namespace *user_ns;
 
@@ -220,9 +247,11 @@ void __ns_tree_add_raw(struct ns_common *ns, struct ns_tree_root *ns_tree)
 			VFS_WARN_ON_ONCE(owner->ns_type != CLONE_NEWUSER);
 
 			/* Insert into owner's tree and list */
+			/* owner 的子树持有索引关系，但不额外增加普通引用。 */
 			ns_tree_node_add(&ns->ns_owner_node, &owner->ns_owner_root, ns_cmp_owner);
 		} else {
 			/* Only the initial user namespace doesn't have an owner. */
+			/* 只有 init_user_ns 合法地没有 owning user namespace。 */
 			VFS_WARN_ON_ONCE(ns != to_ns_common(&init_user_ns));
 		}
 	}
@@ -230,6 +259,15 @@ void __ns_tree_add_raw(struct ns_common *ns, struct ns_tree_root *ns_tree)
 	VFS_WARN_ON_ONCE(node);
 }
 
+/*
+ * __ns_tree_remove() - 从每类型、统一和 owner 索引原子摘除 namespace。
+ *
+ * @ns 必须仍有普通引用且当前已入树；@ns_tree 必须是匹配的类型根。函数
+ * 持 ns_tree_lock 写锁依次删除三个节点，使新读者无法再发现对象；
+ * 无返回值，不释放 inode、普通引用或外层内存。既有 RCU 读者仍可能
+ * 持有裸指针，调用者必须在随后采用 RCU 延迟回收。空节点/链表表示
+ * 重复摘除并触发警告。
+ */
 void __ns_tree_remove(struct ns_common *ns, struct ns_tree_root *ns_tree)
 {
 	const struct proc_ns_operations *ops = ns->ops;
@@ -238,15 +276,21 @@ void __ns_tree_remove(struct ns_common *ns, struct ns_tree_root *ns_tree)
 	VFS_WARN_ON_ONCE(ns_tree_node_empty(&ns->ns_tree_node));
 	VFS_WARN_ON_ONCE(list_empty(&ns->ns_tree_node.ns_list_entry));
 
+	/*
+	 * 三套索引必须在同一个写序列中摘除，读者才能重试不一致快照。
+	 */
 	write_seqlock(&ns_tree_lock);
 
 	/* Remove from per-type tree and list */
+	/* 先停止按具体类型和同类型链表的新查找。 */
 	ns_tree_node_del(&ns->ns_tree_node, ns_tree);
 
 	/* Remove from unified tree and list */
+	/* 再从跨类型统一索引消失。 */
 	ns_tree_node_del(&ns->ns_unified_node, &ns_unified_root);
 
 	/* Remove from owner's tree if applicable */
+	/* 最后解除 owning user namespace 的子对象索引关系。 */
 	if (ops) {
 		user_ns = ops->owner(ns);
 		if (user_ns) {
