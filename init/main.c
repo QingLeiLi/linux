@@ -2636,7 +2636,6 @@ void start_kernel(void)
 	/* 初始化时间命名空间（容器内独立时钟偏移） */
 	time_ns_init();
 
-	// @todo
 	/* 初始化内核密钥系统（存储加密密钥、凭证等） */
 	key_init();
 
