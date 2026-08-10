@@ -3171,6 +3171,19 @@ static void __init do_initcalls(void)
  *
  * Now we can finally start doing some real work..
  */
+/*
+ * 原英文注释说明：此时机器的 CPU、内存和进程管理已能工作，但尚未触碰任何
+ * 设备，现在终于可以开始建立更高层基础设施。这里的“未触碰设备”指普通驱动
+ * 尚未经 initcall 探测，并不表示体系结构早期启动从未访问硬件。
+ *
+ * do_basic_setup() - 从内核基础设施切换到驱动模型和内建驱动初始化。
+ *
+ * 入参：无；返回：无直接返回值。由 kernel_init_freeable() 在 init 进程上下文
+ * 调用，可以睡眠，不持有需跨调用传递的锁。顺序先建立 cpuset、内核 sysfs、
+ * driver core 和 irq proc，再运行构造器与分级 initcall。这个顺序提供“先建父层、
+ * 后注册消费者”的正常路径前提；但 ksysfs_init()/driver_init() 都是 void，失败
+ * 不会上送到本函数，所以顺序本身不构成“所有对象一定已发布”的成功证明。
+ */
 static void __init do_basic_setup(void)
 {
 	/*
@@ -3179,6 +3192,13 @@ static void __init do_basic_setup(void)
 	 */
 	cpuset_init_smp();
 	ksysfs_init();
+	/*
+	 * 驱动模型的发布边界：正常成功时，返回后 /sys/devices、bus/class 根及
+	 * 核心系统总线已经建立；具体内建驱动仍要等下面的 do_initcalls() 才开始
+	 * 注册/探测。driver_init() 是 void 且忽略内部 int 错误，所以“返回”本身
+	 * 不能证明每个根对象都创建成功，失败只能由日志、WARN、panic 或后续依赖
+	 * 暴露。
+	 */
 	driver_init();
 	init_irq_proc();
 	do_ctors();

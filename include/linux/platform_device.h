@@ -428,6 +428,11 @@ static inline int is_sh_early_platform_device(struct platform_device *pdev)
 #endif /* CONFIG_SUPERH */
 
 /* For now only SuperH uses it */
+/*
+ * 原英文注释说明：目前只有 SuperH 使用该清理入口。其他体系结构链接到
+ * drivers/base/platform.c 的弱空实现，SuperH 则提供清除 early-device 串链的
+ * 强实现；统一声明让 platform_bus_init() 无需体系结构条件分支。
+ */
 void early_platform_cleanup(void);
 
 #endif /* _PLATFORM_DEVICE_H_ */

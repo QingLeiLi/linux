@@ -471,29 +471,56 @@ static int devtmpfs_configure_context(void)
  * Create devtmpfs instance, driver-core devices will add their device
  * nodes here.
  */
+/*
+ * 原英文注释说明：这里创建 devtmpfs 实例，驱动核心随后会把设备节点加入
+ * 其中。它强调的是承载顺序：文件系统必须先于普通设备注册路径可用。
+ *
+ * devtmpfs_init() - 建立 devtmpfs 的内部挂载、文件系统入口和工作线程。
+ *
+ * 【宏观位置】driver_init() 在 devices_init() 之前调用。无入参；运行于可睡眠
+ * 的早期进程上下文，入口不持锁。opts 是仅在挂载调用期间有效的栈内参数；
+ * err 在父线程与新建 kdevtmpfs 线程同步交接 setup 结果。
+ *
+ * 【阶段】先以内核身份挂载 shmem/ramfs 后端，再复制后端 fs_context 操作并
+ * 注册外部可见的 devtmpfs 类型，最后启动 kdevtmpfs。父线程等待 setup_done，
+ * 因而成功返回时后台线程已完成初始 setup，后续设备节点请求才不会越过准备
+ * 边界。
+ *
+ * 返回：0 表示挂载、类型和线程都可用；负 errno 分别表示挂载、context、
+ * register_filesystem、kthread 创建或线程 setup 失败。后两类失败会注销已注册
+ * 类型，但挂载成功后的任何失败都没有在本函数中 kern_unmount(mnt)。因此它
+ * 不是恢复到入口状态的通用可重试事务，早期内部挂载仍由全局 mnt 保留。
+ */
 int __init devtmpfs_init(void)
 {
 	char opts[] = "mode=0755";
 	int err;
 
+	/* 阶段 1：创建 mode=0755 的内部实例，mnt 成为后续节点操作的全局锚点。 */
 	mnt = vfs_kern_mount(&internal_fs_type, 0, "devtmpfs", opts);
 	if (IS_ERR(mnt)) {
 		pr_err("unable to create devtmpfs %ld\n", PTR_ERR(mnt));
 		return PTR_ERR(mnt);
 	}
 
+	/* 阶段 2：继承实际后端的 context ops，只替换取得目录树的入口。 */
 	err = devtmpfs_configure_context();
 	if (err) {
 		pr_err("unable to configure devtmpfs type %d\n", err);
 		return err;
 	}
 
+	/* 阶段 3：发布用户可请求挂载的 devtmpfs 文件系统类型。 */
 	err = register_filesystem(&dev_fs_type);
 	if (err) {
 		pr_err("unable to register devtmpfs type %d\n", err);
 		return err;
 	}
 
+	/*
+	 * 阶段 4：启动唯一消费者线程。&err 在父线程等待 completion 期间保持有效；
+	 * devtmpfsd 先写 setup 结果、complete，再进入长期工作循环或返回错误。
+	 */
 	thread = kthread_run(devtmpfsd, &err, "kdevtmpfs");
 	if (!IS_ERR(thread)) {
 		wait_for_completion(&setup_done);
@@ -502,6 +529,7 @@ int __init devtmpfs_init(void)
 		thread = NULL;
 	}
 
+	/* 汇合 kthread_run 错误和线程内 setup 错误，撤销对外文件系统注册。 */
 	if (err) {
 		pr_err("unable to create devtmpfs %d\n", err);
 		unregister_filesystem(&dev_fs_type);
@@ -509,6 +537,7 @@ int __init devtmpfs_init(void)
 		return err;
 	}
 
+	/* 成功发布边界：线程 setup 已完成，驱动核心可以开始创建设备。 */
 	pr_info("initialized\n");
 	return 0;
 }

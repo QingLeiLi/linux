@@ -247,6 +247,11 @@ driver_find_device_by_acpi_dev(const struct device_driver *drv, const void *adev
 
 void driver_deferred_probe_add(struct device *dev);
 int driver_deferred_probe_check_state(struct device *dev);
+/*
+ * driver_init() 由 do_basic_setup() 在普通 initcall 前调用，无入参、无返回值。
+ * 它只建立驱动模型公共对象和核心总线，不探测具体设备；实现位于
+ * drivers/base/init.c，且代码属于 __init 生命周期。
+ */
 void driver_init(void);
 
 /**

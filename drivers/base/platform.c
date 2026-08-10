@@ -1540,21 +1540,46 @@ struct device *platform_find_device_by_driver(struct device *start,
 }
 EXPORT_SYMBOL_GPL(platform_find_device_by_driver);
 
+/*
+ * early_platform_cleanup() - 体系结构可覆盖的早期 platform 过渡清理钩子。
+ *
+ * 默认弱实现无入参、无返回值、无副作用。体系结构若在正式 driver core 可用前
+ * 建立过临时 platform 状态，可提供强符号在 platform_bus_init() 注册正式总线
+ * 前撤销它；该钩子与调用者都位于 __init 段，只服务启动期。
+ */
 void __weak __init early_platform_cleanup(void) { }
 
+/*
+ * platform_bus_init() - 从早期 platform 机制切换到正式 platform 设备模型。
+ *
+ * 【宏观位置】driver_init() 在 devices_init()/buses_init() 后调用；无入参，
+ * 早期进程上下文可睡眠，入口不持锁。error 保存每个注册阶段的 errno。
+ *
+ * 【阶段】先让体系结构清除临时状态，再注册静态 platform_bus 根设备，最后
+ * 注册 platform_bus_type。device_register() 成功后设备核心持有根设备引用；
+ * bus 注册失败必须 device_unregister() 摘除已发布设备。根设备注册失败时
+ * 显式 put_device() 释放静态设备初始化时的引用，避免残留半初始化 kobject。
+ *
+ * 返回：0 表示根设备和 bus_type 均可供后续 platform_device/driver 注册使用；
+ * 负 errno 表示相应阶段失败，函数已撤销本次已发布的对象。
+ */
 int __init platform_bus_init(void)
 {
 	int error;
 
+	/* 阶段 1：结束体系结构可能提供的临时 early-platform 生命周期。 */
 	early_platform_cleanup();
 
+	/* 阶段 2：先发布根设备，确保总线出现时已有稳定的设备父锚点。 */
 	error = device_register(&platform_bus);
 	if (error) {
 		put_device(&platform_bus);
 		return error;
 	}
+	/* 阶段 3：发布匹配 platform device/driver 的正式总线类型。 */
 	error =  bus_register(&platform_bus_type);
 	if (error)
+		/* bus 未发布成功，撤销根设备；release 路径最终平衡其引用。 */
 		device_unregister(&platform_bus);
 
 	return error;

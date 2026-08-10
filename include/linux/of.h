@@ -157,6 +157,7 @@ extern struct device_node *of_stdout;
 #define OF_BAD_ADDR	((u64)-1)
 
 #ifdef CONFIG_OF
+/* 将 early device tree 节点发布到 sysfs/procfs，并建立 phandle 快取。 */
 void of_core_init(void);
 
 static inline bool is_of_node(const struct fwnode_handle *fwnode)
@@ -486,6 +487,7 @@ void *of_kexec_alloc_and_setup_fdt(const struct kimage *image,
 				   const char *cmdline, size_t extra_fdt_size);
 #else /* CONFIG_OF */
 
+/* 未启用 OF 时不创建 device-tree 用户态视图，调用点保持为空操作。 */
 static inline void of_core_init(void)
 {
 }

@@ -122,6 +122,10 @@ struct mem_section;
 #define KSM_CALLBACK_PRI	100
 
 #ifndef CONFIG_MEMORY_HOTPLUG
+/*
+ * 未启用内存热插拔时没有 memory block 设备模型；保留空入口使 driver_init()
+ * 无需条件编译，也明确表示该配置下不会发布 /sys/devices/system/memory。
+ */
 static inline void memory_dev_init(void)
 {
 	return;
@@ -156,6 +160,7 @@ int create_memory_block_devices(unsigned long start, unsigned long size,
 				int nid, struct vmem_altmap *altmap,
 				struct memory_group *group);
 void remove_memory_block_devices(unsigned long start, unsigned long size);
+/* 启动期发布 memory 子系统并为已存在内存创建 block device；失败会 panic。 */
 extern void memory_dev_init(void);
 extern int memory_notify(enum memory_block_state state, void *v);
 struct memory_block *memory_block_get(unsigned long block_id);

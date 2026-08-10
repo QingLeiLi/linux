@@ -75,7 +75,7 @@
 
 /* Only access this in an NMI enter/exit */
 /*
- * 原文意为：nmi_contexts 只能由 NMI 进入/退出协议访问。每 CPU 的 nmi_ctx
+ * nmi_contexts 只能由 NMI 进入/退出协议访问。每 CPU 的 nmi_ctx
  * 保存嵌套计数 cnt 和最外层入口前的 HCR_EL2；
  * arch_nmi_enter/exit() 用编译器屏障约束两字段顺序，使嵌套 NMI
  * 不会覆盖最外层恢复现场。普通 IRQ 代码不得把它当作通用计数器，
@@ -347,7 +347,7 @@ void __init init_IRQ(void)
 		 * the PMR/PSR pair to a consistent state.
 		 */
 		/*
-		 * 原文意为：既然 IRQ handler 已经有安全栈，现在可以把 PMR
+		 * 既然 IRQ handler 已经有安全栈，现在可以把 PMR
 		 * 与 PSTATE/DAIF 这两半中断屏蔽状态调整为一致。之所以必须等
 		 * 栈就绪，是因为恢复过程中可能允许高优先级 pseudo-NMI 到达。
 		 */

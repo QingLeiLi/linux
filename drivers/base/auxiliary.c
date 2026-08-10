@@ -506,7 +506,19 @@ bool dev_is_auxiliary(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(dev_is_auxiliary);
 
+/*
+ * auxiliary_bus_init() - 发布 auxiliary_bus_type。
+ *
+ * 【宏观位置】driver_init() 在通用 bus 根建立后调用；仅在
+ * CONFIG_AUXILIARY_BUS=y 时有实体实现，关闭配置时 base.h 提供空 stub。
+ * 无入参，早期进程上下文可睡眠，入口不持锁。
+ *
+ * 返回：无直接返回值。bus_register() 成功后辅助设备/驱动可注册并匹配；失败
+ * 时 WARN_ON 记录非零 errno 对应的异常启动状态，但不 panic，也不向上返回。
+ * 函数没有取得需在局部释放的引用。
+ */
 void __init auxiliary_bus_init(void)
 {
+	/* WARN_ON 同时把 int 错误压缩为诊断条件，不能把失败误解成成功返回。 */
 	WARN_ON(bus_register(&auxiliary_bus_type));
 }

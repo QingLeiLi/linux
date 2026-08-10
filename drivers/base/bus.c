@@ -1470,15 +1470,39 @@ struct device *bus_get_dev_root(const struct bus_type *bus)
 }
 EXPORT_SYMBOL_GPL(bus_get_dev_root);
 
+/*
+ * buses_init() - 建立总线注册的 sysfs 根和 system 设备容器。
+ *
+ * 【宏观位置】driver_init() 在 devices_init() 之后调用；正确入口前提是
+ * devices_kset 已成功创建，因为第二阶段会直接取 &devices_kset->kobj，代码不做
+ * NULL 检查。后续 bus_register() 把每种 bus_type 挂入 bus_kset，而
+ * subsys_system_register() 把 CPU、内存、node、container 等系统设备放到
+ * system_kset 下。无入参，可睡眠，入口不持锁。
+ *
+ * 返回：0 表示 /sys/bus 与 /sys/devices/system 均已发布；-ENOMEM 表示任一
+ * kset 创建失败。第二步失败会注销第一步，故不会留下只有 /sys/bus 的半成品。
+ * 成功对象由全局 bus_kset/system_kset 持有并在运行期常驻。
+ */
 int __init buses_init(void)
 {
+	/* 第一发布点：总线类型的公共 sysfs 容器，同时安装总线 uevent 策略。 */
 	bus_kset = kset_create_and_add("bus", &bus_uevent_ops, NULL);
 	if (!bus_kset)
 		return -ENOMEM;
 
+	/*
+	 * 第二发布点：system 必须成为 /sys/devices 的子目录，这正是本函数必须
+	 * 晚于 devices_init() 的直接源码依据。
+	 */
 	system_kset = kset_create_and_add("system", NULL, &devices_kset->kobj);
 	if (!system_kset) {
 		/* Do error handling here as devices_init() do */
+		/*
+		 * 原英文注释要求像 devices_init() 一样处理错误：撤销已经发布的
+		 * bus_kset，而不是让后续注册者看到不完整的基础层次。需要注意，真正
+		 * 失败的是上面的 system_kset 创建；下方历史日志仍写成 kset 'bus'，
+		 * 诊断文字会把失败对象说错，判断根因应以控制流和返回位置为准。
+		 */
 		kset_unregister(bus_kset);
 		bus_kset = NULL;
 		pr_err("%s: failed to create and add kset 'bus'\n", __func__);

@@ -323,11 +323,29 @@ int __init sh_early_platform_driver_probe(char *class_str,
 /**
  * early_platform_cleanup - clean up early platform code
  */
+/*
+ * 原英文注释说明：清理由 SuperH 使用的 early-platform 临时框架。
+ *
+ * early_platform_cleanup() - 在正式 platform bus 注册前拆除临时设备串链。
+ *
+ * 由 drivers/base/platform.c:platform_bus_init() 调用，无入参、无直接返回值；
+ * 仅在启动期执行，外部尚不能并发修改 sh_early_platform_device_list，故无需锁。
+ * pd 是当前设备，pd2 预取下一项，使删除当前节点后仍能安全继续遍历；两者均为
+ * 借用指针，不改变 platform_device 本体的引用计数或注册状态。
+ *
+ * 本函数只清除借用 dev.devres_head 临时串起设备的链表状态，使同一字段恢复为
+ * 未初始化的全零状态，避免正式 device_register()/devres 路径误把早期链表节点
+ * 当成运行期 devres。它是默认弱空实现被 SuperH 强符号覆盖的实际落点。
+ */
 void __init early_platform_cleanup(void)
 {
 	struct platform_device *pd, *pd2;
 
 	/* clean up the devres list used to chain devices */
+	/*
+	 * 原英文注释说明：清除曾借用来串联设备的 devres 链表。safe 迭代器先保存
+	 * 下一设备；list_del 摘链后清零整个链表头，完成从临时协议到正式协议的交接。
+	 */
 	list_for_each_entry_safe(pd, pd2, &sh_early_platform_device_list,
 				 dev.devres_head) {
 		list_del(&pd->dev.devres_head);

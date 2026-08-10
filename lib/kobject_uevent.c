@@ -12,6 +12,12 @@
  *	Arjan van de Ven	<arjanv@redhat.com>
  *	Greg Kroah-Hartman	<greg@kroah.com>
  */
+/*
+ * 本文件把 kobject 状态变化编码为 ACTION/DEVPATH/SUBSYSTEM 等环境变量，并通过
+ * netlink 广播或可选的用户态 helper 投递。kernel/ksysfs.c 暴露的 seqnum/helper
+ * 属性正是这里的全局生产状态：事件发布点原子领取序号，helper 路径则在真正
+ * call_usermodehelper_setup() 时借用读取。
+ */
 
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -30,11 +36,24 @@
 #include <net/net_namespace.h>
 
 
+/*
+ * 全局事件序列分配器。每次真正走到投递阶段的 kobject 事件以及用户注入的
+ * netlink 事件都用 atomic64_inc_return() 领取唯一值；初始化为零、静态寿命。
+ * 原子操作保证并发发送不重复，但不同投递通道的到达次序仍可与领取次序不同。
+ */
 atomic64_t uevent_seqnum;
 #ifdef CONFIG_UEVENT_HELPER
+/*
+ * 兼容性用户态 helper 路径，初值来自内核配置，随后可由 sysfs 或 sysctl 改写。
+ * 数组本身永不释放；事件路径只在当前构造期间借用其内容，不持有动态引用。
+ */
 char uevent_helper[UEVENT_HELPER_PATH_LEN] = CONFIG_UEVENT_HELPER_PATH;
 #endif
 
+/*
+ * 每个网络命名空间拥有一个 uevent netlink socket；初始用户命名空间的 socket
+ * 还通过 list 节点加入全局广播集合。对象由 per-net init 创建、exit 摘链并释放。
+ */
 struct uevent_sock {
 	struct list_head list;
 	struct sock *sk;
@@ -43,10 +62,12 @@ struct uevent_sock {
 #ifdef CONFIG_NET
 static LIST_HEAD(uevent_sock_list);
 /* This lock protects uevent_sock_list */
+/* 该互斥锁保护初始用户命名空间 socket 的全局链表增删与遍历，持锁路径可睡眠。 */
 static DEFINE_MUTEX(uevent_sock_mutex);
 #endif
 
 /* the strings here must match the enum in include/linux/kobject.h */
+/* 表下标必须与 kobject_action 枚举一致，字符串成为用户态 ACTION= ABI。 */
 static const char *kobject_actions[] = {
 	[KOBJ_ADD] =		"add",
 	[KOBJ_REMOVE] =		"remove",
@@ -232,6 +253,12 @@ out:
 }
 
 #ifdef CONFIG_UEVENT_HELPER
+/*
+ * kobj_usermode_filter() - 判断对象是否属于非初始命名空间。
+ * @kobj 是借用对象；返回 1 表示传统全局 helper 必须过滤，0 表示允许。存在
+ * namespace ops 时比较对象命名空间与 initial_ns；无命名空间类型默认允许。
+ * 回调期间 kobject 核心保证对象有效，本函数不取得引用、无动态资源。
+ */
 static int kobj_usermode_filter(struct kobject *kobj)
 {
 	const struct kobj_ns_type_operations *ops;
@@ -248,6 +275,13 @@ static int kobj_usermode_filter(struct kobject *kobj)
 	return 0;
 }
 
+/*
+ * init_uevent_argv() - 为异步 helper 构造 argv，而不复制全局 helper 路径。
+ * @env 是当前事件拥有的可写环境对象；@subsystem 是借用的 NUL 结尾名称。
+ * 成功返回 0，并把 subsystem 复制到 env 内部缓冲区、设置 argv[0..2]；空间不足
+ * 返回 -ENOMEM，env 仍由调用者释放。argv[0] 直接指向全局 uevent_helper，
+ * argv[1] 指向 env->buf，因此 env 必须活到 helper cleanup 回调执行。
+ */
 static int init_uevent_argv(struct kobj_uevent_env *env, const char *subsystem)
 {
 	int buffer_size = sizeof(env->buf) - env->buflen;
@@ -268,6 +302,11 @@ static int init_uevent_argv(struct kobj_uevent_env *env, const char *subsystem)
 	return 0;
 }
 
+/*
+ * cleanup_uevent_env() - helper 执行框架结束使用参数后释放事件环境。
+ * @info 由 usermode-helper 核心持有；info->data 是 kobject_uevent_env() 成功转移
+ * 给它的 env。返回无直接值；只释放 data，不释放静态 uevent_helper。
+ */
 static void cleanup_uevent_env(struct subprocess_info *info)
 {
 	kfree(info->data);
@@ -473,6 +512,15 @@ static void zap_modalias_env(struct kobj_uevent_env *env)
  * Returns 0 if kobject_uevent_env() is completed with success or the
  * corresponding error when it fails.
  */
+/*
+ * kobject_uevent_env() - 构造并投递带扩展环境的 kobject 用户态事件。
+ * @kobj 是发生动作的借用对象，调用期间必须保持有效；@action 必须是合法的
+ * kobject_action；@envp_ext 是可为 NULL、以 NULL 结尾的借用 KEY=VALUE 数组。
+ * 成功、被 suppress/filter 有意丢弃时返回 0；缺少 kset、分配/容量、广播或 helper
+ * setup 失败时返回负 errno。函数在可睡眠进程上下文分配内存；正常路径不改变
+ * kobj ownership，但会更新 add/remove 状态位、领取全局序号并产生外部可见事件。
+ * env/devpath 由本函数持有，只有 helper setup 成功时 env ownership 转移。
+ */
 int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 		       char *envp_ext[])
 {
@@ -490,6 +538,10 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 	 * Mark "remove" event done regardless of result, for some subsystems
 	 * do not want to re-trigger "remove" event via automatic cleanup.
 	 */
+	/*
+	 * 无论后续投递是否成功，都先记住 remove 已尝试；部分子系统不希望对象自动
+	 * 清理时再次触发 remove。这个状态位是“去重承诺”，不是投递成功确认。
+	 */
 	if (action == KOBJ_REMOVE)
 		kobj->state_remove_uevent_sent = 1;
 
@@ -497,6 +549,7 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 		 kobject_name(kobj), kobj, __func__);
 
 	/* search the kset we belong to */
+	/* 沿 parent 向上找到首个所属 kset；kset 决定 filter、名称和扩展环境回调。 */
 	top_kobj = kobj;
 	while (!top_kobj->kset && top_kobj->parent)
 		top_kobj = top_kobj->parent;
@@ -512,6 +565,7 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 	uevent_ops = kset->uevent_ops;
 
 	/* skip the event, if uevent_suppress is set*/
+	/* 对象显式 suppress 时视为有意丢弃并返回成功，不分配序号。 */
 	if (kobj->uevent_suppress) {
 		pr_debug("kobject: '%s' (%p): %s: uevent_suppress "
 				 "caused the event to drop!\n",
@@ -519,6 +573,7 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 		return 0;
 	}
 	/* skip the event, if the filter returns zero. */
+	/* 子系统 filter 返回零同样是策略性抑制，不是传输错误。 */
 	if (uevent_ops && uevent_ops->filter)
 		if (!uevent_ops->filter(kobj)) {
 			pr_debug("kobject: '%s' (%p): %s: filter function "
@@ -528,6 +583,7 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 		}
 
 	/* originating subsystem */
+	/* 优先让 kset 提供动态子系统名，否则使用 kset 自身名称；NULL 表示丢弃。 */
 	if (uevent_ops && uevent_ops->name)
 		subsystem = uevent_ops->name(kobj);
 	else
@@ -540,11 +596,13 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 	}
 
 	/* environment buffer */
+	/* 分配本次事件独占的环境容器；从这里开始所有失败统一进入 exit 释放。 */
 	env = kzalloc_obj(struct kobj_uevent_env);
 	if (!env)
 		return -ENOMEM;
 
 	/* complete object path */
+	/* 路径字符串由 kobject_get_path() 动态分配，当前函数持有并在 exit 释放。 */
 	devpath = kobject_get_path(kobj, GFP_KERNEL);
 	if (!devpath) {
 		retval = -ENOENT;
@@ -552,6 +610,7 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 	}
 
 	/* default keys */
+	/* 先放通用 ABI 键，任一容量失败都放弃整个事件，避免发送缺字段消息。 */
 	retval = add_uevent_var(env, "ACTION=%s", action_string);
 	if (retval)
 		goto exit;
@@ -563,6 +622,7 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 		goto exit;
 
 	/* keys passed in from the caller */
+	/* 调用者扩展字符串逐项复制进 env，原始 envp_ext 仍归调用者。 */
 	if (envp_ext) {
 		for (i = 0; envp_ext[i]; i++) {
 			retval = add_uevent_var(env, "%s", envp_ext[i]);
@@ -572,6 +632,7 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 	}
 
 	/* let the kset specific function add its stuff */
+	/* kset 回调可补充环境或拒绝事件；env ownership 仍留在当前函数。 */
 	if (uevent_ops && uevent_ops->uevent) {
 		retval = uevent_ops->uevent(kobj, env);
 		if (retval) {
@@ -591,6 +652,10 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 		 * automatically generated by the core, if not already done
 		 * by the caller.
 		 */
+		/*
+		 * add 成功走到发布阶段后记录状态，使核心能在对象自动清理时补发 remove；
+		 * 若调用者已经发过 remove，核心不会重复。该位描述生命周期配对关系。
+		 */
 		kobj->state_add_uevent_sent = 1;
 		break;
 
@@ -603,6 +668,10 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 	}
 
 	/* we will send an event, so request a new sequence number */
+	/*
+	 * 到达真正投递边界才领取序号并写入环境。失败或被 filter/suppress 丢弃的前期
+	 * 路径不消耗序号；领取后若广播/helper 失败则允许出现序号空洞。
+	 */
 	retval = add_uevent_var(env, "SEQNUM=%llu",
 				atomic64_inc_return(&uevent_seqnum));
 	if (retval)
@@ -613,6 +682,10 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 
 #ifdef CONFIG_UEVENT_HELPER
 	/* call uevent_helper, usually only enabled during early boot */
+	/*
+	 * helper 通常只服务早期启动，且只允许初始命名空间对象使用，避免容器对象让
+	 * 宿主执行全局程序。空路径关闭此通道，netlink 广播结果仍保存在 retval 中。
+	 */
 	if (uevent_helper[0] && !kobj_usermode_filter(kobj)) {
 		struct subprocess_info *info;
 
@@ -632,13 +705,19 @@ int kobject_uevent_env(struct kobject *kobj, enum kobject_action action,
 						 env->envp, GFP_KERNEL,
 						 NULL, cleanup_uevent_env, env);
 		if (info) {
+			/*
+			 * UMH_NO_WAIT 把执行及最终释放交给 helper 核心；无论 exec 返回何值，
+			 * setup 成功后 env ownership 已转移，置 NULL 防止 exit 重复 kfree。
+			 */
 			retval = call_usermodehelper_exec(info, UMH_NO_WAIT);
 			env = NULL;	/* freed by cleanup_uevent_env */
+			/* env 已由 cleanup_uevent_env 负责释放，本函数不再持有。 */
 		}
 	}
 #endif
 
 exit:
+	/* devpath 始终仍归本函数；env 只在未转移给 helper 时由这里释放。 */
 	kfree(devpath);
 	kfree(env);
 	return retval;
@@ -654,6 +733,11 @@ EXPORT_SYMBOL_GPL(kobject_uevent_env);
  * Returns 0 if kobject_uevent() is completed with success or the
  * corresponding error when it fails.
  */
+/*
+ * kobject_uevent() - 无额外环境变量的便捷包装。
+ * @kobj/@action 契约与 kobject_uevent_env() 相同；返回值原样透传。函数不改变
+ * ownership，真正的构造、序号领取和投递全部由下层完成。
+ */
 int kobject_uevent(struct kobject *kobj, enum kobject_action action)
 {
 	return kobject_uevent_env(kobj, action, NULL);
@@ -667,6 +751,13 @@ EXPORT_SYMBOL_GPL(kobject_uevent);
  *
  * Returns 0 if environment variable was added successfully or -ENOMEM
  * if no space was available.
+ */
+/*
+ * add_uevent_var() - 把格式化 KEY=VALUE 追加到事件的定长环境区。
+ * @env 是调用者持有的可写事件环境；@format 及可变参数仅在调用期间借用。
+ * 成功返回 0，并让 envp 新槽指向 env->buf 中新增的 NUL 结尾字符串；指针槽或
+ * 字节区不足返回 -ENOMEM，既不扩容也不转移 ownership。调用者必须串行构造
+ * 单个 env；该 helper 本身不提供并发同步。
  */
 int add_uevent_var(struct kobj_uevent_env *env, const char *format, ...)
 {
@@ -696,15 +787,24 @@ int add_uevent_var(struct kobj_uevent_env *env, const char *format, ...)
 EXPORT_SYMBOL_GPL(add_uevent_var);
 
 #if defined(CONFIG_NET)
+/*
+ * uevent_net_broadcast() - 给用户注入的 uevent 追加内核序号并广播。
+ * @usk 是目标网络命名空间的借用 netlink socket；@skb 是接收路径交入的消息；
+ * @extack 是借用的详细错误输出。成功或无监听者/接收队列溢出返回 0，消息过大
+ * 返回 -EINVAL，复制失败返回 -ENOMEM，其他广播错误原样返回。函数复制 skb，
+ * 原 skb ownership 不变；netlink_broadcast() 消费复制体。
+ */
 static int uevent_net_broadcast(struct sock *usk, struct sk_buff *skb,
 				struct netlink_ext_ack *extack)
 {
 	/* u64 to chars: 2^64 - 1 = 21 chars */
+	/* 十进制 u64 最大值含 20 位数字，连同结尾 NUL 预留 21 字节。 */
 	char buf[sizeof("SEQNUM=") + 21];
 	struct sk_buff *skbc;
 	int ret;
 
 	/* bump and prepare sequence number */
+	/* 用户注入事件同样从全局计数器领取序号，保持一个统一序列空间。 */
 	ret = snprintf(buf, sizeof(buf), "SEQNUM=%llu",
 		       atomic64_inc_return(&uevent_seqnum));
 	if (ret < 0 || (size_t)ret >= sizeof(buf))
@@ -712,28 +812,34 @@ static int uevent_net_broadcast(struct sock *usk, struct sk_buff *skb,
 	ret++;
 
 	/* verify message does not overflow */
+	/* 追加 SEQNUM 后仍必须落在 uevent 固定消息上限内，超出时拒绝而不截断。 */
 	if ((skb->len + ret) > UEVENT_BUFFER_SIZE) {
 		NL_SET_ERR_MSG(extack, "uevent message too big");
 		return -EINVAL;
 	}
 
 	/* copy skb and extend to accommodate sequence number */
+	/* 复制原 skb 并只扩充尾部空间，保持接收路径拥有的原消息不变。 */
 	skbc = skb_copy_expand(skb, 0, ret, GFP_KERNEL);
 	if (!skbc)
 		return -ENOMEM;
 
 	/* append sequence number */
+	/* 把包含终止 NUL 的 SEQNUM 字符串追加为最后一个环境项。 */
 	skb_put_data(skbc, buf, ret);
 
 	/* remove msg header */
+	/* 广播给用户态前移除用于内核注入协议的 netlink 消息头。 */
 	skb_pull(skbc, NLMSG_HDRLEN);
 
 	/* set portid 0 to inform userspace message comes from kernel */
+	/* portid=0 明确把复制后的消息标记为内核来源，并投递到 multicast group 1。 */
 	NETLINK_CB(skbc).portid = 0;
 	NETLINK_CB(skbc).dst_group = 1;
 
 	ret = netlink_broadcast(usk, skbc, 0, 1, GFP_KERNEL);
 	/* ENOBUFS should be handled in userspace */
+	/* 队列溢出由用户态借助序号空洞检测；无监听者也不是内核发送失败。 */
 	if (ret == -ENOBUFS || ret == -ESRCH)
 		ret = 0;
 
@@ -831,6 +937,11 @@ postcore_initcall(kobject_uevent_init);
 #endif
 
 #ifdef CONFIG_UEVENT_HELPER
+/*
+ * /proc/sys/kernel/hotplug 与 /sys/kernel/uevent_helper 共享同一个静态字符数组。
+ * proc_dostring 按 maxlen 限制输入；两个配置面都改变后续事件选择的 helper，
+ * 并不影响已经把 env ownership 交给 usermode-helper 核心的请求。
+ */
 static const struct ctl_table uevent_helper_sysctl_table[] = {
 	{
 		.procname	= "hotplug",
@@ -841,6 +952,11 @@ static const struct ctl_table uevent_helper_sysctl_table[] = {
 	},
 };
 
+/*
+ * init_uevent_helper_sysctl() - 在 postcore initcall 阶段注册兼容 sysctl。
+ * 入参：无；返回 0。register_sysctl_init() 管理启动期注册结果与表生命周期；
+ * 静态表和 helper 数组贯穿运行期，本函数不取得需要释放的动态 ownership。
+ */
 static int __init init_uevent_helper_sysctl(void)
 {
 	register_sysctl_init("kernel", uevent_helper_sysctl_table);

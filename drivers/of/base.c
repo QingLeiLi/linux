@@ -189,20 +189,49 @@ void __of_phandle_cache_inv_entry(phandle handle)
 		phandle_cache[handle_hash] = NULL;
 }
 
+/*
+ * of_core_init() - 把启动阶段解析好的设备树节点接入重配置、sysfs 和 procfs。
+ *
+ * 【宏观位置】driver_init() 在 firmware_init() 之后调用；正常成功路径以
+ * firmware_kobj 作为 /sys/firmware 父对象，但顶层没有检查 firmware_init()
+ * 返回值。若该指针为 NULL，kset 会退化为 sysfs 根对象，随后固定指向
+ * /sys/firmware/devicetree/base 的 proc 软链接也可能悬空。无入参、无直接
+ * 返回值；早期进程上下文可睡眠，入口不要求持锁。np 是遍历全局设备树的
+ * 借用指针，不取得长期节点引用。
+ *
+ * 【阶段】先注册 platform 重配置通知，再在 of_mutex 下发布 devicetree kset、
+ * 为所有启动时节点建立 sysfs 表示并填充 phandle 直映快取，最后创建兼容 ABI
+ * 所需的 /proc/device-tree 软链接。启动期尚无并发 overlay 修改，但仍使用
+ * of_mutex，使该构造过程遵守运行期设备树对象与 sysfs 的同一串行化协议。
+ *
+ * 失败语义：kset 创建失败时解锁、记录错误并返回；通知器已注册但没有节点
+ * sysfs 视图。成功副作用通过全局 of_kset、phandle_cache 以及 procfs 链接
+ * 对后续调用者可见。函数为 void，driver_init() 没有可处理的返回通道。
+ */
 void __init of_core_init(void)
 {
 	struct device_node *np;
 
+	/* 先接通动态重配置事件；后续发布的节点视图才能随变更保持同步。 */
 	of_platform_register_reconfig_notifier();
 
 	/* Create the kset, and register existing nodes */
+	/*
+	 * 原英文注释说明：创建 kset 并注册已经存在的节点。这里的 existing 指
+	 * early boot 期间已从固件树展开到全局 allnodes 链表的 device_node。
+	 */
 	mutex_lock(&of_mutex);
+	/* firmware_kobj 是父对象，因此目录最终为 /sys/firmware/devicetree。 */
 	of_kset = kset_create_and_add("devicetree", NULL, firmware_kobj);
 	if (!of_kset) {
 		mutex_unlock(&of_mutex);
 		pr_err("failed to register existing nodes\n");
 		return;
 	}
+	/*
+	 * 阶段 2：逐个发布节点；phandle_cache 采用直接映射，碰撞时保留先到节点，
+	 * 未命中或碰撞仍可由完整树查找保证功能正确，快取只优化常见查询。
+	 */
 	for_each_of_allnodes(np) {
 		__of_attach_node_sysfs(np);
 		if (np->phandle && !phandle_cache[of_phandle_cache_hash(np->phandle)])
@@ -211,6 +240,10 @@ void __init of_core_init(void)
 	mutex_unlock(&of_mutex);
 
 	/* Symlink in /proc as required by userspace ABI */
+	/*
+	 * 原英文注释说明：用户空间 ABI 要求在 /proc 创建软链接。只有存在根节点
+	 * 才创建 /proc/device-tree，并把它指向 sysfs 中已发布的 base 节点。
+	 */
 	if (of_root)
 		proc_symlink("device-tree", NULL, "/sys/firmware/devicetree/base");
 }

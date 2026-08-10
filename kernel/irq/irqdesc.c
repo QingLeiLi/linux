@@ -101,7 +101,7 @@ static int __init irq_affinity_setup(char *str)
 	 * bugreports caused by random commandline masks
 	 */
 	/*
-	 * 原文意为：至少加入启动 CPU，避免任意命令行掩码造成无接收 CPU 的
+	 * 至少加入启动 CPU，避免任意命令行掩码造成无接收 CPU 的
 	 * 错误报告。即使解析结果为空或只含尚未在线的 CPU，早期中断仍有落点。
 	 */
 	cpumask_set_cpu(smp_processor_id(), irq_default_affinity);
@@ -246,10 +246,32 @@ static void free_masks(struct irq_desc *desc)
  * 回收调用图一致：@desc/@node/@affinity 均不被消费，分配始终返回成功，
  * 也没有任何副作用。
  */
+/*
+ * alloc_masks() - UP 配置下省略描述符亲和性掩码分配
+ *
+ * @desc: 未消费的描述符借用指针。
+ * @node: 未消费的 NUMA 节点编号。
+ * 返回恒为 0，表示没有需要分配的 SMP 子资源；不睡眠、无所有权变化。
+ */
 static inline int
 alloc_masks(struct irq_desc *desc, int node) { return 0; }
+/*
+ * desc_smp_init() - UP 配置下省略描述符亲和性和重定向初始化
+ *
+ * @desc: 未消费的描述符借用指针。
+ * @node: 未消费的 NUMA 节点编号。
+ * @affinity: 未消费的可空亲和性掩码借用指针。
+ * 返回：无直接返回值、不睡眠、无副作用；UP 上不存在需要初始化的 SMP 字段。
+ */
 static inline void
 desc_smp_init(struct irq_desc *desc, int node, const struct cpumask *affinity) { }
+/*
+ * free_masks() - UP 配置下的亲和性掩码回收空实现
+ *
+ * @desc: 未消费的描述符借用指针。
+ * 返回：无直接返回值、不睡眠、无副作用；它与成功但未分配资源的 alloc_masks()
+ * 配对，使初始化回滚和最终析构无需增加条件编译分支。
+ */
 static inline void free_masks(struct irq_desc *desc) { }
 #endif
 
@@ -710,6 +732,11 @@ static ssize_t actions_show(struct kobject *kobj, struct kobj_attribute *attr, c
 }
 IRQ_ATTR_RO(actions);
 
+/*
+ * irq_attrs 是每个动态 IRQ kobject 默认公开的只读属性表。数组元素借用上述
+ * 静态 attribute 对象，以 NULL 结尾；kobject 核心只消费表结构，不取得由
+ * 本文件单独释放的所有权。各 show 回调的锁决定字段一致性，属性表本身只读。
+ */
 static struct attribute *irq_attrs[] = {
 	&per_cpu_count_attr.attr,
 	&chip_name_attr.attr,
@@ -720,6 +747,7 @@ static struct attribute *irq_attrs[] = {
 	&actions_attr.attr,
 	NULL
 };
+/* 由 irq_attrs 生成 irq_groups，供 irq_kobj_type.default_groups 在 add 时批量建文件。 */
 ATTRIBUTE_GROUPS(irq);
 
 /*
@@ -750,7 +778,7 @@ static void irq_sysfs_add(int irq, struct irq_desc *desc)
 		 * cannot be rolled back.
 		 */
 		/*
-		 * 原文意为：即使失败也继续，因为 sysfs 不是 IRQ 正确工作的必要
+		 * 即使失败也继续，因为 sysfs 不是 IRQ 正确工作的必要
 		 * 条件，而且晚期 irq_sysfs_init() 中已创建的目录无法整体回滚。
 		 * 因此这里的事务边界只覆盖单个 kobject，不影响描述符发布。
 		 */
@@ -777,7 +805,7 @@ static void irq_sysfs_del(struct irq_desc *desc)
 	 * kobject_add() invocation.
 	 */
 	/*
-	 * 原文意为：仅在该描述符的 kobject_add() 成功执行过时才调用
+	 * 仅在该描述符的 kobject_add() 成功执行过时才调用
 	 * kobject_del()；这样同时覆盖 sysfs 尚未初始化的早期启动，以及
 	 * kobject_add() 自身失败两种情况，避免删除一个从未加入的对象。
 	 */
@@ -817,6 +845,7 @@ static int __init irq_sysfs_init(void)
 		irq_sysfs_add(irq, desc);
 	return 0;
 }
+/* postcore 阶段在普通 IRQ 动态分配开始后补建 sysfs，因此函数会遍历早期条目。 */
 postcore_initcall(irq_sysfs_init);
 
 #else /* !CONFIG_SYSFS */
@@ -829,7 +858,20 @@ static const struct kobj_type irq_kobj_type = {
 	.release	= irq_kobj_release,
 };
 
+/*
+ * irq_sysfs_add() - SYSFS 关闭时保留动态描述符发布调用点
+ *
+ * @irq: 未消费的逻辑 IRQ 号。
+ * @desc: 未消费的描述符借用指针。
+ * 返回：无直接返回值、不睡眠、无副作用；kobject 仍承担最终内存析构职责。
+ */
 static void irq_sysfs_add(int irq, struct irq_desc *desc) {}
+/*
+ * irq_sysfs_del() - SYSFS 关闭时保留动态描述符撤销调用点
+ *
+ * @desc: 未消费的描述符借用指针。
+ * 返回：无直接返回值、不睡眠、无副作用；随后 rcuref/RCU/kobject_put() 仍须配对。
+ */
 static void irq_sysfs_del(struct irq_desc *desc) {}
 
 #endif /* CONFIG_SYSFS */
@@ -862,6 +904,12 @@ void irq_lock_sparse(void)
 	mutex_lock(&sparse_irq_lock);
 }
 
+/*
+ * irq_unlock_sparse() - 释放当前任务持有的描述符全局拓扑锁
+ *
+ * 入参、返回值：无。必须与同一任务先前成功的 irq_lock_sparse() 配对；释放后
+ * Maple Tree、proc/sysfs 拓扑可立即被其他任务修改，旧借用指针不能仅凭此锁使用。
+ */
 void irq_unlock_sparse(void)
 {
 	mutex_unlock(&sparse_irq_lock);
@@ -916,6 +964,10 @@ static struct irq_desc *alloc_desc(int irq, int node, unsigned int flags,
  * 唯一包含 desc。调用前该 desc 已从树/sysfs 摘除、rcuref 已耗尽且经过
  * RCU 宽限期，因此不再有合法读者。无返回值；按子对象到外壳的顺序释放
  * SMP 掩码、per-CPU 统计和 desc 本身。
+ *
+ * 此处只回收 init_desc() 建立的通用子资源；irq_set_percpu_devid() 后另行
+ * 建立的 percpu_enabled 不在本析构函数的释放清单内，因此该专用模式依赖
+ * “描述符长期存在、只设置一次”的调用协议，不能把本路径理解为回收它。
  */
 static void irq_kobj_release(struct kobject *kobj)
 {
@@ -956,7 +1008,7 @@ void irq_desc_free_rcu(struct irq_desc *desc)
 	 * This also allows us to use rcu in kstat_irqs_usr().
 	 */
 	/*
-	 * 原文意为：描述符、亲和性掩码和统计字段统一经 RCU 释放，使级联/
+	 * 描述符、亲和性掩码和统计字段统一经 RCU 释放，使级联/
 	 * 解复用中断可以用 RCU 管理子中断，也让 kstat_irqs_usr() 能在读侧
 	 * 临界区无锁统计。RCU 只延长存储期，不冻结 desc 内字段。
 	 */
@@ -990,7 +1042,7 @@ static void free_desc(unsigned int irq)
 	 * irq_sysfs_init() as well.
 	 */
 	/*
-	 * 原文意为：sparse_irq_lock 同时保护 show_interrupts() 和
+	 * sparse_irq_lock 同时保护 show_interrupts() 和
 	 * kstat_irq_usr()；从稀疏树删除后，后续 proc 查找会失败。sysfs 删除
 	 * 也必须与并发 irq_sysfs_init() 串行。补充：已开始的引用型读者仍由
 	 * rcuref/RCU 保护，故“可以释放”表示可以启动延迟释放而非立即 kfree。
@@ -1011,6 +1063,9 @@ static void free_desc(unsigned int irq)
  * affinity 元素为空返回 -EINVAL 且不分配；任一内存分配失败返回 -ENOMEM，
  * 并逆序 free_desc() 已发布前缀，使区间恢复为空。发布后所有权由树中的
  * 初始 rcuref 承担。
+ *
+ * 精确地说，成功只保证每项已进入主 Maple Tree；sysfs 尚未初始化或辅助入口
+ * 创建失败时，IRQ 分配仍成功，debugfs/sysfs 仅是已经尝试建立的诊断界面。
  */
 static int alloc_descs(unsigned int start, unsigned int cnt, int node,
 		       const struct irq_affinity_desc *affinity,
@@ -1365,7 +1420,7 @@ int handle_irq_desc(struct irq_desc *desc)
  * 		initialized.
   */
 /*
- * 原文意为：为指定 Linux IRQ 调用处理函数；@irq 是逻辑中断号。成功返回
+ * 为指定 Linux IRQ 调用处理函数；@irq 是逻辑中断号。成功返回
  * 0，号码无法转换为 desc 时返回 -EINVAL。调用者必须已在 IRQ 上下文并
  * 初始化 irq regs；函数只做 irq_to_desc() 转换并把契约交给
  * handle_irq_desc()，不取得长期引用。
@@ -1388,7 +1443,7 @@ EXPORT_SYMBOL_GPL(generic_handle_irq);
  * marked to enforce IRQ-context only.
  */
 /*
- * 原文意为：从任意上下文为指定逻辑 IRQ 调用处理函数。@irq 是逻辑号；
+ * 从任意上下文为指定逻辑 IRQ 调用处理函数。@irq 是逻辑号；
  * 返回 0 或 handle_irq_desc() 的负错误。函数保存并关闭本地硬中断，使
  * 流控路径不会在当前 CPU 被普通硬中断嵌套；退出时精确恢复原状态。
  * 若 IRQ 带“必须真正来自 hardirq”标记，仅 local_irq_disable() 并不会
@@ -1420,7 +1475,7 @@ EXPORT_SYMBOL_GPL(generic_handle_irq_safe);
  * 		initialized.
  */
 /*
- * 原文意为：在 @domain 中把硬件号 @hwirq 映射为 Linux IRQ 并调用其
+ * 在 @domain 中把硬件号 @hwirq 映射为 Linux IRQ 并调用其
  * handler；成功返回 0，映射不存在时经 NULL desc 返回 -EINVAL。domain
  * 和映射是调用期间的借用对象，调用者必须处于已初始化 irq regs 的 IRQ
  * 上下文。irq_resolve_mapping() 只完成映射查找，流控仍由 desc 决定。
@@ -1474,7 +1529,7 @@ EXPORT_SYMBOL_GPL(generic_handle_domain_irq_safe);
  * 		initialized.
  **/
 /*
- * 原文意为：解析 @domain 中的 NMI 硬件号 @hwirq 并调用对应 handler；
+ * 解析 @domain 中的 NMI 硬件号 @hwirq 并调用对应 handler；
  * 成功返回 0，映射失败返回 -EINVAL。调用者必须处于 NMI 上下文且 irq
  * regs 已初始化。WARN 只诊断契约违例，不阻止继续分派；NMI 路径必须使用
  * 已配置为 NMI 安全的 chip/handler，函数不会替调用者建立 NMI 语义。
@@ -1519,7 +1574,7 @@ static bool demux_redirect_remote(struct irq_desc *desc)
 	 * in the interrupt's affinity mask, redirection is not necessary.
 	 */
 	/*
-	 * 原文意为：若 handler 已运行在有效亲和掩码包含的 CPU 上，就无需
+	 * 若 handler 已运行在有效亲和掩码包含的 CPU 上，就无需
 	 * 重定向。本地直接处理可避免额外 IPI/irq_work 延迟。
 	 */
 	if (cpumask_test_cpu(smp_processor_id(), m))
@@ -1584,7 +1639,7 @@ static bool demux_redirect_remote(struct irq_desc *desc)
  * Returns:	True on success, or false if lookup has failed
  */
 /*
- * 原文意为：处理解复用 domain 中的硬件中断 @hwirq。@domain 为借用映射
+ * 处理解复用 domain 中的硬件中断 @hwirq。@domain 为借用映射
  * 域；查找失败返回 false。成功找到 desc 后，若当前 CPU 不符合有效亲和性
  * 则排到目标 CPU 并返回 true；否则本地调用 handle_irq_desc()，其 0
  * 转换为 true、负错误转换为 false。这里的 true 表示“已接受本次分派”，
@@ -1623,7 +1678,7 @@ EXPORT_SYMBOL_GPL(generic_handle_demux_domain_irq);
  * @cnt:	Number of consecutive irqs to free
  */
 /*
- * 原文意为：释放从 @from 开始的 @cnt 个连续 IRQ 描述符。参数单位均为
+ * 释放从 @from 开始的 @cnt 个连续 IRQ 描述符。参数单位均为
  * 逻辑 IRQ 个数；越界请求静默返回，不释放部分区间。函数在可睡眠上下文
  * 获取 sparse_irq_lock，逐个调用配置相关的 free_desc()；无返回值。
  *
@@ -1663,7 +1718,7 @@ EXPORT_SYMBOL_GPL(irq_free_descs);
  * Returns the first irq number or error code
  */
 /*
- * 原文意为：分配并初始化一段 IRQ 描述符。
+ * 分配并初始化一段 IRQ 描述符。
  *
  * @irq >= 0 时要求精确分配该逻辑号，负值表示由框架选择；@from 是包含式
  * 搜索下界；@cnt 是非零连续数量；@node 是默认 NUMA 节点；@owner 是
@@ -1675,6 +1730,10 @@ EXPORT_SYMBOL_GPL(irq_free_descs);
  * -ENOSPC（无连续空洞）或 -ENOMEM（描述符/掩码分配或容量扩展失败）；
  * alloc_descs() 保证部分构造被回滚。__ref 允许启动期代码与常驻调用者
  * 共享此入口，而不把函数本身永久限制在 __init section。
+ *
+ * 实现细节：irq_find_free_area() 内部虽用 -ENOSPC 表示搜索失败，但自由分配的
+ * 正常调用会在随后的容量检查中把无法扩展统一报告为 -ENOMEM；精确分配若未找到
+ * 指定首号则报告 -EEXIST。调用者不应依赖从本入口直接观察内部 -ENOSPC。
  */
 int __ref __irq_alloc_descs(int irq, unsigned int from, unsigned int cnt, int node,
 			    struct module *owner, const struct irq_affinity_desc *affinity)
@@ -1700,7 +1759,7 @@ int __ref __irq_alloc_descs(int irq, unsigned int from, unsigned int cnt, int no
 		 * argument. x86 uses this to exclude the GSI space.
 		 */
 		/*
-		 * 原文意为：自由分配时架构可抬高 @from 下界；x86 用它跳过为
+		 * 自由分配时架构可抬高 @from 下界；x86 用它跳过为
 		 * GSI 保留的号码空间。该调整发生在加锁前且只改变搜索策略。
 		 */
 		from = arch_dynirq_lower_bound(from);
@@ -1732,7 +1791,7 @@ EXPORT_SYMBOL_GPL(__irq_alloc_descs);
  * Returns next irq number after offset or total_nr_irqs if none is found.
  */
 /*
- * 原文意为：从 @offset 开始寻找下一个已分配 IRQ；实现实际上是包含
+ * 从 @offset 开始寻找下一个已分配 IRQ；实现实际上是包含
  * @offset 的“at or after”，找到时返回其逻辑号，没有则返回
  * total_nr_irqs 哨兵。函数用自动 RCU guard 保护 Maple Tree 借用指针，
  * 在读侧退出前只提取稳定的 irq 数值，不把 desc 返回给调用者；不睡眠。
@@ -1816,6 +1875,12 @@ void __irq_put_desc_unlock(struct irq_desc *desc, unsigned long flags, bool bus)
  * percpu_enabled 的每 CPU 单元记录该 CPU 上此 IRQ 是否启用，所有权转给
  * desc，后续 IRQ 生命周期负责释放。先分配再发布 flags，避免读者看到
  * per-CPU 模式却没有配套存储。
+ *
+ * 这里的存储是一个普通动态分配的 struct cpumask，每个 CPU 对应其中一位；
+ * 它不是 __percpu 区域。enable_percpu_irq()/disable_percpu_irq() 在描述符锁下
+ * 设置或清除当前 CPU 位，free_percpu_irq() 据此拒绝释放仍在使用的 action。
+ * 当前 free_desc()/irq_kobj_release() 不显式 kfree 该指针，所以接口面向创建后
+ * 长期存在的 per-CPU IRQ；“所有权转给 desc”不等于任意动态释放路径都会回收它。
  */
 int irq_set_percpu_devid(unsigned int irq)
 {
@@ -1855,7 +1920,7 @@ void kstat_incr_irq_this_cpu(unsigned int irq)
  * concurrently.
  */
 /*
- * 原文意为：返回逻辑 IRQ @irq 自启动以来在 CPU @cpu 上的累计次数；调用
+ * 返回逻辑 IRQ @irq 自启动以来在 CPU @cpu 上的累计次数；调用
  * 者必须保证描述符不会并发删除。@cpu 应是合法 possible CPU 编号。找到
  * desc 且统计区存在时返回该 per-CPU cnt 的无锁快照，否则返回 0。
  *
@@ -1922,6 +1987,8 @@ static unsigned int kstat_irqs(unsigned int irq)
  * 入参、返回值：无。调用者保证当前 CPU 上下文稳定，并保证遍历期间描述符
  * 集合不会失效；函数遍历已分配 desc，把当前 CPU 的 cnt 复制到同 CPU 的
  * ref。只写本 CPU per-CPU 存储，无需跨 CPU 锁；其他 CPU 的基线不变。
+ * softlockup watchdog 在怀疑硬中断风暴时调用它，随后以
+ * kstat_get_irq_since_snapshot() 选出该采样区间内最频繁的 IRQ。
  */
 void kstat_snapshot_irqs(void)
 {
@@ -1969,7 +2036,7 @@ unsigned int kstat_get_irq_since_snapshot(unsigned int irq)
  * delayed_free_desc()/irq_kobj_release().
  */
 /*
- * 原文意为：从线程上下文返回 @irq 在全部 CPU 上自启动以来的累计次数。
+ * 从线程上下文返回 @irq 在全部 CPU 上自启动以来的累计次数。
  * 函数用 RCU 保护访问，因为并发删除描述符会先等待一个 RCU 宽限期，再经
  * delayed_free_desc()/irq_kobj_release() 释放。@irq 是逻辑号；不存在
  * 或尚无统计都返回 0，无错误码。

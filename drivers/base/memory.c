@@ -940,17 +940,44 @@ static const struct attribute_group *memory_root_attr_groups[] = {
  * is called, we cannot have concurrent creation/deletion of memory block
  * devices, the device_hotplug_lock is not needed.
  */
+/*
+ * 原英文注释说明：本函数初始化 memory device 的 sysfs 支持；调用时尚不可能
+ * 并发创建或删除 memory block，因而不需要 device_hotplug_lock。这个早期启动
+ * 单线程前提只免除了热插拔串行锁，并不改变 device/kobject 自身的引用规则。
+ *
+ * memory_dev_init() - 发布 memory 系统子系统并表示启动时已有的物理内存块。
+ *
+ * 【宏观位置】CONFIG_MEMORY_HOTPLUG 下由 driver_init() 调用，位于
+ * node_dev_init() 之前。正确入口前提是 buses_init() 已建立 system_kset，
+ * subsys_system_register() 会直接解引用它而不做 NULL 检查。无入参、无直接
+ * 返回值；可睡眠，入口不持锁。
+ *
+ * 【变量地图】block_sz 是一个 memory block 覆盖的字节数；sections_per_block
+ * 是其包含的最小 section 数并发布给后续换算；nr 遍历 present section 编号；
+ * block_id 把多个 section 合并成唯一 memory block，ULONG_MAX 是首轮哨兵；
+ * ret 传递注册错误。
+ *
+ * 【失败与发布】非法 block 大小、子系统注册失败或任一启动内存块创建失败都
+ * panic，因为后续热插拔/sysfs 模型无法在半构造状态安全继续。正常返回时
+ * memory_subsys 和所有启动 memory block 已可见，node_dev_init() 可建立链接。
+ */
 void __init memory_dev_init(void)
 {
 	int ret;
 	unsigned long block_sz, block_id, nr;
 
 	/* Validate the configured memory block size */
+	/*
+	 * 原英文注释说明：先验证配置所得 memory block 大小。power-of-two 和最小
+	 * section 下限保证 section↔block 的移位/整除映射稳定且不会出现零跨度。
+	 */
 	block_sz = memory_block_size_bytes();
 	if (!is_power_of_2(block_sz) || block_sz < MIN_MEMORY_BLOCK_SIZE)
 		panic("Memory block size not suitable: 0x%lx\n", block_sz);
+	/* 验证后才发布全局换算比例，后续 memory_block_id() 依赖该不变量。 */
 	sections_per_block = block_sz / MIN_MEMORY_BLOCK_SIZE;
 
+	/* 注册 /sys/devices/system/memory 及其根属性；失败属于不可恢复启动错误。 */
 	ret = subsys_system_register(&memory_subsys, memory_root_attr_groups);
 	if (ret)
 		panic("%s() failed to register subsystem: %d\n", __func__, ret);
@@ -962,12 +989,23 @@ void __init memory_dev_init(void)
 	 * to bypass the block ID matching check for the first present
 	 * block so that it can be covered.
 	 */
+	/*
+	 * 原英文注释说明：为启动时发现并已初始化的 memory section 创建条目；
+	 * block_id 记录上一个已处理块，初值 ULONG_MAX 是无效 ID，使第一个 present
+	 * block 绕过“与上一块相同”的去重检查，确保它不会被误跳过。
+	 */
 	block_id = ULONG_MAX;
+	/*
+	 * 同一 block 可能包含多个连续 section，循环只在 block_id 改变时创建一次
+	 * device。NUMA_NO_NODE 暂不固化节点，node_dev_init() 随后根据 memblock
+	 * 拓扑补充 node/zone 关系；MEM_ONLINE 表示这些启动内存已在线。
+	 */
 	for_each_present_section_nr(0, nr) {
 		if (block_id != ULONG_MAX && memory_block_id(nr) == block_id)
 			continue;
 
 		block_id = memory_block_id(nr);
+		/* 创建并发布 memory block device；成功后由设备模型持有其生命周期。 */
 		ret = add_memory_block(block_id, NUMA_NO_NODE, MEM_ONLINE, NULL, NULL);
 		if (ret) {
 			panic("%s() failed to add memory block: %d\n",

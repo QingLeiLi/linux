@@ -172,6 +172,7 @@ static inline int hotplug_node_notifier(notifier_fn_t fn, int pri)
 #endif
 
 #ifdef CONFIG_NUMA
+/* 启动期发布在线 NUMA node 设备，并关联已创建的 CPU/memory 设备。 */
 extern void node_dev_init(void);
 /* Core of the node registration - only memory hotplug should use this */
 int register_node(int nid);
@@ -184,6 +185,7 @@ extern int register_memory_node_under_compute_node(unsigned int mem_nid,
 						   unsigned int cpu_nid,
 						   enum access_coordinate_class access);
 #else
+/* 非 NUMA 配置没有 node 设备层次，统一空入口保持 driver_init() 顺序稳定。 */
 static inline void node_dev_init(void)
 {
 }

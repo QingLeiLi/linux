@@ -233,27 +233,48 @@ void faux_device_destroy(struct faux_device *faux_dev)
 }
 EXPORT_SYMBOL_GPL(faux_device_destroy);
 
+/*
+ * faux_bus_init() - 构造 faux 设备的根对象、总线类型和配套驱动。
+ *
+ * 【宏观位置】driver_init() 在 devices/buses/classes 核心根发布后调用。无入参，
+ * 早期进程上下文可睡眠，入口不持锁。
+ *
+ * 【变量与 ownership】root 是 root_device_register() 返回的持有引用，只有全部
+ * 注册成功后才发布到全局 faux_bus_root；ret 贯穿 bus/driver 注册错误。先注册
+ * 根设备，再注册 bus_type，最后注册该总线的内建 faux_driver，保证任何对外
+ * 可见的后续层都能找到完整父层。
+ *
+ * 返回：0 表示三层均已注册且全局变量接管 root 的长期引用；负 errno 可能是
+ * 编码在 ERR_PTR(root) 中的根设备错误，也可能来自 bus_register()/
+ * driver_register()。失败路径按 driver→bus→root 的反向取得顺序撤销，入口
+ * 状态不变。
+ */
 int __init faux_bus_init(void)
 {
 	struct device *root;
 	int ret;
 
+	/* 阶段 1：创建 /sys/devices/faux 根设备；错误以 ERR_PTR 编码返回。 */
 	root = root_device_register("faux");
 	if (IS_ERR(root))
 		return PTR_ERR(root);
 
+	/* 阶段 2：发布 bus_type；此后设备和驱动可以开始引用该总线。 */
 	ret = bus_register(&faux_bus_type);
 	if (ret)
 		goto err_deregister_root;
 
+	/* 阶段 3：注册总线配套驱动；成功前 root 仍只保存在局部变量中。 */
 	ret = driver_register(&faux_driver);
 	if (ret)
 		goto err_deregister_bus;
 
+	/* 最终提交：全局指针接管 root，运行期 faux_device_create() 可以使用它。 */
 	faux_bus_root = root;
 
 	return 0;
 
+	/* driver 注册失败时，先撤销已经可见的 bus，再释放 root 设备引用。 */
 err_deregister_bus:
 	bus_unregister(&faux_bus_type);
 err_deregister_root:

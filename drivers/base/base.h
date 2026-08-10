@@ -131,6 +131,12 @@ struct device_private {
 	container_of(obj, struct device_private, knode_class)
 
 /* initialisation functions */
+/*
+ * 以下入口共同构成 driver_init() 的早期启动序列。它们只在 __init 生命周期
+ * 被调用：前一组建立 device/bus/class 等公共父对象，后一组注册具体系统总线
+ * 和设备。声明返回 int 的入口可报告 errno，但当前顶层编排不统一回滚；void
+ * 入口在不可恢复错误时自行 panic，或对可选功能记录诊断后继续。
+ */
 int devices_init(void);
 int buses_init(void);
 int classes_init(void);
@@ -138,6 +144,7 @@ int firmware_init(void);
 #ifdef CONFIG_SYS_HYPERVISOR
 int hypervisor_init(void);
 #else
+/* 配置关闭时保留同一调用顺序；成功 stub 不发布 /sys/hypervisor。 */
 static inline int hypervisor_init(void) { return 0; }
 #endif
 int platform_bus_init(void);
@@ -147,6 +154,7 @@ void container_dev_init(void);
 #ifdef CONFIG_AUXILIARY_BUS
 void auxiliary_bus_init(void);
 #else
+/* 配置关闭时为空操作，调用者无需散布条件编译。 */
 static inline void auxiliary_bus_init(void) { }
 #endif
 
@@ -265,6 +273,7 @@ static inline void module_remove_driver(struct device_driver *drv) { }
 #ifdef CONFIG_DEVTMPFS
 int devtmpfs_init(void);
 #else
+/* 未构建 devtmpfs 时按成功处理；设备节点由用户空间或其他机制负责。 */
 static inline int devtmpfs_init(void) { return 0; }
 #endif
 
@@ -312,6 +321,7 @@ static inline int devtmpfs_create_node(struct device *dev) { return 0; }
 static inline int devtmpfs_delete_node(struct device *dev) { return 0; }
 #endif
 
+/* 发布 software-node kset；随后 notify 路径在 device 与 swnode 间建立链接。 */
 void software_node_init(void);
 void software_node_notify(struct device *dev);
 void software_node_notify_remove(struct device *dev);

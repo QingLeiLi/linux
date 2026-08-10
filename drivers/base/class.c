@@ -645,8 +645,20 @@ bool class_is_registered(const struct class *class)
 }
 EXPORT_SYMBOL_GPL(class_is_registered);
 
+/*
+ * classes_init() - 发布设备 class 的全局 sysfs 容器。
+ *
+ * 【宏观位置】driver_init() 在 devices/bus 根建立后调用；后续 class_register()
+ * 将按功能组织的 class 加入 class_kset，形成 /sys/class。无入参，运行于可睡眠
+ * 的早期进程上下文，入口不持锁。
+ *
+ * 返回：0 表示 class_kset 已发布并持有创建引用；-ENOMEM 表示没有创建任何
+ * 可用容器。函数只有一个资源取得点，因此失败无需 goto 回滚；成功对象在
+ * 驱动核心运行期常驻。
+ */
 int __init classes_init(void)
 {
+	/* 父对象为 NULL，使 class kset 位于 sysfs 顶层。 */
 	class_kset = kset_create_and_add("class", NULL, NULL);
 	if (!class_kset)
 		return -ENOMEM;

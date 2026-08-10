@@ -1004,19 +1004,41 @@ static void cgwb_remove_from_bdi_list(struct bdi_writeback *wb)
 
 #endif	/* CONFIG_CGROUP_WRITEBACK */
 
+/*
+ * bdi_init() - 初始化一个已分配 backing_dev_info 的通用状态。
+ *
+ * @bdi: 调用者拥有且保证非 NULL 的 BDI 存储；本函数原地初始化，既不接管
+ * 结构体内存，也不把它注册到全局 BDI 索引。driver_init() 传入静态常驻的
+ * noop_backing_dev_info，bdi_alloc() 则传入刚分配的动态对象。
+ *
+ * 【上下文与阶段】调用者不需持 bdi_lock；cgwb_bdi_init()/wb_init() 可能分配
+ * per-CPU 等内部资源，因此按 GFP_KERNEL 语义可睡眠。先建立引用计数、比例
+ * 上限、链表头、等待队列和时间基线，最后初始化默认 writeback 实例。
+ *
+ * 返回：0 表示 @bdi 及其默认 wb 可继续使用；负 errno 来自 cgwb_bdi_init()。
+ * 成功不代表对象已经通过 bdi_register() 发布。失败时结构体本身仍归调用者，
+ * 调用者不得把部分初始化对象投入使用；bdi_alloc() 会直接释放其存储。
+ */
 int bdi_init(struct backing_dev_info *bdi)
 {
+	/* 尚未关联 sysfs 设备；注册阶段稍后才会设置 dev。 */
 	bdi->dev = NULL;
 
+	/*
+	 * 建立 BDI 本体的生命周期和脏页比例默认值：0..100% 表示初始不额外
+	 * 收窄全局阈值，max_prop_frac 则为比例分配算法的满刻度。
+	 */
 	kref_init(&bdi->refcnt);
 	bdi->min_ratio = 0;
 	bdi->max_ratio = 100 * BDI_RATIO_SCALE;
 	bdi->max_prop_frac = FPROP_FRAC_BASE;
+	/* 对象尚未进入全局 bdi_list，wb_list 也只具备空表自环不变量。 */
 	INIT_LIST_HEAD(&bdi->bdi_list);
 	INIT_LIST_HEAD(&bdi->wb_list);
 	init_waitqueue_head(&bdi->wb_waitq);
 	bdi->last_bdp_sleep = jiffies;
 
+	/* 最后建立默认 wb；这是本函数唯一可能失败且可能分配资源的阶段。 */
 	return cgwb_bdi_init(bdi);
 }
 

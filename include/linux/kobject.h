@@ -11,6 +11,11 @@
  * interface, ESPECIALLY the parts about reference counts and object
  * destructors.
  */
+/*
+ * kobject 是 sysfs 目录、引用计数和对象层级的共同基础。使用接口前尤其要理解
+ * 引用计数与 release 析构：把对象挂入 sysfs 只建立可见性，最后一次 kobject_put()
+ * 才沿 ktype->release 结束内存生命周期；kernel_kobj 等全局根则通常贯穿运行期。
+ */
 
 #ifndef _KOBJECT_H_
 #define _KOBJECT_H_
@@ -31,13 +36,28 @@
 #define UEVENT_HELPER_PATH_LEN		256
 #define UEVENT_NUM_ENVP			64	/* number of env pointers */
 #define UEVENT_BUFFER_SIZE		2048	/* buffer for the variables */
+/*
+ * 每个 uevent 环境最多保存 64 个字符串指针，所有字符串共享 2048 字节缓冲区；
+ * helper 路径另有 256 字节上限。add_uevent_var() 同时检查指针槽和字符缓冲区，
+ * 任一耗尽都使本次事件构造失败，而不是截断出一个语义不完整的事件。
+ */
 
 #ifdef CONFIG_UEVENT_HELPER
 /* path to the userspace helper executed on an event */
+/*
+ * 事件发生时可执行的用户态 helper 路径。存储定义在 lib/kobject_uevent.c，初值
+ * 来自 CONFIG_UEVENT_HELPER_PATH；kernel/ksysfs.c 与 /proc/sys/kernel/hotplug
+ * 都可改写它。调用方只借用全局数组，不拥有或释放其内存。
+ */
 extern char uevent_helper[];
 #endif
 
 /* counter to tag the uevent, read only except for the kobject core */
+/*
+ * 为 uevent 分配全局单调序号的原子计数器。只有 kobject 事件核心递增；
+ * /sys/kernel/uevent_seqnum 只读取快照。原子性避免并发发送得到相同或撕裂值，
+ * 但序号代表“已开始构造/发送事件”的顺序，不保证用户态跨通道接收顺序。
+ */
 extern atomic64_t uevent_seqnum;
 
 /*
@@ -49,6 +69,11 @@ extern atomic64_t uevent_seqnum;
  * or device specific properties. In most cases you want to send a
  * kobject_uevent_env(kobj, KOBJ_CHANGE, env) with additional event
  * specific variables added to the event environment.
+ */
+/*
+ * 枚举下标必须与 lib/kobject_uevent.c 的字符串表严格一致。动作只描述对象通用
+ * 生命周期变化；设备/子系统细节应作为 KOBJ_CHANGE 的环境变量携带，避免把
+ * 稳定 ABI 扩展成无法维护的设备专用动作集合。
  */
 enum kobject_action {
 	KOBJ_ADD,
@@ -201,6 +226,11 @@ static inline const struct kobj_type *get_ktype(const struct kobject *kobj)
 struct kobject *kset_find_obj(struct kset *, const char *);
 
 /* The global /sys/kernel/ kobject for people to chain off of */
+/*
+ * 全局 /sys/kernel 根，定义并由 kernel/ksysfs.c 在 do_basic_setup() 阶段创建。
+ * 后续子系统借用该指针作为 kobject_create_and_add() 的父对象；声明本身不授予
+ * 额外引用，调用方也不得对这个长寿命全局根执行匹配 kobject_put()。
+ */
 extern struct kobject *kernel_kobj;
 /* The global /sys/kernel/mm/ kobject for people to chain off of */
 extern struct kobject *mm_kobj;

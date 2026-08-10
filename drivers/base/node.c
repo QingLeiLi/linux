@@ -993,13 +993,31 @@ static const struct attribute_group *cpu_root_attr_groups[] = {
 	NULL,
 };
 
+/*
+ * node_dev_init() - 发布 NUMA node 子系统并创建所有在线节点的设备表示。
+ *
+ * 【宏观位置】CONFIG_NUMA 下由 driver_init() 在 memory_dev_init() 后、
+ * cpu_dev_init() 前调用。正确入口前提是 system_kset 已由 buses_init() 建立；
+ * subsys_system_register() 不接受缺失的父层。无入参、无直接返回值；早期进程
+ * 上下文可睡眠，入口不持 device_hotplug_lock，因为启动枚举尚无并发热插拔。
+ *
+ * 【变量地图】i 是在线 NUMA node ID；ret 传递 system 子系统或单个 node
+ * device 的注册结果。两个 BUILD_BUG_ON 在编译期证明 node 状态枚举与 sysfs
+ * 属性表一一对应，避免新增状态后静默漏出 ABI 属性。
+ *
+ * 【阶段】先注册 /sys/devices/system/node 和根属性；再为每个 online node
+ * 调用 register_node()；最后把 memory_dev_init() 已创建的 memory block 链到
+ * 对应 node。失败均 panic，因为部分 NUMA 拓扑会使后续资源归属模型不一致。
+ */
 void __init node_dev_init(void)
 {
 	int ret, i;
 
+	/* 阶段 1：编译期校验属性描述和值指针数组都完整覆盖 NR_NODE_STATES。 */
  	BUILD_BUG_ON(ARRAY_SIZE(node_state_attr) != NR_NODE_STATES);
  	BUILD_BUG_ON(ARRAY_SIZE(node_state_attrs)-1 != NR_NODE_STATES);
 
+	/* 阶段 2：发布 node system 子系统；名称保留为 cpu_root_attr_groups 是历史命名。 */
 	ret = subsys_system_register(&node_subsys, cpu_root_attr_groups);
 	if (ret)
 		panic("%s() failed to register subsystem: %d\n", __func__, ret);
@@ -1008,11 +1026,19 @@ void __init node_dev_init(void)
 	 * Create all node devices, which will properly link the node
 	 * to already created cpu devices.
 	 */
+	/*
+	 * 原英文注释说明：创建全部 node 设备，并把 node 正确链接到已经存在的 CPU
+	 * 设备。register_node() 会尝试链接当前已经发布的 CPU；通用 CPU 设备若尚未
+	 * 创建，稍后的 register_cpu() 也会调用 register_cpu_under_node() 反向补链，
+	 * 因而两种体系结构启动顺序都收敛到相同拓扑。
+	 */
+	/* 阶段 3：逐个发布 online node；任一缺口都会导致系统拓扑不完整。 */
 	for_each_online_node(i) {
 		ret =  register_node(i);
 		if (ret)
 			panic("%s() failed to add node: %d\n", __func__, ret);
 	}
 
+	/* 阶段 4：node 对象齐全后，才能安全建立 memory block 的双向 sysfs 链接。 */
 	register_memory_blocks_under_nodes();
 }

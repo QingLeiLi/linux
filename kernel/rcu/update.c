@@ -55,8 +55,17 @@
 #define MODULE_PARAM_PREFIX "rcupdate."
 
 #ifndef CONFIG_TINY_RCU
+/*
+ * ksysfs.c 定义的 rcu_expedited/rcu_normal 同时注册为只读模块参数：启动命令行
+ * 可设初值，运行期则由 /sys/kernel 对应属性读写。rcu_normal 优先级更高；
+ * TINY_RCU 没有可选择的树形宽限期实现，因此整组策略不存在。
+ */
 module_param(rcu_expedited, int, 0444);
 module_param(rcu_normal, int, 0444);
+/*
+ * 启动结束后是否自动强制普通宽限期；PREEMPT_RT 默认启用以避免 expedited 路径
+ * 的实时性代价。__read_mostly 不需要，因为该量主要在启动状态转换时读取。
+ */
 static int rcu_normal_after_boot = IS_ENABLED(CONFIG_PREEMPT_RT);
 #if !defined(CONFIG_PREEMPT_RT) || defined(CONFIG_NO_HZ_FULL)
 module_param(rcu_normal_after_boot, int, 0444);
@@ -138,6 +147,12 @@ EXPORT_SYMBOL(rcu_read_lock_sched_held);
  * when the first task is spawned until the rcu_set_runtime_mode()
  * core_initcall() is invoked, at which point everything is expedited.)
  */
+/*
+ * rcu_gp_is_normal() - 判断 expedited 请求是否必须退回普通宽限期。
+ * 入参：无；返回布尔值，无 ownership 或可睡眠副作用。运行期 rcu_normal 非零
+ * 即返回真；但 RCU_SCHEDULER_INIT 启动窗口强制加速，暂时忽略 normal。READ_ONCE
+ * 只稳定这次策略读取，不等待并发 sysfs writer，也不改变已开始的宽限期。
+ */
 bool rcu_gp_is_normal(void)
 {
 	return READ_ONCE(rcu_normal) &&
@@ -145,10 +160,19 @@ bool rcu_gp_is_normal(void)
 }
 EXPORT_SYMBOL_GPL(rcu_gp_is_normal);
 
+/*
+ * async-hurry 嵌套计数初值 1，使启动期 call_rcu() 回调不采用 lazy 延迟；只有
+ * CONFIG_RCU_LAZY 下计数才参与决策。每次 hurry 必须与一次 relax 配对。
+ */
 static atomic_t rcu_async_hurry_nesting = ATOMIC_INIT(1);
 /*
  * Should call_rcu() callbacks be processed with urgency or are
  * they OK being executed with arbitrary delays?
+ */
+/*
+ * rcu_async_should_hurry() - 判断异步 call_rcu() 回调是否必须及时处理。
+ * 入参：无；不启用 RCU_LAZY 时恒真，否则返回嵌套计数是否非零。原子读取无锁、
+ * 不睡眠，只影响后续回调调度策略，不改变已经排队回调的 ownership。
  */
 bool rcu_async_should_hurry(void)
 {
@@ -163,6 +187,11 @@ EXPORT_SYMBOL_GPL(rcu_async_should_hurry);
  * After a call to this function, future calls to call_rcu()
  * will be processed in a timely fashion.
  */
+/*
+ * rcu_async_hurry() - 取得一次“未来异步回调不可 lazy”的嵌套票据。
+ * 入参：无；返回无直接值。仅 RCU_LAZY 配置执行原子递增；调用者随后必须配对
+ * rcu_async_relax()，否则系统会长期保持及时处理策略。
+ */
 void rcu_async_hurry(void)
 {
 	if (IS_ENABLED(CONFIG_RCU_LAZY))
@@ -176,6 +205,11 @@ EXPORT_SYMBOL_GPL(rcu_async_hurry);
  * After a call to this function, future calls to call_rcu()
  * will be processed in a lazy fashion.
  */
+/*
+ * rcu_async_relax() - 归还此前取得的一次 async-hurry 票据。
+ * 入参：无；返回无直接值。仅 RCU_LAZY 配置原子递减；计数归零后未来回调才可
+ * 延迟批处理。函数不校验配对，额外调用会破坏嵌套计数。
+ */
 void rcu_async_relax(void)
 {
 	if (IS_ENABLED(CONFIG_RCU_LAZY))
@@ -183,6 +217,11 @@ void rcu_async_relax(void)
 }
 EXPORT_SYMBOL_GPL(rcu_async_relax);
 
+/*
+ * expedited 嵌套计数初值 1，使内核启动期默认加速同步宽限期；每个
+ * rcu_expedite_gp() 必须由 rcu_unexpedite_gp() 配对。它表达叠加请求数量，
+ * 与 sysfs 的永久策略位 rcu_expedited 是“或”关系，不能互相抵消。
+ */
 static atomic_t rcu_expedited_nesting = ATOMIC_INIT(1);
 /*
  * Should normal grace-period primitives be expedited?  Intended for
@@ -190,6 +229,14 @@ static atomic_t rcu_expedited_nesting = ATOMIC_INIT(1);
  * sysfs/boot variable and rcu_scheduler_active into account as well
  * as the rcu_expedite_gp() nesting.  So looping on rcu_unexpedite_gp()
  * until rcu_gp_is_expedited() returns false is a -really- bad idea.
+ */
+/*
+ * rcu_gp_is_expedited() - 判断普通同步 RCU API 是否应走 expedited 实现。
+ * 入参：无；返回全局策略位或嵌套请求是否为真。查询无锁、不可睡眠且不取得
+ * ownership。不能通过循环 unexpedite 逼迫其变假：计数属于配对调用者，sysfs
+ * 策略位也独立存在，额外递减会破坏其他调用者的嵌套不变量。原英文所说的
+ * rcu_scheduler_active 影响在当前实现中通过启动期嵌套票据间接体现，并非本函数
+ * 直接读取该变量。
  */
 bool rcu_gp_is_expedited(void)
 {
@@ -203,6 +250,11 @@ EXPORT_SYMBOL_GPL(rcu_gp_is_expedited);
  * After a call to this function, future calls to synchronize_rcu() and
  * friends act as the corresponding synchronize_rcu_expedited() function
  * had instead been called.
+ */
+/*
+ * rcu_expedite_gp() - 为调用者增加一个“后续宽限期需加速”的嵌套请求。
+ * 入参：无；返回无直接值。原子递增可在并发上下文使用，不睡眠；它只影响随后
+ * 的策略选择，不追溯转换已开始的宽限期。调用者拥有一次必须配对撤销的逻辑票据。
  */
 void rcu_expedite_gp(void)
 {
@@ -219,16 +271,29 @@ EXPORT_SYMBOL_GPL(rcu_expedite_gp);
  * subsequent calls to synchronize_rcu() and friends will return to
  * their normal non-expedited behavior.
  */
+/*
+ * rcu_unexpedite_gp() - 撤销当前调用者此前取得的一次 expedited 请求。
+ * 入参：无；返回无直接值。原子递减后，只有嵌套计数归零且 sysfs/boot 的
+ * rcu_expedited 未设置，后续同步调用才可能恢复普通实现；函数不验证调用者是否
+ * 真正持有票据，错误的额外调用会破坏全局计数。
+ */
 void rcu_unexpedite_gp(void)
 {
 	atomic_dec(&rcu_expedited_nesting);
 }
 EXPORT_SYMBOL_GPL(rcu_unexpedite_gp);
 
+/* 启动状态发布位：只在启动结束时置真，之后供 rcutorture 等观察而不再清零。 */
 static bool rcu_boot_ended __read_mostly;
 
 /*
  * Inform RCU of the end of the in-kernel boot sequence.
+ */
+/*
+ * rcu_end_inkernel_boot() - 结束 RCU 的内核启动加速阶段。
+ * 入参：无；返回无直接值。调用者在启动序列末端单次调用；函数撤销初始 expedited
+ * 和 async-hurry 票据，按 rcu_normal_after_boot 发布 normal 策略，最后置启动结束
+ * 标志。顺序保证观察到 boot_ended 的测试代码面对的已是运行期策略。
  */
 void rcu_end_inkernel_boot(void)
 {
@@ -241,6 +306,11 @@ void rcu_end_inkernel_boot(void)
 
 /*
  * Let rcutorture know when it is OK to turn it up to eleven.
+ */
+/*
+ * rcu_inkernel_boot_has_ended() - 告知 rcutorture 何时可以开始高强度测试。
+ * 入参：无；返回启动结束快照，无副作用、无 ownership 转移。“turn it up to
+ * eleven”表示在基础启动约束解除后把压力提升到极限。
  */
 bool rcu_inkernel_boot_has_ended(void)
 {
@@ -730,6 +800,12 @@ void rcu_early_boot_tests(void) {}
 
 /*
  * Print any significant non-default boot-time settings.
+ */
+/*
+ * rcupdate_announce_bootup_oddness() - 打印影响 RCU 行为的非默认启动策略。
+ * 入参：无；返回无直接值。仅在 __init 阶段读取策略快照并输出诊断，不改变
+ * rcu_expedited/rcu_normal。normal 与 normal_after_boot 优先于 expedited 的打印
+ * 顺序对应实际策略优先级，最后继续让 RCU Tasks 报告其特殊配置。
  */
 void __init rcupdate_announce_bootup_oddness(void)
 {

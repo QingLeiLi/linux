@@ -47,6 +47,20 @@
  * - RCU 读侧拿到的指针，离开临界区前要转成引用。
  */
 
+/*
+ * 原始英文总览的当前版本解读：struct pid 是共享同一类数字身份的 task 所挂靠的
+ * 后端对象，早期实现把数字散列并用 bitmap page 管理可用空间；原文还强调分配
+ * 近似无锁、最坏扫描 32 个表项和一页、释放 O(1)。当前文件已经改用每个
+ * pid_namespace 的 IDR，并由 pidmap_lock 串行化分配、发布与删除，因此这些
+ * bitmap/lockless/复杂度描述只保留为历史材料，不能当作当前实现事实。
+ *
+ * 当前并发边界分为三层：pidmap_lock 保护 namespace IDR 与 pid_allocated；
+ * tasklist_lock 写侧保护 task 与 pid->tasks[] 的绑定变化；RCU 允许查找者在对象
+ * 从索引/链表摘除后短暂继续访问内存。struct pid 引用计数只保证生命周期，不
+ * 冻结链表内容。PID namespace 的 numbers[] 从最外层 0 到最内层 level 保存同一
+ * 身份的多层数字，因而一个稳定对象可同时回答容器内外的可见 PID。
+ */
+
 #include <linux/mm.h>
 #include <linux/export.h>
 #include <linux/slab.h>
@@ -66,6 +80,13 @@
 #include <net/sock.h>
 #include <uapi/linux/pidfd.h>
 
+/*
+ * init_struct_pid 是 boot task 使用的静态 PID 后端对象，编译期创建且永不走普通
+ * alloc_pid() 分配。count 初始 1 提供永久基础引用；各 PIDTYPE 链表起初为空，
+ * level=0 且 numbers[0]={nr=0, ns=&init_pid_ns} 表示 idle/init_task 的特殊 0 号
+ * 身份。启动代码及 init_task 借用它，静态存储期决定最终生命周期；字段绑定
+ * 发布后仍遵循 tasklist_lock/RCU 规则。
+ */
 struct pid init_struct_pid = {
 	.count		= REFCOUNT_INIT(1),
 	.tasks		= {
@@ -100,6 +121,15 @@ static int pid_max_max = PID_MAX_LIMIT;
  *
  * 学习补充：当前分配核心是 namespace 内的 idr。
  * 这里要理解的思想仍然是“按需扩展、避免低 pid_max 浪费内存”。
+ */
+/*
+ * init_pid_ns 是根 PID namespace 的静态实例：ns 提供 namespacefs 身份，idr
+ * 索引根空间 PID，pid_allocated 带 PIDNS_ADDING 状态位，level=0 表示没有父层，
+ * child_reaper 指向 init_task，user_ns 决定权限映射，pid_max 是运行期分配上限。
+ * CONFIG_SYSCTL && CONFIG_MEMFD_CREATE 时还保存本 namespace 的 memfd noexec
+ * 策略。对象在启动期由 pid_idr_init()/register_pidns_sysctls() 补全，作为所有
+ * 后代 PID namespace 的根长期存活；字段分别由 pidmap_lock、sysctl 生命周期及
+ * 各自子系统协议保护，不能把整个结构视为由一把锁统一冻结。
  */
 struct pid_namespace init_pid_ns = {
 	.ns = NS_COMMON_INIT(init_pid_ns),
@@ -136,6 +166,14 @@ static  __cacheline_aligned_in_smp DEFINE_SPINLOCK(pidmap_lock);
  * 生命周期：引用归零后释放 pidfs 状态、pid slab 对象和 pid namespace
  * 引用。它不负责从 idr 删除数字，也不负责从 task 链表摘除 task。
  */
+/*
+ * 补充说明：主要调用者是持有型查找、pidfd 和失败清理路径；它与 get_pid() 成对，
+ * 位于“索引/关系已处理 → 最后一份身份引用释放”的生命周期末端。函数不要求
+ * tasklist_lock/pidmap_lock，不能假设 @pid 字段静止；路径本身不睡眠，RCU 回调
+ * 也会调用它。最后引用执行 pidfs 非阻塞清理、slab 回收和 put_pid_ns()。局部
+ * @ns 是从最内层 upid 借用的 namespace 指针，在释放 pid slab 前有效；引用未
+ * 归零时除计数外无可观察副作用，归零时 @pid 此后不可再使用。
+ */
 void put_pid(struct pid *pid)
 {
 	struct pid_namespace *ns;
@@ -159,6 +197,12 @@ EXPORT_SYMBOL_GPL(put_pid);
  * 背景：find_pid_ns()/pid_task() 的读者可能只持有 RCU 读锁。
  * free_pid() 从 idr 移除对象后，仍要等 RCU 读者离开才能释放内存。
  */
+/*
+ * 补充说明：本函数只由 call_rcu() 在 RCU callback 上下文调用，不能睡眠。@rhp
+ * 不可为 NULL，且 ownership 已从 free_pid() 转交 RCU；container_of() 取得的是
+ * 嵌入对象，不增加引用。返回无直接值，调用 put_pid() 消耗 free_pid() 保留的
+ * 基础引用；若这是最后一份，pid 内存与 namespace 引用在本回调中结束。
+ */
 static void delayed_put_pid(struct rcu_head *rhp)
 {
 	struct pid *pid = container_of(rhp, struct pid, rcu);
@@ -181,6 +225,15 @@ static void delayed_put_pid(struct rcu_head *rhp)
  *
  * 注意：pid 数字释放不等于 task_struct 释放。
  * task 退出、pid 链表摘除、pid 对象回收是不同层面的生命周期。
+ */
+/*
+ * 补充说明：调用链通常为 detach/change 收集最后绑定 → 释放 tasklist_lock →
+ * free_pid()。@pid 是输入且本函数接管“从所有 namespace 数字索引撤销并最终
+ * put”的责任；调用后调用者不得再依赖该基础引用。局部 @active_ns 是最内层
+ * namespace，@i 逐层遍历，@upid/@ns 是锁内借用指针。函数不能持 tasklist_lock，
+ * 自身不进行调度睡眠；返回无直接值。发布的逆过程是先在 pidmap_lock 下删除
+ * 所有 IDR 槽并更新 pid_allocated，再移除 pidfs 表示，最后 call_rcu() 延迟释放。
+ * wake_up_process() 只通知 namespace reaper，并不转移其 task 引用。
  */
 void free_pid(struct pid *pid)
 {
@@ -242,6 +295,12 @@ void free_pid(struct pid *pid)
  * 背景：fork 错误路径可能同时拿到 PID/TGID/PGID/SID。
  * 用数组集中释放，能让调用者把“解除绑定”和“释放 PID”分开处理。
  */
+/*
+ * 补充说明：@pids 是调用者持有的 PIDTYPE_MAX 元素输入数组，本函数不修改槽位，
+ * 但对每个非 NULL 元素执行 free_pid()，因此消耗对应的释放责任；调用者返回后
+ * 不得再次 free。入口不得持 tasklist_lock，函数不睡眠、无错误返回。@tmp 从高
+ * PIDTYPE 向低类型扫描只是确定批次顺序，当前实现仍逐个取得 pidmap_lock。
+ */
 void free_pids(struct pid **pids)
 {
 	int tmp;
@@ -276,6 +335,21 @@ void free_pids(struct pid **pids)
  * - 指定 TID 是 checkpoint/restore 能力，必须做权限检查。
  * - idr 中先占 NULL，最后再替换成 pid，避免半初始化对象被查到。
  * - 任一层分配失败，都必须回滚已占用的外/内层数字。
+ */
+/*
+ * 补充说明：主要由 copy_process() 在 task 尚未可运行时调用；成功后调用者持有
+ * 新 pid 的初始引用，并继续把它安装到 task/PIDTYPE 关系，失败时没有可见对象
+ * 留给调用者。@ns 是借用输入且不可为 NULL，函数内部 get_pid_ns() 把其生命期
+ * 延长到 pid 最终释放；@arg_set_tid 是可空、只读借用数组，长度以元素个数计，
+ * 不转移 ownership。函数运行在可睡眠进程上下文：锁外 slab/preload/pidfs
+ * 准备可分配内存，pidmap_lock 内只能用 GFP_ATOMIC。
+ *
+ * 返回 ERR_PTR(-EINVAL/-EPERM/-ENOMEM/-EAGAIN/-EEXIST 等当前分支错误) 或带一份
+ * 引用的 struct pid。set_tid/pid_max 是按“最内层到最外层”排列的栈上快照；
+ * @tmp/@upid 只在相应 namespace/数组生命期内借用；@i/@nr 标记当前层与分配号；
+ * @retval 保存统一失败码；@retried_preload 防止 -ENOMEM 无限重试。发布边界是
+ * idr_replace(NULL→pid)，其前错误只回滚预留槽，其后 pidfs 失败必须 free_pid()
+ * 完成公开对象的摘除、RCU 延迟释放和 namespace active 引用配平。
  */
 struct pid *alloc_pid(struct pid_namespace *ns, pid_t *arg_set_tid,
 		      size_t arg_set_tid_size)
@@ -495,6 +569,14 @@ struct pid *alloc_pid(struct pid_namespace *ns, pid_t *arg_set_tid,
 	 * 中文补充：namespace 停止接收新 PID 时，历史 ABI 要返回 ENOMEM。
 	 * 这不完全直观，但用户态已经依赖该行为。
 	 */
+	/*
+	 * 原英文的完整约束：child reaper 已退出、namespace 拒绝新进程时，ENOMEM
+	 * 并非最贴切错误，但它已成为文档化用户 ABI，不能轻易更换。检查不能提前，
+	 * 否则会遮蔽前面更具体的参数/权限/分配错误。即使 copy_process() 也检查，
+	 * 此处仍不可省：多个父 namespace task 并发向死亡 pidns 注入 child 时，其中
+	 * 一个 copy_process() 错误回滚的 free_pid() 可能去唤醒已经释放的
+	 * ns->child_reaper；在 pidmap_lock 下复核关闭状态可封住该竞态。
+	 */
 	retval = -ENOMEM;
 	if (unlikely(!(ns->pid_allocated & PIDNS_ADDING)))
 		goto out_free;
@@ -547,6 +629,12 @@ out_abort:
  * 背景：namespace 退出时清除 PIDNS_ADDING。
  * 后续 alloc_pid() 会按历史 ABI 失败为 -ENOMEM。
  */
+/*
+ * 补充说明：PID namespace teardown 在阻止新进程创建时调用。@ns 是不可空的
+ * 输入/输出借用对象，调用者保证其存活；本函数不取得引用、不睡眠、无返回。
+ * pidmap_lock 与 alloc_pid()/free_pid() 的状态读写竞争，清除 PIDNS_ADDING 是
+ * 不可逆的关闭发布点，但不会移除已经分配的 PID，后续由退出路径逐个回收。
+ */
 void disable_pid_allocation(struct pid_namespace *ns)
 {
 	spin_lock(&pidmap_lock);
@@ -564,6 +652,12 @@ void disable_pid_allocation(struct pid_namespace *ns)
  * 注意：调用者必须持有 tasklist_lock 或 rcu_read_lock()。
  * 若要把结果带出临界区，必须 get_pid()。
  */
+/*
+ * 补充说明：主要调用者是 find_vpid()、proc 遍历和按 namespace 的 task 查找。
+ * @nr 是 @ns 层内的正 PID 数字，@ns 为不可空借用且调用期间必须存活。函数不
+ * 睡眠、无副作用；IDR 读由外层 RCU/tasklist_lock 提供生命周期与关系保护。
+ * NULL 同时表示数字不存在或分配器仍以 NULL 预留尚未发布的槽位。
+ */
 struct pid *find_pid_ns(int nr, struct pid_namespace *ns)
 {
 	return idr_find(&ns->idr, nr);
@@ -575,6 +669,11 @@ EXPORT_SYMBOL_GPL(find_pid_ns);
  * @nr: 入参，当前 namespace 可见的 PID 数字。
  *
  * 返回值：同 find_pid_ns()，不带引用。
+ */
+/*
+ * 补充说明：current 决定查找视图，task_active_pid_ns(current) 返回借用 namespace；
+ * 调用者仍必须持 RCU/tasklist_lock，并在跨临界区使用前 get_pid()。函数不睡眠、
+ * 不修改状态；找不到或尚未发布返回 NULL，成功后通常继续 pid_task()/get_pid()。
  */
 struct pid *find_vpid(int nr)
 {
@@ -592,6 +691,13 @@ EXPORT_SYMBOL_GPL(find_vpid);
  * 背景：线程自己的 PID 在 task->thread_pid；
  * 线程组/进程组/会话这类共享身份在 signal->pids[]。
  */
+/*
+ * 补充说明：这是内部字段分派器，主要供 attach/change/get_task_pid 等关系路径
+ * 使用。@task 是不可空借用；@type 必须落在有效 enum pid_type 范围，函数不做
+ * 边界检查。返回的是可写“指针槽地址”，不是持有的 struct pid 引用；其有效期
+ * 受 task/signal 生命周期及 tasklist_lock/RCU 规则限制。函数不睡眠、无直接
+ * 状态副作用，调用者随后才决定读取或发布新指针。
+ */
 static struct pid **task_pid_ptr(struct task_struct *task, enum pid_type type)
 {
 	return (type == PIDTYPE_PID) ?
@@ -604,6 +710,13 @@ static struct pid **task_pid_ptr(struct task_struct *task, enum pid_type type)
  *
  * 中文补充：这是 PID 绑定关系的写侧规则。
  * pid->tasks[] 是 RCU 链表；写者用 tasklist_lock 串行化修改。
+ */
+/*
+ * 补充说明：copy_process()/关系切换路径在 task 的 pid 指针已设置后调用本函数。
+ * @task 是输入/输出借用且不可空，@type 是有效 PIDTYPE；二者 ownership 不变。
+ * 入口必须写持 tasklist_lock，不能睡眠。返回无直接值；hlist_add_head_rcu() 是
+ * 关系发布点，使 RCU 读者可从 pid->tasks[type] 找到 task。局部 @pid 只是从 task
+ * 槽读取的借用指针，调用者必须保证非 NULL及对象生命周期。
  */
 void attach_pid(struct task_struct *task, enum pid_type type)
 {
@@ -627,6 +740,14 @@ void attach_pid(struct task_struct *task, enum pid_type type)
  *
  * 注意：旧 pid 只有在所有 PIDTYPE 链表都空时才可释放。
  * 一个 struct pid 可能同时服务 TGID/PGID/SID 等身份。
+ */
+/*
+ * 补充说明：@pids 是调用者提供的 PIDTYPE_MAX 输出数组，入口相应槽应为 NULL；
+ * 当旧 pid 的所有类型链表都空时，本函数把释放责任写入 pids[type]，真正
+ * free_pid() 必须在释放 tasklist_lock 后执行。@new 是可空借用的新 pid，本函数
+ * 只写 task 槽，不把 task 挂入新链表（由 change_pid() 后续 attach）；因此这是
+ * 一个内部两阶段关系变更。入口写持 tasklist_lock、不可睡眠、无直接返回。
+ * @pid_ptr/@pid 是旧槽地址和旧对象借用，@tmp 扫描所有类型验证是否仍被使用。
  */
 static void __change_pid(struct pid **pids, struct task_struct *task,
 			 enum pid_type type, struct pid *new)
@@ -658,6 +779,12 @@ static void __change_pid(struct pid **pids, struct task_struct *task,
  * @task: 入参/出参，目标 task。
  * @type: 入参，PID 类型。
  */
+/*
+ * 补充说明：调用者写持 tasklist_lock，@pids 为输出数组，@task 为输入/输出借用，
+ * @type 为有效类型。函数不睡眠、无直接返回；它从旧 RCU 链表摘除 task、把 task
+ * 槽清为 NULL，并在旧 pid 完全无绑定时向 @pids 转移后续释放责任。返回后通常
+ * 先完成其他关系修改并解锁，再 free_pids()。
+ */
 void detach_pid(struct pid **pids, struct task_struct *task, enum pid_type type)
 {
 	__change_pid(pids, task, type, NULL);
@@ -669,6 +796,12 @@ void detach_pid(struct pid **pids, struct task_struct *task, enum pid_type type)
  * @task: 入参/出参，目标 task。
  * @type: 入参，PID 类型。
  * @pid: 入参，新 struct pid。
+ */
+/*
+ * 补充说明：@pid 是不可空借用的新身份对象，其基础引用由更高层关系生命周期
+ * 管理；本函数不单独 get_pid()。入口写持 tasklist_lock、不可睡眠、无返回。
+ * 先 __change_pid() 摘除旧关系并写新槽，再 attach_pid() 发布新反向链表；锁使
+ * RCU 读者只看到协议允许的过渡。旧 pid 若失去最后绑定，其释放责任写入 @pids。
  */
 void change_pid(struct pid **pids, struct task_struct *task, enum pid_type type,
 		struct pid *pid)
@@ -684,6 +817,14 @@ void change_pid(struct pid **pids, struct task_struct *task, enum pid_type type,
  *
  * 背景：de_thread() 等路径会转移线程组 leader。
  * 必须同时交换 hlist、thread_pid 指针和 task->pid 缓存。
+ */
+/*
+ * 补充说明：主要由 exec 的 de_thread() 在非 leader 接管线程组身份时调用。
+ * @left/@right 是不可空的输入/输出借用 task，入口写持 tasklist_lock，二者的
+ * thread_pid 必须有效且 PIDTYPE_PID 链表符合单 task 不变量。函数不睡眠、无
+ * 返回、不改变引用计数；局部 pid1/pid2/head1/head2 都是锁内借用。链表头交换、
+ * RCU 指针发布和数值缓存更新必须作为同一写锁事务，避免查找关系与 task->pid
+ * 不一致；返回后调用者继续完成 leader/线程组的其余状态转换。
  */
 void exchange_tids(struct task_struct *left, struct task_struct *right)
 {
@@ -714,6 +855,13 @@ void exchange_tids(struct task_struct *left, struct task_struct *right)
  * 中文补充：这是共享 PID 身份转移的快速路径。
  * 禁止 PIDTYPE_PID，因为线程 PID 还涉及 task->pid 缓存和 thread_pid。
  */
+/*
+ * 补充说明：这是 exec/任务替换场景中“新 task 接管旧 task 的共享身份”路径。
+ * @old/@new 为不可空输入/输出借用 task，@type 必须是 TGID/PGID/SID 等非 PID
+ * 类型。入口写持 tasklist_lock、不可睡眠、无返回；hlist_replace_rcu() 原地替换
+ * 节点，保持链表位置和 struct pid 引用关系不变，比 detach+attach 少一次拆装。
+ * 调用者负责事先让 new 的对应 pid 槽指向同一对象，并继续处理旧 task 生命周期。
+ */
 void transfer_pid(struct task_struct *old, struct task_struct *new,
 			   enum pid_type type)
 {
@@ -731,6 +879,13 @@ void transfer_pid(struct task_struct *old, struct task_struct *new,
  *
  * 注意：调用者必须在 RCU 或 tasklist_lock 保护下使用返回值。
  * TGID/PGID/SID 可能有多个 task，本函数只返回链表第一个。
+ */
+/*
+ * 补充说明：调用链通常是持 RCU/tasklist_lock 的查找者 → pid_task() → 可选的
+ * get_task_struct()。@pid 可空且为借用，@type 必须有效。函数不睡眠、不修改
+ * 链表；局部 @first 是 RCU 链节点借用，@result 只在外层保护范围内有效。返回
+ * NULL 表示无对象/空链，成功不承诺具体成员在锁外继续存活，也不保证共享类型
+ * 的“第一个”具有稳定顺序语义。
  */
 struct task_struct *pid_task(struct pid *pid, enum pid_type type)
 {
@@ -752,6 +907,13 @@ EXPORT_SYMBOL(pid_task);
  *
  * 中文补充：返回 task 不带引用，只能在 RCU 临界区内安全使用。
  */
+/*
+ * 补充说明：英文入口要求是硬契约。@nr 是 @ns 中的 PID 数字，@ns 为不可空借用；
+ * 调用者已持 rcu_read_lock()，函数用 lockdep 告警验证但不会替调用者加锁。它不
+ * 睡眠、无副作用，返回 PIDTYPE_PID 链表中的借用 task 或 NULL；离开 RCU 前若
+ * 需长期使用必须 get_task_struct()。通常由 find_task_by_vpid() 或 namespace
+ * 定向查找继续消费。
+ */
 struct task_struct *find_task_by_pid_ns(pid_t nr, struct pid_namespace *ns)
 {
 	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
@@ -765,6 +927,11 @@ struct task_struct *find_task_by_pid_ns(pid_t nr, struct pid_namespace *ns)
  *
  * 返回值：task_struct * 或 NULL；不带引用。
  */
+/*
+ * 补充说明：@vnr 是 current active PID namespace 中的数字，调用者必须已持 RCU
+ * 读锁；函数不自行验证、不睡眠、不修改状态。返回借用 task 只在临界区内有效，
+ * 下一步若要跨越 task 退出应改用 find_get_task_by_vpid() 或显式取引用。
+ */
 struct task_struct *find_task_by_vpid(pid_t vnr)
 {
 	return find_task_by_pid_ns(vnr, task_active_pid_ns(current));
@@ -776,6 +943,13 @@ struct task_struct *find_task_by_vpid(pid_t vnr)
  *
  * 返回值：成功返回带引用的 task；找不到返回 NULL。
  * 调用者负责 put_task_struct()。
+ */
+/*
+ * 补充说明：@nr 是 current namespace 中的输入 PID 数字。函数可在不持 RCU 的
+ * 普通调用点使用，自行建立读侧临界区且不睡眠；成功在解锁前 get_task_struct()
+ * 把借用指针转换为持有引用，失败返回 NULL。局部 @task 在 RCU 内先借用、成功后
+ * 由返回值向调用者转移一份释放责任；数字复用只影响查找时刻，不会改写已取得
+ * task 引用指向的对象。
  */
 struct task_struct *find_get_task_by_vpid(pid_t nr)
 {
@@ -799,6 +973,13 @@ struct task_struct *find_get_task_by_vpid(pid_t nr)
  *
  * 注意：这只 pin struct pid，不保证 task 仍存活。
  */
+/*
+ * 补充说明：@task 是调用期间必须存活的不可空借用对象，@type 为有效 PIDTYPE。
+ * 函数不睡眠，自行用 RCU 稳定 task 槽，并以 get_pid() 把可能为空的借用转换成
+ * 持有引用。局部 @pid 成功返回后 ownership 交给调用者并须 put_pid()；NULL
+ * 表示 task 当前没有该类身份。引用只 pin 身份后端，关系链和 task 生命周期仍
+ * 可变化，调用者下一步通常用 pid_nr_ns() 或 pidfd 相关操作。
+ */
 struct pid *get_task_pid(struct task_struct *task, enum pid_type type)
 {
 	struct pid *pid;
@@ -815,6 +996,12 @@ EXPORT_SYMBOL_GPL(get_task_pid);
  * @type: 入参，PID 类型。
  *
  * 返回值：带引用 task 或 NULL。调用者负责 put_task_struct()。
+ */
+/*
+ * 补充说明：@pid 是调用期间存活的可空借用（NULL 会得到 NULL），@type 为有效
+ * PIDTYPE。函数不睡眠，自行持 RCU，先借用 pid_task() 结果再在临界区内增加
+ * task 引用。成功把一份 task ownership 交给调用者；若链表空/目标已摘除返回
+ * NULL。共享类型只选择链表第一个成员，不能把它当作枚举全部任务的接口。
  */
 struct task_struct *get_pid_task(struct pid *pid, enum pid_type type)
 {
@@ -833,6 +1020,12 @@ EXPORT_SYMBOL_GPL(get_pid_task);
  * @nr: 入参，虚拟 PID。
  *
  * 返回值：带引用 struct pid 或 NULL。调用者负责 put_pid()。
+ */
+/*
+ * 补充说明：@nr 是 current active namespace 的瞬时 PID 数字。函数不睡眠，
+ * 自行持 RCU 并在临界区内 get_pid()，成功把一份 struct pid 引用转移给调用者；
+ * 查找不到/预留未发布返回 NULL。局部 @pid 解锁后仅因这份引用而存活，但它与
+ * task 的绑定仍可消失；通常用于 pidfd_open、sysctl 转换等稳定身份入口。
  */
 struct pid *find_get_pid(pid_t nr)
 {
@@ -855,6 +1048,12 @@ EXPORT_SYMBOL_GPL(find_get_pid);
  *
  * 注意：0 表示无可见 PID，不是稳定进程身份。
  */
+/*
+ * 补充说明：@pid/@ns 都是可空借用输入，调用者负责保证非空对象的生命周期；
+ * 函数不加引用、不睡眠、无副作用。@ns 只能看到自身或后代 pid 的对应层：先按
+ * level 定位 @upid，再验证 upid->ns 身份相同，防止同层不同 namespace 混淆。
+ * 局部 @nr 初值 0 是不可见哨兵。返回数字可立即复用，跨时间身份应持 struct pid。
+ */
 pid_t pid_nr_ns(struct pid *pid, struct pid_namespace *ns)
 {
 	struct upid *upid;
@@ -875,6 +1074,11 @@ EXPORT_SYMBOL_GPL(pid_nr_ns);
  *
  * 返回值：当前 namespace 可见 PID；不可见返回 0。
  */
+/*
+ * 补充说明：@pid 是可空借用输入，current 提供 namespace 视图；调用者保证对象
+ * 存活。函数不睡眠、无副作用，直接包装 pid_nr_ns()。返回值是瞬时 pid_t，常
+ * 用于向当前进程展示/proc/sysctl，不附带引用或长期唯一性。
+ */
 pid_t pid_vnr(struct pid *pid)
 {
 	return pid_nr_ns(pid, task_active_pid_ns(current));
@@ -890,6 +1094,12 @@ EXPORT_SYMBOL_GPL(pid_vnr);
  * 返回值：数字快照；不可见返回 0。
  *
  * 注意：返回的是可复用数字，不是长期稳定引用。
+ */
+/*
+ * 补充说明：@task 是不可空借用，@type 有效；@ns 可空，NULL 明确选择 current
+ * active namespace，而不是 task 自己的视图。函数不睡眠，自行用 RCU 稳定 pid
+ * 槽；局部 @nr 是返回快照。成功/不可见均不取得引用或改状态，返回后下一步
+ * 通常仅做展示、比较或 ABI 输出，不能保存作永久句柄。
  */
 pid_t __task_pid_nr_ns(struct task_struct *task, enum pid_type type,
 			struct pid_namespace *ns)
@@ -912,6 +1122,12 @@ EXPORT_SYMBOL(__task_pid_nr_ns);
  *
  * 返回值：pid namespace；若 task 没有 pid，可能返回 NULL。
  */
+/*
+ * 补充说明：@tsk 是调用期间存活的不可空借用 task；函数不睡眠、无副作用，
+ * 通过 task_pid(tsk) 的线程 PID 后端取得最内层 namespace 借用指针，不增加
+ * namespace 引用。调用者若跨越 task/pid 生命周期保存结果必须另取 namespace
+ * 引用；current 的虚拟 PID 查找以此 helper 确定视图。
+ */
 struct pid_namespace *task_active_pid_ns(struct task_struct *tsk)
 {
 	return ns_of_pid(task_pid(tsk));
@@ -926,6 +1142,13 @@ EXPORT_SYMBOL_GPL(task_active_pid_ns);
  * 中文补充：/proc 遍历需要“从 nr 开始找下一个 PID”。
  * 这和精确查找不同，idr_get_next() 提供游标式查找。
  * 返回值不带引用，读侧仍需 RCU 或 tasklist_lock。
+ */
+/*
+ * 补充说明：英文定义的精确语义是返回第一个数字大于等于 @nr 的 pid；若 @nr
+ * 本身存在则与 find_pid_ns() 相同。@nr 是按值输入，idr_get_next() 对其内部
+ * 游标更新不会反馈调用者；@ns 是不可空借用。函数不睡眠、无副作用，返回的
+ * struct pid 不带引用，只能在 RCU/tasklist_lock 保护下使用；主要供 /proc
+ * 顺序枚举，NULL 表示从起点到当前 IDR 末尾都没有已发布对象。
  */
 struct pid *find_ge_pid(int nr, struct pid_namespace *ns)
 {
@@ -942,6 +1165,13 @@ EXPORT_SYMBOL_GPL(find_ge_pid);
  *
  * 背景：pidfd 的优点是稳定引用进程身份，避免 pid_t 复用问题。
  * 但打开 fd 时仍要验证它确实是 pidfd。
+ */
+/*
+ * 补充说明：@fd 是当前进程 fdtable 的无符号描述符编号；@flags 是不可空输出
+ * 指针，只有成功时写入底层 file->f_flags，失败保持未指定。CLASS(fd, f) 在
+ * 作用域退出时自动 fdput()，局部 @pid 从 file 借用后通过 get_pid() 转为持有。
+ * 函数可执行 fd 查找但不睡眠；返回 -EBADF 表示槽无 file，pidfd_pid() 还可返回
+ * 非 pidfd 的错误指针。成功把一份 pid 引用转移给调用者，须 put_pid()。
  */
 struct pid *pidfd_get_pid(unsigned int fd, unsigned int *flags)
 {
@@ -974,6 +1204,14 @@ struct pid *pidfd_get_pid(unsigned int fd, unsigned int *flags)
  * 中文补充：成功返回带引用 task，调用者负责 put_task_struct()。
  * pidfd 稳定引用 struct pid，但目标 task 可能已经退出。
  * 所以这里还需要 get_pid_task()，失败时返回 -ESRCH。
+ */
+/*
+ * 补充说明：@pidfd 可为普通 fd、PIDFD_SELF_THREAD 或
+ * PIDFD_SELF_THREAD_GROUP；@flags 是不可空输出，仅成功写入，self 特殊值写 0。
+ * 函数不要求外层 RCU，当前 helper 不睡眠。局部 @f_flags 保存普通 pidfd file
+ * flags，@type 决定线程/线程组语义，@pid 在各分支取得持有引用并在转换后统一
+ * put。成功返回带引用 task，调用者负责 put_task_struct()；错误指针包括 fd/
+ * pidfd 验证错误和目标已无 task 的 -ESRCH。
  */
 struct task_struct *pidfd_get_task(int pidfd, unsigned int *flags)
 {
@@ -1033,6 +1271,13 @@ struct task_struct *pidfd_get_task(int pidfd, unsigned int *flags)
  * 注意：一旦 fd_install() 完成，用户态就能看到该 fd。
  * 因此调用者必须保证 fd table 已经 unshare，避免 fork 时泄漏给子进程。
  */
+/*
+ * 补充说明：@pid 是调用期间存活的借用身份对象，@flags 只允许 pidfd_prepare()
+ * 支持的位；本函数不消费调用者引用。运行在可睡眠进程上下文，因为 prepare
+ * 可分配 file/fd。局部 @pidfd 是预留描述符或负 errno，@pidfd_file 在成功时
+ * 由 prepare 交给本函数；fd_install() 是不可失败的发布边界并把 file ownership
+ * 转给 fdtable。prepare 失败返回负 errno 且没有待安装 file，成功返回 cloexec fd。
+ */
 static int pidfd_create(struct pid *pid, unsigned int flags)
 {
 	int pidfd;
@@ -1065,6 +1310,15 @@ static int pidfd_create(struct pid *pid, unsigned int flags)
  * 优点：后续操作使用 fd，不再受 PID 数字复用影响。
  * 限制：打开瞬间仍按数字查找，目标当时必须存在。
  */
+/*
+ * 补充说明：系统调用处于可睡眠进程上下文。@pid 是 current namespace 中的正
+ * PID 数字；@flags 仅允许 PIDFD_NONBLOCK/PIDFD_THREAD，未知位返回 -EINVAL。
+ * 局部 @p 由 find_get_pid() 持有，保证 pidfd_create() 期间身份对象不释放，
+ * 无论成功失败都 put_pid()；@fd 保存创建结果。返回新 cloexec fd，或
+ * -EINVAL/-ESRCH 及 prepare 路径错误；成功后 fdtable 拥有 pidfd file。
+ * 原英文还规定未设置 PIDFD_THREAD 时目标必须是线程组 leader，该验证由下游
+ * pidfd_prepare()/pidfd 语义完成，不应误以为本 wrapper 的数字查找已完成全部检查。
+ */
 SYSCALL_DEFINE2(pidfd_open, pid_t, pid, unsigned int, flags)
 {
 	int fd;
@@ -1095,6 +1349,11 @@ SYSCALL_DEFINE2(pidfd_open, pid_t, pid, unsigned int, flags)
  *
  * 返回值：current active PID namespace 的 ctl_table_set。
  */
+/*
+ * 补充说明：sysctl 核心通过 pid_table_root.lookup 调用本函数；@root 是借用输入，
+ * 当前实现无需读取。函数不睡眠、无副作用，返回 current active pidns 内嵌 set
+ * 的借用指针，不增加 namespace 引用；调用框架负责在访问期间稳定 current/ns。
+ */
 static struct ctl_table_set *pid_table_root_lookup(struct ctl_table_root *root)
 {
 	return &task_active_pid_ns(current)->set;
@@ -1105,6 +1364,11 @@ static struct ctl_table_set *pid_table_root_lookup(struct ctl_table_root *root)
  * @set: 入参，待判断 set。
  *
  * 返回值：可见返回非 0，否则返回 0。
+ */
+/*
+ * 补充说明：@set 是 sysctl 核心借用的候选集合，可为空与否由框架契约保证；函数
+ * 只做地址身份比较，不睡眠、不取引用。true 表示候选正是 current active pidns
+ * 的集合，false 阻止该 namespace 视图看到其他 pidns 的表项。
  */
 static int set_is_seen(struct ctl_table_set *set)
 {
@@ -1119,6 +1383,13 @@ static int set_is_seen(struct ctl_table_set *set)
  * 返回值：对 current 生效的 mode。
  *
  * 背景：容器内 root 要按 pidns->user_ns 的 uid/gid 映射判断权限。
+ */
+/*
+ * 补充说明：sysctl inode 权限查询调用本回调。@head/@table 均为不可空只读借用，
+ * 分别确定所属 pidns 和原始 mode。函数可执行凭据/组查询但不睡眠、不改表项；
+ * 局部 @pidns 由 container_of(head->set) 借用，@mode 先复制再根据 user namespace
+ * 中 CAP_SYS_ADMIN、映射 root uid、root gid 或 other 三类选择一组三位权限，最后
+ * 复制到 u/g/o 位返回。无错误码、无 ownership 转移。
  */
 static int pid_table_root_permissions(struct ctl_table_header *head,
 				      const struct ctl_table *table)
@@ -1144,6 +1415,12 @@ static int pid_table_root_permissions(struct ctl_table_header *head,
  * @uid: 出参，namespace root uid 有效时写入。
  * @gid: 出参，namespace root gid 有效时写入。
  */
+/*
+ * 补充说明：@head 是不可空借用 sysctl header；@uid/@gid 是不可空输入/输出槽，
+ * 仅当 pidns user namespace 的 0 号 ID 能映射到宿主 kuid/kgid 时覆盖，否则保留
+ * 调用者默认值。函数不睡眠、无直接返回、不取得 namespace 引用。局部 pidns
+ * 从内嵌 set 恢复，两个 ns_root_* 只是本次映射快照。
+ */
 static void pid_table_root_set_ownership(struct ctl_table_header *head,
 					 kuid_t *uid, kgid_t *gid)
 {
@@ -1162,6 +1439,11 @@ static void pid_table_root_set_ownership(struct ctl_table_header *head,
 }
 
 /* PID namespace sysctl 根，集中定义 lookup、权限和属主映射策略。 */
+/*
+ * pid_table_root 是 CONFIG_SYSCTL 下的静态策略对象，由 sysctl 核心长期借用且不
+ * 动态释放；lookup 按 current 选择 set，permissions/set_ownership 把 userns
+ * 语义投影到 proc sysctl inode。字段均为只读回调表，初始化后不需要额外锁。
+ */
 static struct ctl_table_root pid_table_root = {
 	.lookup		= pid_table_root_lookup,
 	.permissions	= pid_table_root_permissions,
@@ -1180,6 +1462,14 @@ static struct ctl_table_root pid_table_root = {
  *
  * 背景：cad_pid 内部保存 struct pid，sysctl 展示 pid_t。
  * 读写时必须在二者之间转换，避免长期保存裸 PID。
+ */
+/*
+ * 补充说明：@table 为只读借用表项；@write 选择方向；@buffer 是用户数据窗口；
+ * @lenp/@ppos 为不可空输入/输出，分别携带剩余长度和文件偏移，ownership 均不变。
+ * 函数在 sysctl 进程上下文中可睡眠/访问用户内存。局部 @tmp_table 是栈上表项
+ * 副本，data 改指向 @tmp_pid，避免通用 handler 直接接触 struct pid；@new_pid
+ * 写路径成功后持有引用，经 xchg 原子转移给全局 cad_pid，旧引用由 put_pid()
+ * 释放。返回 0、proc_dointvec() 错误或数字找不到的 -ESRCH；读路径不改全局状态。
  */
 static int proc_do_cad_pid(const struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos)
@@ -1207,6 +1497,13 @@ static int proc_do_cad_pid(const struct ctl_table *table, int write, void *buffe
 	return 0;
 }
 
+/*
+ * pid_table 是每个 PID namespace sysctl 表的只读模板。首项 pid_max 用 init_pid_ns
+ * 字段占位，注册其他 pidns 时 kmemdup() 后把 data 重定向到对应 pidns->pid_max；
+ * extra1/extra2 借用全局上下限。CONFIG_PROC_SYSCTL 时第二项 cad_pid 通过自定义
+ * handler 在 pid_t 与带引用 struct pid 之间转换。模板静态存活、不直接注销；
+ * 每 namespace 副本的 ownership 由 register/unregister 成对管理。
+ */
 static const struct ctl_table pid_table[] = {
 	{
 		/* pid_max 是每个 PID namespace 的自动分配上限。 */
@@ -1238,6 +1535,14 @@ static const struct ctl_table pid_table[] = {
  *
  * 背景：每个 PID namespace 需要独立 pid_max。
  * 因此这里复制 pid_table，再把 data 指向 pidns->pid_max。
+ */
+/*
+ * 补充说明：@pidns 是不可空输入/输出借用对象，调用者保证 namespace 生命周期。
+ * CONFIG_SYSCTL=y 时函数在可睡眠进程/创建上下文中分配表副本并注册；局部 @tbl
+ * 成功后 ownership 转给 sysctl registration，并由 pidns->sysctls 间接保存；若
+ * 实际注册失败，本函数 kfree 表副本并 retire set，kmemdup 失败则直接返回。
+ * 成功还按 possible CPU 数抬高 pid_max。返回 0 或 -ENOMEM；CONFIG_SYSCTL=n 时
+ * 参数无可观察修改且恒为 0。销毁时必须 unregister_pidns_sysctls()。
  */
 int register_pidns_sysctls(struct pid_namespace *pidns)
 {
@@ -1276,6 +1581,12 @@ int register_pidns_sysctls(struct pid_namespace *pidns)
  *
  * 注意：ctl_table 是 register 时 kmemdup() 的副本，必须释放。
  */
+/*
+ * 补充说明：@pidns 是已成功注册 sysctl 的不可空输入/输出借用对象。函数运行在
+ * 可睡眠 teardown 上下文，无直接返回；CONFIG_SYSCTL=y 时局部 @tbl 从 header
+ * 借用注册参数，先注销可见表、退休 set，最后释放副本，调用后 sysctls 指针不应
+ * 再被使用。CONFIG_SYSCTL=n 时为空操作。调用者仍拥有 pidns 本体。
+ */
 void unregister_pidns_sysctls(struct pid_namespace *pidns)
 {
 #ifdef CONFIG_SYSCTL
@@ -1293,9 +1604,17 @@ void unregister_pidns_sysctls(struct pid_namespace *pidns)
  *
  * 返回值：无。只在启动期执行。
  */
+/*
+ * 补充说明：入参无；由内核早期初始化在并发 fork 发生前调用，可执行 slab 创建，
+ * 但失败由 SLAB_PANIC 终止启动而非返回 errno。函数无直接返回；编译期断言验证
+ * PIDNS_ADDING 状态位不会与合法 pid_max 冲突，随后按 CPU 数确定默认/最小上限，
+ * 初始化根 IDR，并创建只容纳一层 numbers[] 的根 pid cache。对 init_pid_ns、
+ * pid_max_min 的写入是启动期一次性发布，后续分配/sysctl 路径开始读取。
+ */
 void __init pid_idr_init(void)
 {
 	/* Verify no one has done anything silly: */
+	/* 英文说明：用编译期检查阻止不合理的常量布局进入可运行内核。 */
 	/*
 	 * 中文补充：PID_MAX_LIMIT 不能碰到 PIDNS_ADDING 哨兵范围。
 	 * 否则普通计数和 namespace 状态位会混淆。
@@ -1303,6 +1622,7 @@ void __init pid_idr_init(void)
 	BUILD_BUG_ON(PID_MAX_LIMIT >= PIDNS_ADDING);
 
 	/* bump default and minimum pid_max based on number of cpus */
+	/* 英文说明：依据 CPU 数量提高默认及最小 pid_max，降低并发系统数字回绕。 */
 	/*
 	 * 中文补充：CPU 越多，fork/exit 并发越高。
 	 * 提高 pid_max 可以降低 PID 数字快速回绕概率。
@@ -1329,10 +1649,17 @@ void __init pid_idr_init(void)
  *
  * 返回值：0。
  */
+/*
+ * 补充说明：无参数；由 subsys_initcall 在 sysctl 核心的 "kernel" 目录已建立后
+ * 调用，允许注册过程分配内存。CONFIG_SYSCTL=y 时失败被 BUG_ON 视为启动期不可
+ * 恢复错误；关闭时无副作用。返回恒为 0，成功后 init_pid_ns 持有注册表直到
+ * 系统生命周期结束。subsys_initcall 宏把函数地址发布到对应 init section。
+ */
 static __init int pid_namespace_sysctl_init(void)
 {
 #ifdef CONFIG_SYSCTL
 	/* "kernel" directory will have already been initialized. */
+	/* 英文说明：父目录已由 sysctl 更早初始化，本函数只添加 PID 叶子项。 */
 	/* 中文补充：这里只注册 kernel/ 下的 PID 相关叶子表项。 */
 	BUG_ON(register_pidns_sysctls(&init_pid_ns));
 #endif
@@ -1352,6 +1679,14 @@ subsys_initcall(pid_namespace_sysctl_init);
  *
  * 注意：目标任务退出时，files 可能已经释放。
  * 某些 EBADF 会被修正为 ESRCH，以表达“目标任务正在退出”。
+ */
+/*
+ * 补充说明：@task 是已由调用者持有引用的不可空借用目标，@fd 是其 fdtable 中的
+ * 非负编号。函数处于可睡眠进程上下文，down_read_killable() 可因信号返回错误；
+ * exec_update_lock 读侧把 ptrace 权限检查、PF_EXITING 检查和 fget_task() 与 exec
+ * 凭据/文件表更新串行化。局部 @file 成功时带一份引用并把 fput 责任转给调用者，
+ * @ret 保存加锁错误。返回 ERR_PTR(-ERESTARTSYS/-EPERM/-ESRCH/-EBADF 等) 或 file。
+ * 解锁后再次观察 PF_EXITING 只用于把“files 已释放”的空结果修正为 -ESRCH。
  */
 static struct file *__pidfd_fget(struct task_struct *task, int fd)
 {
@@ -1390,6 +1725,12 @@ static struct file *__pidfd_fget(struct task_struct *task, int fd)
 		 * 用户更需要知道目标任务消失，
 		 * 而不是误以为只是目标 fd 编号不存在。
 		 */
+		/*
+		 * 原英文列出退出竞态的三个时刻：exit_signals() 前和 exit_files() 取得
+		 * task_lock 前仍可得到真实 fd；exit_files() 解锁后 files=NULL 且已设置
+		 * PF_EXITING。第三种底层看似 EBADF，实质是 task 正在退出并已释放 files，
+		 * 所以改报 ESRCH；只有非退出任务的空槽才保留 EBADF。
+		 */
 		if (task->flags & PF_EXITING)
 			file = ERR_PTR(-ESRCH);
 		else
@@ -1405,6 +1746,14 @@ static struct file *__pidfd_fget(struct task_struct *task, int fd)
  * @fd: 入参，目标 fd 编号。
  *
  * 返回值：成功返回当前进程中新安装的 cloexec fd；失败返回负 errno。
+ */
+/*
+ * 补充说明：@pid 是调用期间存活的借用身份，@fd 是目标 task 的描述符编号。
+ * 函数在可睡眠进程上下文运行：先 get_pid_task(PIDTYPE_PID) 取得 task 引用，交给
+ * __pidfd_fget() 取得 file 引用，再及时 put task；receive_fd() 可能分配当前
+ * fd 并在成功时向 fdtable 发布同一 file，随后本地 fput() 配平。局部 @ret 保存
+ * 新 fd/errno。返回 -ESRCH、权限/目标 fd 错误、分配错误或 cloexec 新 fd；成功
+ * 不影响目标进程原 fd 和 file ownership。
  */
 static int pidfd_getfd(struct pid *pid, int fd)
 {
@@ -1450,12 +1799,21 @@ static int pidfd_getfd(struct pid *pid, int fd)
  * 优点：目标由 pidfd 稳定定位，不受 pid_t 复用影响。
  * 风险：能力很强，所以必须经过 pidfd 验证和 ptrace 权限检查。
  */
+/*
+ * 补充说明：@pidfd 是 current fdtable 中的 pidfd，@fd 是目标进程 fd 编号，
+ * @flags 当前保留且必须为 0。系统调用可睡眠。CLASS(fd, f) 对 pidfd file 建立
+ * scope-bound 借用并在退出时自动 fdput；局部 @pid 由 pidfd file 借用，file
+ * 引用保证调用 pidfd_getfd() 期间它有效，无需额外 get_pid。成功返回当前进程
+ * 新 cloexec fd；失败返回 -EINVAL/-EBADF、非 pidfd 错误、-ESRCH/-EPERM 或 fd
+ * 复制错误。英文强调目标进程本身不受复制影响，权限使用 ptrace real creds。
+ */
 SYSCALL_DEFINE3(pidfd_getfd, int, pidfd, int, fd,
 		unsigned int, flags)
 {
 	struct pid *pid;
 
 	/* flags is currently unused - make sure it's unset */
+	/* 英文说明：flags 尚未使用，必须验证为 0，而不是静默忽略未知未来语义。 */
 	/* 中文补充：保留 flags 必须为 0，防止旧内核忽略未来语义。 */
 	if (flags)
 		return -EINVAL;

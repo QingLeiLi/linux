@@ -4207,11 +4207,31 @@ struct device *device_find_child(struct device *parent, const void *data,
 }
 EXPORT_SYMBOL_GPL(device_find_child);
 
+/*
+ * devices_init() - 建立设备模型最基础的 sysfs 根对象和异步链接工作队列。
+ *
+ * 【宏观位置】driver_init() 在 buses_init()/classes_init() 之前调用；后续所有
+ * device_add()、system 子系统和 /sys/dev 索引都依赖这里发布的父对象。
+ * 入参：无；早期进程上下文，可睡眠，入口不持锁。
+ *
+ * 【阶段与状态】
+ * 1. devices_kset 发布 /sys/devices，并安装 device_uevent_ops。
+ * 2. dev_kobj 以及 block/char 子对象发布 /sys/dev/{block,char} 反向索引根。
+ * 3. device_link_wq 承接设备依赖链接的异步工作。
+ * 每一步成功后当前函数都持有相应全局对象；任何后续失败都按创建逆序 put/
+ * unregister，避免留下可见但不完整的层次。
+ *
+ * 返回：0 表示上述对象全部可用；-ENOMEM 覆盖任一分配/注册失败，失败出口已
+ * 撤销本次取得的资源。driver_init() 虽不上传错误，但后续核心初始化直接依赖
+ * devices_kset，因此成功是继续建立驱动模型的事实前提。
+ */
 int __init devices_init(void)
 {
+	/* 阶段 1：先发布所有物理/逻辑设备的共同 kset。 */
 	devices_kset = kset_create_and_add("devices", &device_uevent_ops, NULL);
 	if (!devices_kset)
 		return -ENOMEM;
+	/* 阶段 2：建立按设备号查找字符/块设备所需的 /sys/dev 层次。 */
 	dev_kobj = kobject_create_and_add("dev", NULL);
 	if (!dev_kobj)
 		goto dev_kobj_err;
@@ -4221,12 +4241,18 @@ int __init devices_init(void)
 	sysfs_dev_char_kobj = kobject_create_and_add("char", dev_kobj);
 	if (!sysfs_dev_char_kobj)
 		goto char_kobj_err;
+	/* 阶段 3：对象层次完整后再创建处理 device link 的工作队列。 */
 	device_link_wq = alloc_workqueue("device_link_wq", WQ_PERCPU, 0);
 	if (!device_link_wq)
 		goto wq_err;
 
 	return 0;
 
+	/*
+	 * 回滚栈：到达每个标签时，其下方对象已经创建；逐层释放当前对象并自然
+	 * 落入前一阶段。kobject_put()/kset_unregister() 负责摘除 sysfs 可见性并
+	 * 释放创建引用，最终恢复到入口前“无设备根目录”的状态。
+	 */
  wq_err:
 	kobject_put(sysfs_dev_char_kobj);
  char_kobj_err:

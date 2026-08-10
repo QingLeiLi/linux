@@ -577,13 +577,27 @@ void __weak arch_unregister_cpu(int num)
 #endif /* CONFIG_HOTPLUG_CPU */
 #endif /* CONFIG_GENERIC_CPU_DEVICES */
 
+/*
+ * cpu_dev_register_generic() - 按体系结构策略发布所有 present CPU 设备。
+ *
+ * 无入参、无返回值；仅 CONFIG_GENERIC_CPU_DEVICES 启用时执行。i 是逻辑 CPU
+ * 编号，ret 是 arch_register_cpu() 的结果。每次注册成功都会让对应 struct
+ * device 进入 cpu_subsys，并在已有 NUMA node 下建立链接；对象由设备核心持有。
+ *
+ * -EPROBE_DEFER 表示体系结构当前缺少完成注册的依赖；例如 arm64 ACPI 热插拔
+ * 配置会在 processor handle 尚未建立时返回它，随后 ACPI processor 路径再调用
+ * arch_register_cpu()。这里不打印误导性警告，也不在本循环内重试；其他错误
+ * 只记录并继续枚举，使单个 CPU sysfs 表示失败不阻断其余 CPU。
+ */
 static void __init cpu_dev_register_generic(void)
 {
 	int i, ret;
 
+	/* 编译器会把关闭配置的分支折叠为空操作，保留统一调用点。 */
 	if (!IS_ENABLED(CONFIG_GENERIC_CPU_DEVICES))
 		return;
 
+	/* present 表示硬件已被发现；它不同于当前 online CPU 集合。 */
 	for_each_present_cpu(i) {
 		ret = arch_register_cpu(i);
 		if (ret && ret != -EPROBE_DEFER)
@@ -671,11 +685,20 @@ static const struct attribute_group cpu_root_vulnerabilities_group = {
 	.attrs = cpu_root_vulnerabilities_attrs,
 };
 
+/*
+ * cpu_register_vulnerabilities() - 在 CPU 根设备下发布体系结构漏洞属性组。
+ *
+ * 无入参、无返回值。bus_get_dev_root() 返回带引用的 cpu_subsys 根设备；dev
+ * 在非 NULL 分支中由本函数持有，sysfs_create_group() 只借用其 kobject，最后
+ * 必须 put_device() 平衡引用。属性创建失败只记录错误，不撤销已注册 CPU。
+ */
 static void __init cpu_register_vulnerabilities(void)
 {
+	/* 取得引用后即使并发模型以后扩展，也可保证建组期间根设备不会释放。 */
 	struct device *dev = bus_get_dev_root(&cpu_subsys);
 
 	if (dev) {
+		/* 组名 vulnerabilities 形成 /sys/devices/system/cpu/vulnerabilities。 */
 		if (sysfs_create_group(&dev->kobj, &cpu_root_vulnerabilities_group))
 			pr_err("Unable to register CPU vulnerabilities\n");
 		put_device(dev);
@@ -683,14 +706,30 @@ static void __init cpu_register_vulnerabilities(void)
 }
 
 #else
+/* 未启用通用漏洞属性时保留统一调用点，不创建 vulnerabilities 属性组。 */
 static inline void cpu_register_vulnerabilities(void) { }
 #endif
 
+/*
+ * cpu_dev_init() - 发布 CPU system 子系统、CPU 设备及漏洞信息。
+ *
+ * 【宏观位置】driver_init() 在 node_dev_init() 后调用。无入参、无直接返回值；
+ * 正确入口前提是 buses_init() 已发布 system_kset，否则首个
+ * subsys_system_register() 无法取得父对象。早期进程上下文可睡眠，入口不持
+ * 热插拔锁，此时普通 CPU hotplug 尚未并发。
+ *
+ * 【阶段】subsys_system_register() 先建立 /sys/devices/system/cpu 与根属性；
+ * cpu_dev_register_generic() 再为 present CPU 创建设备并补 NUMA 链接；最后在
+ * CPU 根设备下发布体系结构漏洞属性组。根子系统失败会 panic，因为所有后续
+ * CPU 设备都依赖它；单 CPU 或漏洞属性失败由各 helper 记录并允许继续启动。
+ */
 void __init cpu_dev_init(void)
 {
+	/* 发布 cpu_subsys 是后续 register_cpu() 的父层和总线可见性边界。 */
 	if (subsys_system_register(&cpu_subsys, cpu_root_attr_groups))
 		panic("Failed to register CPU subsystem");
 
+	/* 先发布成员设备，再建立只读漏洞属性，确保属性组有稳定根对象可挂接。 */
 	cpu_dev_register_generic();
 	cpu_register_vulnerabilities();
 }

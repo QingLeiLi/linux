@@ -1135,8 +1135,22 @@ void software_node_notify_remove(struct device *dev)
 	}
 }
 
+/*
+ * software_node_init() - 建立软件节点对象的全局 kset。
+ *
+ * 【宏观位置】driver_init() 在 ksysfs_init() 和 firmware/OF 基础层之后调用；
+ * 无入参，早期进程上下文可睡眠，入口不持锁。software node 为没有 ACPI/DT
+ * 固件节点的设备提供统一 fwnode 属性表示。正常成功路径把 kset 放在
+ * kernel_kobj 下；若 ksysfs_init() 失败留下 NULL 父指针，本函数仍可能把它
+ * 发布到 sysfs 根，void 接口无法把这种层次退化上报给 driver_init()。
+ *
+ * 返回：无直接返回值。成功时 swnode_kset 持有并发布
+ * /sys/kernel/software_nodes，后续注册的软件节点加入其中；失败时全局指针为
+ * NULL，只记录错误，调用者没有可释放资源或重试协议。
+ */
 void __init software_node_init(void)
 {
+	/* kset_create_and_add() 是分配、初始化和 sysfs 发布的单一提交点。 */
 	swnode_kset = kset_create_and_add("software_nodes", NULL, kernel_kobj);
 	if (!swnode_kset)
 		pr_err("failed to register software nodes\n");

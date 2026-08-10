@@ -115,6 +115,10 @@ int bdi_set_strict_limit(struct backing_dev_info *bdi, unsigned int strict_limit
 
 extern struct backing_dev_info noop_backing_dev_info;
 
+/*
+ * 原地初始化调用者拥有的 backing_dev_info 及默认 writeback 状态；成功并不
+ * 等于已经注册，返回负 errno 时结构体存储仍归调用者且不得发布。
+ */
 int bdi_init(struct backing_dev_info *bdi);
 
 /**
