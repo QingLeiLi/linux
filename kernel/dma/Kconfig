@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+# 明确标记体系结构完全没有 DMA。选中后 HAS_DMA 的依赖失败，通用 mapping/direct 对象不编译；
+# 该符号由体系结构选择，不向普通用户展示。
 config NO_DMA
 	bool
 
+# DMA 通用层总开关：只要体系结构未声明 NO_DMA 就默认开启。它控制 mapping.o/direct.o，
+# 从而决定驱动是否拥有标准 DMA API；这是隐藏 bool，用户不能单独关闭。
 config HAS_DMA
 	bool
 	depends on !NO_DMA
 	default y
 
+# 为传统 dma_map_ops 后端编译公共 page alloc/free 等 helper。ARCH_HAS_DMA_OPS 会选择它；
+# 纯 direct 或 dma-iommu 平台无需因通用 API 本身启用。
 config DMA_OPS_HELPERS
 	bool
 
@@ -16,25 +22,38 @@ config DMA_OPS_HELPERS
 # mapping fast path should select this option and set the dma_ops_bypass
 # flag in struct device where applicable
 #
+# 能绕过 IOMMU、按设备选择 direct 快速路径的 IOMMU 驱动应选择本项，并在适用设备上维护
+# struct device.dma_ops_bypass。它只启用分派能力，不自动证明某个 mask 足以 direct 映射。
 config DMA_OPS_BYPASS
 	bool
 
 # Lets platform IOMMU driver choose between bypass and IOMMU
+# 允许平台 IOMMU 驱动在 direct 与 IOMMU 之间逐次选择；对应 arch_dma_map/unmap_*_direct hook。
 config ARCH_HAS_DMA_MAP_DIRECT
 	bool
 
+# scatterlist 需要额外 dma_flags 字段时由体系结构/后端选择；典型用途是记录 bus-address、
+# SWIOTLB 等逐项状态，使 unmap 能区分无需处理的 P2PDMA 段。
 config NEED_SG_DMA_FLAGS
 	bool
 
+# 后端需要独立于原始 length 保存 DMA 段长度时选择；启用后 scatterlist 带 dma_length，
+# map 可合并/改变输出段长度而不破坏调用者传入的物理布局。
 config NEED_SG_DMA_LENGTH
 	bool
 
+# 驱动需要在描述符中保存 unmap 地址/长度时启用。CPU sync、SWIOTLB 和 dma-debug 会选择它，
+# 关闭时 DEFINE_DMA_UNMAP_* 宏退化为空以避免无用字段。
 config NEED_DMA_MAP_STATE
 	bool
 
+# dma_addr_t 需要 64 位的派生能力：64 位内核或 64 位 phys_addr_t 任一成立即自动开启，
+# 保证设备地址类型能表达平台潜在物理/总线地址范围。
 config ARCH_DMA_ADDR_T_64BIT
 	def_bool 64BIT || PHYS_ADDR_T_64BIT
 
+# 体系结构需要在 dma_set_mask() 成功后执行额外硬件/平台更新时选择，并实现 arch_dma_set_mask()；
+# 未选择时通用层仅写 dev->dma_mask。
 config ARCH_HAS_DMA_SET_MASK
 	bool
 
@@ -44,34 +63,54 @@ config ARCH_HAS_DMA_SET_MASK
 # people think of when saying write combine, so very few platforms should
 # need to enable this.
 #
+# 仅当体系结构必须特殊实现 DMA_ATTR_WRITE_COMBINE 时选择。通常“uncached”页保护已提供用户期望的
+# write-combine 语义，因此绝大多数平台不应开启；开启后 dma_pgprot() 使用架构专用转换。
 config ARCH_HAS_DMA_WRITE_COMBINE
 	bool
 
+# 允许设备声明一段预留 coherent DMA 内存并由 coherent.c 位图管理。选择后编译声明、分配、
+# 释放和 mmap 接口；未选择时相应 helper 为固定失败/未命中 stub。
 config DMA_DECLARE_COHERENT
 	bool
 
+# 体系结构需要在设备建立 DMA 配置时安装 IOMMU/传统 ops 等状态则选择，并实现
+# arch_setup_dma_ops()；未选择时调用点为空函数。
 config ARCH_HAS_SETUP_DMA_OPS
 	bool
 
+# 与 setup 配对：设备移除时需要拆除体系结构 DMA 状态则选择并实现 arch_teardown_dma_ops()；
+# 关闭时 teardown 调用无副作用。
 config ARCH_HAS_TEARDOWN_DMA_OPS
 	bool
 
+# 非一致性平台需要在 CPU 把缓冲区交给设备前做 cache 维护时选择，并实现
+# arch_sync_dma_for_device()；direct 路径据此编译实际同步函数。
 config ARCH_HAS_SYNC_DMA_FOR_DEVICE
 	bool
 
+# 非一致性平台需要在设备把缓冲区交还 CPU 前维护 cache 时选择，并实现
+# arch_sync_dma_for_cpu()。同时选择 NEED_DMA_MAP_STATE，保证驱动可保存配对映射信息。
 config ARCH_HAS_SYNC_DMA_FOR_CPU
 	bool
 	select NEED_DMA_MAP_STATE
 
+# 某些体系结构还需在局部同步后执行全 CPU/全 cache 操作时选择，并实现
+# arch_sync_dma_for_cpu_all()；direct CPU sync 会在逐区间 hook 后调用它。
 config ARCH_HAS_SYNC_DMA_FOR_CPU_ALL
 	bool
 
+# coherent 分配发布前需要体系结构清理脏 cache 别名时选择，并实现 arch_dma_prep_coherent()；
+# direct 分配/remap 和原子池初始化会调用该 hook。
 config ARCH_HAS_DMA_PREP_COHERENT
 	bool
 
+# 机密计算平台可能必须让特定设备使用未加密 DMA 内存；选择后实现
+# force_dma_unencrypted() 等策略，direct 分配会使用解密页保护或原子池。
 config ARCH_HAS_FORCE_DMA_UNENCRYPTED
 	bool
 
+# 体系结构允许把多个逐段 cache 操作累积后由 arch_sync_dma_flush() 一次提交时选择；
+# SG 路径用 flush=false 批处理，循环结束再统一 flush。
 config ARCH_HAS_BATCHED_DMA_SYNC
 	bool
 
@@ -79,9 +118,13 @@ config ARCH_HAS_BATCHED_DMA_SYNC
 # Select this option if the architecture assumes DMA devices are coherent
 # by default.
 #
+# 体系结构若默认假设所有 DMA 设备硬件 cache coherent，应选择本项；设备/固件仍可覆盖属性。
+# 该默认值决定未提供显式描述时 dev_is_dma_coherent() 的结论。
 config ARCH_DMA_DEFAULT_COHERENT
 	bool
 
+# 编译软件 IO TLB bounce-buffer 后端：当设备地址受限、缓冲区对齐不安全或机密计算强制隔离时，
+# 在原内存与设备可达槽位间复制。选择 NEED_DMA_MAP_STATE 以保存 unmap/sync 所需状态。
 config SWIOTLB
 	bool
 	select NEED_DMA_MAP_STATE
@@ -99,15 +142,25 @@ config SWIOTLB_DYNAMIC
 
 	  If unsure, say N.
 
+# 允许软件 IO TLB 运行期动态扩容。内核启动时先建一个池，槽位不足时再分配额外池；若希望降低
+# 常驻内存，可用内核命令行 `swiotlb=` 缩小初始池。扩容提高成功率但增加运行期管理成本；
+# 不确定时保持 N。本项依赖 SWIOTLB，关闭基础后端时不可见。
 config DMA_BOUNCE_UNALIGNED_KMALLOC
 	bool
 	depends on SWIOTLB
 
+# 非一致性 DMA 对小 kmalloc 对象存在 cacheline 共享风险时选择，使 direct 路径把不满足
+# ARCH_DMA_MINALIGN 的缓冲区 bounce 到独占槽；依赖 SWIOTLB 提供隔离存储。
+#
+# DMA 通用层是否必须保留/执行 sync 路径的派生能力。任一体系结构 CPU/device sync、全 CPU sync、
+# dma-debug、传统 dma_ops 或 SWIOTLB 存在时自动为 y；否则相关调用可编译为无操作快速路径。
 config DMA_NEED_SYNC
 	def_bool ARCH_HAS_SYNC_DMA_FOR_DEVICE || ARCH_HAS_SYNC_DMA_FOR_CPU || \
 		 ARCH_HAS_SYNC_DMA_FOR_CPU_ALL || DMA_API_DEBUG || \
 		 ARCH_HAS_DMA_OPS || SWIOTLB
 
+# 受限 DMA 池在缺少 IOMMU 等强硬件隔离的平台上，用设备树预留内存和 SWIOTLB bounce 把设备
+# 访问限制在指定池内，提供有限内存保护。需要 OF、OF_RESERVED_MEM 和 SWIOTLB。
 config DMA_RESTRICTED_POOL
 	bool "DMA Restricted Pool"
 	depends on OF && OF_RESERVED_MEM && SWIOTLB
@@ -121,25 +174,35 @@ config DMA_RESTRICTED_POOL
 	  and <kernel/dma/swiotlb.c>.
 	  If unsure, say "n".
 
+# 上述选项适用于硬件保护能力有限（例如没有 IOMMU）的系统；详细绑定见 reserved-memory 文档，
+# 实现见 swiotlb.c。不确定时选 n。它不是完整 IOMMU，保护边界仍取决于预留池和 bounce 路径。
 #
 # Should be selected if we can mmap non-coherent mappings to userspace.
 # The only thing that is really required is a way to set an uncached bit
 # in the pagetables
 #
+# 平台若能为用户页表设置 uncached 等合适属性、从而安全 mmap 非一致性 DMA 分配，应选择本项。
+# 无 MMU 系统没有独立页表属性，默认 y；有 MMU 平台必须由体系结构确认能力。
 config DMA_NONCOHERENT_MMAP
 	default y if !MMU
 	bool
 
+# 编译供不可睡眠 coherent 分配使用的预建原子池 pool.o，并选择通用 gen_pool 分配器。
+# 池在启动/工作队列上下文扩容，热路径只从已有块分配，避免原子上下文睡眠。
 config DMA_COHERENT_POOL
 	select GENERIC_ALLOCATOR
 	bool
 
+# 使用全局声明式 coherent 预留池作为 DMA 分配后端，并选择 DMA_DECLARE_COHERENT。
+# 它只适用于既无 arch set_uncached、也不使用 direct remap 的平台，避免 CPU 映射方案冲突。
 config DMA_GLOBAL_POOL
 	select DMA_DECLARE_COHERENT
 	depends on !ARCH_HAS_DMA_SET_UNCACHED
 	depends on !DMA_DIRECT_REMAP
 	bool
 
+# direct 后端需要通过 remap/vmap 创建 coherent CPU 别名时选择；它同时要求原子 coherent pool
+# 和 noncoherent 用户 mmap 能力。该通用方案与架构 set_uncached/全局池互斥。
 config DMA_DIRECT_REMAP
 	bool
 	select DMA_COHERENT_POOL
@@ -148,12 +211,16 @@ config DMA_DIRECT_REMAP
 #
 # Fallback to arch code for DMA allocations.  This should eventually go away.
 #
+# DMA 分配仍需退回体系结构私有 arch_dma_alloc/free 的兼容开关，长期目标是删除。
+# 仅在没有 arch set_uncached、direct remap 和全局 pool 三种通用方案时允许选择。
 config ARCH_HAS_DMA_ALLOC
 	depends on !ARCH_HAS_DMA_SET_UNCACHED
 	depends on !DMA_DIRECT_REMAP
 	depends on !DMA_GLOBAL_POOL
 	bool
 
+# 启用 DMA 连续内存分配器接口，要求体系结构支持 DMA contiguous 且通用 CMA 已开启；
+# 它为无法使用 IOMMU 映射或 scatter-gather 的设备预留并分配大块物理连续内存。
 config DMA_CMA
 	bool "DMA Contiguous Memory Allocator"
 	depends on HAVE_DMA_CONTIGUOUS && CMA
@@ -168,8 +235,12 @@ config DMA_CMA
 	  For more information see <kernel/dma/contiguous.c>.
 	  If unsure, say "n".
 
+# 上述 CMA 让驱动为不支持 I/O 地址转换和 SG 的硬件取得大块物理连续页。命令行 `cma=0`
+# 可禁用，具体实现见 contiguous.c；预留会减少普通页分配器可自由使用的内存，不确定时选 n。
 if  DMA_CMA
 
+# 为每个 NUMA 节点建立独立 CMA 区，优先让 coherent DMA 分配使用设备本地连续内存；
+# 只有 DMA_CMA 和 NUMA 同时存在时可选。
 config DMA_NUMA_CMA
 	bool "Enable separate DMA Contiguous Memory Area for NUMA Node"
 	depends on NUMA
@@ -183,6 +254,8 @@ config DMA_NUMA_CMA
 	  rare case that the above 2 are both setup, then the "numa_cma="
 	  takes priority for the specified numa nodes.
 
+# 可用 `cma_pernuma=size` 为所有节点设定大小，或用 `numa_cma=<node>:size,...` 精确指定；
+# 两者同时设置时，`numa_cma=` 对列出的节点优先。代价是每节点预留更多连续内存。
 config CMA_SIZE_PERNUMA
 	bool "Default CMA area per NUMA node"
 	depends on DMA_NUMA_CMA
@@ -193,8 +266,13 @@ config CMA_SIZE_PERNUMA
 	  so that most devices may have benefit from better DMA
 	  locality without an explicit command-line opt-in.
 
+# 多 NUMA 节点系统默认在每个附加节点按所选 CMA 大小再预留一块，使多数设备无需命令行即可获得
+# 更好的 DMA 本地性；开启会按节点成倍增加预留量。
 comment "Default contiguous memory area size:"
 
+# 以下选项共同决定默认 CMA 区大小；命令行 cma= 仍可覆盖编译期默认。
+
+# 以 MiB 指定默认 CMA 大小；若选择百分比模式则隐藏。X86 默认 0，其他平台默认 16 MiB。
 config CMA_SIZE_MBYTES
 	int "Size in Mega Bytes"
 	depends on !CMA_SIZE_SEL_PERCENTAGE
@@ -205,7 +283,9 @@ config CMA_SIZE_MBYTES
 	  Memory Allocator.  If the size of 0 is selected, CMA is disabled by
 	  default, but it can be enabled by passing cma=size[MG] to the kernel.
 
+# 该值定义默认连续内存区的 MiB 数；0 表示编译期默认禁用，但启动参数 `cma=size[MG]` 可重新启用。
 
+# 以系统总内存百分比指定默认 CMA 大小；若选择固定 MiB 模式则隐藏。X86 默认 0，其他平台 10%。
 config CMA_SIZE_PERCENTAGE
 	int "Percentage of total memory"
 	depends on !CMA_SIZE_SEL_MBYTES
@@ -217,24 +297,32 @@ config CMA_SIZE_PERCENTAGE
 	  If 0 percent is selected, CMA is disabled by default, but it can be
 	  enabled by passing cma=size[MG] to the kernel.
 
+# 该值把默认 CMA 区表示为总内存百分比；0% 默认禁用，仍可由启动参数 `cma=size[MG]` 覆盖。
+#
+# 四选一决定固定 MiB 与百分比同时可计算时采用哪种结果，默认只使用 MiB 值。
 choice
 	prompt "Selected region size"
 	default CMA_SIZE_SEL_MBYTES
 
+# 只采用 CMA_SIZE_MBYTES，不计算百分比值。
 config CMA_SIZE_SEL_MBYTES
 	bool "Use mega bytes value only"
 
+# 只采用 CMA_SIZE_PERCENTAGE，不采用固定 MiB 值。
 config CMA_SIZE_SEL_PERCENTAGE
 	bool "Use percentage value only"
 
+# 同时计算固定值和百分比值，选择较小者，减少预留内存占用。
 config CMA_SIZE_SEL_MIN
 	bool "Use lower value (minimum)"
 
+# 同时计算固定值和百分比值，选择较大者，优先保证连续内存容量。
 config CMA_SIZE_SEL_MAX
 	bool "Use higher value (maximum)"
 
 endchoice
 
+# 限制连续缓冲区的最大页阶对齐，范围 2～12、默认 8；它控制对齐浪费与大块分配友好性的折中。
 config CMA_ALIGNMENT
 	int "Maximum PAGE_SIZE order of alignment for contiguous buffers"
 	range 2 12
@@ -253,8 +341,14 @@ config CMA_ALIGNMENT
 
 	  If unsure, leave the default value "8".
 
+# 默认算法按不小于请求大小的最小 PAGE_SIZE order 对齐；数百 KiB 内通常合理，大缓冲区会浪费。
+# 本值为对齐 order 设置上限，更大缓冲区只按该阶对齐；order 表示 PAGE_SIZE×2^order。
+# 例如 4 KiB 页、order=8 时最大对齐为 1 MiB；不确定时保留 8。
 endif
+# 到此结束仅在 DMA_CMA=y 时可见的 NUMA、默认大小选择和对齐参数组。
 
+# 启用 DMA API 生命周期调试，记录 map/alloc、sync 和 unmap/free，以发现重复释放、未映射释放、
+# 方向/大小不匹配等驱动错误；选择 NEED_DMA_MAP_STATE，代价是内存和热路径性能下降。
 config DMA_API_DEBUG
 	bool "Enable debugging of DMA-API usage"
 	select NEED_DMA_MAP_STATE
@@ -269,6 +363,10 @@ config DMA_API_DEBUG
 
 	  If unsure, say N.
 
+# 上述调试面向驱动与 DMA 交互排错，可检测 double-free 和释放从未分配的映射；它会降低性能，
+# 只应在需要诊断时开启，不确定时选 N。
+#
+# 编译流式 DMA map/unmap 基准控制面；依赖 DEBUG_FS，因为用户通过 debugfs 提交参数并读取结果。
 config DMA_MAP_BENCHMARK
 	bool "Enable benchmarking of streaming DMA mapping"
 	depends on DEBUG_FS
@@ -277,3 +375,6 @@ config DMA_MAP_BENCHMARK
 	  performance of dma_(un)map_page.
 
 	  See tools/testing/selftests/dma/dma_map_benchmark.c
+
+# 该选项提供 `/sys/kernel/debug/dma_map_benchmark`，用于测量 dma_map_page()/dma_unmap_page()
+# 性能；配套用户程序见 tools/testing/selftests/dma/dma_map_benchmark.c。它不参与正常 DMA 路径。
