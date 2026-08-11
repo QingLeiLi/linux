@@ -234,7 +234,7 @@ __setup("sched_proxy_exec", setup_proxy_exec);
  * at compile time and compiler optimization based on features default.
  */
 /*
- * 原文说明这些位控制调度器调试/实验特性。关闭 SCHED_DEBUG 时，每个编译单元
+ * 这些位控制调度器调试/实验特性。关闭 SCHED_DEBUG 时，每个编译单元
  * 可拥有可常量传播的副本，使编译器裁掉关闭功能；开启时则由统一 sysctl 暴露。
  * features.h 通过重复展开 SCHED_FEAT 生成初值，宏续行中不能插入独立注释。
  */
@@ -253,7 +253,7 @@ __read_mostly unsigned int sysctl_sched_features =
  * per boot.
  */
 /*
- * 原文说明 LATENCY_WARN 开启时，need_resched 持续超过给定毫秒数会报警；
+ *  LATENCY_WARN 开启时，need_resched 持续超过给定毫秒数会报警；
  * *_once 把噪声限制为每次启动一次。这些 __read_mostly 调优量由 sysctl 读写，
  * 热路径频繁读取，修改不要求与 rq 状态形成事务。
  */
@@ -265,7 +265,7 @@ __read_mostly int sysctl_resched_latency_warn_once = 1;
  * Limited because this is done with IRQs disabled.
  */
 /*
- * 原文说明一次 load-balance 最多扫描的 task 数。平衡阶段常持 rq 锁并关闭 IRQ，
+ * 一次 load-balance 最多扫描的 task 数。平衡阶段常持 rq 锁并关闭 IRQ，
  * 因而上限不仅是吞吐参数，也是 IRQ latency 的保护阈值；未扫描完的工作留给
  * 后续平衡轮次，而不是在一次临界区内无限完成。
  */
@@ -2003,7 +2003,7 @@ void set_load_weight(struct task_struct *p, bool update_load)
  * updates or API abuses.
  */
 /*
- * 原文说明 uclamp_mutex 串行化用户态慢路径的 clamp 配置更新；每 CPU rq 锁仍
+ *  uclamp_mutex 串行化用户态慢路径的 clamp 配置更新；每 CPU rq 锁仍
  * 保护 enqueue/dequeue 热路径。二者职责不同：mutex 防止多个控制面请求互相
  * 覆盖，rq 锁保证桶计数与 runnable 集合一致。uclamp 是容量选择约束，并不直接
  * 锁定硬件频率；task/task_group 的最终有效值还会经过层级限制。
@@ -4520,7 +4520,7 @@ EXPORT_SYMBOL_GPL(kick_process);
  * to satisfy the above rules.
  */
 /*
- * 原文说明 cpus_ptr 同时受 rq 锁和 p->pi_lock 保护，并区分 online 与 active：
+ *  cpus_ptr 同时受 rq 锁和 p->pi_lock 保护，并区分 online 与 active：
  * active 必为 online 子集；CPU-up 期间 per-CPU kthread 可先用 online 非 active CPU，
  * CPU-down 先清 active 阻止普通 placement，再迁走存量 task。因此 fallback 不能
  * 选择非 active CPU，而普通 select_task_rq() 为特殊 kthread 规则可以。
@@ -9331,7 +9331,7 @@ asmlinkage __visible void __sched schedule_user(void)
 	 * too frequently to make sense yet.
 	 */
 	/*
-	 * 原文说明随机 set_need_resched() 或远端唤醒但 IPI 尚未到达时，CPU 可能
+	 * 随机 set_need_resched() 或远端唤醒但 IPI 尚未到达时，CPU 可能
 	 * 尚未退出 RCU idle 就进入这里，因此暂时手工恢复 watching。
 	 * 原文也承认存在错误调用者；理想上 prev_state 非 USER 应告警，
 	 * 但当前会过于频繁。
@@ -9475,7 +9475,7 @@ EXPORT_SYMBOL(dynamic_preempt_schedule);
 /*
  * preempt_schedule_notrace() - tracing 触发抢占时先修复可能残留的 USER 状态。
  *
- * 原文说明 tracing 用 preempt_enable_notrace 防递归，但 tracing 可能发生在
+ *  tracing 用 preempt_enable_notrace 防递归，但 tracing 可能发生在
  * 用户入口/出口附近，使抢占早于 user_exit()，调度器遂在仍标记 USER/EQS 时
  * 运行。本接口替代普通 preempt_schedule()，必要时先退出用户上下文。
  * 入参、返回均无；不可抢占或 IRQ-off 时直接返回。循环中可切换任务；
@@ -9505,7 +9505,7 @@ asmlinkage __visible void __sched notrace preempt_schedule_notrace(void)
 		 * which can also be traced by the function tracer.
 		 */
 		/*
-		 * 原文说明 tracer 本身会跟踪 preempt_count_sub()，又会调用 notrace
+		 *  tracer 本身会跟踪 preempt_count_sub()，又会调用 notrace
 		 * 抢占开关；若 NEED_RESCHED 已置位，递归可无限发生。
 		 * 因此先用不插桩
 		 * 操作禁抢占，再单独开始仍可被跟踪的抢占延迟记账。
@@ -9574,7 +9574,7 @@ EXPORT_SYMBOL(dynamic_preempt_schedule_notrace);
 /*
  * preempt_schedule_irq() - IRQ 退出路径在 IRQ-off 条件下执行内核抢占。
  *
- * 原文说明这是 IRQ context 触发 schedule() 的入口，调用与返回均保持 IRQ
+ * 这是 IRQ context 触发 schedule() 的入口，调用与返回均保持 IRQ
  * 关闭，以阻止 IRQ 上下文递归。入参、返回均无；要求 preempt_count 为 0。
  * exception_enter/exit 保护可能残留的 USER/EQS 状态；循环中临时开 IRQ并可
  * 切换任务，最终恢复入口 Context Tracking 状态，无 ownership。

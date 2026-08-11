@@ -382,7 +382,7 @@ static __always_inline bool rcu_is_watching_curr_cpu(void)
  * with ordering.  Return the new value.
  */
 /*
- * 原文说明：按指定增量、以有序方式增加当前 CPU 的 context_tracking.state，
+ * 按指定增量、以有序方式增加当前 CPU 的 context_tracking.state，
  * 并返回更新后的值。这里的“有序”来自原子 read-modify-write，而不是普通
  * 本地计数器赋值。
  *

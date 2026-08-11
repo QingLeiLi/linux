@@ -50,7 +50,7 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 /*
- * 原文说明：本实现源自 32 位 ARM 的 arch/arm/kernel/irq.c，并保留了
+ * 本实现源自 32 位 ARM 的 arch/arm/kernel/irq.c，并保留了
  * 相应作者与动态 tick 支持的版权记录。ARM64 版本在共同的 IRQ 框架之外，
  * 额外处理每 CPU vmap IRQ 栈、Shadow Call Stack、FIQ 和 pseudo-NMI。
  */

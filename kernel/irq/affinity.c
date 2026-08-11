@@ -26,6 +26,11 @@
  * 设置 nr_sets=1、set_size[0]=affvecs；无返回值。即使 affvecs 为 0 也执行，使调用者看到
  * 与实际可用向量一致的集合状态。
  */
+/*
+ * irq_create_affinity_masks() 在调用者未提供 calc_sets 时把本函数安装为回调并同步执行。
+ * @affd 是调用期输入输出借用，不转移 ownership；@affvecs 是向量个数而非 CPU 位图。
+ * 函数不分配内存、不睡眠，返回后由创建路径继续读取刚写入的单集合布局。
+ */
 static void default_calc_sets(struct irq_affinity *affd, unsigned int affvecs)
 {
 	affd->nr_sets = 1;
@@ -51,6 +56,15 @@ static void default_calc_sets(struct irq_affinity *affd, unsigned int affvecs)
  * 复制 irq_default_affinity；每个集合分别调用 group_cpus_evenly()，只复制实际初始化的
  * nr_masks。最终整个 `[pre_vectors, nvecs-post_vectors)` 中段均标 is_managed，包括回退
  * 默认 mask 的中段项。函数在可睡眠上下文分配内存，不持 CPU hotplug 锁。
+ */
+/*
+ * PCI MSI/MSI-X 与 platform IRQ 批量申请路径是主要调用者。@nvecs 是整个数组项数；@affd
+ * 在调用期间借用但会被 calc_sets 更新，调用者继续拥有它。NULL 同时表示无需中段、集合
+ * 描述非法或分配失败，调用者必须结合自己的输入约束解释，不能一律假定只有 -ENOMEM。
+ */
+/*
+ * 修正说明：英文 kernel-doc 把 NULL 只写成 allocation failed，并不完整。当前源码还在
+ * nr_sets 越界和 affvecs 为 0 时返回 NULL；三个出口都没有分配结果可由调用者释放。
  */
 struct irq_affinity_desc *
 irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
@@ -163,6 +177,11 @@ irq_create_affinity_masks(unsigned int nvecs, struct irq_affinity *affd)
  * 无回调时通用策略把中段上限限制为 possible CPU 数，避免创建多于 CPU 的专用向量。
  * 返回 resv + min(set_vecs, maxvec-resv)，不分配内存、不修改 @affd；调用者应保证
  * maxvec >= minvec 且保留数不会导致无符号下溢。
+ */
+/*
+ * PCI MSI 和 platform IRQ 路径先用本函数收缩请求规模，再把结果交给创建函数。三个参数
+ * 都是纯输入，@affd 为调用期只读借用；函数不睡眠、不取锁、不转移引用。返回 0 表示
+ * 保留向量已违反最小数量约束，非零值只是建议总数，尚未分配或发布任何 IRQ。
  */
 unsigned int irq_calc_affinity_vectors(unsigned int minvec, unsigned int maxvec,
 				       const struct irq_affinity *affd)

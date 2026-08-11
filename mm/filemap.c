@@ -3012,7 +3012,7 @@ put:
  * XA_PRESENT 的通用批量包装。返回按 index 升序、各持引用的
  * folio，允许 hole；*@start 推到下一 folio 位置。具体实现复用 tag 扫描。
  *
- * 契约补充：@mapping 为借用索引；@start 是页索引单位的输入输出游标，
+ * @mapping 为借用索引；@start 是页索引单位的输入输出游标，
  * @end 为含端点上界；@fbatch 由调用者提供并接收持引用 folio。函数使用
  * XArray RCU 查找、不要求入口锁且不睡眠。返回批量数量；调用者必须逐项 put。
  */

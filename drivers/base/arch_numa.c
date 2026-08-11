@@ -561,7 +561,7 @@ out_free_distance:
  * 内存的区间；通常不会失败。成功返回 0，失败返回 errno。
  */
 /*
- * 契约补充：
+ * 
  * 调用时 memblock 已包含最终 DRAM，numa_memblks_init() 已清除上一轮
  * nid/距离状态。start/end 是物理字节地址，numa_add_memblk() 接受
  * [start, end) 半开区间，所以先计算 inclusive end 再传 end+1。
@@ -638,7 +638,7 @@ static int __init arch_acpi_numa_init(void)
  * 最后的 fallback 是覆盖全部内存的 dummy 单节点配置。
  */
 /*
- * 契约补充：
+ * 
  * arm64/RISC-V 在 memblock 建立、zone 初始化之前调用，无参数和返回值。
  * `numa=off` 直接跳过真实来源。ACPI 可用时只尝试 ACPI；ACPI 全局禁用
  * 时尝试 Device Tree，避免同一次启动把两种固件拓扑混合。

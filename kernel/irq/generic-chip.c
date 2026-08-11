@@ -5,7 +5,7 @@
  * Copyright (C) 2011, Thomas Gleixner
  */
 /*
- * 原文说明：本文件是一组可复用的通用 irq_chip 实现，面向最多 32 条线路的简单寄存器
+ * 本文件是一组可复用的通用 irq_chip 实现，面向最多 32 条线路的简单寄存器
  * 控制器。驱动通过 irq_chip_generic 保存共享寄存器基址、锁、mask/wake 缓存和一个或多个
  * irq_chip_type；每个 type 可为 level/edge 等 flow 使用不同回调、寄存器偏移和 handler。
  *
@@ -38,6 +38,10 @@ static DEFINE_RAW_SPINLOCK(gc_lock);
  * 空操作 irqchip 回调。@d 为未消费的 irq_data 借用指针；无返回值、无寄存器
  * 访问，供硬件不需要某阶段操作但接口要求函数指针的场景使用。
  */
+/*
+ * 驱动可把它安装到 irq_chip 的无副作用操作槽，IRQ 核心在相应原子路径调用。
+ * 函数不保存 @d、不取得引用、不会睡眠，返回后线路和所有权状态完全不变。
+ */
 void irq_gc_noop(struct irq_data *d)
 {
 }
@@ -54,6 +58,10 @@ EXPORT_SYMBOL_GPL(irq_gc_noop);
  * 控制器使用独立 enable/disable 写寄存器时，mask @d 对应线路。由 irq_data
  * 取得所属 gc/type 和单线位 mask，在 gc->lock 下把该位写入 disable 偏移，并从 type 当前
  * mask_cache 清位，使缓存镜像这种硬件的“enabled 位集合”。无返回值，可在 hardirq 下调用。
+ */
+/*
+ * 作为 chip->irq_mask 回调由通用 disable/flow 路径调用；@d、gc、ct 均为 IRQ 注册生命周期内
+ * 的借用对象。函数持 raw gc 锁、不可睡眠，不转移引用；返回时硬件与缓存都已标为 disabled。
  */
 void irq_gc_mask_disable_reg(struct irq_data *d)
 {
@@ -79,6 +87,10 @@ EXPORT_SYMBOL_GPL(irq_gc_mask_disable_reg);
  * 缓存写回 type->regs.mask，避免并发线路更新互相覆盖。缓存指针可由所有 type 共享，也可
  * 按 IRQ_GC_MASK_CACHE_PER_TYPE 私有。无返回值。
  */
+/*
+ * 作为 chip->irq_mask 回调执行；@d 及派生的 gc/ct 只在调用期借用。raw 锁把缓存读改写与
+ * MMIO 提交组成不可分割阶段，函数不睡眠、不改变对象 ownership。
+ */
 void irq_gc_mask_set_bit(struct irq_data *d)
 {
 	struct irq_chip_generic *gc = irq_data_get_irq_chip_data(d);
@@ -101,6 +113,10 @@ EXPORT_SYMBOL_GPL(irq_gc_mask_set_bit);
 /*
  * 单一 mask 寄存器采用“清 0 屏蔽”语义。锁内从缓存清除 @d 位，再整值写回
  * mask 寄存器。函数名描述对寄存器位的操作，不代表 cache 在所有控制器上具有统一极性。
+ */
+/*
+ * 作为另一种 chip->irq_mask 极性实现；@d、gc、ct 均为借用，调用者已保证 chip 配置稳定。
+ * 函数在 raw 锁内完成缓存和硬件的配对更新，不睡眠、无直接返回值或引用变化。
  */
 void irq_gc_mask_clr_bit(struct irq_data *d)
 {
@@ -126,6 +142,10 @@ EXPORT_SYMBOL_GPL(irq_gc_mask_clr_bit);
  * 寄存器，并在缓存中置位，缓存因而表示 enabled 位集合；与 irq_gc_mask_disable_reg()
  * 对称。无返回值。
  */
+/*
+ * 作为 chip->irq_unmask 回调由 enable/flow 收尾调用；@d 及派生对象不发生 ownership 转移。
+ * raw 锁临界区不可睡眠，返回时 enable 写已提交且缓存同步反映线路 enabled。
+ */
 void irq_gc_unmask_enable_reg(struct irq_data *d)
 {
 	struct irq_chip_generic *gc = irq_data_get_irq_chip_data(d);
@@ -146,6 +166,10 @@ EXPORT_SYMBOL_GPL(irq_gc_unmask_enable_reg);
  * 对 write-1-to-ack 控制器确认 @d 的 pending 事件。锁内只把该线 mask 写到
  * type->regs.ack，不修改 mask_cache；无返回值，具体 ack 副作用由硬件定义。
  */
+/*
+ * 作为 chip->irq_ack 回调在 flow handler 的确认阶段执行；@d、gc、ct 均为调用期借用。
+ * raw 锁串行共享寄存器，函数不睡眠、不保存指针；返回只保证写已发出，不等待设备后续状态。
+ */
 void irq_gc_ack_set_bit(struct irq_data *d)
 {
 	struct irq_chip_generic *gc = irq_data_get_irq_chip_data(d);
@@ -165,6 +189,10 @@ EXPORT_SYMBOL_GPL(irq_gc_ack_set_bit);
  * 对“清目标位完成 ack”的寄存器写入按位取反的 @d->mask，即目标位为 0、其他
  * 位为 1。gc->lock 串行寄存器访问；不修改缓存、无返回值。驱动只有在硬件确属该写入语义
  * 时才能选用此 helper。
+ */
+/*
+ * 作为清零极性的 chip->irq_ack 回调；@d 和派生对象不转移 ownership。函数可在 hardirq
+ * 原子上下文执行，持 raw gc 锁且不能睡眠；返回后不改变 mask cache 或软件 IRQ 状态。
  */
 void irq_gc_ack_clr_bit(struct irq_data *d)
 {
@@ -194,6 +222,10 @@ void irq_gc_ack_clr_bit(struct irq_data *d)
  * 函数在一次 gc 锁临界区先写 disable、清“enabled”缓存位，再写 ack，避免 mask 与确认
  * 被其他线路寄存器更新穿插。@d 是存活 irq_data；无返回值。
  */
+/*
+ * 作为 chip->irq_mask_ack 由需要原子“屏蔽并确认”的 flow 路径调用；@d/gc/ct 均为借用。
+ * 函数不可睡眠、不取得引用，返回时该线已从 enabled cache 清除且 ack 写已提交。
+ */
 void irq_gc_mask_disable_and_ack_set(struct irq_data *d)
 {
 	struct irq_chip_generic *gc = irq_data_get_irq_chip_data(d);
@@ -214,6 +246,10 @@ EXPORT_SYMBOL_GPL(irq_gc_mask_disable_and_ack_set);
 /*
  * 向当前 chip type 的 EOI 偏移写入 @d->mask，结束该线路的控制器服务状态。
  * gc->lock 保护共享寄存器访问；不修改缓存、无返回值。
+ */
+/*
+ * 作为 chip->irq_eoi 在 flow 服务完成点调用；@d 及派生 gc/ct 只在调用期借用。
+ * raw 锁临界区不可睡眠，函数不转移 ownership，也不替具体控制器判断 EOI 是否已生效。
  */
 void irq_gc_eoi(struct irq_data *d)
 {
@@ -240,6 +276,10 @@ void irq_gc_eoi(struct irq_data *d)
  * -EINVAL；否则锁内更新 wake_active 并返回 0。函数不访问硬件，后续 gc suspend/resume
  * 回调读取 wake_active 统一编程；wake_enabled 通常在发布前静态配置。
  */
+/*
+ * 作为 chip->irq_set_wake 由 wake 管理路径调用；@d 是借用，@on 是布尔策略值且不被保存。
+ * 能力拒绝时无副作用；成功路径持 raw gc 锁、不可睡眠，不改变引用或直接触碰电源硬件。
+ */
 int irq_gc_set_wake(struct irq_data *d, unsigned int on)
 {
 	struct irq_chip_generic *gc = irq_data_get_irq_chip_data(d);
@@ -262,6 +302,10 @@ EXPORT_SYMBOL_GPL(irq_gc_set_wake);
  *
  * @addr: 有效 __iomem 地址。返回 ioread32be() 转换后的 CPU 端 u32；供 gc->reg_readl 使用。
  */
+/*
+ * IRQ_GC_BE_IO 建立期把它安装为访问器；@addr 是 MMIO 映射内的瞬时借用地址。
+ * 函数不保存地址、不取得资源、不可睡眠，返回值是本次 32 位大端读取的快照。
+ */
 static u32 irq_readl_be(void __iomem *addr)
 {
 	return ioread32be(addr);
@@ -271,6 +315,10 @@ static u32 irq_readl_be(void __iomem *addr)
  * irq_writel_be() - generic chip 的 32 位大端寄存器写适配器
  *
  * @val: CPU 端数值；@addr: 有效 __iomem 地址。调用 iowrite32be()，无返回值。
+ */
+/*
+ * IRQ_GC_BE_IO 把它安装为 gc->reg_writel；@val 为纯输入，@addr 是瞬时 MMIO 借用。
+ * 函数不保存参数、不转移映射 ownership、不可睡眠；只保证采用大端访问语义发出写操作。
  */
 static void irq_writel_be(u32 val, void __iomem *addr)
 {
@@ -288,6 +336,11 @@ static void irq_writel_be(u32 val, void __iomem *addr)
  * @handler: 首要 type（索引 0）的默认 flow handler。
  * 初始化 gc raw lock、公共字段和所有 type 的 chip.name，仅设置 type0 handler；驱动须在
  * 发布前补齐寄存器偏移、回调及其他 type handler/type。无分配、无返回值、无需锁。
+ */
+/*
+ * irq_alloc_generic_chip() 和 domain 批量分配路径在对象尚未发布时调用。@gc 为调用者拥有的
+ * 输入输出存储；@name、@reg_base、@handler 都只被记录而不取得 ownership，其中 @name 与
+ * MMIO 映射必须至少活到 gc 解除安装。函数不睡眠，返回后仍由调用者负责发布或释放 @gc。
  */
 void irq_init_generic_chip(struct irq_chip_generic *gc, const char *name,
 			   int num_ct, unsigned int irq_base,
@@ -322,6 +375,11 @@ void irq_init_generic_chip(struct irq_chip_generic *gc, const char *name,
  * 成功返回由调用者拥有的零初始化对象，最终用 irq_free_generic_chip()/kfree 释放；失败
  * 返回 NULL。函数可睡眠，尚未把 chip 安装到 IRQ 或全局 PM 链。
  */
+/*
+ * 传统非-domain 驱动通常调用本函数，随后填写 type 并交给 irq_setup_generic_chip()。
+ * @name/@reg_base/@handler 为借用配置且不会复制；成功只转移新分配 gc 的释放责任，尚未
+ * 取得 IRQ 号、加入 gc_list 或访问硬件，NULL 时调用者仍拥有全部输入资源。
+ */
 struct irq_chip_generic *
 irq_alloc_generic_chip(const char *name, int num_ct, unsigned int irq_base,
 		       void __iomem *reg_base, irq_flow_handler_t handler)
@@ -345,6 +403,10 @@ EXPORT_SYMBOL_GPL(irq_alloc_generic_chip);
  * 指向 gc->mask_cache；IRQ_GC_INIT_MASK_CACHE 再从相应 regs.mask 读取硬件初值。共享缓存
  * 模式下 mskreg 保持 type0 偏移，只读入同一值；调用者在尚未并发使用或持 gc 锁时调用。
  * 无返回值，读取失败无法报告，寄存器访问器/偏移必须由驱动预先保证有效。
+ */
+/*
+ * domain 首次 map 或传统 setup 在发布线路前调用；@gc 为输入输出借用，@flags 为纯输入。
+ * 函数不分配、不转移引用；启用硬件初值读取时执行 MMIO，必须处于不可睡眠的安全访问阶段。
  */
 static void
 irq_gc_init_mask_cache(struct irq_chip_generic *gc, enum irq_gc_flags flags)
@@ -385,9 +447,18 @@ irq_gc_init_mask_cache(struct irq_chip_generic *gc, enum irq_gc_flags flags)
  * 完成 init/入链的前序 chip 逆序调用 exit+remove，清 d->gc 并释放整块；失败的当前 chip
  * init 若已取得部分私有资源，须由 init 自身在返回错误前回滚。
  */
+/*
+ * irqdomain 建立路径在尚无并发 map/unmap 时调用。@d 是输入输出借用，成功后拥有 dgc；
+ * @info 是只读借用，内部只复制标量/回调/名称指针，不接管其存储。函数用 GFP_KERNEL，可能
+ * 睡眠；成功返回 0 并把所有 gc 发布给 domain，失败保证 d->gc 恢复 NULL 且无 gc_list 残留。
+ */
 int irq_domain_alloc_generic_chips(struct irq_domain *d,
 				   const struct irq_domain_chip_generic_info *info)
 {
+	/*
+	 * 变量地图：dgc 是整块分配的头部及最终 domain ownership；gc/tmp 在连续块内逐项游走；
+	 * dgc_sz/gc_sz/sz 是布局字节数；i 是已成功 init 并入链的 chip 数，ret 保存 init errno。
+	 */
 	struct irq_domain_chip_generic *dgc;
 	struct irq_chip_generic *gc;
 	int numchips, i;
@@ -397,9 +468,11 @@ int irq_domain_alloc_generic_chips(struct irq_domain *d,
 	void *tmp;
 	int ret;
 
+	/* 每个 domain 只允许一套 generic-chip 容器，避免覆盖仍被映射使用的旧 ownership。 */
 	if (d->gc)
 		return -EBUSY;
 
+	/* revmap 覆盖范围按每 chip 容量向上取整；零结果没有可建立对象。 */
 	numchips = DIV_ROUND_UP(d->revmap_size, info->irqs_per_chip);
 	if (!numchips)
 		return -EINVAL;
@@ -413,6 +486,10 @@ int irq_domain_alloc_generic_chips(struct irq_domain *d,
 	tmp = dgc = kzalloc(sz, GFP_KERNEL);
 	if (!dgc)
 		return -ENOMEM;
+	/*
+	 * 阶段 1：填充容器契约并暂挂到 domain。此时 map 尚未并发可见；若后续 init 失败，
+	 * err 路径会清指针。exit 回调由 dgc 保存，负责每个成功 chip 的驱动私有资源。
+	 */
 	dgc->irqs_per_chip = info->irqs_per_chip;
 	dgc->num_chips = numchips;
 	dgc->irq_flags_to_set = info->irq_flags_to_set;
@@ -444,6 +521,7 @@ int irq_domain_alloc_generic_chips(struct irq_domain *d,
 				goto err;
 		}
 
+		/* init 成功是加入 syscore PM 链的提交点；失败对象从未入链。 */
 		scoped_guard (raw_spinlock_irqsave, &gc_lock)
 			list_add_tail(&gc->list, &gc_list);
 		/* Calc pointer to the next generic chip */
@@ -453,6 +531,10 @@ int irq_domain_alloc_generic_chips(struct irq_domain *d,
 	return 0;
 
 err:
+	/*
+	 * 当前第 i 个 init 已自行回滚且未入链；这里只逆序撤销 [0, i) 的已提交对象。
+	 * exit 先释放驱动私有资源，irq_remove_generic_chip() 随后摘 gc_list 并解除可能的映射。
+	 */
 	while (i--) {
 		if (dgc->exit)
 			dgc->exit(dgc->gc[i]);
@@ -475,19 +557,27 @@ EXPORT_SYMBOL_GPL(irq_domain_alloc_generic_chips);
  * 清 d->gc 并一次释放连续内存。调用者必须已阻止新 map、IRQ 执行和 syscore PM 遍历；
  * 无返回值，exit 必须自行完成私有资源清理。
  */
+/*
+ * irqdomain teardown 在停止映射/分派后调用。@d 是输入输出借用；本函数消费 d->gc 所代表的
+ * 整块 ownership，但不释放 domain 自身。过程可能进入驱动 exit，调用上下文必须满足其睡眠
+ * 约束；返回保证 d->gc==NULL，调用者不得再使用先前取得的任何 gc 借用指针。
+ */
 void irq_domain_remove_generic_chips(struct irq_domain *d)
 {
+	/* dgc 是从 domain 取出的待消费 ownership；i 只遍历连续块内已建立的 gc。 */
 	struct irq_domain_chip_generic *dgc = d->gc;
 	unsigned int i;
 
 	if (!dgc)
 		return;
 
+	/* 阶段 1：逐 chip 先撤销驱动私有状态，再从 PM 链和 IRQ 映射中解除。 */
 	for (i = 0; i < dgc->num_chips; i++) {
 		if (dgc->exit)
 			dgc->exit(dgc->gc[i]);
 		irq_remove_generic_chip(dgc->gc[i], ~0U, 0, 0);
 	}
+	/* 阶段 2：先阻止后续查询取得已释放容器，再释放唯一连续分配。 */
 	d->gc = NULL;
 	kfree(dgc);
 }
@@ -509,6 +599,11 @@ EXPORT_SYMBOL_GPL(irq_domain_remove_generic_chips);
  * 批量分配函数。@irqs_per_chip 是每个 gc 的 hwirq 数（调用者必须保证 1..32），@num_ct
  * 是 type 数；@clr/@set 在 map 时传给 irq_modify_status；@gcflags 控制缓存、嵌套锁和 I/O。
  * 返回底层 0 或负 errno，不提供 per-chip init/exit。
+ */
+/*
+ * 旧式 irq_alloc_domain_generic_chips() 宏在 domain 建立期调用；所有指针参数均为借用，
+ * 本 wrapper 不保存局部 info 地址。它本身只组装参数，ownership、睡眠和失败保证完全继承
+ * irq_domain_alloc_generic_chips()。
  */
 int __irq_alloc_domain_generic_chips(struct irq_domain *d, int irqs_per_chip,
 				     int num_ct, const char *name,
@@ -538,6 +633,10 @@ EXPORT_SYMBOL_GPL(__irq_alloc_domain_generic_chips);
  * ERR_PTR(-EINVAL)；成功返回连续分配内的 gc 借用指针。函数不验证该具体线是否 unused/
  * installed，不加锁，调用者保证 domain/gc 生命周期稳定。
  */
+/*
+ * map 与公开查询 helper 调用它。@d 是借用，@hw_irq 是纯输入 domain-local 编号；函数不睡眠、
+ * 不取得引用。错误指针保留“未建立容器”和“索引越界”的区别，成功指针只能在 domain 生命周期内用。
+ */
 static struct irq_chip_generic *
 __irq_get_domain_generic_chip(struct irq_domain *d, unsigned int hw_irq)
 {
@@ -560,6 +659,10 @@ __irq_get_domain_generic_chip(struct irq_domain *d, unsigned int hw_irq)
 /*
  * 公开查询 @hw_irq 所属 generic chip。内部错误指针统一转换为 NULL，成功返回
  * 由 domain 拥有的借用指针；调用者不得释放，且必须在 domain remove 前使用完。
+ */
+/*
+ * 驱动在完成 domain generic-chip 分配后查询实例；@d/@hw_irq 均不发生 ownership 转移。
+ * 函数不加锁、不睡眠；NULL 合并 -ENODEV/-EINVAL，调用者不能从 NULL 单独判断失败原因。
  */
 struct irq_chip_generic *
 irq_get_domain_generic_chip(struct irq_domain *d, unsigned int hw_irq)
@@ -593,9 +696,18 @@ static struct lock_class_key irq_nested_request_class;
  * `1 << idx`，最后 irq_domain_set_info() 发布 chip/gc/handler，并修改 desc status。
  * 成功返回 0；调用者/domain core 串行 map/unmap。默认位移要求 irqs_per_chip<=32。
  */
+/*
+ * irqdomain core 的 ->map 回调在建立 virq 映射时调用。@d 是输入输出借用，@virq/@hw_irq
+ * 是纯输入编号；成功后 domain/desc 持有 chip 与 gc 关联，本函数不另取引用。全程不可睡眠；
+ * 失败返回 -ENODEV/-EINVAL/-ENOTSUPP/-EBUSY，且在 set_bit 提交点之前不改变映射状态。
+ */
 int irq_map_generic_chip(struct irq_domain *d, unsigned int virq,
 			 irq_hw_number_t hw_irq)
 {
+	/*
+	 * 变量地图：data 是待发布 virq 的借用 irq_data；dgc/gc/ct/chip 依次定位容器、实例、
+	 * 首要 type 和操作表；idx 是 gc 内 0..irqs_per_chip-1 的相对线路号。
+	 */
 	struct irq_data *data = irq_domain_get_irq_data(d, virq);
 	struct irq_domain_chip_generic *dgc = d->gc;
 	struct irq_chip_generic *gc;
@@ -603,6 +715,7 @@ int irq_map_generic_chip(struct irq_domain *d, unsigned int virq,
 	struct irq_chip *chip;
 	int idx;
 
+	/* 阶段 1：定位实例并在任何状态写入前拒绝无容器、越界、保留或重复映射。 */
 	gc = __irq_get_domain_generic_chip(d, hw_irq);
 	if (IS_ERR(gc))
 		return PTR_ERR(gc);
@@ -638,6 +751,7 @@ int irq_map_generic_chip(struct irq_domain *d, unsigned int virq,
 	else
 		data->mask = 1 << idx;
 
+	/* 阶段 3：完整 mask/锁类准备后才向 desc 发布 chip、chip_data 与 flow handler。 */
 	irq_domain_set_info(d, virq, hw_irq, chip, gc, ct->handler, NULL, NULL);
 	irq_modify_status(virq, dgc->irq_flags_to_clear, dgc->irq_flags_to_set);
 	return 0;
@@ -651,8 +765,13 @@ int irq_map_generic_chip(struct irq_domain *d, unsigned int virq,
  * info。无返回值；不重置 mask_cache、不调用 gc exit，也不释放 gc，后续可重新 map。
  * 调用者由 irqdomain core 保证无并发 handler 使用正在解绑的信息。
  */
+/*
+ * irqdomain core 的 ->unmap 回调调用。@d 是输入输出借用、@virq 是纯输入；函数不可睡眠，
+ * 不释放 domain 拥有的 gc。返回后 desc 不再引用 gc/chip/handler，但缓存和实例可供未来重映射。
+ */
 void irq_unmap_generic_chip(struct irq_domain *d, unsigned int virq)
 {
+	/* data/dgc/gc 都是 domain 生命周期内借用；irq_idx 是 gc 内 installed 位。 */
 	struct irq_data *data = irq_domain_get_irq_data(d, virq);
 	struct irq_domain_chip_generic *dgc = d->gc;
 	unsigned int hw_irq = data->hwirq;
@@ -665,6 +784,7 @@ void irq_unmap_generic_chip(struct irq_domain *d, unsigned int virq)
 
 	irq_idx = hw_irq % dgc->irqs_per_chip;
 
+	/* 先撤销内部占用，再把 desc 信息恢复为空；domain core 保证没有并发 map 观察中间态。 */
 	clear_bit(irq_idx, &gc->installed);
 	irq_domain_set_info(d, virq, hw_irq, &no_irq_chip, NULL, NULL, NULL,
 			    NULL);
@@ -704,19 +824,27 @@ EXPORT_SYMBOL_GPL(irq_generic_chip_ops);
  * irq_cnt。无错误返回/回滚，调用前必须确保 IRQ 号有效且未被占用，gc/type/寄存器已配置；
  * 生命周期结束用同范围 irq_remove_generic_chip()。调用可触及 MMIO，配置阶段执行。
  */
+/*
+ * 传统驱动在 irq_alloc_generic_chip() 后调用。@gc 仍由调用者拥有，@msk/@flags/@clr/@set
+ * 都按值输入；成功后 IRQ desc 和 gc_list 借用该 gc，调用者必须保持其内存/名称/MMIO 有效。
+ * 函数不睡眠、无直接返回值；因没有错误通道，所有 IRQ 号和寄存器前提必须在调用前验证。
+ */
 void irq_setup_generic_chip(struct irq_chip_generic *gc, u32 msk,
 			    enum irq_gc_flags flags, unsigned int clr,
 			    unsigned int set)
 {
+	/* ct/chip 借用 type0；i 是当前 Linux IRQ，退出时与 irq_base 的差记录扫描跨度。 */
 	struct irq_chip_type *ct = gc->chip_types;
 	struct irq_chip *chip = &ct->chip;
 	unsigned int i;
 
+	/* 阶段 1：先加入 syscore PM 链；后续不存在失败分支，remove 负责唯一配对摘链。 */
 	scoped_guard (raw_spinlock, &gc_lock)
 		list_add_tail(&gc->list, &gc_list);
 
 	irq_gc_init_mask_cache(gc, flags);
 
+	/* 阶段 2：按值右移本地 msk，逐个初始化选中的 desc；未选位只推进相对编号。 */
 	for (i = gc->irq_base; msk; msk >>= 1, i++) {
 		if (!(msk & 0x01))
 			continue;
@@ -737,6 +865,7 @@ void irq_setup_generic_chip(struct irq_chip_generic *gc, u32 msk,
 		irq_set_chip_data(i, gc);
 		irq_modify_status(i, clr, set);
 	}
+	/* irq_cnt 是扫描至最高置位的跨度，不等于稀疏 @msk 的置位数量。 */
 	gc->irq_cnt = i - gc->irq_base;
 }
 EXPORT_SYMBOL_GPL(irq_setup_generic_chip);
@@ -754,6 +883,10 @@ EXPORT_SYMBOL_GPL(irq_setup_generic_chip);
  * 顺序扫描 chip_types，首个 ct->type 与 @type 有交集时，同时把 d->chip 改为该 type 的
  * irq_chip，并把所属 desc->handle_irq 改为其 flow handler，返回 0；无匹配返回 -EINVAL，
  * 状态不变。调用者持 desc 锁并负责实际硬件 type 寄存器编程；gc/type 生命周期稳定。
+ */
+/*
+ * irq_chip->irq_set_type 实现调用它；@d 是输入输出借用，@type 为纯输入位图。函数持 desc
+ * 锁、不可睡眠、不取得引用。成功发布新的 chip/flow handler，失败保证两个指针都不改变。
  */
 int irq_setup_alt_chip(struct irq_data *d, unsigned int type)
 {
@@ -790,11 +923,19 @@ EXPORT_SYMBOL_GPL(irq_setup_alt_chip);
  * 无返回值，不释放 gc 内存、不调用 domain unmap，也不清 installed 位；调用者必须在停止
  * IRQ/映射及 PM 遍历后使用，并负责随后的 exit/内存释放。@msk 应与 setup 范围一致。
  */
+/*
+ * irq_destroy_generic_chip()、domain teardown 或建立失败回滚调用。@gc 是借用，@msk/@clr/@set
+ * 为纯输入；本函数消费 gc_list 成员关系和 desc 绑定，但不清 installed 位图、不消费内存
+ * ownership。不可睡眠；exit 的先后由外层 API 约定，kfree 必须在本函数返回后。未曾入链的
+ * gc 不得传入，避免 list_del 非法节点。
+ */
 void irq_remove_generic_chip(struct irq_chip_generic *gc, u32 msk,
 			     unsigned int clr, unsigned int set)
 {
+	/* i 是 gc 内相对位，virq 是 domain 映射结果或传统 irq_base+i。 */
 	unsigned int i, virq;
 
+	/* 阶段 1：先阻止后续 syscore 遍历取得该 gc，再逐线路撤销 desc 绑定。 */
 	scoped_guard (raw_spinlock, &gc_lock)
 		list_del(&gc->list);
 
@@ -838,6 +979,10 @@ EXPORT_SYMBOL_GPL(irq_remove_generic_chip);
  * 缺失也返回 NULL。返回值只是借用，回调应把它作为进入 chip 的代表，不得假定它代表
  * 所有线路的独立状态；函数不加锁，PM 阶段要求映射稳定。
  */
+/*
+ * suspend/resume/shutdown 回调调用它。@gc 是 gc_list 生命周期内借用；函数不保存指针、
+ * 不取得引用且不可睡眠。NULL 表示 domain 没有已安装代表线或映射缺失，调用者必须跳过 per-IRQ 回调。
+ */
 static struct irq_data *irq_gc_get_irq_data(struct irq_chip_generic *gc)
 {
 	unsigned int virq;
@@ -866,11 +1011,17 @@ static struct irq_data *irq_gc_get_irq_data(struct irq_chip_generic *gc)
  * 适合保存整芯片状态。返回 0，单个回调无错误通道；PM 阶段列表/映射必须冻结。顺序使
  * per-IRQ 风格回调先执行，per-gc 回调后执行。
  */
+/*
+ * syscore_suspend() 在仅一颗 CPU 在线且本地中断关闭时调用，因而本函数及所有下游回调都不能
+ * 睡眠。外层 @data 是未使用的 syscore 私有借用；循环内同名 data 只在当前 gc 的映射稳定期借用。
+ */
 static int irq_gc_suspend(void *data)
 {
+	/* gc 逐项借用 gc_list 成员；syscore 冻结期不需 gc_lock，也不得并发 remove。 */
 	struct irq_chip_generic *gc;
 
 	list_for_each_entry(gc, &gc_list, list) {
+		/* type0 提供 per-IRQ 风格 PM 槽；ct 与代表 data 都不逃逸本轮迭代。 */
 		struct irq_chip_type *ct = gc->chip_types;
 
 		if (ct->chip.irq_suspend) {
@@ -880,6 +1031,7 @@ static int irq_gc_suspend(void *data)
 				ct->chip.irq_suspend(data);
 		}
 
+		/* per-gc 回调即使没有任何 installed IRQ 也执行，用于保存整块控制器状态。 */
 		if (gc->suspend)
 			gc->suspend(gc);
 	}
@@ -893,16 +1045,23 @@ static int irq_gc_suspend(void *data)
  * irq_data 时调用 type0 irq_chip->irq_resume，顺序与 suspend 对称反转。无返回值，回调
  * 不能向 syscore 传播失败。
  */
+/*
+ * syscore_resume() 同样在仅一颗 CPU 在线且中断关闭时调用，不能睡眠。@data 未消费；gc/type/
+ * 代表 irq_data 都是冻结期借用。恢复顺序先整芯片、后 per-IRQ，与 suspend 的提交顺序逆向配对。
+ */
 static void irq_gc_resume(void *data)
 {
+	/* gc_list 在 syscore 冻结期稳定，不持 gc_lock 避免把未知 PM 回调放进全局 raw 锁。 */
 	struct irq_chip_generic *gc;
 
 	list_for_each_entry(gc, &gc_list, list) {
 		struct irq_chip_type *ct = gc->chip_types;
 
+		/* 阶段 1：先恢复 gc 共享寄存器、访问基础和缓存。 */
 		if (gc->resume)
 			gc->resume(gc);
 
+		/* 阶段 2：有已安装代表线时，再让 type0 完成 irq_chip 级恢复。 */
 		if (ct->chip.irq_resume) {
 			struct irq_data *data = irq_gc_get_irq_data(gc);
 
@@ -924,8 +1083,13 @@ static void irq_gc_resume(void *data)
  * 调用。无 gc 级独立 shutdown 回调、无返回值；用于在 reboot/poweroff 前把控制器置于
  * 安全状态，列表和 mapping 此时必须稳定。
  */
+/*
+ * syscore_shutdown() 持其注册表 mutex 调用本函数；@data 未消费，gc/type/代表 data 都是借用。
+ * generic 层自身不睡眠，但具体 irq_pm_shutdown 回调必须遵守系统关机阶段约束；无错误返回通道。
+ */
 static void irq_gc_shutdown(void *data)
 {
+	/* 关机阶段禁止并发 setup/remove，故遍历 gc_list 时不再取得 gc_lock。 */
 	struct irq_chip_generic *gc;
 
 	list_for_each_entry(gc, &gc_list, list) {
@@ -957,6 +1121,10 @@ static struct syscore irq_gc_syscore = {
  *
  * 无参数。register_syscore() 发布静态 irq_gc_syscore，返回 0；没有注销路径，因为对象及
  * gc 基础设施与内核同寿命。此后加入 gc_list 的 chip 会参与系统 suspend/resume/shutdown。
+ */
+/*
+ * device_initcall 同步调用；入参和外部 ownership 均无。register_syscore() 内部取得 mutex，
+ * 因而本函数运行在可睡眠初始化上下文；成功发布的是静态对象，不存在分配失败或释放责任。
  */
 static int __init irq_gc_init_ops(void)
 {

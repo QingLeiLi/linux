@@ -43,7 +43,7 @@
  *
  */
 /*
- * 原文说明：本文件包含中断描述符管理代码，更完整的通用 IRQ 设计说明
+ * 本文件包含中断描述符管理代码，更完整的通用 IRQ 设计说明
  * 位于 Documentation/core-api/genericirq.rst。这里的“管理”特指
  * irq_desc 的编号空间和生命周期，而不是具体 irq_chip 驱动。
  */

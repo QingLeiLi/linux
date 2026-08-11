@@ -98,7 +98,7 @@ static __always_inline bool arch_in_rcu_eqs(void) { return false; }
 /*
  * enter_from_user_mode() - 用户态 syscall/IRQ 进入后建立可插桩内核环境。
  *
- * 原文说明硬件入口已关闭 IRQ，但 tracing 仍把用户态视为 IRQ-on，NO_HZ_FULL
+ * 硬件入口已关闭 IRQ，但 tracing 仍把用户态视为 IRQ-on，NO_HZ_FULL
  * 下 RCU 还可能处于 EQS。阶段依次为：让 lockdep 看到 IRQ-off、通过 Context
  * Tracking 恢复 RCU watching、完成 IRQ-off trace。体系结构不可插桩代码以
  * IRQ-off 调用，返回后 IRQ 仍关闭，但后续代码已可插桩。
@@ -288,7 +288,7 @@ static __always_inline void irqentry_exit_to_user_mode_prepare(struct pt_regs *r
 /*
  * exit_to_user_mode() - 返回用户态前提交最终 IRQ/RCU/架构状态。
  *
- * 原文说明 syscall/IRQ 出口最终会开启 IRQ，但调用时仍 IRQ-off；阶段依次为
+ *  syscall/IRQ 出口最终会开启 IRQ，但调用时仍 IRQ-off；阶段依次为
  * 准备 IRQ-on trace/lockdep、Context Tracking 进入 USER/EQS、执行架构最后
  * 防护（如推测执行缓解）、让 lockdep 发布 IRQ-on。体系结构不可插桩代码
  * 调用，且用户返回工作必须已完成。

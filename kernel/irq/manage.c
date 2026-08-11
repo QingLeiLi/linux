@@ -6,7 +6,7 @@
  * This file contains driver APIs to the irq subsystem.
  */
 /*
- * 原文说明：本文件实现驱动面向 IRQ 子系统的管理 API。它覆盖 request/free、嵌套
+ * 本文件实现驱动面向 IRQ 子系统的管理 API。它覆盖 request/free、嵌套
  * disable/enable、亲和性、线程化 action、NMI 与 irqchip 状态查询；chip.c 负责硬件
  * flow，本文件负责把驱动请求转换为安全的 action/线程/引用生命周期。
  *
@@ -613,9 +613,14 @@ int irq_set_affinity_locked(struct irq_data *data, const struct cpumask *mask,
 	if (!chip || !chip->irq_set_affinity)
 		return -EINVAL;
 
+	/* 阶段 1：未激活且只能在激活期编程时，只缓存请求，不触碰硬件。 */
 	if (irq_set_affinity_deactivated(data, mask))
 		return 0;
 
+	/*
+	 * 阶段 2：chip 允许当前上下文迁移且没有旧请求时立即尝试；否则仅覆盖
+	 * desc 拥有的 pending mask，留给安全的屏蔽/迁移窗口提交。
+	 */
 	if (irq_can_move_pcntxt(data) && !irqd_is_setaffinity_pending(data)) {
 		ret = irq_try_set_affinity(data, mask, force);
 	} else {
@@ -623,6 +628,10 @@ int irq_set_affinity_locked(struct irq_data *data, const struct cpumask *mask,
 		irq_copy_pending(desc, mask);
 	}
 
+	/*
+	 * 阶段 3：发布“调用者设置过 affinity”的软件状态，并异步通知观察者。
+	 * notifier 合并事件且读取执行时的最新值，因此这里不把 @mask 借给 work。
+	 */
 	if (desc->affinity_notify)
 		irq_affinity_schedule_notify_work(desc);
 
@@ -807,6 +816,7 @@ static void irq_affinity_notify(struct work_struct *work)
 	struct irq_desc *desc = irq_to_desc(notify->irq);
 	cpumask_var_t cpumask;
 
+	/* 阶段 1：为跨越 desc 锁和外部回调边界建立本次 work 私有的值快照。 */
 	if (!desc || !alloc_cpumask_var(&cpumask, GFP_KERNEL))
 		goto out;
 
@@ -817,10 +827,15 @@ static void irq_affinity_notify(struct work_struct *work)
 			cpumask_copy(cpumask, desc->irq_common_data.affinity);
 	}
 
+	/* 阶段 2：锁外交付快照，允许用户回调睡眠，也避免回调反向取得 desc 锁。 */
 	notify->notify(notify, cpumask);
 
 	free_cpumask_var(cpumask);
 out:
+	/*
+	 * 阶段 3：无论是否取得快照都归还调度时的 work 引用；这可能成为最后
+	 * 一份引用并在当前 workqueue 上调用 release()。
+	 */
 	kref_put(&notify->kref, notify->release);
 }
 
@@ -990,6 +1005,7 @@ int irq_set_vcpu_affinity(unsigned int irq, void *vcpu_info)
 		struct irq_chip *chip;
 
 		data = irq_desc_get_irq_data(desc);
+		/* 阶段 1：沿叶子到根逐层寻找真正理解 @vcpu_info 的第一个 chip。 */
 		do {
 			chip = irq_data_get_irq_chip(data);
 			if (chip && chip->irq_set_vcpu_affinity)
@@ -1000,6 +1016,7 @@ int irq_set_vcpu_affinity(unsigned int irq, void *vcpu_info)
 
 		if (!data)
 			return -ENOSYS;
+		/* 阶段 2：仍在描述符锁域内调用选中层，返回值与副作用完全由 chip 定义。 */
 		return chip->irq_set_vcpu_affinity(data, vcpu_info);
 	}
 	return -EINVAL;
@@ -1295,6 +1312,7 @@ int irq_set_irq_wake(unsigned int irq, unsigned int on)
 		 * wake_depth 汇总各调用方引用，不能让一次关闭覆盖其他调用方的启用。
 		 */
 		if (on) {
+			/* 启用只在 0->1 边界下发；失败把引用计数和硬件状态一起回滚。 */
 			if (desc->wake_depth++ == 0) {
 				ret = set_irq_wake_real(irq, on);
 				if (ret)
@@ -1303,6 +1321,7 @@ int irq_set_irq_wake(unsigned int irq, unsigned int on)
 					irqd_set(&desc->irq_data, IRQD_WAKEUP_STATE);
 			}
 		} else {
+			/* 禁用只在 1->0 边界下发；不配平只告警，硬件失败则恢复一份引用。 */
 			if (desc->wake_depth == 0) {
 				WARN(1, "Unbalanced IRQ %d wake disable\n", irq);
 			} else if (--desc->wake_depth == 0) {
@@ -1371,6 +1390,7 @@ int __irq_set_trigger(struct irq_desc *desc, unsigned long flags)
 		return 0;
 	}
 
+	/* 阶段 1：按 chip 契约建立 set_type 回调所需的临时 masked 状态。 */
 	if (chip->flags & IRQCHIP_SET_TYPE_MASKED) {
 		if (!irqd_irq_masked(&desc->irq_data))
 			mask_irq(desc);
@@ -1383,6 +1403,10 @@ int __irq_set_trigger(struct irq_desc *desc, unsigned long flags)
 	flags &= IRQ_TYPE_SENSE_MASK;
 	ret = chip->irq_set_type(&desc->irq_data, flags);
 
+	/*
+	 * 阶段 2：把 chip 的三类成功约定归一化。普通成功由核心写 trigger，
+	 * NOCOPY 则从 chip 已更新的 irq_data 回读；二者最终同步 desc 的 level 属性。
+	 */
 	switch (ret) {
 	case IRQ_SET_MASK_OK:
 	case IRQ_SET_MASK_OK_DONE:
@@ -1406,6 +1430,7 @@ int __irq_set_trigger(struct irq_desc *desc, unsigned long flags)
 		pr_err("Setting trigger mode %lu for irq %u failed (%pS)\n",
 		       flags, irq_desc_get_irq(desc), chip->irq_set_type);
 	}
+	/* 阶段 3：只恢复入口时本来可运行的线路，不能意外启用已 disabled 的 IRQ。 */
 	if (unmask)
 		unmask_irq(desc);
 	return ret;
@@ -1793,6 +1818,7 @@ static int irq_thread(void *data)
 	irqreturn_t (*handler_fn)(struct irq_desc *desc,
 			struct irqaction *action);
 
+	/* 阶段 1：先发布 READY，再确定调度策略和本线程实际执行的包装函数。 */
 	irq_thread_set_ready(desc, action);
 
 	if (action->handler == irq_forced_secondary_handler)
@@ -1806,9 +1832,14 @@ static int irq_thread(void *data)
 	else
 		handler_fn = irq_thread_fn;
 
+	/* 阶段 2：安装异常退出兜底；正常 free 会在退出前取消这个 task_work。 */
 	init_task_work(&on_exit_work, irq_thread_dtor);
 	task_work_add(current, &on_exit_work, TWA_NONE);
 
+	/*
+	 * 阶段 3：每次成功领取 RUNTHREAD 只执行一次并配平一次 threads_active；
+	 * handler 要求唤醒 secondary 时，由后者建立自己独立的活动计数。
+	 */
 	while (!irq_wait_for_interrupt(desc, action)) {
 		irqreturn_t action_ret;
 
@@ -1852,6 +1883,10 @@ void irq_wake_thread(unsigned int irq, void *dev_id)
 	if (!desc || WARN_ON(irq_settings_is_per_cpu_devid(desc)))
 		return;
 
+	/*
+	 * desc 锁同时稳定 action 链并与 hardirq 的线程唤醒记账串行；匹配后只把
+	 * 工作提交给已有 thread，action 和 @dev_id 的所有权均不改变。
+	 */
 	guard(raw_spinlock_irqsave)(&desc->lock);
 	for_each_action_of_desc(desc, action) {
 		if (action->dev_id == dev_id) {
@@ -2781,15 +2816,18 @@ const void *free_irq(unsigned int irq, void *dev_id)
 		return NULL;
 
 #ifdef CONFIG_SMP
+	/* 阶段 1：先切断违约遗留的 notifier 借用，避免后续 affinity 变化再调度它。 */
 	if (WARN_ON(desc->affinity_notify))
 		desc->affinity_notify = NULL;
 #endif
 
+	/* 阶段 2：内部事务负责摘链、同步全部执行者并归还 action 之外的资源。 */
 	action = __free_irq(desc, dev_id);
 
 	if (!action)
 		return NULL;
 
+	/* 阶段 3：先保存仍由驱动拥有的名称指针，再释放核心拥有的 action 外壳。 */
 	devname = action->name;
 	kfree(action);
 	return devname;
@@ -2809,6 +2847,7 @@ static const void *__cleanup_nmi(unsigned int irq, struct irq_desc *desc)
 	struct irqaction *action = NULL;
 	const char *devname = NULL;
 
+	/* 阶段 1：在 desc 锁内撤销 NMI 模式、摘除唯一 action 并关闭 domain 生命周期。 */
 	scoped_guard(raw_spinlock_irqsave, &desc->lock) {
 		irq_nmi_teardown(desc);
 
@@ -2825,6 +2864,7 @@ static const void *__cleanup_nmi(unsigned int irq, struct irq_desc *desc)
 		irq_shutdown_and_deactivate(desc);
 	}
 
+	/* 阶段 2：action 已不可达，锁外拆除 proc 和对象内存，再归还共享外围资源。 */
 	irq_proc_update_valid(desc);
 
 	if (action)
@@ -3054,12 +3094,14 @@ int request_any_context_irq(unsigned int irq, irq_handler_t handler,
 	if (!desc)
 		return -EINVAL;
 
+	/* 阶段 1：desc 的 nested 属性决定 handler 实际运行在父 IRQ 线程还是 hardirq。 */
 	if (irq_settings_is_nested_thread(desc)) {
 		ret = request_threaded_irq(irq, NULL, handler,
 					   flags, name, dev_id);
 		return !ret ? IRQC_IS_NESTED : ret;
 	}
 
+	/* 阶段 2：普通描述符沿 request_irq() 建立 hardirq action，并转换成功类别。 */
 	ret = request_irq(irq, handler, flags, name, dev_id);
 	return !ret ? IRQC_IS_HARDIRQ : ret;
 }
@@ -3106,6 +3148,7 @@ int request_nmi(unsigned int irq, irq_handler_t handler,
 	struct irq_desc *desc;
 	int retval;
 
+	/* 阶段 1：在分配任何对象前拒绝断线号、共享/轮询、非 per-CPU 和空 handler。 */
 	if (irq == IRQ_NOTCONNECTED)
 		return -ENOTCONN;
 
@@ -3129,6 +3172,7 @@ int request_nmi(unsigned int irq, irq_handler_t handler,
 	    !irq_supports_nmi(desc))
 		return -EINVAL;
 
+	/* 阶段 2：构造尚未发布的 action；直到 __setup_irq() 成功前都由本函数拥有。 */
 	action = kzalloc(sizeof(struct irqaction), GFP_KERNEL);
 	if (!action)
 		return -ENOMEM;
@@ -3146,6 +3190,7 @@ int request_nmi(unsigned int irq, irq_handler_t handler,
 	if (retval)
 		goto err_irq_setup;
 
+	/* 阶段 3：普通 action 建立完成后，在 desc 锁内提交不可共享的 NMI 身份和 chip 模式。 */
 	scoped_guard(raw_spinlock_irqsave, &desc->lock) {
 		/* Setup NMI state */
 		/* 在 desc 锁内先发布 NMI 状态，再让 chip 建立 NMI 模式。 */
@@ -3278,6 +3323,7 @@ static struct irqaction *__free_percpu_irq(unsigned int irq, void __percpu *dev_
 		return NULL;
 
 	scoped_guard(raw_spinlock_irqsave, &desc->lock) {
+		/* 阶段 1：按 percpu_dev_id 搜索唯一 action；desc 锁稳定整条链。 */
 		action_ptr = &desc->action;
 		for (;;) {
 			action = *action_ptr;
@@ -3293,6 +3339,7 @@ static struct irqaction *__free_percpu_irq(unsigned int irq, void __percpu *dev_
 			action_ptr = &action->next;
 		}
 
+		/* 阶段 2：目标 CPU 必须已全部禁用，handler 才不会再使用待释放 cookie。 */
 		if (cpumask_intersects(desc->percpu_enabled, action->affinity)) {
 			WARN(1, "percpu IRQ %d still enabled on CPU%d!\n", irq,
 			     cpumask_first_and(desc->percpu_enabled, action->affinity));
@@ -3311,6 +3358,7 @@ static struct irqaction *__free_percpu_irq(unsigned int irq, void __percpu *dev_
 		}
 	}
 
+	/* 阶段 3：action 已从并发查找域消失，锁外撤销控制面和注册期引用。 */
 	unregister_handler_proc(irq, action);
 	irq_chip_pm_put(&desc->irq_data);
 	module_put(desc->owner);
@@ -3384,9 +3432,11 @@ struct irqaction *create_percpu_irqaction(irq_handler_t handler, unsigned long f
 {
 	struct irqaction *action;
 
+	/* 阶段 1：把空 affinity 规范化为覆盖全部 possible CPU 的长期全局掩码。 */
 	if (!affinity)
 		affinity = cpu_possible_mask;
 
+	/* 阶段 2：分配并填充仍由调用者拥有、尚不可被中断路径观察的 action。 */
 	action = kzalloc_obj(struct irqaction);
 	if (!action)
 		return NULL;
@@ -3444,6 +3494,7 @@ int request_percpu_irq_affinity(unsigned int irq, irq_handler_t handler, const c
 	struct irq_desc *desc;
 	int retval;
 
+	/* 阶段 1：先验证 percpu cookie 与描述符类型，尚不取得 PM 或 action 所有权。 */
 	if (!dev_id)
 		return -EINVAL;
 
@@ -3452,6 +3503,7 @@ int request_percpu_irq_affinity(unsigned int irq, irq_handler_t handler, const c
 	    !irq_settings_is_per_cpu_devid(desc))
 		return -EINVAL;
 
+	/* 阶段 2：构造 action 并取得 chip PM 引用；setup 成功后两者都转交 IRQ 核心。 */
 	action = create_percpu_irqaction(handler, 0, devname, affinity, dev_id);
 	if (!action)
 		return -ENOMEM;
@@ -3464,6 +3516,7 @@ int request_percpu_irq_affinity(unsigned int irq, irq_handler_t handler, const c
 
 	retval = __setup_irq(irq, desc, action);
 
+	/* 阶段 3：setup 失败未发生所有权转移，按 PM 引用、action 的逆序回滚。 */
 	if (retval) {
 		irq_chip_pm_put(&desc->irq_data);
 		kfree(action);
@@ -3513,6 +3566,7 @@ int request_percpu_nmi(unsigned int irq, irq_handler_t handler, const char *name
 	struct irq_desc *desc;
 	int retval;
 
+	/* 阶段 1：验证 per-CPU 描述符具备 NMI 能力且不会被普通 auto-enable。 */
 	if (!handler)
 		return -EINVAL;
 
@@ -3530,6 +3584,7 @@ int request_percpu_nmi(unsigned int irq, irq_handler_t handler, const char *name
 	    (!affinity || cpumask_equal(affinity, cpu_possible_mask)))
 		return -EINVAL;
 
+	/* 阶段 2：建立带目标 CPU 借用掩码的 action，并取得覆盖注册期的 chip PM 引用。 */
 	action = create_percpu_irqaction(handler, IRQF_NO_THREAD | IRQF_NOBALANCING,
 					 name, affinity, dev_id);
 	if (!action)
@@ -3543,6 +3598,7 @@ int request_percpu_nmi(unsigned int irq, irq_handler_t handler, const char *name
 	if (retval)
 		goto err_irq_setup;
 
+	/* 阶段 3：action 已发布后提交 NMI 身份；每 CPU 的 chip setup 仍留给 prepare API。 */
 	scoped_guard(raw_spinlock_irqsave, &desc->lock)
 		desc->istate |= IRQS_NMI;
 	return 0;
@@ -3633,6 +3689,7 @@ static int __irq_get_irqchip_state(struct irq_data *data, enum irqchip_irq_state
 	struct irq_chip *chip;
 	int err = -EINVAL;
 
+	/* 阶段 1：从叶子向根寻找首个支持该状态查询契约的 irqchip。 */
 	do {
 		chip = irq_data_get_irq_chip(data);
 		if (WARN_ON_ONCE(!chip))
@@ -3646,6 +3703,7 @@ static int __irq_get_irqchip_state(struct irq_data *data, enum irqchip_irq_state
 #endif
 	} while (data);
 
+	/* 阶段 2：只有找到回调才允许写 @state；缺能力时保留 -EINVAL 和原输出内容。 */
 	if (data)
 		err = chip->irq_get_irqchip_state(data, which, state);
 	return err;
@@ -3671,6 +3729,7 @@ static int __irq_get_irqchip_state(struct irq_data *data, enum irqchip_irq_state
  */
 int irq_get_irqchip_state(unsigned int irq, enum irqchip_irq_state which, bool *state)
 {
+	/* 查找与慢总线串行成功后，层级 helper 负责选择回调并写输出；否则不触碰 @state。 */
 	scoped_irqdesc_get_and_buslock(irq, 0) {
 		struct irq_data *data = irq_desc_get_irq_data(scoped_irqdesc);
 
@@ -3704,6 +3763,7 @@ int irq_set_irqchip_state(unsigned int irq, enum irqchip_irq_state which, bool v
 		struct irq_data *data = irq_desc_get_irq_data(scoped_irqdesc);
 		struct irq_chip *chip;
 
+		/* 阶段 1：从叶子向根寻找首个可解释 @which 的设置回调。 */
 		do {
 			chip = irq_data_get_irq_chip(data);
 
@@ -3716,6 +3776,7 @@ int irq_set_irqchip_state(unsigned int irq, enum irqchip_irq_state which, bool v
 			data = irqd_get_parent_data(data);
 		} while (data);
 
+		/* 阶段 2：找到后在 bus lock 内提交硬件状态；无实现则统一落到 -EINVAL。 */
 		if (data)
 			return chip->irq_set_irqchip_state(data, which, val);
 	}

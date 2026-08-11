@@ -721,7 +721,7 @@ EXPORT_SYMBOL(seq_path);
  * 从持有引用的 @file 借用 f_path，复用 seq_path 输出绝对路径。
  * 返回值、转义与溢出语义完全相同，不取得额外 file/path 引用。
  *
- * 契约补充：@m 是持锁调用链中的输出缓冲，@file 为调用者持有引用的输入，
+ * @m 是持锁调用链中的输出缓冲，@file 为调用者持有引用的输入，
  * @esc 是 NUL 结尾转义字符集合且在调用期间有效。路径解析可能睡眠；
  * 返回 0、-ENAMETOOLONG 或路径 helper errno，输入 ownership 均不转移。
  */

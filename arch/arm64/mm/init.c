@@ -135,7 +135,7 @@ phys_addr_t __ro_after_init arm64_dma_phys_limit;
  * 可放高端。预留必须早于标准资源树发布，失败由通用解析/日志策略处理。
  */
 /*
- * 契约补充：由 bootmem_init() 在 boot CPU 的 __init 单线程上下文调用，
+ * 由 bootmem_init() 在 boot CPU 的 __init 单线程上下文调用，
  * 无入参、无直接返回值。局部 size/base 均为物理字节数/地址，ret 仅承接
  * parse errno；解析失败不改变 memblock，成功后预留区所有权交给 crash
  * kernel，后续资源树据此标记。helper 可能修改 memblock，但不睡眠。
@@ -177,7 +177,7 @@ static phys_addr_t __init max_zone_phys(phys_addr_t zone_limit)
  * 提供；DMA/DMA32 按构建配置填充，NORMAL 总到 max_pfn。只读全局边界。
  */
 /*
- * 契约补充：max_zone_pfns 是通用 free-area 初始化提供的非 NULL 输出数组，
+ * max_zone_pfns 是通用 free-area 初始化提供的非 NULL 输出数组，
  * 调用前由调用者拥有，函数只写已编译 zone 槽且不保留指针。boot CPU
  * __init 上下文、不睡眠、无返回值；dma32_phys_limit 单位物理字节，
  * PFN_DOWN 后所有输出单位为 exclusive PFN。
@@ -202,7 +202,7 @@ void __init arch_zone_limits_init(unsigned long *max_zone_pfns)
  * 可寻址范围。启动串行，无返回。
  */
 /*
- * 契约补充：由 bootmem_init() 在 CMA 预留前调用；无入参、无直接返回。
+ * 由 bootmem_init() 在 CMA 预留前调用；无入参、无直接返回。
  * ACPI/DT limit 和 dma32 limit 均为物理字节开区间上界。成功后
  * arm64_dma_phys_limit 非零并冻结，供 zone、CMA、SWIOTLB 共同读取。
  */
@@ -241,7 +241,7 @@ static void __init dma_limits_init(void)
  * 回验防止超宽 bogus PFN 在移位时截断产生假阳性；返回 1/0，不取得 page 引用。
  */
 /*
- * 契约补充：pfn 是绝对物理页帧号，不是相对 PHYS_PFN_OFFSET 的索引。
+ * pfn 是绝对物理页帧号，不是相对 PHYS_PFN_OFFSET 的索引。
  * 运行期查询可在原子上下文调用，不睡眠；只读初始化后稳定的 memblock
  * memory 类型。返回 1 表示可由 linear map 访问，0 表示越界、hole 或 NOMAP。
  */
@@ -292,7 +292,7 @@ early_param("mem", early_mem);
  * 成功后所有保留 RAM 均能由 __phys_to_virt 覆盖。
  */
 /*
- * 契约补充：由 setup_arch() 在 boot CPU、memblock 可修改而伙伴分配器尚未
+ * 由 setup_arch() 在 boot CPU、memblock 可修改而伙伴分配器尚未
  * 启动时调用；无入参/返回且不睡眠。linear_region_size 单位字节，是当前
  * PAGE_END 与实际 vabits 起点间可用窗口。函数原地修改 memblock.memory/
  * reserved、memstart_addr 和 initrd VA；memblock helper 失败由启动期
@@ -426,7 +426,7 @@ void __init arm64_memblock_init(void)
  * crashkernel 必须早于资源树。无返回，严重子系统失败由各 helper panic/降级。
  */
 /*
- * 契约补充：调用时 arm64_memblock_init() 已完成；boot CPU __init 上下文，
+ * 调用时 arm64_memblock_init() 已完成；boot CPU __init 上下文，
  * 无入参/返回。min/max 是 DRAM 的 inclusive/exclusive PFN 边界。成功后
  * min/max_pfn、NUMA、KVM hyp、DMA limit、CMA 和 crashkernel 预留均已
  * 建立，下一步可初始化 zone/伙伴分配器。
@@ -483,7 +483,7 @@ void __init arch_setup_zero_pages(void)
  * 极小大页系统默认开启 overcommit，避免页粒度导致可用内存无法启动。
  */
 /*
- * 契约补充：伙伴分配器正式发布前在 boot CPU 调用，无入参/返回。
+ * 伙伴分配器正式发布前在 boot CPU 调用，无入参/返回。
  * flags 是 SWIOTLB 初始化策略位图，swiotlb 表示是否需要启用 bounce。
  * 函数可分配 SWIOTLB 早期内存并产生日志，但不进入普通可睡眠分配路径。
  * 完成后页表层数不变量已由 BUILD_BUG_ON 证明，SWIOTLB 策略已固定。
@@ -563,7 +563,7 @@ void __init mem_init(void)
  * 但保留 VA 区域不供模块复用，避免 kallsyms 对地址归属产生歧义。
  */
 /*
- * 契约补充：由通用 init 释放阶段调用，无入参/返回。lm_init_begin/end 是
+ * 由通用 init 释放阶段调用，无入参/返回。lm_init_begin/end 是
  * 同一 __init 镜像物理页的 linear-map 别名，均为借用地址。函数先把物理页
  * 交给伙伴分配器，再撤销 image alias 页表；跨过 free_reserved_area()
  * 后这些内容不可再访问，且没有失败回滚。

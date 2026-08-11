@@ -12,7 +12,7 @@
  * we allow the resending of IRQs via a tasklet.
  */
 /*
- * 原文说明：本文件实现 IRQ resend。若事件已 pending 但尚未处理，核心尝试重新触发它；
+ * 本文件实现 IRQ resend。若事件已 pending 但尚未处理，核心尝试重新触发它；
  * 调用者可能正处于中断保护区，不能直接在当前栈执行 flow handler。优先使用 irqchip 的
  * 硬件 retrigger；控制器不支持时，在 HARDIRQS_SW_RESEND 配置下把 desc 排入全局 hlist，
  * 由 tasklet 在 softirq 上下文重新调用 handle_irq。
@@ -50,13 +50,29 @@ static DEFINE_RAW_SPINLOCK(irq_resend_lock);
  */
 static void resend_irqs(struct tasklet_struct *unused)
 {
+	/*
+	 * guard 在本作用域入口执行 raw_spin_lock_irq()，退出时自动执行
+	 * raw_spin_unlock_irq()：它既串行 irq_resend_list，也让本 CPU 在模拟
+	 * flow-handler 入口期间保持硬中断关闭。@unused 只是 tasklet 框架传入的
+	 * 静态 tasklet 借用指针，本函数不读取也不保存它。
+	 */
 	guard(raw_spinlock_irq)(&irq_resend_lock);
 	while (!hlist_empty(&irq_resend_list)) {
+		/*
+		 * desc 是从内嵌 resend_node 反推得到的借用指针。持有全局锁时链首
+		 * 与节点归属稳定；hlist_del_init() 同时完成“本轮领取”和恢复 unhashed
+		 * 状态，使处理期间再次到来的重发请求能够重新入链而不丢失。
+		 */
 		struct irq_desc *desc;
 
 		desc = hlist_entry(irq_resend_list.first, struct irq_desc,  resend_node);
 		hlist_del_init(&desc->resend_node);
 
+		/*
+		 * 设备 flow handler 可能再次进入 IRQ 核心并取得 desc->lock，绝不能在
+		 * irq_resend_lock 下调用。这里只释放 raw lock，保留本地 IRQ 关闭；返回后
+		 * 重新取得链锁，继续消费处理期间新排入的节点。
+		 */
 		raw_spin_unlock(&irq_resend_lock);
 		desc->handle_irq(desc);
 		raw_spin_lock(&irq_resend_lock);
@@ -75,6 +91,12 @@ static DECLARE_TASKLET(resend_tasklet, resend_irqs);
  * nested-thread IRQ 不能直接触发子 flow，必须有有效 parent_irq，并改为重发父描述符。
  * 在全局锁下仅当节点尚未入链时加入以去重，随后 schedule tasklet；成功返回 0。调用者
  * 通过 REPLAY 位防止逻辑重复，描述符生命周期由 clear/synchronize 协议保护。
+ */
+/*
+ * 该 helper 只由 check_irq_resend() 的退化路径调用，继承“本地 IRQ 关闭、原始
+ * desc->lock 已持有”的原子上下文，不能睡眠。输入指针不转移 ownership；nested 情况下
+ * 只把局部变量改指向父描述符，不把父对象引用带出函数。成功只表示异步工作已提交，
+ * 真正的 flow handler 尚未执行；失败只有 -EINVAL，且没有节点入链。
  */
 static int irq_sw_resend(struct irq_desc *desc)
 {
@@ -126,6 +148,10 @@ static int irq_sw_resend(struct irq_desc *desc)
  * 节点，返回后节点不在链中；无返回值。它只阻止尚未取出的任务，调用者仍须与可能已经
  * 摘节点并执行 handle_irq 的 tasklet 做相应同步。
  */
+/*
+ * 主要调用者是 irq_shutdown()，它在 desc->lock 下关闭已 started 的线路；本函数额外
+ * 取得 irq_resend_lock 与排队/消费方串行，不睡眠，也不改变 desc 的引用所有权。
+ */
 void clear_irq_resend(struct irq_desc *desc)
 {
 	guard(raw_spinlock)(&irq_resend_lock);
@@ -138,19 +164,43 @@ void clear_irq_resend(struct irq_desc *desc)
  * @desc: 尚未对外发布/尚未入 resend 链的描述符。将 resend_node 标成 unhashed；无锁、
  * 无返回值，只能在描述符初始化或已确认摘链后调用。
  */
+/*
+ * 主要调用者 init_desc() 尚未把 desc 发布到 sparse_irqs，因此这里无需取得
+ * irq_resend_lock，也不存在并发消费者。初始化只建立节点不在任何 hlist 中的不变量，
+ * 不排队 tasklet、不转移 ownership、不会睡眠。
+ */
 void irq_resend_init(struct irq_desc *desc)
 {
 	INIT_HLIST_NODE(&desc->resend_node);
 }
 #else
 /* 未启用软件重发时，描述符无需维护 resend_node，清理与初始化为空操作。 */
+/*
+ * clear_irq_resend() - 软件重发关闭配置下的清理桩
+ *
+ * @desc: 调用者仍传入存活的描述符借用指针，但本配置没有 resend_node 队列状态可清。
+ * 无需锁、不会睡眠、无直接返回值和可观察副作用；保留同一接口使 shutdown 路径无需
+ * 条件编译。调用后对象 ownership 与入口完全相同。
+ */
 void clear_irq_resend(struct irq_desc *desc) {}
+/*
+ * irq_resend_init() - 软件重发关闭配置下的初始化桩
+ *
+ * @desc: 尚未发布的描述符借用指针，本函数不读取、不保存也不取得引用。
+ * 无需锁、不会睡眠、无直接返回值和可观察副作用；描述符随后由 irqdesc 初始化路径
+ * 继续构造，但不会具备 tasklet 软件重发能力。
+ */
 void irq_resend_init(struct irq_desc *desc) {}
 
 /*
  * irq_sw_resend() - 配置关闭时的软件重发失败桩
  *
  * @desc: 未消费的借用描述符。始终返回 -EINVAL，促使上层报告该 IRQ 无可用重发机制。
+ */
+/*
+ * check_irq_resend() 在本地 IRQ 关闭并持有 desc->lock 时调用本桩；本配置不取锁、
+ * 不睡眠、不保存指针，也不改变任何描述符或全局状态。调用者收到 -EINVAL 后不会置
+ * IRQS_REPLAY。
  */
 static int irq_sw_resend(struct irq_desc *desc)
 {
@@ -165,6 +215,11 @@ static int irq_sw_resend(struct irq_desc *desc)
  * 当前 chip 有 irq_retrigger 时直接调用；层级 domain 配置下否则沿父层寻找能力；非层级
  * 且无回调返回 0。返回遵循 retrigger 契约：非零表示已接受/成功，0 表示不可重触发，
  * 上层随后尝试软件重发。函数不修改 PENDING/REPLAY，不睡眠。
+ */
+/*
+ * 该 helper 只由 check_irq_resend() 调用；@desc 是调用期借用，返回后仍由原调用路径
+ * 持有。直接 chip 回调与 hierarchy helper 的返回值都按“非零已接受、零不支持”解释，
+ * 本函数本身不取得锁、不转移引用，也不等待硬件真正递送 IRQ。
  */
 static int try_retrigger(struct irq_desc *desc)
 {
@@ -195,6 +250,7 @@ static int try_retrigger(struct irq_desc *desc)
  */
 int check_irq_resend(struct irq_desc *desc, bool inject)
 {
+	/* err 同时承载软件排队结果；硬件 retrigger 被接受时保持初始成功值 0。 */
 	int err = 0;
 
 	/*
@@ -211,14 +267,26 @@ int check_irq_resend(struct irq_desc *desc, bool inject)
 		return -EINVAL;
 	}
 
+	/*
+	 * REPLAY 是“已经提交、尚未由 flow handler 接管”的去重门禁。调用者持有
+	 * desc->lock，因而检查与后面的置位构成同一原子状态转换；命中时不能再次
+	 * 触碰 pending 或控制器。
+	 */
 	if (desc->istate & IRQS_REPLAY)
 		return -EBUSY;
 
+	/* 普通补发只消费真实 pending；测试注入用 @inject 绕过这一空操作快速路径。 */
 	if (!(desc->istate & IRQS_PENDING) && !inject)
 		return 0;
 
+	/*
+	 * 从这里起本次调用已经领取事件：先清 PENDING，再把责任提交给硬件或软件机制。
+	 * 若两种机制都失败，本函数不会恢复 PENDING，调用者必须依据负错误处理失败；
+	 * 这避免把一个当前无法安全重放的请求留成无界重试。
+	 */
 	desc->istate &= ~IRQS_PENDING;
 
+	/* 非零表示 irqchip 已接受硬件重触发；只有返回 0 才退化到 tasklet 软件重发。 */
 	if (!try_retrigger(desc))
 		err = irq_sw_resend(desc);
 
@@ -256,8 +324,15 @@ int check_irq_resend(struct irq_desc *desc, bool inject)
  * replay、未激活、无硬件 retrigger 且无可用软件重发等均返回负 errno。函数可访问慢总线，
  * 必须在可满足 chip bus-lock 约束的测试上下文调用。
  */
+/*
+ * @irq 是 Linux 逻辑 IRQ 号，不携带对象 ownership；导出的调试/故障注入调用者负责保证
+ * 其测试不会与真实设备协议冲突。函数不保留 desc 引用：scoped_irqdesc_get_and_buslock()
+ * 只在词法作用域内稳定描述符并在退出时释放 bus lock/desc lock。成功返回仅表示硬件状态
+ * 已置位或重发已提交，不保证 handler 已经执行；失败不留下由本函数持有的资源。
+ */
 int irq_inject_interrupt(unsigned int irq)
 {
+	/* err 是最终返回状态；保持 -EINVAL 表示未找到满足注入前提的可执行路径。 */
 	int err = -EINVAL;
 
 	/* Try the state injection hardware interface first */
@@ -268,6 +343,7 @@ int irq_inject_interrupt(unsigned int irq)
 	/* That failed, try via the resend mechanism */
 	/* 状态接口失败后，再尝试通用硬件 retrigger/软件 tasklet resend。 */
 	scoped_irqdesc_get_and_buslock(irq, 0) {
+		/* desc 是 scope helper 在锁保护期提供的借用指针，离开作用域后不可继续使用。 */
 		struct irq_desc *desc = scoped_irqdesc;
 
 		/*

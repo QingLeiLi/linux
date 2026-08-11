@@ -31,6 +31,12 @@
  * false；pending_mask 仍含另一在线 CPU 时返回 true，表示仍可继续迁移。函数只调整
  * SETAFFINITY_PENDING，不清 pending_mask 内容、不调用 chip；调用者持 desc 锁。
  */
+/*
+ * 主要调用者 migrate_one_irq() 已把 dying CPU 排除出 cpu_online_mask。@desc 是调用期
+ * 借用，@force_clear 是纯输入策略；函数不睡眠、不转移 ownership。注意返回 true 只说明
+ * mask 还有在线目标：@force_clear 为 true 时 pending 位仍会被清除，调用者随后直接复用
+ * pending_mask 完成迁移，而不是等待下一次 pending 执行。
+ */
 bool irq_fixup_move_pending(struct irq_desc *desc, bool force_clear)
 {
 	/* data 是 desc 内嵌顶层 irq_data 的借用指针。 */
@@ -64,8 +70,14 @@ bool irq_fixup_move_pending(struct irq_desc *desc, bool force_clear)
  * 调用并返回；无支持层为空操作。无错误返回，回调负责完成诸如旧向量清理；调用者保证
  * 所需锁和不可迁移/中断上下文条件。
  */
+/*
+ * 主要调用者 migrate_one_irq() 正在 CPU 下线期间迁走该 CPU 的 IRQ，并持有对应
+ * desc->lock；函数不睡眠、不取得 irq_data 引用，也不改变通用 pending/affinity 字段。
+ * 循环变量 @d 依次借用顶层及各 parent irq_data，回调返回后立即失效于本次遍历。
+ */
 void irq_force_complete_move(struct irq_desc *desc)
 {
+	/* 首个实现回调的层负责整条底层向量清理协议，不能继续向 parent 重复完成。 */
 	for (struct irq_data *d = irq_desc_get_irq_data(desc); d; d = irqd_get_parent_data(d)) {
 		if (d->chip && d->chip->irq_force_complete_move) {
 			d->chip->irq_force_complete_move(d);
@@ -84,15 +96,34 @@ void irq_force_complete_move(struct irq_desc *desc)
  * 仅 -EBUSY 会重新置 pending 并保留 mask 下次重试，其他结果（含错误或无在线目标）均清
  * pending_mask。无返回值，成功会同步请求/effective affinity 并通知 IRQ 线程。
  */
+/*
+ * 修正说明：上述“其他结果均清 pending_mask”只适用于执行到函数尾的路径。源码在
+ * per-CPU IRQ、空 pending_mask 或 chip 缺少 irq_set_affinity 时会提前返回：move-pending
+ * 位已经清除；空 mask 本就没有内容，而 per-CPU 与缺回调路径的既有内容不会被清理。
+ * 只有目标无在线交集，或 irq_do_set_affinity() 返回非 -EBUSY 结果时，才落到末尾清空。
+ */
+/*
+ * 主要由 irq_move_irq() 的通用 pending 快速检查和 x86 IO-APIC 已确认安全的 ack 路径调用。
+ * @idata 是调用期借用；函数持 raw desc 锁、线路已 mask，不能睡眠，也不取得或转移引用。
+ */
 void irq_move_masked_irq(struct irq_data *idata)
 {
+	/*
+	 * 变量地图：desc 归一化出该逻辑 IRQ 的顶层描述符；data/chip 是 desc 生命周期内
+	 * 的借用指针。@idata 只用于定位，不转移引用；函数的所有状态输出都写回 desc/data。
+	 */
 	struct irq_desc *desc = irq_data_to_desc(idata);
 	struct irq_data *data = &desc->irq_data;
 	struct irq_chip *chip = data->chip;
 
+	/* 快速路径不领取请求，pending 标志和 mask 都保持入口状态。 */
 	if (likely(!irqd_is_setaffinity_pending(data)))
 		return;
 
+	/*
+	 * 从这里起先领取 pending 标志，阻止同一请求再次执行；后续只有 -EBUSY 会重新置位。
+	 * pending_mask 是否被清理由各早退点和末尾提交结果分别决定。
+	 */
 	irqd_clr_move_pending(data);
 
 	/*
@@ -104,9 +135,11 @@ void irq_move_masked_irq(struct irq_data *idata)
 		return;
 	}
 
+	/* 空请求没有可编程目标；标志已领取，mask 本身已满足“空”状态。 */
 	if (unlikely(cpumask_empty(desc->pending_mask)))
 		return;
 
+	/* 缺少硬件 affinity 回调时无法提交；虽保留 mask 内容，但不重新置 pending，后续不能执行它。 */
 	if (!chip->irq_set_affinity)
 		return;
 
@@ -130,6 +163,7 @@ void irq_move_masked_irq(struct irq_data *idata)
 	 * 正确性依赖调用者已把 IRQ mask；本函数只断言 desc 锁，不自行验证硬件 mask。
 	 */
 	if (cpumask_intersects(desc->pending_mask, cpu_online_mask)) {
+		/* ret 只区分需要重试的 -EBUSY 与本轮已经终结的其他结果。 */
 		int ret;
 
 		ret = irq_do_set_affinity(data, desc->pending_mask, false);
@@ -147,6 +181,7 @@ void irq_move_masked_irq(struct irq_data *idata)
 			return;
 		}
 	}
+	/* 请求已成功、永久失败或暂时没有在线目标：清值，结束本轮 pending 生命周期。 */
 	cpumask_clear(desc->pending_mask);
 }
 
@@ -159,8 +194,14 @@ void irq_move_masked_irq(struct irq_data *idata)
  * 调用者持 desc->lock，chip 必须提供相应 mask/unmask；无返回值。对 ONESHOT threaded IRQ
  * 尤其不能误解既有 MASKED 并提前 unmask，否则设备电平未清可能形成中断风暴。
  */
+/*
+ * inline irq_move_irq() 在看到 SETAFFINITY_PENDING 后进入本函数；@idata 是调用期借用，
+ * 不转移引用。函数处于持 raw desc 锁的原子路径，不能睡眠；成功、早退均无直接返回值，
+ * 可观察结果由 pending 标志/mask、chip 路由和最终 MASKED 状态共同表达。
+ */
 void __irq_move_irq(struct irq_data *idata)
 {
+	/* masked 保存入口硬件/软件屏蔽状态，决定末尾是否有责任执行配对 unmask。 */
 	bool masked;
 
 	/*
@@ -174,6 +215,7 @@ void __irq_move_irq(struct irq_data *idata)
 	 */
 	idata = irq_desc_get_irq_data(irq_data_to_desc(idata));
 
+	/* disabled 线路留待后续允许迁移的路径处理 pending，不在这里临时操作 chip。 */
 	if (unlikely(irqd_irq_disabled(idata)))
 		return;
 
@@ -187,6 +229,7 @@ void __irq_move_irq(struct irq_data *idata)
 	 * 完成；若迁移后无条件 unmask，设备仍 active 时可能造成中断风暴。
 	 */
 	masked = irqd_irq_masked(idata);
+	/* 只为本次重编程临时 mask；入口本已 masked 时保持其既有 ownership/原因。 */
 	if (!masked)
 		idata->chip->irq_mask(idata);
 	irq_move_masked_irq(idata);
@@ -200,6 +243,11 @@ void __irq_move_irq(struct irq_data *idata)
  * @data: 层级内任意、配置稳定的 irq_data 借用指针。
  * 规范为 desc 顶层 data 后返回 irq_can_move_pcntxt() 的能力判定；层级关闭时转换会被优化。
  * 返回 bool，无锁、无副作用，只是即时能力快照，不能代替实际设置路径的锁与忙状态检查。
+ */
+/*
+ * IMSIC 等 irqchip 在设计亲和性更新/临时向量协议时调用它：true 表示顶层 chip 声明可在
+ * process context 直接重编程，false 表示必须按中断上下文迁移约束处理。@data 是纯输入
+ * 借用，函数不保存指针、不睡眠，也不保证查询后能力或 IRQ 状态仍保持不变。
  */
 bool irq_can_move_in_process_context(struct irq_data *data)
 {

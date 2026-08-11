@@ -8,7 +8,7 @@
  * Documentation/core-api/genericirq.rst
  */
 /*
- * 原文说明：本文件实现以 irq_chip 为硬件抽象的架构通用 IRQ 核心，设计背景见
+ * 本文件实现以 irq_chip 为硬件抽象的架构通用 IRQ 核心，设计背景见
  * Documentation/core-api/genericirq.rst。irq_chip 提供 startup、mask、ack、eoi、
  * affinity 等控制器操作；本文件把这些回调与 irq_desc 软件状态、disable depth、
  * irq_domain 层级以及 edge/level/fasteoi 流处理器组合成一致协议。

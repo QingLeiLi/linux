@@ -664,7 +664,7 @@ static void __sigqueue_free(struct sigqueue *q)
 }
 
 /*
- * 契约补充：@queue 是 siglock 下借用的私有或共享 pending 容器；本函数
+ * @queue 是 siglock 下借用的私有或共享 pending 容器；本函数
  * 不睡眠。返回无；位图清零，节点和其配额引用按类型释放，所有权不外泄。
  */
 void flush_sigqueue(struct sigpending *queue)
@@ -1575,7 +1575,7 @@ static inline bool has_si_pid_and_uid(struct kernel_siginfo *info)
 }
 
 /*
- * 契约补充：调用者必须持 @t->sighand->siglock；@info/@t 为借用输入，
+ * 调用者必须持 @t->sighand->siglock；@info/@t 为借用输入，
  * @type 决定作用域。函数不睡眠；返回排队结果，并可能唤醒目标或启动组退出。
  */
 int send_signal_locked(int sig, struct kernel_siginfo *info,
@@ -1671,7 +1671,7 @@ static void print_fatal_signal(int signr)
 
 /* setup_print_fatal_signals()：解析早期启动参数中的致命信号打印开关。 */
 /*
- * 契约补充：早期启动阶段借用并解析可写字符串 @str；无并发与睡眠需求。
+ * 早期启动阶段借用并解析可写字符串 @str；无并发与睡眠需求。
  * 返回 1 表示参数已消费；副作用是更新启动期 print_fatal_signals。
  */
 static int __init setup_print_fatal_signals(char *str)
@@ -1685,7 +1685,7 @@ static int __init setup_print_fatal_signals(char *str)
 __setup("print-fatal-signals=", setup_print_fatal_signals);
 
 /*
- * 契约补充：@sig 是编号，@info/@p 为借用输入，@type 决定线程或组作用域。
+ * @sig 是编号，@info/@p 为借用输入，@type 决定线程或组作用域。
  * 本函数获取目标 siglock；成功返回 0，目标退出返回 -ESRCH，输入所有权不变。
  */
 int do_send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p,
@@ -2149,7 +2149,7 @@ static int kill_something_info(int sig, struct kernel_siginfo *info, pid_t pid)
 
 /* 以下 wrapper 把旧内核调用约定归一化到 siginfo 核心发送路径。 */
 /*
- * 契约补充：内核线程定向发送入口；@info/@p 均为借用且不转移所有权。
+ * 内核线程定向发送入口；@info/@p 均为借用且不转移所有权。
  * 无入口锁要求；返回 0、-EINVAL、-ESRCH 或排队错误。
  */
 int send_sig_info(int sig, struct kernel_siginfo *info, struct task_struct *p)
@@ -2196,7 +2196,7 @@ void force_sig(int sig)
 EXPORT_SYMBOL(force_sig);
 
 /*
- * 契约补充：在 current 进程上下文强制 @sig 使用默认致命动作；无入口锁，
+ * 在 current 进程上下文强制 @sig 使用默认致命动作；无入口锁，
  * 不睡眠。返回无；副作用是在 siglock 下发布不可被现有 handler 阻止的信号。
  */
 void force_fatal_sig(int sig)
@@ -2214,7 +2214,7 @@ void force_fatal_sig(int sig)
 }
 
 /*
- * 契约补充：把 @sig 固化为 current 的退出原因；无入口锁且不睡眠。
+ * 把 @sig 固化为 current 的退出原因；无入口锁且不睡眠。
  * 返回无；HANDLER_EXIT 同时使动作不可由用户 sigaction 再改写。
  */
 void force_exit_sig(int sig)
@@ -2285,7 +2285,7 @@ int send_sig_fault(int sig, int code, void __user *addr, struct task_struct *t)
 }
 
 /*
- * 契约补充：@code 限 MCEERR_AO/AR，@addr 是故障地址值，@lsb 是影响粒度
+ * @code 限 MCEERR_AO/AR，@addr 是故障地址值，@lsb 是影响粒度
  * 指数；均为纯输入。无入口锁；返回 current 的强制发送结果。
  */
 int force_sig_mceerr(int code, void __user *addr, short lsb)
@@ -2304,7 +2304,7 @@ int force_sig_mceerr(int code, void __user *addr, short lsb)
 }
 
 /*
- * 契约补充：向借用目标 @t 发送 MCE SIGBUS；地址只复制、不解引用。
+ * 向借用目标 @t 发送 MCE SIGBUS；地址只复制、不解引用。
  * 无入口锁；返回目标退出/分配/发送结果，@t 所有权不变。
  */
 int send_sig_mceerr(int code, void __user *addr, short lsb, struct task_struct *t)
@@ -2324,7 +2324,7 @@ int send_sig_mceerr(int code, void __user *addr, short lsb, struct task_struct *
 EXPORT_SYMBOL(send_sig_mceerr);
 
 /*
- * 契约补充：三个用户指针分别是故障地址与合法边界，仅作为 payload。
+ * 三个用户指针分别是故障地址与合法边界，仅作为 payload。
  * 无入口锁且不访问其内存；返回 current 的强制 SIGSEGV 发送结果。
  */
 int force_sig_bnderr(void __user *addr, void __user *lower, void __user *upper)
@@ -2344,7 +2344,7 @@ int force_sig_bnderr(void __user *addr, void __user *lower, void __user *upper)
 
 #ifdef SEGV_PKUERR
 /*
- * 契约补充：@addr 为故障地址值，@pkey 为保护键；均为纯输入。
+ * @addr 为故障地址值，@pkey 为保护键；均为纯输入。
  * 无入口锁；返回强制发送结果，仅在定义 SEGV_PKUERR 的配置构建。
  */
 int force_sig_pkuerr(void __user *addr, u32 pkey)
@@ -2363,7 +2363,7 @@ int force_sig_pkuerr(void __user *addr, u32 pkey)
 #endif
 
 /*
- * 契约补充：@addr/@type/@sig_data 构成 perf SIGTRAP payload；不取引用。
+ * @addr/@type/@sig_data 构成 perf SIGTRAP payload；不取引用。
  * 无入口锁；返回排队结果，并依据 current blocked 状态标记异步递送。
  */
 int send_sig_perf(void __user *addr, u32 type, u64 sig_data)
@@ -2447,7 +2447,7 @@ int force_sig_ptrace_errno_trap(int errno, void __user *addr)
  */
 /* 强制版本携带架构 trap 编号并发给 current。 */
 /*
- * 契约补充：四个参数均为构造 fault siginfo 的输入值，@addr 不解引用。
+ * 四个参数均为构造 fault siginfo 的输入值，@addr 不解引用。
  * 无入口锁；返回 current 强制发送结果，仅供携带 trapno 的架构。
  */
 int force_sig_fault_trapno(int sig, int code, void __user *addr, int trapno)
@@ -2469,7 +2469,7 @@ int force_sig_fault_trapno(int sig, int code, void __user *addr, int trapno)
  */
 /* 普通发送版本尊重指定任务的 disposition。 */
 /*
- * 契约补充：向借用目标 @t 普通发送 trapno fault，尊重其 disposition。
+ * 向借用目标 @t 普通发送 trapno fault，尊重其 disposition。
  * 输入所有权不变；返回发送 errno，内部管理可能分配的队列节点。
  */
 int send_sig_fault_trapno(int sig, int code, void __user *addr, int trapno,
@@ -2488,7 +2488,7 @@ int send_sig_fault_trapno(int sig, int code, void __user *addr, int trapno,
 }
 
 /*
- * 契约补充：@info/@pgrp 为借用，函数以 tasklist 读锁稳定进程组遍历。
+ * @info/@pgrp 为借用，函数以 tasklist 读锁稳定进程组遍历。
  * 返回至少一次成功的 0、空组 -ESRCH，或全部失败时的成员错误。
  */
 static int kill_pgrp_info(int sig, struct kernel_siginfo *info, struct pid *pgrp)
@@ -2502,7 +2502,7 @@ static int kill_pgrp_info(int sig, struct kernel_siginfo *info, struct pid *pgrp
 }
 
 /*
- * 契约补充：旧式进程组 wrapper；@pid 为借用 PGID，@priv 选择来源语义。
+ * 旧式进程组 wrapper；@pid 为借用 PGID，@priv 选择来源语义。
  * 返回组发送结果，不接管 pid 引用，调用者负责其生命周期。
  */
 int kill_pgrp(struct pid *pid, int sig, int priv)
@@ -2513,7 +2513,7 @@ int kill_pgrp(struct pid *pid, int sig, int priv)
 EXPORT_SYMBOL(kill_pgrp);
 
 /*
- * 契约补充：旧式线程组 wrapper；@pid 为借用稳定 PID，@priv 决定来源。
+ * 旧式线程组 wrapper；@pid 为借用稳定 PID，@priv 决定来源。
  * 返回发送结果；目标退出由内部 RCU/leader 重试处理。
  */
 int kill_pid(struct pid *pid, int sig, int priv)
@@ -2569,7 +2569,7 @@ void flush_itimer_signals(void)
 }
 
 /*
- * 契约补充：@q 是 k_itimer 所有的输出对象；函数为它预占用户 pending
+ * @q 是 k_itimer 所有的输出对象；函数为它预占用户 pending
  * 配额。成功 true 并把配额释放责任交给 q，失败 false 且 q 不可排队。
  */
 bool posixtimer_init_sigqueue(struct sigqueue *q)
@@ -2623,7 +2623,7 @@ static inline struct task_struct *posixtimer_get_target(struct k_itimer *tmr)
 }
 
 /*
- * 契约补充：@tmr 为调用者持有引用的 timer；函数在 RCU 下找目标并取得
+ * @tmr 为调用者持有引用的 timer；函数在 RCU 下找目标并取得
  * sighand 锁。返回无；可能排队、转入 ignored 链表或归还 signal 引用。
  */
 void posixtimer_send_sigqueue(struct k_itimer *tmr)
@@ -4391,7 +4391,7 @@ COMPAT_SYSCALL_DEFINE4(rt_sigprocmask, int, how, compat_sigset_t __user *, nset,
 
 /* do_sigpending()：汇总 current 私有/共享且当前被屏蔽的 pending 信号。 */
 /*
- * 契约补充：@set 为调用者提供的输出集合；函数短暂持 current siglock，
+ * @set 为调用者提供的输出集合；函数短暂持 current siglock，
  * 不睡眠。返回无；输出仅包含私有/共享 pending 中当前被屏蔽的信号。
  */
 static void do_sigpending(sigset_t *set)
@@ -4469,7 +4469,7 @@ static const struct {
 /* 表驱动记录信号专属正 si_code 的上界及其 union 布局。 */
 
 /*
- * 契约补充：@sig/@si_code 为纯值输入，无锁且不睡眠。
+ * @sig/@si_code 为纯值输入，无锁且不睡眠。
  * 返回 true 表示内核完整理解对应 union 布局，false 要求校验扩展区全零。
  */
 static bool known_siginfo_layout(unsigned sig, int si_code)
@@ -4547,7 +4547,7 @@ enum siginfo_layout siginfo_layout(unsigned sig, int si_code)
 
 /* si_expansion()：定位用户 siginfo 公共内核前缀之后的 ABI 扩展区。 */
 /*
- * 契约补充：@info 是不解引用的用户地址值；无锁、不睡眠。
+ * @info 是不解引用的用户地址值；无锁、不睡眠。
  * 返回同一用户对象内核公共前缀之后的借用地址，不检查其可访问性。
  */
 static inline char __user *si_expansion(const siginfo_t __user *info)
@@ -4557,7 +4557,7 @@ static inline char __user *si_expansion(const siginfo_t __user *info)
 }
 
 /*
- * 契约补充：@from 为只读借用，@to 为用户输出缓冲；函数可能 user fault。
+ * @from 为只读借用，@to 为用户输出缓冲；函数可能 user fault。
  * 成功返回 0 并写前缀、清零扩展区，失败 -EFAULT；输入所有权不变。
  */
 int copy_siginfo_to_user(siginfo_t __user *to, const kernel_siginfo_t *from)
@@ -4610,7 +4610,7 @@ static int __copy_siginfo_from_user(int signo, kernel_siginfo_t *to,
 }
 
 /*
- * 契约补充：@from 为用户输入，@to 为内核输出；可能因 usercopy 睡眠。
+ * @from 为用户输入，@to 为内核输出；可能因 usercopy 睡眠。
  * 成功 0 并完整初始化 @to，失败 -EFAULT/-E2BIG，任何对象所有权均不转移。
  */
 int copy_siginfo_from_user(kernel_siginfo_t *to, const siginfo_t __user *from)
@@ -4720,7 +4720,7 @@ void copy_siginfo_to_external32(struct compat_siginfo *to,
 
 /* __copy_siginfo_to_user32()：按 tagged layout 导出并写入 32 位 siginfo。 */
 /*
- * 契约补充：@from 为只读内核信息，@to 为 compat 用户输出；先在栈上转换，
+ * @from 为只读内核信息，@to 为 compat 用户输出；先在栈上转换，
  * 再一次复制。成功 0，用户访存失败 -EFAULT；不转移输入所有权。
  */
 int __copy_siginfo_to_user32(struct compat_siginfo __user *to,
@@ -4736,7 +4736,7 @@ int __copy_siginfo_to_user32(struct compat_siginfo __user *to,
 }
 
 /*
- * 契约补充：@from 是已稳定的 compat 内核栈副本，@to 为输出；
+ * @from 是已稳定的 compat 内核栈副本，@to 为输出；
  * 无 usercopy、无锁且不睡眠。返回 0，并按 tagged layout 完整初始化 @to。
  */
 static int post_copy_siginfo_from_user32(kernel_siginfo_t *to,
@@ -4834,7 +4834,7 @@ static int post_copy_siginfo_from_user32(kernel_siginfo_t *to,
 
 /* __copy_siginfo_from_user32()：导入 compat siginfo 并强制采用 syscall signo。 */
 /*
- * 契约补充：从 @ufrom 导入 compat 信息并用 @signo 覆盖用户信号号。
+ * 从 @ufrom 导入 compat 信息并用 @signo 覆盖用户信号号。
  * @to 为输出；成功 0，usercopy 失败 -EFAULT，所有权均不转移。
  */
 static int __copy_siginfo_from_user32(int signo, struct kernel_siginfo *to,
@@ -4851,7 +4851,7 @@ static int __copy_siginfo_from_user32(int signo, struct kernel_siginfo *to,
 }
 
 /*
- * 契约补充：从 compat 用户结构完整导入 @to，并保留其中 signo。
+ * 从 compat 用户结构完整导入 @to，并保留其中 signo。
  * 可能因用户缺页睡眠；返回 0/-EFAULT，输出仅在成功路径可依赖。
  */
 int copy_siginfo_from_user32(struct kernel_siginfo *to,
@@ -5087,7 +5087,7 @@ COMPAT_SYSCALL_DEFINE4(rt_sigtimedwait_time32, compat_sigset_t __user *, uthese,
 
 /* prepare_kill_siginfo()：用 current 可见身份构造 kill/tkill 来源信息。 */
 /*
- * 契约补充：@sig/@type 为输入，@info 为完整输出；无锁且不睡眠。
+ * @sig/@type 为输入，@info 为完整输出；无锁且不睡眠。
  * 返回无；用 current 在当前 namespace 可见的身份构造可信来源信息。
  */
 static void prepare_kill_siginfo(int sig, struct kernel_siginfo *info,
@@ -5144,7 +5144,7 @@ static bool access_pidfd_pidns(struct pid *pid)
 }
 
 /*
- * 契约补充：@info 是当前 syscall ABI 的用户输入，@kinfo 为内核输出。
+ * @info 是当前 syscall ABI 的用户输入，@kinfo 为内核输出。
  * 根据 in_compat_syscall() 分派；返回转换 errno，不转移任何所有权。
  */
 static int copy_siginfo_from_user_any(kernel_siginfo_t *kinfo,
@@ -5166,7 +5166,7 @@ static int copy_siginfo_from_user_any(kernel_siginfo_t *kinfo,
 }
 
 /*
- * 契约补充：@file 是 fd guard 保持有效的借用文件；无锁、不睡眠。
+ * @file 是 fd guard 保持有效的借用文件；无锁、不睡眠。
  * 返回借用的 struct pid 或错误指针，引用生命周期仍由 file/调用者保护。
  */
 static struct pid *pidfd_to_pid(const struct file *file)
@@ -5186,7 +5186,7 @@ static struct pid *pidfd_to_pid(const struct file *file)
 	 PIDFD_SIGNAL_PROCESS_GROUP)
 
 /*
- * 契约补充：@pid 为稳定借用目标，@sig/@type/@flags 决定信号与 scope，
+ * @pid 为稳定借用目标，@sig/@type/@flags 决定信号与 scope，
  * @info 可空且为用户输入。函数可能 usercopy/取锁；返回权限、参数或发送结果。
  */
 static int do_pidfd_send_signal(struct pid *pid, int sig, enum pid_type type,
@@ -5454,7 +5454,7 @@ COMPAT_SYSCALL_DEFINE3(rt_sigqueueinfo,
 
 /* do_rt_tgsigqueueinfo()：携带实时 payload 的 tgid+tid 定向发送核心。 */
 /*
- * 契约补充：@tgid/@pid 必须为正并共同唯一定位线程，@info 为借用 payload。
+ * @tgid/@pid 必须为正并共同唯一定位线程，@info 为借用 payload。
  * 无入口锁；返回 -EINVAL/-EPERM/-ESRCH 或发送结果，不接管 @info。
  */
 static int do_rt_tgsigqueueinfo(pid_t tgid, pid_t pid, int sig, kernel_siginfo_t *info)
@@ -5639,7 +5639,7 @@ static inline void sigaltstack_unlock(void) { }
 #endif
 
 /*
- * 契约补充：@ss/@oss 分别为可空输入/输出内核副本，@sp 是当前用户栈地址，
+ * @ss/@oss 分别为可空输入/输出内核副本，@sp 是当前用户栈地址，
  * @min_ss_size 为字节下限。可能取得 siglock；返回 0 或 -EPERM/-EINVAL/-ENOMEM。
  */
 static int
@@ -5727,7 +5727,7 @@ SYSCALL_DEFINE2(sigaltstack,const stack_t __user *,uss, stack_t __user *,uoss)
 }
 
 /*
- * 契约补充：@uss 是 sigreturn 帧中的用户输入；可能 user fault。
+ * @uss 是 sigreturn 帧中的用户输入；可能 user fault。
  * 返回仅传播 -EFAULT，其余配置错误按历史 ABI 吞掉；current 栈状态可能更新。
  */
 int restore_altstack(const stack_t __user *uss)
@@ -5799,7 +5799,7 @@ COMPAT_SYSCALL_DEFINE2(sigaltstack,
 
 /* compat_restore_altstack()：从 32 位 signal frame 恢复备用栈状态。 */
 /*
- * 契约补充：@uss 是 32 位 sigreturn 帧输入；可能 user fault。
+ * @uss 是 32 位 sigreturn 帧输入；可能 user fault。
  * 返回仅保留 -EFAULT，成功时更新 current 备用栈且不持有用户地址。
  */
 int compat_restore_altstack(const compat_stack_t __user *uss)
@@ -6140,7 +6140,7 @@ SYSCALL_DEFINE0(pause)
 #endif
 
 /*
- * 契约补充：@set 为借用临时屏蔽集合；进程上下文调用并可睡眠。
+ * @set 为借用临时屏蔽集合；进程上下文调用并可睡眠。
  * 函数保存旧 mask，睡至信号后返回 -ERESTARTNOHAND，并由返回路径恢复旧值。
  */
 static int sigsuspend(sigset_t *set)
@@ -6216,7 +6216,7 @@ SYSCALL_DEFINE3(sigsuspend, int, unused1, int, unused2, old_sigset_t, mask)
 
 /* arch_vma_name()：供架构覆盖的特殊 VMA 命名钩子，通用实现返回 NULL。 */
 /*
- * 契约补充：@vma 为借用且调用期间有效；默认实现无锁、不睡眠。
+ * @vma 为借用且调用期间有效；默认实现无锁、不睡眠。
  * 返回 NULL 表示无架构专名；架构覆盖时返回字符串所有权仍归架构。
  */
 __weak const char *arch_vma_name(struct vm_area_struct *vma)
@@ -6226,7 +6226,7 @@ __weak const char *arch_vma_name(struct vm_area_struct *vma)
 }
 
 /*
- * 契约补充：无入参、无运行时返回或副作用；全部检查在编译期求值。
+ * 无入参、无运行时返回或副作用；全部检查在编译期求值。
  * 任一用户/内核 ABI 大小或偏移不一致都会使构建失败。
  */
 static inline void siginfo_buildtime_checks(void)
@@ -6342,7 +6342,7 @@ static const struct ctl_table signal_table[] = {
 
 /* init_signal_sysctls()：注册信号异常诊断与致命信号打印 sysctl。 */
 /*
- * 契约补充：早期 init 上下文、无入参；注册两组长期 sysctl 表。
+ * 早期 init 上下文、无入参；注册两组长期 sysctl 表。
  * 返回固定 0；注册结果由 sysctl 核心持有，函数退出后无需回滚。
  */
 static int __init init_signal_sysctls(void)

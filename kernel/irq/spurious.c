@@ -5,7 +5,7 @@
  * This file contains spurious interrupt handling.
  */
 /*
- * 原文说明：本文件实现杂散/无人处理 IRQ 的检测、诊断与恢复。
+ * 本文件实现杂散/无人处理 IRQ 的检测、诊断与恢复。
  *
  * 正常硬中断结束时 note_interrupt() 汇总整条共享 action 链的返回值；它以 100000 次窗口
  * 判断线路是否近乎持续无人处理，必要时增加 disable depth、关闭 IRQ，并启动 10Hz 定时
@@ -145,6 +145,7 @@ static int misrouted_irq(int irq)
 
 		/* 当前 @irq 的正常 action 链已经尝试过，不在误路由扫描中重复执行。 */
 		if (i == irq)	/* Already tried */
+			/* 当前 IRQ 已经尝试过。 */
 			continue;
 
 		if (try_one_irq(desc, false))

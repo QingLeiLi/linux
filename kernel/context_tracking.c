@@ -38,7 +38,7 @@
  * where the relevant authorship may be found.
  */
 /*
- * 原文说明：Context Tracking 在 kernel、userspace、guest、idle 等高层
+ * Context Tracking 在 kernel、userspace、guest、idle 等高层
  * 上下文边界设置探针。RCU 借此在 CPU 运行于 idle、用户态或来宾态时摆脱
  * 对 timer tick 的依赖。用户/来宾跟踪由 Frederic Weisbecker 发起，RCU
  * 扩展静止态位则从 kernel/rcu/tree.c 迁入；版权与致谢保持原样。
@@ -129,7 +129,7 @@ static noinstr void ct_kernel_exit_state(int offset)
 	 * next idle sojourn.
 	 */
 	/*
-	 * 原文说明：观察到原子更新的 CPU 必须同时看到此前的
+	 * 观察到原子更新的 CPU 必须同时看到此前的
 	 * RCU 读侧临界区，
 	 * 且本次更新还要与下一段 idle 停留排序，避免远端过早判定静止。
 	 */
@@ -165,7 +165,7 @@ static noinstr void ct_kernel_enter_state(int offset)
 	 * critical section.
 	 */
 	/*
-	 * 原文说明：远端看到本次更新时必须看到此前 idle 停留；
+	 * 远端看到本次更新时必须看到此前 idle 停留；
 	 * 本次更新也必须先于下一段 RCU 读侧临界区，
 	 * 防止新读者在“仍 idle”的快照下运行。
 	 */
@@ -186,7 +186,7 @@ static noinstr void ct_kernel_enter_state(int offset)
 /*
  * ct_kernel_exit() - 处理任务嵌套并在最外层真正进入 RCU EQS。
  *
- * 原文说明 EQS 可来自 idle loop 或 adaptive-tickless 用户态；进入前把
+ *  EQS 可来自 idle loop 或 adaptive-tickless 用户态；进入前把
  * nmi_nesting 强制归零，以容忍上一 busy period 的用户 upcall 扰乱计数。
  * @user: true 表示 USER/GUEST，false 表示 idle，仅影响调试约束。
  * @offset: 纯输入 state 增量，编码 watching 翻转与目标上下文。
@@ -246,7 +246,7 @@ static void noinstr ct_kernel_exit(bool user, int offset)
 /*
  * ct_kernel_enter() - 处理嵌套并在最外层从 EQS 恢复 RCU watching。
  *
- * 原文说明退出 EQS 时把 nmi_nesting 重置为大偏移，以容忍此前用户 upcall
+ * 退出 EQS 时把 nmi_nesting 重置为大偏移，以容忍此前用户 upcall
  * 造成的计数偏差。@user/@offset 与 ct_kernel_exit() 对称；入口应关中断
  * 且尚不可使用 RCU，最外层返回后才可执行读侧代码。
  * 无 ownership 或错误码。
@@ -305,7 +305,7 @@ static void noinstr ct_kernel_enter(bool user, int offset)
 /*
  * ct_nmi_exit() - 在退出 NMI/IRQ 最外层时恢复被打断 CPU 的 RCU-idle。
  *
- * 原文说明：若正在退出的是打断 RCU-idle 的最外层 NMI，就更新 state 与
+ * 若正在退出的是打断 RCU-idle 的最外层 NMI，就更新 state 与
  * nmi_nesting，通知宽限期逻辑 CPU 再次 idle；增删调用点必须用
  * CONFIG_RCU_EQS_DEBUG=y 测试。
  * 入参：无。入口位于 noinstr、CPU 固定的 NMI/IRQ 尾部，不可睡眠。
@@ -335,7 +335,7 @@ void noinstr ct_nmi_exit(void)
 	 * leave it in non-RCU-idle state.
 	 */
 	/*
-	 * 原文说明：值不等于 1 表示该 NMI 没有打断 RCU-idle，
+	 * 值不等于 1 表示该 NMI 没有打断 RCU-idle，
 	 * 或仍有外层嵌套；
 	 * 因此只减去本层编码 2，保持 CPU 为非 idle/watching。
 	 */
@@ -351,7 +351,7 @@ void noinstr ct_nmi_exit(void)
 
 	/* This NMI interrupted an RCU-idle CPU, restore RCU-idleness. */
 	/*
-	 * 原文说明：值 1 精确标识“最外层 NMI 打断了 RCU-idle”，现在把嵌套
+	 * 值 1 精确标识“最外层 NMI 打断了 RCU-idle”，现在把嵌套
 	 * 归零并在插桩窗口结束后重新发布 EQS。
 	 */
 	trace_rcu_watching(TPS("Endirq"), ct_nmi_nesting(), 0, ct_rcu_watching());
@@ -392,7 +392,7 @@ void noinstr ct_nmi_exit(void)
 /*
  * ct_nmi_enter() - NMI/IRQ 进入时确保 RCU watching 并编码嵌套来源。
  *
- * 原文说明：若 CPU 从 RCU 视角 idle，则更新 state/nmi_nesting 使宽限期逻辑
+ * 若 CPU 从 RCU 视角 idle，则更新 state/nmi_nesting 使宽限期逻辑
  * 知道它已活跃；支持嵌套 NMI，实际先耗尽栈才可能溢出 long。
  * 增删调用点要用
  * CONFIG_RCU_EQS_DEBUG 验证。
@@ -421,7 +421,7 @@ void noinstr ct_nmi_enter(void)
 	 * period (observation due to Andy Lutomirski).
 	 */
 	/*
-	 * 原文说明编码不变量：从 RCU-idle 进入时原子改为 watching，
+	 * 编码不变量：从 RCU-idle 进入时原子改为 watching，
 	 * 且深度加 1；其他入口深度加 2。因此值恰好为 1
 	 * 只可能是打断 idle 的最外层 handler，
 	 * ct_nmi_exit() 可据此决定是否恢复 EQS，而不需要额外布尔字段。
@@ -512,7 +512,7 @@ EXPORT_SYMBOL_GPL(ct_idle_enter);
 /*
  * ct_idle_exit() - 离开 idle 时恢复可执行 RCU 读侧代码的内核状态。
  *
- * 原文说明这是重新进入可发生 RCU 读侧临界区的模式，增删调用点要用 EQS
+ * 这是重新进入可发生 RCU 读侧临界区的模式，增删调用点要用 EQS
  * 调试测试。入参、返回均无；实现自行保存并关闭本地 IRQ，调用
  * ct_kernel_enter() 后恢复原 IRQ 状态，不转移 ownership。
  */
@@ -552,7 +552,7 @@ EXPORT_SYMBOL_GPL(ct_idle_exit);
 /*
  * ct_irq_enter() - IRQ 从 idle/EQS 打断 CPU 时恢复 RCU watching。
  *
- * 原文说明 handler 可能使 CPU 离开 idle，因此进入可执行读侧临界区的模式；
+ *  handler 可能使 CPU 离开 idle，因此进入可执行读侧临界区的模式；
  * 调用者必须关中断。原文还警告 idle loop 不能通过用户 upcall 等方式造成
  * irq_enter/exit 不配对，否则会产生罕见且难复现的 RCU 错误，
  * 应改用工作队列。
@@ -586,7 +586,7 @@ noinstr void ct_irq_enter(void)
 /*
  * ct_irq_exit() - IRQ 返回 idle 时按嵌套来源恢复 EQS。
  *
- * 原文说明 handler 退出可能重新进入 idle，即离开普通 RCU 读侧模式；调用者
+ *  handler 退出可能重新进入 idle，即离开普通 RCU 读侧模式；调用者
  * 必须关中断。idle loop 若制造不配对入口/出口会得到
  * 罕见难复现故障，应把
  * 异步工作移交 workqueue。入参、返回均无，委托 ct_nmi_exit() 恢复状态。
@@ -606,7 +606,7 @@ noinstr void ct_irq_exit(void)
 /*
  * ct_irq_enter_irqson() - 为 IRQ 开启的调用点保存 IRQ 状态后进入 CT IRQ。
  *
- * 原文说明它只是 ct_irq_enter() 的 IRQ-on 包装，增删调用点需 EQS 调试。
+ * 它只是 ct_irq_enter() 的 IRQ-on 包装，增删调用点需 EQS 调试。
  * 入参、返回均无；flags 只保存本地 IRQ 状态，无 ownership 或失败路径。
  */
 void ct_irq_enter_irqson(void)
@@ -628,7 +628,7 @@ void ct_irq_enter_irqson(void)
 /*
  * ct_irq_exit_irqson() - 为 IRQ 开启的调用点提供配对退出包装。
  *
- * 原文说明它包装 ct_irq_exit()，并要求改动调用点后进行 EQS 调试。
+ * 它包装 ct_irq_exit()，并要求改动调用点后进行 EQS 调试。
  * 入参、返回均无；临时关闭 IRQ 保证 per-CPU 嵌套更新不被同 CPU 打断。
  */
 void ct_irq_exit_irqson(void)
@@ -733,7 +733,7 @@ void noinstr __ct_user_enter(enum ctx_state state)
 
 	/* Kernel threads aren't supposed to go to userspace */
 	/*
-	 * 原文说明内核线程不应返回用户态；
+	 * 内核线程不应返回用户态；
 	 * current->mm 为空即报告协议错误。
 	 */
 	WARN_ON_ONCE(!current->mm);
@@ -753,7 +753,7 @@ void noinstr __ct_user_enter(enum ctx_state state)
 			 * on the tick.
 			 */
 			/*
-			 * 原文说明此时只剩低层体系结构出口，直到 user_exit() 或
+			 * 此时只剩低层体系结构出口，直到 user_exit() 或
 			 * ct_irq_enter() 前不会再有 RCU 读侧临界区，因此可移除
 			 * RCU 对 tick 的依赖。USER 还需在可插桩窗口切换 vtime。
 			 */
@@ -769,7 +769,7 @@ void noinstr __ct_user_enter(enum ctx_state state)
 			 * that will fire and reschedule once we resume in user/guest mode.
 			 */
 			/*
-			 * 原文说明某些非通用入口可能已越过最后调度点；
+			 * 某些非通用入口可能已越过最后调度点；
 			 * 若此时需要 resched，就排一个 self-IPI，
 			 * 待恢复 USER/GUEST 后再触发调度。
 			 */
@@ -795,7 +795,7 @@ void noinstr __ct_user_enter(enum ctx_state state)
 			 * In this we case we don't care about any concurrency/ordering.
 			 */
 			/*
-			 * 原文说明仅做 tickless cputime、未支持 RCU EQS 的特殊配置
+			 * 仅做 tickless cputime、未支持 RCU EQS 的特殊配置
 			 * 不关心并发/顺序，直接把低位状态设为目标值。
 			 */
 			if (!IS_ENABLED(CONFIG_CONTEXT_TRACKING_IDLE))
@@ -815,7 +815,7 @@ void noinstr __ct_user_enter(enum ctx_state state)
 			 * is false because we know that CPU is not tickless.
 			 */
 			/*
-			 * 原文说明即使本 CPU 不 active
+			 * 即使本 CPU 不 active
 			 * （例如不在 full-dynticks mask），仍须记录上下文，
 			 * 防止任务在异常中睡眠并迁移后，另一 CPU 的
 			 * exception_exit() 不知道应返回哪里。
@@ -880,7 +880,7 @@ void ct_user_enter(enum ctx_state state)
 	 * just return immediately if we detect we are in an IRQ.
 	 */
 	/*
-	 * 原文说明异常可能发生在 IRQ 中，形成 IRQ enter、临时 EQS exit/enter、
+	 * 异常可能发生在 IRQ 中，形成 IRQ enter、临时 EQS exit/enter、
 	 * IRQ exit 的嵌套；再做用户转换会破坏 dyntick_nesting，而 rcu_irq_*
 	 * 已足够保护异常内 RCU，所以检测到 IRQ 时直接返回。
 	 */
@@ -960,7 +960,7 @@ void noinstr __ct_user_exit(enum ctx_state state)
 			 * run a RCU read side critical section anytime.
 			 */
 			/*
-			 * 原文说明进入内核后随时可能执行 RCU 读侧临界区，
+			 * 进入内核后随时可能执行 RCU 读侧临界区，
 			 * 因此首先退出 RCU idle；
 			 * 这是真正允许高层内核代码运行的发布边界。
 			 */
@@ -982,7 +982,7 @@ void noinstr __ct_user_exit(enum ctx_state state)
 			 * In this we case we don't care about any concurrency/ordering.
 			 */
 			/*
-			 * 原文说明仅做 tickless cputime、未支持 RCU EQS 时不需要
+			 * 仅做 tickless cputime、未支持 RCU EQS 时不需要
 			 * 并发/排序，直接把状态恢复为 KERNEL。
 			 */
 			if (!IS_ENABLED(CONFIG_CONTEXT_TRACKING_IDLE))
@@ -1062,7 +1062,7 @@ EXPORT_SYMBOL_GPL(ct_user_exit);
 /*
  * user_exit_callable() - 旧架构从汇编可调用的 user_exit() 符号入口。
  *
- * 原文说明它因无法在低层检查 static key 而存在，但已经过时且不安全；
+ * 它因无法在低层检查 static key 而存在，但已经过时且不安全；
  * 新代码应在 IRQ-off 入口直接调用 user_exit_irqoff()。无入参、无返回，
  * 只转发兼容包装，不改变 ownership。
  */
@@ -1103,7 +1103,7 @@ void __init ct_cpu_track_user(int cpu)
 	 * This assumes that init is the only task at this early boot stage.
 	 */
 	/*
-	 * 原文说明：把 TIF_NOHZ 设置到 init/0，随后由 fork 传播给所有任务；
+	 * 把 TIF_NOHZ 设置到 init/0，随后由 fork 传播给所有任务；
 	 * 前提是此启动阶段 init 仍是唯一任务。
 	 * 下面的 tasklist 检查验证该假设。
 	 */

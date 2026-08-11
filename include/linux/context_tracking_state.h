@@ -70,7 +70,7 @@ struct context_tracking {
 	 * may be further optimized using static keys.
 	 */
 	/*
-	 * 原文说明：active 为 false 时会撤除探针以降低开销，清除 TIF 标志，
+	 * active 为 false 时会撤除探针以降低开销，清除 TIF 标志，
 	 * user_enter/exit 的昂贵工作也会跳过，并可继续由 static key 优化。
 	 * active 是“本 CPU 是否 full-dynticks 跟踪”的策略位；recursion 是本 CPU
 	 * 防止 tracing/记账重入状态机的深度计数，

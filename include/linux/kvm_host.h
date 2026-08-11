@@ -418,7 +418,7 @@ static __always_inline void guest_timing_enter_irqoff(void)
 	 * stime pending cputime to flush.
 	 */
 	/*
-	 * 原文说明当前位于 ioctl 上下文，可安全假定待冲刷的是 stime 系统态
+	 * 当前位于 ioctl 上下文，可安全假定待冲刷的是 stime 系统态
 	 * CPU 时间；vtime helper 会在边界结清它，再开始 guest 时间记账。
 	 */
 	instrumentation_begin();
@@ -453,7 +453,7 @@ static __always_inline void guest_context_enter_irqoff(void)
 	 * we do with user-mode execution.
 	 */
 	/*
-	 * 原文说明 KVM 切换 guest 前不持有 RCU 保护数据的引用；从 RCU 看，
+	 *  KVM 切换 guest 前不持有 RCU 保护数据的引用；从 RCU 看，
 	 * guest 类似用户态，而且可能持续一个时间片，
 	 * 因此可把它作为静止态，
 	 * 减少 RCU 为该 CPU 保持 tick 的需要。
@@ -505,7 +505,7 @@ static __always_inline void guest_enter_irqoff(void)
 /*
  * guest_state_enter_irqoff() - 在真正运行 guest 前修正 IRQ/RCU/lockdep 状态。
  *
- * 原文说明 guest 将开启 IRQ，但调用时内核 IRQ 仍关闭；阶段依次是准备
+ *  guest 将开启 IRQ，但调用时内核 IRQ 仍关闭；阶段依次是准备
  * “IRQ on” trace/lockdep、进入 Context Tracking EQS、最终让 lockdep 认为
  * IRQ 已开启。由体系结构不可插桩代码调用，且 timing_enter 必须已完成。
  * 入参、返回均无；状态发布后到 guest exit 前受不可插桩协议约束。
@@ -545,7 +545,7 @@ static __always_inline void guest_context_exit_irqoff(void)
 	 * Guest mode is treated as a quiescent state, see
 	 * guest_context_enter_irqoff() for more details.
 	 */
-	/* 原文说明 guest 被当作静止态，完整理由见配对 enter。 */
+	/*  guest 被当作静止态，完整理由见配对 enter。 */
 	if (!context_tracking_guest_exit()) {
 		instrumentation_begin();
 		rcu_virt_note_context_switch();

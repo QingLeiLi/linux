@@ -1,111 +1,138 @@
 # SPDX-License-Identifier: GPL-2.0-only
 menu "IRQ subsystem"
 # Options selectable by the architecture code
+# 以下多为无用户提示的能力位，由体系结构或 irqchip 选择，表示通用 IRQ 核心可以启用相应路径。
 
 # Make sparse irq Kconfig switch below available
+# 体系结构选择此隐藏门控后，后面的 SPARSE_IRQ 才向用户显示可配置提示。
 config MAY_HAVE_SPARSE_IRQ
        bool
 
 # Enable the generic irq autoprobe mechanism
+# 提供 probe_irq_on/off/mask 的通用旧式中断自动探测实现；仅应由仍需该能力的平台选择。
 config GENERIC_IRQ_PROBE
 	bool
 
 # Use the generic /proc/interrupts implementation
+# 使用 IRQ 核心提供的 /proc/interrupts 展示与相关格式约束，而非体系结构私有实现。
 config GENERIC_IRQ_SHOW
        bool
 
 # Print level/edge extra information
+# 让通用中断统计输出附加 level/edge 触发类型信息；它是展示能力位，不改变硬件触发配置。
 config GENERIC_IRQ_SHOW_LEVEL
        bool
 
 # Supports effective affinity mask
+# SMP 控制器可选择此项保存并展示硬件实际生效的 affinity，区别于软件请求掩码。
 config GENERIC_IRQ_EFFECTIVE_AFF_MASK
        depends on SMP
        bool
 
 # Support for delayed migration from interrupt context
+# 为不能立即迁移的中断保存 pending affinity，稍后在安全的核心路径完成迁移。
 config GENERIC_PENDING_IRQ
 	bool
 
 # Support for generic irq migrating off cpu before the cpu is offline.
+# 启用 CPU 下线前把普通 IRQ 迁离目标 CPU 的通用辅助逻辑；具体平台仍负责合法目标与硬件回调。
 config GENERIC_IRQ_MIGRATION
 	bool
 
 # Alpha specific irq affinity mechanism
+# Alpha 使用的自动 affinity 选择替代机制；通用代码会据此裁剪默认选择路径。
 config AUTO_IRQ_AFFINITY
        bool
 
 # Interrupt injection mechanism
+# 启用通过 IRQ 核心状态接口注入 pending 事件的调试机制，不能等同于真实硬件到达。
 config GENERIC_IRQ_INJECTION
 	bool
 
 # Tasklet based software resend for pending interrupts on enable_irq()
+# 控制器无法硬件 retrigger 时，用全局 tasklet 在 softirq 上下文重放 pending IRQ。
 config HARDIRQS_SW_RESEND
        bool
 
 # Generic configurable interrupt chip implementation
+# 构建 generic-chip 寄存器/缓存辅助层，并强制启用其映射所依赖的 IRQ_DOMAIN。
 config GENERIC_IRQ_CHIP
        bool
        select IRQ_DOMAIN
 
 # Generic irq_domain hw <--> linux irq number translation
+# 提供硬件中断号与 Linux virq 的映射、反向索引及生命周期框架。
 config IRQ_DOMAIN
 	bool
 
 # Support for simulated interrupts
+# 构建基于 irq_work 与线性 irq_domain 的软件模拟中断 provider，因此自动选择二者。
 config IRQ_SIM
 	bool
 	select IRQ_WORK
 	select IRQ_DOMAIN
 
 # Support for hierarchical irq domains
+# 允许 irq_data/irq_domain 形成父子层级并逐层分配、激活和释放；隐含基础 IRQ_DOMAIN。
 config IRQ_DOMAIN_HIERARCHY
 	bool
 	select IRQ_DOMAIN
 
 # Support for obsolete non-mapping irq domains
+# 保留 hwirq 与 virq 直接对应的旧 nomap domain 模式；新控制器不应优先采用。
 config IRQ_DOMAIN_NOMAP
 	bool
 	select IRQ_DOMAIN
 
 # Support for hierarchical fasteoi+edge and fasteoi+level handlers
+# 构建层级控制器专用的 fasteoi+edge/level flow handlers，供需要逐层 EOI 语义的平台选择。
 config IRQ_FASTEOI_HIERARCHY_HANDLERS
 	bool
 
 # Generic IRQ IPI support
+# SMP 下把 IPI 建模为层级 irq_domain 映射，复用通用 IRQ 分配与分派框架。
 config GENERIC_IRQ_IPI
 	bool
 	depends on SMP
 	select IRQ_DOMAIN_HIERARCHY
 
 # Generic IRQ IPI Mux support
+# SMP 下允许多个逻辑 IPI 复用一个父 IRQ，并由 per-CPU pending 位图解复用。
 config GENERIC_IRQ_IPI_MUX
 	bool
 	depends on SMP
 
 # Generic MSI hierarchical interrupt domain support
+# 构建设备 MSI 的通用层级 domain、描述符与分配 API，并自动启用层级 IRQ domain。
 config GENERIC_MSI_IRQ
 	bool
 	select IRQ_DOMAIN_HIERARCHY
 
 # irqchip drivers should select this if they call iommu_dma_prepare_msi()
+# irqchip 若调用 iommu_dma_prepare_msi()，必须选择此项以构建 IOMMU/MSI 协作接口与状态。
 config IRQ_MSI_IOMMU
 	bool
 
+# 通用 CPU/向量矩阵分配器能力位，由实际使用 irq_matrix API 的体系结构选择。
 config GENERIC_IRQ_MATRIX_ALLOCATOR
 	bool
 
+# 启用 managed IRQ 的预留向量记账模式；会限制运行期重新配置 affinity management。
 config GENERIC_IRQ_RESERVATION_MODE
 	bool
 
 # Snapshot for interrupt statistics
+# 为当前 CPU 保存 IRQ 计数基线并计算区间增量，供硬中断风暴等诊断路径使用。
 config GENERIC_IRQ_STAT_SNAPSHOT
 	bool
 
 # Support forced irq threading
+# 构建 threadirqs/强制线程化策略；PREEMPT_RT 有独立处理，具体 IRQ 仍受 NOTHREAD 等约束。
 config IRQ_FORCED_THREADING
        bool
 
+# 稀疏 IRQ 按需分配 irq_desc，适合 IRQ 号空间大但实际使用少的系统，也利于 NUMA 放置。
+# 只有 MAY_HAVE_SPARSE_IRQ 选中时显示用户提示；不确定时保持 N。
 config SPARSE_IRQ
 	bool "Support sparse irq numbering" if MAY_HAVE_SPARSE_IRQ
 	help
@@ -119,6 +146,8 @@ config SPARSE_IRQ
 
 	  If you don't know what to do here, say N.
 
+# 通过 debugfs 暴露 IRQ/domain 内部状态并启用调试注入，仅用于开发诊断；依赖 DEBUG_FS。
+# 该选项默认关闭，创建 debugfs 文件失败也不应影响 IRQ 主功能。
 config GENERIC_IRQ_DEBUGFS
 	bool "Expose irq internals in debugfs"
 	depends on DEBUG_FS
@@ -134,9 +163,12 @@ config GENERIC_IRQ_DEBUGFS
 # Clear forwarded VM interrupts during kexec.
 # This option ensures the kernel clears active states for interrupts
 # forwarded to virtual machines (VMs) during a machine kexec.
+# 在机器 kexec 前清除已转发给虚拟机的中断 active 状态，避免新内核继承旧 VM 的在途状态。
 config GENERIC_IRQ_KEXEC_CLEAR_VM_FORWARD
 	bool
 
+# 构建 IRQ 管理 API 的 KUnit 内建测试；要求 KUNIT=y 与动态 SPARSE_IRQ 描述符，并选择
+# IRQ_DOMAIN、建议启用 SMP 以覆盖 CPU 热插拔用例。它会改变真实测试机状态，不用于常规内核。
 config IRQ_KUNIT_TEST
 	bool "KUnit tests for IRQ management APIs" if !KUNIT_ALL_TESTS
 	depends on KUNIT=y
@@ -152,6 +184,7 @@ config IRQ_KUNIT_TEST
 
 endmenu
 
+# 允许体系结构在运行时注册唯一的低级根 IRQ handler；启动完成后该入口只读。
 config GENERIC_IRQ_MULTI_HANDLER
 	bool
 	help
@@ -159,6 +192,7 @@ config GENERIC_IRQ_MULTI_HANDLER
 
 # Cavium Octeon is the last system to use this deprecated option
 # Do not even think of enabling this on any new platform
+# 仅 Cavium Octeon 保留旧式 irq_chip CPU online/offline 回调；默认随该 SoC 选择，新平台禁用。
 config DEPRECATED_IRQ_CPU_ONOFFLINE
 	bool
 	depends on CAVIUM_OCTEON_SOC

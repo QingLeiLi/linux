@@ -8,7 +8,7 @@
  *
  */
 /*
- * 原文说明：本文件实现通用 IRQ 的核心“事件分派”层，更完整的接口与流控背景
+ * 本文件实现通用 IRQ 的核心“事件分派”层，更完整的接口与流控背景
  * 见 Documentation/core-api/genericirq.rst。这里不负责分配 irq_desc，也不直接
  * 决定 edge/level 的 ack、mask、eoi 次序；chip.c 中的流处理器把锁和硬件状态准备好
  * 后，在本文件顺序调用 irqaction 的 primary handler，并按返回值唤醒线程 handler。
