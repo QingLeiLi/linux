@@ -6,8 +6,45 @@
 
 - [ ] `kernel/sched/syscalls.c`
   - 当前状态：部分覆盖。
-  - 建议范围：`yield_to()`、`sched_setaffinity()`、`sched_getaffinity()` 及相关调度策略系统调用。
-  - 补注重点：返回值类别、权限检查、task 生命周期、亲和性掩码与 runqueue 锁协议。
+  - 建议范围：`yield_to()`、`sched_setaffinity()`、`sched_getaffinity()`、调度策略/优先级修改路径，
+    以及修改完成后调用 `rt_mutex_adjust_pi()` 重检阻塞任务 PI 链的衔接点。
+  - 补注重点：返回值类别、权限检查、task 生命周期、亲和性掩码与 runqueue 锁协议；说明为何先释放
+    rq 锁、在 `pi` 条件成立时再重排 rtmutex waiter/owner 链，以及该重排与 balance callback 的顺序。
+
+- [ ] `kernel/futex/pi.c`
+  - 当前状态：PI-futex 的 rtmutex proxy 调用链以英文原注释为主，完整中文学习注释缺失。
+  - 建议范围：pi_state 创建/代理 owner 初始化、futex hashbucket lock 到 rtmutex `wait_lock` 的锁交接、
+    `__rt_mutex_start_proxy_lock()`、`rt_mutex_wait_proxy_lock()`、
+    `rt_mutex_cleanup_proxy_lock()`、`__rt_mutex_futex_unlock()` 与 `rt_mutex_postunlock()` 调用区域。
+  - 补注重点：用户态 futex owner 与内核 proxy owner 的对应关系，pi_state/task/waiter 引用 ownership，
+    PREEMPT_RT 下避免把 hashbucket lock 错误纳入 PI 链的交接顺序，start 错误仍保留 waiter 的契约，
+    timeout/signal 与并发 unlock 最终授予 ownership 的竞态，以及 wake_q/禁抢占的成对恢复。
+
+- [ ] `kernel/futex/requeue.c`
+  - 当前状态：requeue-PI 调用 `rt_mutex_start_proxy_lock()` 和后续 wait/cleanup 的区域缺少完整学习注释。
+  - 建议范围：源/目标 hashbucket 之间的 waiter 迁移、pi_state 引用建立、proxy start 三类返回处理、
+    `rt_mutex_wait_proxy_lock()` 和 `rt_mutex_cleanup_proxy_lock()` 的最终结果修正路径。
+  - 补注重点：`futex_q`、`rt_mutex_waiter` 与 pi_state 的跨队列 ownership，返回 1/0/负 errno 分别对应
+    “已获锁/仍排队/已撤销”的状态，错误时引用回滚和 requeue_state 发布，以及 cleanup 返回 false 时
+    必须忽略原超时/信号错误的原因。
+
+- [ ] `include/linux/mutex.h`
+  - 当前状态：PREEMPT_RT 分支的 mutex 结构/API 映射与 lockdep 嵌套宏只有部分学习注释。
+  - 建议范围：PREEMPT_RT `struct mutex`/初始化宏、`mutex_rt_init_*()` 声明、阻塞/可中断/killable/I/O
+    获取、nest-lock/subclass 包装、trylock 与 unlock 声明，以及关闭 `CONFIG_DEBUG_LOCK_ALLOC` 的退化宏。
+  - 补注重点：普通 mutex ABI 如何落到 `rtmutex_api.c`，`.rtmutex` 与 `.dep_map` 的同步状态，
+    `__acquires`/`__cond_acquires` 静态契约，subclass 与 nest_lock 的区别，trylock 的 1/0 约定及
+    `CONFIG_PREEMPT_RT`、`CONFIG_DEBUG_LOCK_ALLOC` 组合下实际导出符号。
+
+- [ ] `kernel/rcu/tree_plugin.h`
+  - 当前状态：RCU priority boosting 中人工 rtmutex 的设计已有英文说明，但 proxy owner、锁和任务
+    生命周期缺少完整中文串联。
+  - 建议范围：选择 `boost_tasks`/`exp_tasks`、`rt_mutex_init_proxy_locked()` 构造人工 owner、锁外
+    `rt_mutex_lock()`/`rt_mutex_unlock()` 触发 donation，以及被 boost 任务退出最外层 RCU 读侧临界区
+    后释放人工锁的配对路径。
+  - 补注重点：`rnp->lock` 如何稳定阻塞任务及链表节点，人工 rtmutex 为何只利用获取的 PI 副作用，
+    proxy owner 不增加 task 引用时的生命周期依据，普通/expedited grace period waiter 选择，
+    以及任务退出、摘链和 boost kthread 并发时的锁顺序。
 
 - [ ] `fs/exec.c`
   - 当前状态：`__set_task_comm()` 相关学习注释缺失。
