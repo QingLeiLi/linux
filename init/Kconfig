@@ -1,4 +1,18 @@
 # SPDX-License-Identifier: GPL-2.0-only
+#
+# 顶层基础配置导读：本文件先把编译器、汇编器、链接器、Rust 和 pahole 的
+# 实际能力转换为不可见 Kconfig 符号，再进入 General setup 汇聚启动参数、
+# IPC、调度统计、cgroup、namespace、initramfs、系统调用和性能分析等通用
+# 能力。架构和各子系统随后通过 source 继续扩展配置树。
+#
+# 这里的隐藏 bool/int/string 多由构建脚本探测或由架构 select，普通用户不
+# 直接选择；可见选项则通过 depends on 限制可用前提，通过 select/imply
+# 建立下游能力。Kconfig 只决定编译期结构与默认策略，运行期状态仍由对应
+# 启动代码和子系统维护。
+
+# 记录编译器完整版本文本，同时建立“版本变化即重新配置/全量重编译”的
+# 依赖边。默认值引用同名环境变量，使 syncconfig 能观察工具链替换；
+# compiler-version.h 又让 fixdep 把该符号加入每个对象的自动依赖。
 config CC_VERSION_TEXT
 	string
 	default "$(CC_VERSION_TEXT)"
@@ -16,50 +30,65 @@ config CC_VERSION_TEXT
 	    auto-generated dependency. When the compiler is updated, syncconfig
 	    will touch it and then every file will be rebuilt.
 
+# 探测当前 C 编译器是否为 GCC；结果供版本门槛、告警选项和兼容规避条件使用。
 config CC_IS_GCC
 	def_bool $(success,test "$(cc-name)" = GCC)
 
+# 把 GCC 版本编码为整数；非 GCC 构建固定为 0，避免下游版本比较误命中。
 config GCC_VERSION
 	int
 	default $(cc-version) if CC_IS_GCC
 	default 0
 
+# 探测当前 C 编译器是否为 Clang，与 CC_IS_GCC 构成主要编译器分派条件。
 config CC_IS_CLANG
 	def_bool $(success,test "$(cc-name)" = Clang)
 
+# 把 Clang 版本编码为整数；非 Clang 构建使用 0 作为明确哨兵值。
 config CLANG_VERSION
 	int
 	default $(cc-version) if CC_IS_CLANG
 	default 0
 
+# 标记外部汇编器是否来自 GNU binutils，供体系结构选择兼容参数和规避缺陷。
 config AS_IS_GNU
 	def_bool $(success,test "$(as-name)" = GNU)
 
+# 标记是否使用 LLVM 汇编器；Clang integrated assembler 也落入这一能力分支。
 config AS_IS_LLVM
 	def_bool $(success,test "$(as-name)" = LLVM)
 
+# 统一暴露实际汇编器版本。集成汇编器随 Clang 发布，因此必须复用
+# CLANG_VERSION；外部汇编器才调用 as-version 独立探测。
 config AS_VERSION
 	int
 	# Use clang version if this is the integrated assembler
+	# 使用集成汇编器时采用 Clang 版本，不能误填系统中未参与构建的外部 as 版本。
 	default CLANG_VERSION if AS_IS_LLVM
 	default $(as-version)
 
+# 标记链接器是否为 GNU BFD；只有命中时 LD_VERSION 才具有 BFD 版本语义。
 config LD_IS_BFD
 	def_bool $(success,test "$(ld-name)" = BFD)
 
+# 记录 GNU BFD 链接器版本，其他链接器使用 0 哨兵，供缺陷范围判断。
 config LD_VERSION
 	int
 	default $(ld-version) if LD_IS_BFD
 	default 0
 
+# 标记链接器是否为 LLVM lld，与 BFD 分支共同决定链接脚本能力和参数。
 config LD_IS_LLD
 	def_bool $(success,test "$(ld-name)" = LLD)
 
+# 记录 lld 版本；非 lld 构建为 0，避免版本条件脱离实现类型单独成立。
 config LLD_VERSION
 	int
 	default $(ld-version) if LD_IS_LLD
 	default 0
 
+# 无条件探测 rustc 版本，而不依赖 CONFIG_RUST：RUST 自身的 depends on 需要
+# 先读取这个数值才能判断工具链是否合格，不能形成反向循环依赖。
 config RUSTC_VERSION
 	int
 	default $(rustc-version)
@@ -67,6 +96,8 @@ config RUSTC_VERSION
 	  It does not depend on `RUST` since that one may need to use the version
 	  in a `depends on`.
 
+# 运行统一检查脚本，验证 rustc、bindgen、标准库源码等整套 Rust 构建前提。
+# 该隐藏布尔值只表达“当前构建环境可用”，不等于用户已经启用 CONFIG_RUST。
 config RUST_IS_AVAILABLE
 	def_bool $(success,$(srctree)/scripts/rust_is_available.sh)
 	help
@@ -78,14 +109,18 @@ config RUST_IS_AVAILABLE
 	  In particular, the Makefile target 'rustavailable' is useful to check
 	  why the Rust toolchain is not being detected.
 
+# 记录 rustc 内部使用的 LLVM 精确版本，供跨语言 LTO 等 LLVM IR 交互检查。
 config RUSTC_LLVM_VERSION
 	int
 	default $(rustc-llvm-version)
 
+# 从编码版本中取主版本号；只比较主版本可表达 LLVM bitcode 的基础兼容边界。
 config RUSTC_LLVM_MAJOR_VERSION
 	int
 	default $(shell,expr $(rustc-llvm-version) / 10000)
 
+# 仅当 C 编译器为 Clang 且它与 rustc 使用相同 LLVM 主版本时置位。该符号
+# 告诉跨语言 IR/LTO 路径二者具备基本格式兼容性；精确同版本仍是最佳组合。
 config RUSTC_CLANG_LLVM_COMPATIBLE
 	bool
 	default y if CC_IS_CLANG && RUSTC_LLVM_MAJOR_VERSION = $(shell,expr $(cc-version) / 10000)
@@ -97,9 +132,13 @@ config RUSTC_CLANG_LLVM_COMPATIBLE
 	  LTO) require the same LLVM major version to work properly. For best
 	  compatibility it is recommended that the exact same LLVM is used.
 
+# 架构置位后表示它会自行给出 ARCH_CC_CAN_LINK，覆盖通用用户态链接探测；
+# 适用于默认 ABI 不能用简单 m32/m64 测试表达的特殊架构工具链。
 config ARCH_HAS_CC_CAN_LINK
 	bool
 
+# 判断当前编译器/链接器组合能否产出最小用户态可执行文件。架构有专用结论
+# 时优先采用，否则按 64BIT 选择 m64 或 m32 探测；这是构建宿主能力而非内核运行能力。
 config CC_CAN_LINK
 	bool
 	default ARCH_CC_CAN_LINK if ARCH_HAS_CC_CAN_LINK
@@ -108,6 +147,8 @@ config CC_CAN_LINK
 
 # Fixed in GCC 14, 13.3, 12.4 and 11.5
 # https://gcc.gnu.org/bugzilla/show_bug.cgi?id=113921
+# 该 asm goto 输出约束缺陷已在 GCC 11.5、12.4、13.3 和 14 修复；以下版本
+# 区间精确标记仍受影响的编译器，避免只按“大于某版本”错误判断维护分支。
 config GCC_ASM_GOTO_OUTPUT_BROKEN
 	bool
 	depends on CC_IS_GCC
@@ -115,6 +156,8 @@ config GCC_ASM_GOTO_OUTPUT_BROKEN
 	default y if GCC_VERSION >= 120000 && GCC_VERSION < 120400
 	default y if GCC_VERSION >= 130000 && GCC_VERSION < 130300
 
+# 用最小编译样例验证 asm goto 是否支持输出操作数，并排除上方已知错误版本。
+# 下游只有在语法存在且实现可靠时才能启用依赖这种控制流内联汇编的优化。
 config CC_HAS_ASM_GOTO_OUTPUT
 	def_bool y
 	depends on !GCC_ASM_GOTO_OUTPUT_BROKEN
@@ -123,86 +166,120 @@ config CC_HAS_ASM_GOTO_OUTPUT
 config CC_HAS_ASM_GOTO_TIED_OUTPUT
 	depends on CC_HAS_ASM_GOTO_OUTPUT
 	# Detect buggy gcc and clang, fixed in gcc-11 clang-14.
+	# 继续探测 GCC/Clang 的 tied output 缺陷；该问题分别从 GCC 11、Clang 14 修复。
 	def_bool $(success,echo 'int foo(int *x) { asm goto (".long (%l[bar]) - .": "+m"(*x) ::: bar); return *x; bar: return 0; }' | $CC -x c - -c -o /dev/null)
 
+# 运行工具链协同测试，确认编译器、链接器、nm 和 objcopy 都能保留并处理
+# ELF RELR 压缩重定位；任一环节不支持都不能安全启用相关链接格式。
 config TOOLS_SUPPORT_RELR
 	def_bool $(success,env "CC=$(CC)" "LD=$(LD)" "NM=$(NM)" "OBJCOPY=$(OBJCOPY)" $(srctree)/scripts/tools-support-relr.sh)
 
+# 编译最小样例确认 `asm inline` 语法可用，供内核在需要时表达内联代价模型。
 config CC_HAS_ASM_INLINE
 	def_bool $(success,echo 'void foo(void) { asm inline (""); }' | $(CC) -x c - -c -o /dev/null)
 
+# 标记编译器能否安全使用 assume attribute。Clang 19.1 之前该属性语义不同，
+# GCC 则从 13.1 才支持，因此使用显式版本门槛而非仅做语法试编译。
 config CC_HAS_ASSUME
 	bool
 	# clang needs to be at least 19.1.0 since the meaning of the assume
 	# attribute changed:
 	# https://github.com/llvm/llvm-project/commit/c44fa3e8a9a44c2e9a575768a3c185354b9f6c17
+	# Clang 至少需要 19.1.0，因为此前 assume 属性表达的是不同语义。
 	default y if CC_IS_CLANG && CLANG_VERSION >= 190100
 	# supported since gcc 13.1.0
 	# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106654
+	# GCC 从 13.1.0 开始提供该属性。
 	default y if CC_IS_GCC && GCC_VERSION >= 130100
 
+# 以 -Werror 试编译确认 no_profile_instrument_function 属性确实被识别；避免
+# 未知属性仅产生告警却让探测误报成功，进而无法可靠排除函数插桩。
 config CC_HAS_NO_PROFILE_FN_ATTR
 	def_bool $(success,echo '__attribute__((no_profile_instrument_function)) int x();' | $(CC) -x c - -c -o /dev/null -Werror)
 
+# 标记柔性数组 `__counted_by` 属性可安全使用。这里不仅要求语法存在，还绕开
+# 会在实际结构体构建中崩溃的早期 Clang，并遵循 GCC 首个支持版本。
 config CC_HAS_COUNTED_BY
 	bool
 	# clang needs to be at least 20.1.0 to avoid potential crashes
 	# when building structures that contain __counted_by
 	# https://github.com/ClangBuiltLinux/linux/issues/2114
 	# https://github.com/llvm/llvm-project/commit/160fb1121cdf703c3ef5e61fb26c5659eb581489
+	# Clang 至少需 20.1.0，避免编译含 __counted_by 的结构体时潜在崩溃。
 	default y if CC_IS_CLANG && CLANG_VERSION >= 200100
 	# supported since gcc 15.1.0
 	# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108896
+	# GCC 从 15.1.0 开始支持该属性。
 	default y if CC_IS_GCC && GCC_VERSION >= 150100
 
+# 标记增强的 counted_by 指针形式可用；Clang 22 与 GCC 16 是各自支持起点。
 config CC_HAS_COUNTED_BY_PTR
 	bool
 	# supported since clang 22
+	# Clang 从 22 开始支持 counted_by 指针形式。
 	default y if CC_IS_CLANG && CLANG_VERSION >= 220100
 	# supported since gcc 16.0.0
+	# GCC 从 16.0.0 开始支持 counted_by 指针形式。
 	default y if CC_IS_GCC && GCC_VERSION >= 160000
 
+# 标记旧 Clang 的 counted_by 对引用处理存在已知缺陷，供调用点主动禁用危险用法。
 config CC_HAS_BROKEN_COUNTED_BY_REF
 	bool
 	# https://github.com/llvm/llvm-project/issues/182575
+	# 缺陷跟踪见上述 LLVM issue；Clang 22 以前均按有问题处理。
 	default y if CC_IS_CLANG && CLANG_VERSION < 220100
 
+# 通过 cc-option 探测编译器是否接受分配令牌上限参数，供 alloc token 机制选择。
 config CC_HAS_ALLOC_TOKEN
 	def_bool $(cc-option,-falloc-token-max=123)
 
+# 用二维字符数组样例确认 nonstring 属性可用于多维数组；-Werror 防止属性被
+# 忽略时误判成功，CLANG_FLAGS 保持与真实内核编译的 Clang 参数一致。
 config CC_HAS_MULTIDIMENSIONAL_NONSTRING
 	def_bool $(success,echo 'char tag[][4] __attribute__((__nonstring__)) = { };' | $(CC) $(CLANG_FLAGS) -x c - -c -o /dev/null -Werror)
 
 config LD_CAN_USE_KEEP_IN_OVERLAY
 	# ld.lld prior to 21.0.0 did not support KEEP within an overlay description
 	# https://github.com/llvm/llvm-project/pull/130661
+	# lld 21.0.0 之前不能在 OVERLAY 描述内使用 KEEP；GNU BFD 或新版 lld 才置位。
 	def_bool LD_IS_BFD || LLD_VERSION >= 210000
 
+# 以下 Rust 隐藏符号按 rustc 版本开放标准库/宏能力，调用点无需散落重复版本比较。
+# span file 与 unnecessary_transmutes 从 1.88.0 可用。
 config RUSTC_HAS_SPAN_FILE
 	def_bool RUSTC_VERSION >= 108800
 
+# 标记 rustc 1.88.0 起提供 unnecessary_transmutes lint/能力。
 config RUSTC_HAS_UNNECESSARY_TRANSMUTES
 	def_bool RUSTC_VERSION >= 108800
 
+# 标记 rustc 1.89.0 起支持带 NUL 文件相关能力。
 config RUSTC_HAS_FILE_WITH_NUL
 	def_bool RUSTC_VERSION >= 108900
 
+# 标记 rustc 1.91.0 起支持把文件内容作为 C 字符串处理的能力。
 config RUSTC_HAS_FILE_AS_C_STR
 	def_bool RUSTC_VERSION >= 109100
 
+# 从构建环境记录 pahole 版本，供 BTF/DWARF 特性选择与缺陷规避使用。
 config PAHOLE_VERSION
 	int
 	default "$(PAHOLE_VERSION)"
 
+# 架构选择该隐藏开关以允许内核构建并执行编译器生成的构造函数 section。
 config CONSTRUCTORS
 	bool
 
+# SMP 构建默认需要 irq_work 跨 CPU 排队能力；UP 下仍可由其他功能显式选择。
 config IRQ_WORK
 	def_bool y if SMP
 
+# 架构选择后表示某些内核表在构建期排序，避免启动期再付出排序成本。
 config BUILDTIME_TABLE_SORT
 	bool
 
+# 架构选择该布局后，把 thread_info 从内核栈移入 task_struct。这样解除栈底
+# 固定定位假设，但栈观察路径必须显式取得 task stack 引用，避免并发释放。
 config THREAD_INFO_IN_TASK
 	bool
 	help
@@ -213,8 +290,12 @@ config THREAD_INFO_IN_TASK
 	  One subtle change that will be needed is to use try_get_task_stack()
 	  and put_task_stack() in save_thread_stack_tsk() and get_wchan().
 
+# General setup 是面向用户的通用内核配置主菜单；它把前面的工具链事实转成
+# 构建策略，并汇入 IPC、调度、控制组、namespace、启动镜像和基础系统调用。
 menu "General setup"
 
+# 开发者显式启用后，才显示或允许选择已知不能在当前基础设施正常工作的
+# 老旧驱动。它是“允许尝试编译和修复”的风险门，不承诺生成的驱动可运行。
 config BROKEN
 	bool
 	help
@@ -222,11 +303,15 @@ config BROKEN
 	  compile (and fix) old drivers that haven't been updated to
 	  new infrastructure.
 
+# 为只在 SMP 上损坏的功能提供统一依赖符号：UP 构建自然为 y；SMP 构建只有
+# 开启总 BROKEN 开关才为 y，从而让相关选项无需重复书写条件。
 config BROKEN_ON_SMP
 	bool
 	depends on BROKEN || !SMP
 	default y
 
+# 分别限制内核命令行传给 init 的参数个数和环境变量个数，而非二者总和。
+# 普通内核默认各 32 个，UML 因启动方式需要更大空间而默认各 128 个。
 config INIT_ENV_ARG_LIMIT
 	int
 	default 32 if !UML
@@ -235,6 +320,8 @@ config INIT_ENV_ARG_LIMIT
 	  Maximum of each of the number of arguments and environment
 	  variables passed to init from the kernel command line.
 
+# 允许在非目标平台编译具备基础 I/O 映射条件的驱动，以扩大持续集成的语法、
+# 类型和链接覆盖；这些对象可能无法加载或缺少硬件，不能视为运行兼容证明。
 config COMPILE_TEST
 	bool "Compile also drivers which will not load"
 	depends on HAS_IOMEM
@@ -249,6 +336,8 @@ config COMPILE_TEST
 	  here. If you are a user/distributor, say N here to exclude useless
 	  drivers to be distributed.
 
+# 把 C/Rust 编译告警以及部分工具告警提升为错误。COMPILE_TEST 默认开启它以
+# 阻止新告警进入树；异常新旧工具链可关闭，从而区分告警洁净度与能否构建。
 config WERROR
 	bool "Compile the kernel with warnings as errors"
 	default COMPILE_TEST
@@ -266,6 +355,8 @@ config WERROR
 
 	  If in doubt, say Y.
 
+# 在支持 headers_install 的配置中，把导出的 UAPI 头分别作为独立单元编译，
+# 验证它们没有依赖未显式包含的内核内部声明；该测试不改变最终 UAPI ABI。
 config UAPI_HEADER_TEST
 	bool "Compile test UAPI headers"
 	depends on HEADERS_INSTALL
@@ -276,6 +367,8 @@ config UAPI_HEADER_TEST
 	  If you are a developer or tester and want to ensure the exported
 	  headers are self-contained, say Y here. Otherwise, choose N.
 
+# 用户提供的本地 release 后缀。它排在对象树、源码树的 localversion* 文件
+# 内容之后共同组成 KERNELRELEASE，并最终出现在 uname 等接口；总长度受 64 字符限制。
 config LOCALVERSION
 	string "Local version - append to kernel release"
 	help
@@ -286,6 +379,9 @@ config LOCALVERSION
 	  object and source tree, in that order.  Your total string can
 	  be a maximum of 64 characters.
 
+# 允许 scripts/setlocalversion 根据当前 Git 提交自动追加 `-g<12位提交>` 等
+# 身份信息，位置晚于 localversion* 与 CONFIG_LOCALVERSION。COMPILE_TEST 禁用
+# 自动后缀，以免大规模测试配置被源码树状态无意义地区分。
 config LOCALVERSION_AUTO
 	bool "Automatically append version information to the version string"
 	default y
@@ -307,6 +403,8 @@ config LOCALVERSION_AUTO
 
 	  which is done within the script "scripts/setlocalversion".)
 
+# 将发行版提供的盐加入 ELF build-id 计算，使相同源码但不同发行构建能与各自
+# 调试信息稳定匹配；空字符串保持默认行为，不参与运行期随机数或密码学密钥生成。
 config BUILD_SALT
 	string "Build ID Salt"
 	default ""
@@ -316,30 +414,43 @@ config BUILD_SALT
 	  This is mostly useful for distributions which want to ensure the
 	  build is unique between builds. It's safe to leave the default.
 
+# 以下 HAVE_KERNEL_* 均由架构选择，表达其自解压启动路径实际具备哪种算法；
+# 它们只控制后续 choice 的可见候选，不能由通用配置凭空为架构增加解压器。
+# 架构支持以 gzip 压缩内核镜像时选择该符号。
 config HAVE_KERNEL_GZIP
 	bool
 
+# 架构支持 bzip2 自解压镜像时选择该符号。
 config HAVE_KERNEL_BZIP2
 	bool
 
+# 架构支持 LZMA 自解压镜像时选择该符号。
 config HAVE_KERNEL_LZMA
 	bool
 
+# 架构支持 XZ/LZMA2 自解压镜像时选择该符号。
 config HAVE_KERNEL_XZ
 	bool
 
+# 架构支持 LZO 自解压镜像时选择该符号。
 config HAVE_KERNEL_LZO
 	bool
 
+# 架构支持 LZ4 自解压镜像时选择该符号。
 config HAVE_KERNEL_LZ4
 	bool
 
+# 架构支持 Zstandard 自解压镜像时选择该符号。
 config HAVE_KERNEL_ZSTD
 	bool
 
+# 架构启动入口能直接加载未压缩内核镜像时选择该符号。
 config HAVE_KERNEL_UNCOMPRESSED
 	bool
 
+# 在架构声明的可用格式中恰好选择一种内核镜像压缩方式。内核镜像由早期
+# 自解压入口恢复：压缩速度只影响构建，解压速度和解压器内存则在每次启动
+# 都付出；gzip 是兼顾镜像大小、启动速度和工具普及度的默认基线。
 choice
 	prompt "Kernel compression mode"
 	default KERNEL_GZIP
@@ -362,6 +473,8 @@ choice
 
 	  If in doubt, select 'gzip'
 
+# 选择成熟的 gzip 格式；压缩率和解压速度均较均衡，是没有特殊体积或启动
+# 时延约束时的稳妥默认值，前提是架构提供对应解压入口。
 config KERNEL_GZIP
 	bool "Gzip"
 	depends on HAVE_KERNEL_GZIP
@@ -369,6 +482,8 @@ config KERNEL_GZIP
 	  The old and tried gzip compression. It provides a good balance
 	  between compression ratio and decompression speed.
 
+# 选择 bzip2：相对 gzip 镜像约小 10%，但在候选中解压最慢且启动解压至少
+# 需要约 8 MiB 内存；适合存储更紧张而启动时间和早期内存较宽裕的系统。
 config KERNEL_BZIP2
 	bool "Bzip2"
 	depends on HAVE_KERNEL_BZIP2
@@ -379,6 +494,8 @@ config KERNEL_BZIP2
 	  Bzip2 uses a large amount of memory. For modern kernels you
 	  will need at least 8MB RAM or more for booting.
 
+# 选择 LZMA：原说明给出的压缩率最佳、镜像相对 gzip 约小 33%；构建压缩
+# 最慢，启动解压速度介于 gzip 与 bzip2 之间。
 config KERNEL_LZMA
 	bool "LZMA"
 	depends on HAVE_KERNEL_LZMA
@@ -387,6 +504,9 @@ config KERNEL_LZMA
 	  is between gzip and bzip2.  Compression is slowest.
 	  The kernel size is about 33% smaller with LZMA in comparison to gzip.
 
+# 选择基于 LZMA2 的 XZ。它可用体系结构 BCJ 过滤器改善可执行指令流压缩，
+# 常比 gzip 小约 30%，在 i386/x86_64/ARM/ARM64/RISC-V/大端 PowerPC/SPARC
+# 等有过滤器的架构上还会比纯 LZMA 略小；解压快于 bzip2、慢于 gzip/LZO。
 config KERNEL_XZ
 	bool "XZ"
 	depends on HAVE_KERNEL_XZ
@@ -403,6 +523,8 @@ config KERNEL_XZ
 	  speed of XZ is better than that of bzip2 but worse than gzip
 	  and LZO. Compression is slow.
 
+# 选择 LZO：压缩率在这些候选中较差，镜像约比 gzip 大 10%，但构建压缩和
+# 启动解压都最快，适合优先降低启动时延而不苛求镜像体积的场景。
 config KERNEL_LZO
 	bool "LZO"
 	depends on HAVE_KERNEL_LZO
@@ -411,6 +533,8 @@ config KERNEL_LZO
 	  size is about 10% bigger than gzip; however its speed
 	  (both compression and decompression) is the fastest.
 
+# 选择固定字节编码的 LZ77 类 LZ4。其压缩率比 LZO 更差、镜像约再大 8%，
+# 但解压更快；这是用存储空间交换极短启动解压时间的选项。
 config KERNEL_LZ4
 	bool "LZ4"
 	depends on HAVE_KERNEL_LZ4
@@ -423,6 +547,8 @@ config KERNEL_LZ4
 	  is about 8% bigger than LZO. But the decompression speed is
 	  faster than LZO.
 
+# 选择 Zstandard：压缩率优于 gzip，解压速度约等于 LZO但慢于 LZ4；启动端
+# 至少需要约 192 KiB 内存，构建机还必须安装 zstd 命令行压缩工具。
 config KERNEL_ZSTD
 	bool "ZSTD"
 	depends on HAVE_KERNEL_ZSTD
@@ -433,6 +559,8 @@ config KERNEL_ZSTD
 	  will need at least 192 KB RAM or more for booting. The zstd command
 	  line tool is required for compression.
 
+# 直接生成未压缩镜像并跳过早期解压/搬移。通常会显著增大镜像，只适用于
+# 解压异常缓慢的模拟器或需要排除自解压器影响的早期启动调试。
 config KERNEL_UNCOMPRESSED
 	bool "None"
 	depends on HAVE_KERNEL_UNCOMPRESSED
@@ -445,6 +573,8 @@ config KERNEL_UNCOMPRESSED
 
 endchoice
 
+# 编译进内核的默认 init 路径，仅在命令行没有 `init=` 时作为第一次尝试；
+# 路径不存在仍会继续 /sbin/init 等内建候选，空字符串则直接使用后备列表。
 config DEFAULT_INIT
 	string "Default init path"
 	default ""
@@ -455,6 +585,8 @@ config DEFAULT_INIT
 	  locations (e.g. /sbin/init, etc). If this is empty, we will just use
 	  the fallback list when init= is not passed.
 
+# 用户态首次 sethostname(2) 前初始 UTS namespace 的主机名。传统默认值为
+# `(none)`；最小系统可在构建期改成可用名称，之后仍能由用户态覆盖。
 config DEFAULT_HOSTNAME
 	string "Default hostname"
 	default "(none)"
@@ -464,6 +596,8 @@ config DEFAULT_HOSTNAME
 	  but you may wish to use a different default here to make a minimal
 	  system more usable with less configuration.
 
+# 编入 System V 信号量、消息队列和共享内存等 IPC 系统调用，使进程能同步
+# 和交换信息；大量传统用户程序依赖这些 ABI，关闭会同时裁掉相关内核实现。
 config SYSVIPC
 	bool "System V IPC"
 	help
@@ -479,16 +613,22 @@ config SYSVIPC
 	  section 6.4 of the Linux Programmer's Guide, available from
 	  <http://www.tldp.org/guides.html>.
 
+# SYSVIPC 与通用 SYSCTL 同时存在时，默认公开 System V IPC 的运行期 sysctl
+# 调节接口；该隐藏派生项不能脱离 IPC 核心或 /proc/sys 基础设施单独存在。
 config SYSVIPC_SYSCTL
 	bool
 	depends on SYSVIPC
 	depends on SYSCTL
 	default y
 
+# 64 位内核提供兼容 ABI 且启用 SYSVIPC 时，自动编入 32 位 System V IPC
+# 参数布局和系统调用转换层，保持 compat 进程可使用同一内核 IPC 对象。
 config SYSVIPC_COMPAT
 	def_bool y
 	depends on COMPAT && SYSVIPC
 
+# 编入带消息优先级的 POSIX mq_* 接口。实现依赖网络基础设施，并可通过
+# mqueue 文件系统向用户态展示队列；关闭后依赖该 POSIX ABI 的程序无法运行。
 config POSIX_MQUEUE
 	bool "POSIX Message Queues"
 	depends on NET
@@ -505,12 +645,15 @@ config POSIX_MQUEUE
 
 	  If unsure, say Y.
 
+# POSIX 消息队列和 SYSCTL 同时启用时，默认公开队列数量/大小等运行期调节项。
 config POSIX_MQUEUE_SYSCTL
 	bool
 	depends on POSIX_MQUEUE
 	depends on SYSCTL
 	default y
 
+# 提供通用内核到用户态通知队列：事件记录被拼接进 pipe，可由 key/keyring
+# 变化和设备通知等 watch 源复用。默认关闭，避免未使用系统引入额外接口。
 config WATCH_QUEUE
 	bool "General notification queue"
 	default n
@@ -523,6 +666,8 @@ config WATCH_QUEUE
 
 	  See Documentation/core-api/watch_queue.rst
 
+# 在 MMU 系统中默认提供 process_vm_readv/writev，使通过权限检查的进程直接
+# 批量访问另一进程地址空间；权限授权不由本开关绕过，仍由运行期 ptrace 规则控制。
 config CROSS_MEMORY_ATTACH
 	bool "Enable process_vm_readv/writev syscalls"
 	depends on MMU
@@ -533,6 +678,8 @@ config CROSS_MEMORY_ATTACH
 	  to directly read from or write to another process' address space.
 	  See the man page for more details.
 
+# 编入通用审计基础设施，为 SELinux AVC 等子系统提供结构化事件记录；依赖
+# 网络层承载审计 netlink，体系结构是否还能记录系统调用由下方能力符号决定。
 config AUDIT
 	bool "Auditing support"
 	depends on NET
@@ -542,29 +689,41 @@ config AUDIT
 	  logging of avc messages output).  System call auditing is included
 	  on architectures which support it.
 
+# 架构选择该隐藏能力，声明其系统调用入口具备审计所需的寄存器/ABI 钩子。
 config HAVE_ARCH_AUDITSYSCALL
 	bool
 
+# AUDIT 与架构入口能力同时存在时自动编入系统调用级审计，并选择 FSNOTIFY
+# 支撑路径/文件事件关联；普通用户无需在基础审计之外再手动选择。
 config AUDITSYSCALL
 	def_bool y
 	depends on AUDIT && HAVE_ARCH_AUDITSYSCALL
 	select FSNOTIFY
 
+# 在 General setup 中依次嵌入 IRQ、时间、BPF 和抢占模型配置。source 保留
+# 同一 Kconfig 解析上下文，只负责组织菜单，不表示这些子系统由 init/ 实现。
 source "kernel/irq/Kconfig"
 source "kernel/time/Kconfig"
 source "kernel/bpf/Kconfig"
 source "kernel/Kconfig.preempt"
 
+# 本菜单决定 CPU 时间、IRQ 时间、任务资源消耗和系统压力以何种精度采集并
+# 向用户态导出。精度越高，越需要在内核/用户、IRQ、睡眠/唤醒等热路径记账。
 menu "CPU/Task time and stats accounting"
 
+# 两种虚拟 CPU 记账实现共同选择的隐藏核心开关，用于编入共享数据结构和接口。
 config VIRT_CPU_ACCOUNTING
 	bool
 
+# CPU 时间记账实现三选一：普通周期 tick 是默认低成本方案；架构原生计数器
+# 和 context tracking 方案提供更准确或 full-dynticks 可用的边界记账。
 choice
 	prompt "Cputime accounting"
 	default TICK_CPU_ACCOUNTING
 
 # Kind of a stub config for the pure tick based cputime accounting
+# 这是纯 tick 记账的占位选择项：按 jiffy 粒度累计用户、内核和 idle 时间。
+# s390 使用原生方案，NO_HZ_FULL CPU 又不能依赖周期 tick，因此排除这两类配置。
 config TICK_CPU_ACCOUNTING
 	bool "Simple tick based cputime accounting"
 	depends on !S390 && !NO_HZ_FULL
@@ -575,6 +734,9 @@ config TICK_CPU_ACCOUNTING
 
 	  If unsure, say Y.
 
+# 使用架构 CPU 计数器，在每次内核进入/退出以及 system、softirq、hardirq
+# 状态切换时结算时间。精度高于 tick 但热边界多一次读计数器的开销；s390
+# 和较新 POWER 逻辑分区还可据此统计被 hypervisor 抢占的 stolen time。
 config VIRT_CPU_ACCOUNTING_NATIVE
 	bool "Deterministic task and CPU time accounting"
 	depends on HAVE_VIRT_CPU_ACCOUNTING && !NO_HZ_FULL
@@ -588,6 +750,9 @@ config VIRT_CPU_ACCOUNTING_NATIVE
 	  this also enables accounting of stolen time on logically-partitioned
 	  systems.
 
+# 为 NO_HZ_FULL 使用 context tracking 观察每个内核/用户边界并记账，同时选择
+# 通用虚拟记账核心和用户上下文跟踪。它要求架构与 clockevents 支持，边界
+# 追踪开销明显，原说明将其主要定位为 full-dynticks 开发用途。
 config VIRT_CPU_ACCOUNTING_GEN
 	bool "Full dynticks CPU time accounting"
 	depends on HAVE_CONTEXT_TRACKING_USER
@@ -609,6 +774,8 @@ config VIRT_CPU_ACCOUNTING_GEN
 
 endchoice
 
+# 架构支持且未使用原生虚拟记账时，可在 softirq/hardirq 状态切换读取时间戳，
+# 将 IRQ 消耗从当前任务时间中细粒度分离；更精确但会增加每次 IRQ 转换成本。
 config IRQ_TIME_ACCOUNTING
 	bool "Fine granularity task level IRQ time accounting"
 	depends on HAVE_IRQ_TIME_ACCOUNTING && !VIRT_CPU_ACCOUNTING_NATIVE
@@ -620,11 +787,15 @@ config IRQ_TIME_ACCOUNTING
 
 	  If in doubt, say N here.
 
+# SMP 下只要存在 IRQ 时间或半虚拟化时间记账，就自动开放调度器的平均 IRQ
+# 负载能力，使容量估计能够扣除 CPU 被中断/宿主机占用的时间。
 config HAVE_SCHED_AVG_IRQ
 	def_bool y
 	depends on IRQ_TIME_ACCOUNTING || PARAVIRT_TIME_ACCOUNTING
 	depends on SMP
 
+# 在具备 SMP、thermal cpufreq 且架构提供压力更新/缩放回调时，记录热节流造成
+# 的可用算力下降。调度器据此少向受限 CPU 放任务；ARM 拓扑和 ARM64 默认启用。
 config SCHED_HW_PRESSURE
 	bool
 	default y if ARM && ARM_CPU_TOPOLOGY
@@ -644,6 +815,9 @@ config SCHED_HW_PRESSURE
 	  This requires the architecture to implement
 	  arch_update_hw_pressure() and arch_scale_thermal_pressure().
 
+# 已弃用的 BSD 进程记账：用户态通过专用系统调用指定文件，内核在每个进程
+# 退出时追加身份、时间、内存、终端等 acct 记录。它依赖多用户基础设施且
+# 扩展性较差，新部署通常应使用 eBPF；只有兼容旧工具时才启用。
 config BSD_PROCESS_ACCT
 	bool "BSD Process Accounting (DEPRECATED)"
 	depends on MULTIUSER
@@ -661,6 +835,8 @@ config BSD_PROCESS_ACCT
 	  scalability issues.  You probably want to use eBPF instead.  Say
 	  N unless you really need this.
 
+# 把 BSD 记账输出切换为包含进程 PID 和父 PID 的 v3 格式；它与 v0/v1/v2
+# 不兼容，读取端必须同步升级，因此不会随 BSD_PROCESS_ACCT 默认开启。
 config BSD_PROCESS_ACCT_V3
 	bool "BSD Process Accounting version 3 file format"
 	depends on BSD_PROCESS_ACCT
@@ -673,6 +849,8 @@ config BSD_PROCESS_ACCT_V3
 	  for processing it. A preliminary version of these tools is available
 	  at <http://www.gnu.org/software/acct/>.
 
+# 通过 generic netlink 导出 task/process 统计：用户态可在任务存活期间主动
+# 查询，任务退出时也会收到统计。它依赖网络和多用户支持，默认关闭。
 config TASKSTATS
 	bool "Export task/process statistics through netlink"
 	depends on NET
@@ -687,6 +865,8 @@ config TASKSTATS
 
 	  Say N if unsure.
 
+# 在 TASKSTATS 上增加任务等待 CPU、同步块 I/O、换入等资源的延迟累计，并
+# 选择 SCHED_INFO 提供调度等待数据；结果帮助用户态分析优先级和资源瓶颈。
 config TASK_DELAY_ACCT
 	bool "Enable per-task delay accounting"
 	depends on TASKSTATS
@@ -699,6 +879,7 @@ config TASK_DELAY_ACCT
 
 	  Say N if unsure.
 
+# 扩展 TASKSTATS 载荷以携带更多任务记账字段，是后续存储 I/O 字节统计的前提。
 config TASK_XACCT
 	bool "Enable extended accounting over taskstats"
 	depends on TASKSTATS
@@ -708,6 +889,8 @@ config TASK_XACCT
 
 	  Say N if unsure.
 
+# 统计任务实际引起的存储 I/O 字节数，经扩展 taskstats 向用户态导出；它
+# 衡量归因到任务的 I/O，而不是简单统计系统调用请求长度。
 config TASK_IO_ACCOUNTING
 	bool "Enable per-task storage I/O accounting"
 	depends on TASK_XACCT
@@ -717,6 +900,9 @@ config TASK_IO_ACCOUNTING
 
 	  Say N if unsure.
 
+# 采集 CPU、内存和 I/O 资源过量承诺导致的停顿占墙钟时间比例，并选择 kernfs
+# 支撑接口。全局结果出现在 /proc/pressure；启用 cgroup v2 时还按控制组聚合
+# `*.pressure`，区分“部分任务受阻”和“所有非空闲任务均受阻”的压力窗口。
 config PSI
 	bool "Pressure stall information tracking"
 	select KERNFS
@@ -737,6 +923,9 @@ config PSI
 
 	  Say N if unsure.
 
+# 保留 PSI 代码和接口但启动时默认关闭采集，只有命令行 `psi=1` 才启用。
+# 这允许对极端关注调度热路径开销的通用镜像延迟决定；普通负载开销很低，
+# 但 hackbench 等人工压力测试可观察到差异。
 config PSI_DEFAULT_DISABLED
 	bool "Require boot parameter to enable pressure stall information tracking"
 	default n
@@ -759,6 +948,9 @@ config PSI_DEFAULT_DISABLED
 
 endmenu # "CPU/Task time and stats accounting"
 
+# 在 SMP 中编入 housekeeping/CPU 隔离基础设施，使 `isolcpus=` 等启动策略能
+# 把非绑定 workqueue、timer、kthread 等噪声迁往 housekeeping CPU。开关只
+# 提供机制，具体隔离集合仍由启动参数和各子系统运行期登记决定。
 config CPU_ISOLATION
 	bool "CPU isolation"
 	depends on SMP
@@ -771,8 +963,11 @@ config CPU_ISOLATION
 
 	  Say Y if unsure.
 
+# 在当前位置嵌入 RCU 实现与调优选项；RCU 配置属于 General setup，但实现位于 kernel/rcu。
 source "kernel/rcu/Kconfig"
 
+# 把本次构建的完整 `.config` 压缩保存进内核或模块，便于从磁盘镜像通过
+# scripts/extract-ikconfig 恢复构建配置；它保存的是构建快照，不是运行期可变配置。
 config IKCONFIG
 	tristate "Kernel .config support"
 	help
@@ -785,6 +980,8 @@ config IKCONFIG
 	  It can also be extracted from a running kernel by reading
 	  /proc/config.gz if enabled (below).
 
+# IKCONFIG 内建且 procfs 可用时，通过 `/proc/config.gz` 暴露正在运行内核的
+# 配置快照；这只是读取接口，写入它不能重新配置当前内核。
 config IKCONFIG_PROC
 	bool "Enable access to .config through /proc/config.gz"
 	depends on IKCONFIG && PROC_FS
@@ -792,6 +989,8 @@ config IKCONFIG_PROC
 	  This option enables access to the kernel configuration file
 	  through /proc/config.gz.
 
+# 将构建生成的内核头打包为 `/sys/kernel/kheaders.tar.xz`，供 eBPF tracing 等
+# 外部程序针对当前内核编译。选 m 时由 kheaders.ko 按需发布，依赖 sysfs 承载。
 config IKHEADERS
 	tristate "Enable kernel headers through /sys/kernel/kheaders.tar.xz"
 	depends on SYSFS
@@ -801,6 +1000,9 @@ config IKHEADERS
 	  or similar programs.  If you build the headers as a module, a module called
 	  kheaders.ko is built which can be loaded on-demand to get access to headers.
 
+# 设置 printk 静态环形缓冲区最小容量的二进制指数：容量为 2^N 字节，范围
+# 4 KiB 至 32 MiB、默认 128 KiB。多 CPU 扩容可提高最终值，`log_buf_len=`
+# 启动参数也可强制更大/精确容量，因此该值不是不可覆盖的最终大小。
 config LOG_BUF_SHIFT
 	int "Kernel log buffer size (16 => 64KB, 17 => 128KB)"
 	range 12 25
@@ -820,6 +1022,10 @@ config LOG_BUF_SHIFT
 		     13 =>  8 KB
 		     12 =>  4 KB
 
+# 为每个 possible CPU 预留的最大 printk 扩容贡献指数，默认每 CPU 4 KiB，
+# BASE_SMALL 关闭自动贡献。仅当所有 possible CPU 的贡献和超过基础缓冲区一半
+# 才在启动期另分配更大缓冲区；CPU 热插拔不改变按最坏情况预估的容量。
+# `log_buf_len=` 指定精确大小时完全覆盖本算法，原静态缓冲区在扩容后闲置。
 config LOG_CPU_MAX_BUF_SHIFT
 	int "CPU kernel log buffer size contribution (13 => 8 KB, 17 => 128KB)"
 	depends on SMP
@@ -856,6 +1062,9 @@ config LOG_CPU_MAX_BUF_SHIFT
 		     13 =>   8 KB for each CPU
 		     12 =>   4 KB for each CPU
 
+# 在 debugfs 为每个模块导出编译期已知 printk 格式索引，使监控 /dev/kmsg 的
+# 守护进程能审计格式被修改或删除。索引生成不插入 printk 热路径额外工作，
+# 但要求 printk 和 debugfs 都存在。
 config PRINTK_INDEX
 	bool "Printk indexing debugfs interface"
 	depends on PRINTK && DEBUG_FS
@@ -872,15 +1081,20 @@ config PRINTK_INDEX
 
 #
 # Architectures with an unreliable sched_clock() should select this:
+# sched_clock() 不可靠的架构应选择该能力，通知调度时钟层不能直接信任原始读数。
 #
 config HAVE_UNSTABLE_SCHED_CLOCK
 	bool
 
+# 架构选择通用 sched_clock 稳定化实现，用包装层处理 wrap、频率和跨 CPU 一致性。
 config GENERIC_SCHED_CLOCK
 	bool
 
+# 本菜单收纳改变调度决策语义或热路径状态的可选机制。
 menu "Scheduler features"
 
+# 为 RT/FAIR runnable task 维护最小/最大利用率提示，帮助 schedutil 选择频率。
+# clamp 约束的是频率/利用率估计，不授予 CPU 带宽，也不是强制执行时间配额。
 config UCLAMP_TASK
 	bool "Enable utilization clamping for RT/FAIR tasks"
 	depends on CPU_FREQ_GOV_SCHEDUTIL
@@ -899,6 +1113,9 @@ config UCLAMP_TASK
 
 	  If in doubt, say N.
 
+# 将完整利用率范围分成 5～20 个引用计数 bucket 聚合 runnable task 的 clamp。
+# bucket 越多，任务进入/离开 CPU 时的聚合值越精确、额外内存越多；较粗 bucket
+# 可能让 25% 等请求随同桶中的 30% 请求暂时采用更高有效值，空桶再复位标称值。
 config UCLAMP_BUCKETS_COUNT
 	int "Number of supported utilization clamp buckets"
 	range 5 20
@@ -930,13 +1147,19 @@ config UCLAMP_BUCKETS_COUNT
 
 	  If in doubt, use the default value.
 
+# 代理执行让持有 mutex 的任务继承高优先级等待者的调度上下文，从而优先运行
+# 锁持有者、缩短优先级反转。当前仍属专家功能，且暂不支持 PREEMPT_RT、
+# sched_ext 分裂上下文和完整多 runqueue 代理场景。
 config SCHED_PROXY_EXEC
 	bool "Proxy Execution"
 	# Avoid some build failures w/ PREEMPT_RT until it can be fixed
+	# 在兼容问题修复前排除 PREEMPT_RT，避免已知构建失败。
 	depends on !PREEMPT_RT
 	# Need to investigate how to inform sched_ext of split contexts
+	# 尚未确定如何把代理产生的分裂执行上下文通知 sched_ext，因此排除它。
 	depends on !SCHED_CLASS_EXT
 	# Not particularly useful until we get to multi-rq proxying
+	# 完成跨多个 runqueue 的代理前适用面有限，只向 EXPERT 用户开放。
 	depends on EXPERT
 	help
 	  This option enables proxy execution, a mechanism for mutex-owning
@@ -947,6 +1170,8 @@ endmenu
 #
 # For architectures that want to enable the support for NUMA-affine scheduler
 # balancing logic:
+# 需要启用 NUMA 亲和调度与自动放置逻辑的架构应选择该能力；它只声明架构
+# 基础条件满足，用户是否开启 NUMA_BALANCING 仍由后续可见选项决定。
 #
 config ARCH_SUPPORTS_NUMA_BALANCING
 	bool
@@ -958,17 +1183,26 @@ config ARCH_SUPPORTS_NUMA_BALANCING
 # written after the unmap. Details are in mm/rmap.c near the check for
 # should_defer_flush. The architecture should also consider if the full flush
 # and the refill costs are offset by the savings of sending fewer IPIs.
+# 某些架构希望累计一批 unmap 后统一全量刷新 TLB，而不是每页发送一次 IPI。
+# 选择者必须保证 unmap 后迟到写回的 clean TLB 项不会破坏正确性，并确认减少
+# IPI 的收益高于全量 flush 与后续 refill 成本；具体延迟判断位于 mm/rmap.c。
 config ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
 	bool
 
+# 在 64 位目标上探测编译器是否真正提供可用的 `__int128` 基础类型；这是
+# 工具链语法能力，架构还需用 ARCH_SUPPORTS_INT128 声明其 ABI/实现可靠。
 config CC_HAS_INT128
 	def_bool !$(cc-option,$(m64-flag) -D__SIZEOF_INT128__=0) && 64BIT
 
+# 选择当前编译器支持的最严格隐式 switch fallthrough 告警参数。GCC 优先级 5，
+# Clang 使用其可达性 fallthrough 检查；空字符串表示工具链不支持可靠检查。
 config CC_IMPLICIT_FALLTHROUGH
 	string
 	default "-Wimplicit-fallthrough=5" if CC_IS_GCC && $(cc-option,-Wimplicit-fallthrough=5)
 	default "-Wimplicit-fallthrough" if CC_IS_CLANG && $(cc-option,-Wunreachable-code-fallthrough)
 
+# 选择编译器可用的 Microsoft 匿名 struct/union 扩展参数；新参数不可用时回退
+# 到较宽的 `-fms-extensions`，供依赖这类布局语法的兼容代码统一引用。
 config CC_MS_EXTENSIONS
 	string
 	default "-fms-anonymous-structs" if $(cc-option,-fms-anonymous-structs)
@@ -976,37 +1210,50 @@ config CC_MS_EXTENSIONS
 
 # Currently, disable gcc-10+ array-bounds globally.
 # It's still broken in gcc-13, so no upper bound yet.
+# 当前全局禁用 GCC 10 及以上的 array-bounds 告警；GCC 13 仍有误报，因此暂不
+# 设置版本上限。该常开策略符号便于未来修复后集中收窄，而不改所有调用点。
 config GCC10_NO_ARRAY_BOUNDS
 	def_bool y
 
+# GCC 9 及以上且全局规避开关有效时，通知构建参数层关闭 array-bounds 告警。
 config CC_NO_ARRAY_BOUNDS
 	bool
 	default y if CC_IS_GCC && GCC_VERSION >= 90000 && GCC10_NO_ARRAY_BOUNDS
 
 # Currently, disable -Wstringop-overflow for GCC globally.
+# 当前对所有 GCC 全局禁用 `-Wstringop-overflow`，避免已知误报阻断正常构建。
 config GCC_NO_STRINGOP_OVERFLOW
 	def_bool y
 
+# 把 GCC 专用全局规避策略转换成构建参数层使用的“应关闭告警”能力符号。
 config CC_NO_STRINGOP_OVERFLOW
 	bool
 	default y if CC_IS_GCC && GCC_NO_STRINGOP_OVERFLOW
 
+# 只有 GCC 且未要求关闭时才标记 stringop-overflow 检查可启用；与上项互斥。
 config CC_STRINGOP_OVERFLOW
 	bool
 	default y if CC_IS_GCC && !CC_NO_STRINGOP_OVERFLOW
 
 #
 # For architectures that know their GCC __int128 support is sound
+# 架构确认 GCC `__int128` 的 ABI、代码生成和所需运行库支持可靠时选择该能力。
+# 它补充 CC_HAS_INT128 的语法探测，防止“编译器认识类型”被误当成架构可安全使用。
 #
 config ARCH_SUPPORTS_INT128
 	bool
 
 # For architectures that (ab)use NUMA to represent different memory regions
 # all cpu-local but of different latencies, such as SuperH.
+# 某些架构（如 SuperH）借用 NUMA 描述都为 CPU-local、但访问延迟不同的内存区；
+# 这种模型没有“把页迁到任务所在远端节点”的通常含义，必须禁止自动 NUMA balancing。
 #
 config ARCH_WANT_NUMA_VARIABLE_LOCALITY
 	bool
 
+# 在真正支持 NUMA 亲和调度的 SMP 架构上，根据任务访问位置迁移内存/任务，
+# 自动改善放置。它排除变量本地性模型、要求页迁移且暂不支持 PREEMPT_RT；
+# UMA 机器即使编入代码也不会激活该机制。
 config NUMA_BALANCING
 	bool "Memory placement aware NUMA scheduler"
 	depends on ARCH_SUPPORTS_NUMA_BALANCING
@@ -1019,6 +1266,8 @@ config NUMA_BALANCING
 
 	  This system will be inactive on UMA systems.
 
+# SMP 调度器默认尝试把同一进程的任务聚集到同一末级缓存域，在可能时用更好
+# 的共享数据局部性减少 LLC miss；这是平衡偏好，不是硬 CPU 亲和约束。
 config SCHED_CACHE
 	bool "Cache aware load balance"
 	default y
@@ -1030,6 +1279,8 @@ config SCHED_CACHE
 	  resources within the same cache domain, reducing cache misses and
 	  lowering data access latency.
 
+# 决定已编入的自动 NUMA balancing 是否在 NUMA 机器启动时默认开启；关闭它
+# 仍保留机制，管理员可通过运行期接口按需启用。
 config NUMA_BALANCING_DEFAULT_ENABLED
 	bool "Automatically enable NUMA aware memory/task placement"
 	default y
@@ -1038,9 +1289,14 @@ config NUMA_BALANCING_DEFAULT_ENABLED
 	  If set, automatic NUMA balancing will be enabled if running on a NUMA
 	  machine.
 
+# 隐藏基础能力：为 slab 对象附加可选扩展元数据，供 MEMCG 等功能记录每对象
+# 归属；只有被控制器选择时才编入，避免普通配置承担额外对象元数据成本。
 config SLAB_OBJ_EXT
 	bool
 
+# 编入 cgroup 核心，把任务组织成层级并让 CPU、内存、I/O、设备等控制器在
+# 层级上统计或限制资源。选择 KERNFS 提供控制文件树；关闭会移除所有下方
+# 控制器，而不仅是隐藏用户态挂载接口。
 menuconfig CGROUPS
 	bool "Control Group support"
 	select KERNFS
@@ -1057,9 +1313,13 @@ menuconfig CGROUPS
 
 if CGROUPS
 
+# 控制器共享的层级页计数基础设施，负责 charge、limit 与父级传播；由 MEMCG、
+# HugeTLB、DMEM 等需要页式资源配额的控制器选择，用户不直接配置。
 config PAGE_COUNTER
 	bool
 
+# 默认采用 `favordynmods` 取舍：降低任务迁移、控制器开关等结构修改延迟，
+# 代价是 fork/exit 等高频路径承担更多工作。它只改变默认策略，挂载参数仍可覆盖。
 config CGROUP_FAVOR_DYNMODS
 	bool "Favor dynamic modification latency reduction by default"
 	help
@@ -1070,6 +1330,8 @@ config CGROUP_FAVOR_DYNMODS
 
 	  Say N if unsure.
 
+# 内存控制器按 cgroup 统计并限制任务内存足迹。它选择层级页计数、eventfd
+# 通知、slab 对象归属扩展和 VM 事件计数，这些都是 charge、阈值通知与观测基础。
 config MEMCG
 	bool "Memory controller"
 	select PAGE_COUNTER
@@ -1079,6 +1341,8 @@ config MEMCG
 	help
 	  Provides control over the memory footprint of tasks in a cgroup.
 
+# 架构有 NMI 但既无 NMI-safe this_cpu 操作也无 NMI-safe cmpxchg 时自动置位，
+# 标记 memcg 的相关每 CPU 更新不能在 NMI 上下文安全执行，供实现选择规避路径。
 config MEMCG_NMI_UNSAFE
 	bool
 	depends on MEMCG
@@ -1086,6 +1350,8 @@ config MEMCG_NMI_UNSAFE
 	depends on !ARCH_HAS_NMI_SAFE_THIS_CPU_OPS && !ARCH_HAVE_NMI_SAFE_CMPXCHG
 	default y
 
+# 架构缺少 NMI-safe this_cpu 操作、但提供 NMI-safe cmpxchg 时置位，表示 memcg
+# 若要覆盖 NMI 上下文必须改用原子更新；它与“完全不安全”分支互斥。
 config MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
 	bool
 	depends on MEMCG
@@ -1093,6 +1359,8 @@ config MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
 	depends on !ARCH_HAS_NMI_SAFE_THIS_CPU_OPS && ARCH_HAVE_NMI_SAFE_CMPXCHG
 	default y
 
+# 保留已弃用的 cgroup v1 memory controller ABI，仅服务尚未迁移到 cgroup v2
+# 的旧应用。其功能会随弃用过程收缩，新部署默认关闭且不应依赖新增能力。
 config MEMCG_V1
 	bool "Legacy cgroup v1 memory controller"
 	depends on MEMCG
@@ -1110,6 +1378,8 @@ config MEMCG_V1
 
 	  Say N if unsure.
 
+# 提供通用 block cgroup 对象、层级和 I/O 归属接口；它本身不实施带宽/IOPS
+# 策略，BFQ、throttling 等具体调度或限速功能仍需各自配置。依赖块层存在。
 config BLK_CGROUP
 	bool "IO controller"
 	depends on BLOCK
@@ -1132,11 +1402,15 @@ config BLK_CGROUP
 
 	See Documentation/admin-guide/cgroup-v1/blkio-controller.rst for more information.
 
+# MEMCG 与 BLK_CGROUP 同时存在时，默认把脏页回写 I/O 归因到相应 cgroup，
+# 让内存产生者的后台写回也能进入正确的 I/O 控制层级。
 config CGROUP_WRITEBACK
 	bool
 	depends on MEMCG && BLK_CGROUP
 	default y
 
+# CPU controller 让调度器识别 task group，并在组间分配权重或带宽；仅开启
+# 菜单核心不会自动启用所有 FAIR/RT/sched_ext 策略，下方子项继续选择能力。
 menuconfig CGROUP_SCHED
 	bool "CPU controller"
 	default n
@@ -1146,18 +1420,24 @@ menuconfig CGROUP_SCHED
 	  tasks.
 
 if CGROUP_SCHED
+# 调度类选择该隐藏能力后，CPU controller 提供组权重接口和聚合逻辑。
 config GROUP_SCHED_WEIGHT
 	def_bool n
 
+# 调度类选择该隐藏能力后，CPU controller 提供组带宽配额/周期基础设施。
 config GROUP_SCHED_BANDWIDTH
 	def_bool n
 
+# 为普通 SCHED_OTHER/FAIR 任务建立层级调度实体，默认随 CPU controller 开启，
+# 并选择组权重支持，使组间而非仅任务间参与公平份额分配。
 config FAIR_GROUP_SCHED
 	bool "Group scheduling for SCHED_OTHER"
 	depends on CGROUP_SCHED
 	select GROUP_SCHED_WEIGHT
 	default CGROUP_SCHED
 
+# 在 FAIR group 上增加 quota/period 带宽上限；无限额组保持不受约束，超额组
+# 会被节流到下一周期。它选择共享带宽基础设施，但默认不随 FAIR 分组开启。
 config CFS_BANDWIDTH
 	bool "CPU bandwidth provisioning for FAIR_GROUP_SCHED"
 	depends on FAIR_GROUP_SCHED
@@ -1170,6 +1450,8 @@ config CFS_BANDWIDTH
 	  restriction.
 	  See Documentation/scheduler/sched-bwc.rst for more information.
 
+# 为 SCHED_FIFO/RR 任务组显式分配实时 CPU 带宽。启用后，非 root 实时任务在
+# 所属组未配置 RT runtime 前可能无法调度，因此默认关闭并要求管理员规划层级。
 config RT_GROUP_SCHED
 	bool "Group scheduling for SCHED_RR/FIFO"
 	depends on CGROUP_SCHED
@@ -1181,6 +1463,8 @@ config RT_GROUP_SCHED
 	  realtime bandwidth for them.
 	  See Documentation/scheduler/sched-rt-group.rst for more information.
 
+# 编入 RT group scheduling 但启动时默认关闭，必须通过启动参数显式开启。
+# 该反向选项让单独启用 RT_GROUP_SCHED 仍保持传统“默认立即生效”语义。
 config RT_GROUP_SCHED_DEFAULT_DISABLED
 	bool "Require boot parameter to enable group scheduling for SCHED_RR/FIFO"
 	depends on RT_GROUP_SCHED
@@ -1192,6 +1476,8 @@ config RT_GROUP_SCHED_DEFAULT_DISABLED
 
 	  Say N if unsure.
 
+# sched_ext 与 CPU controller 同时启用时，默认开放组调度，并同时选择权重与
+# 带宽基础设施，使 BPF 调度类能接入同一 cgroup CPU 控制模型。
 config EXT_GROUP_SCHED
 	bool
 	depends on SCHED_CLASS_EXT && CGROUP_SCHED
@@ -1201,14 +1487,21 @@ config EXT_GROUP_SCHED
 
 endif #CGROUP_SCHED
 
+# sched_ext 与 cgroup 核心存在时自动编入子调度器层级支持，不要求完整
+# CGROUP_SCHED 菜单开启；这是 sched_ext 内部的层级能力开关。
 config EXT_SUB_SCHED
         def_bool y
         depends on SCHED_CLASS_EXT && CGROUPS
 
+# SMP 与 rseq 同时存在时，为同一 mm 在并发运行 CPU 上维护 concurrency ID，
+# 供用户态 rseq ABI 高效索引按地址空间分片的数据结构。
 config SCHED_MM_CID
 	def_bool y
 	depends on SMP && RSEQ
 
+# 把 utilization clamp 扩展到 task group。组级 min/max 限制成员任务可生效的
+# clamp 范围，任务自己的请求必须受所属 cgroup 上限约束；它仍是频率/利用率
+# 提示而非 CPU 时间保证，并依赖 CPU group scheduling 与任务级 uclamp。
 config UCLAMP_TASK_GROUP
 	bool "Utilization clamping per group of tasks"
 	depends on CGROUP_SCHED
@@ -1231,6 +1524,9 @@ config UCLAMP_TASK_GROUP
 
 	  If in doubt, say N.
 
+# 限制 cgroup 内可创建的进程/线程数量，在 fork 跨过上限时失败，防止全局 PID
+# 在其他内存限制触发前耗尽。把现有任务迁入层级不受该上限阻止，因此配额
+# 约束的是“继续创建”的能力，不是组织层级调整。
 config CGROUP_PIDS
 	bool "PIDs controller"
 	help
@@ -1247,6 +1543,8 @@ config CGROUP_PIDS
 	  since the PIDs limit only affects a process's ability to fork, not to
 	  attach to a cgroup.
 
+# 限制 IB 栈定义的 RDMA 标量资源，避免一个租户耗尽 host 资源。已有活动
+# RDMA 资源的进程仍允许迁入，即使迁入后暂时超过目标层级上限。
 config CGROUP_RDMA
 	bool "RDMA controller"
 	help
@@ -1257,6 +1555,8 @@ config CGROUP_RDMA
 	  Attaching processes with active RDMA resources to the cgroup
 	  hierarchy is allowed even if can cross the hierarchy's limit.
 
+# 设备内存控制器复用 PAGE_COUNTER，让支持它的设备按 cgroup 层级限制显存等
+# device-local memory；具体设备必须主动接入，启用本项不会自动覆盖所有显存。
 config CGROUP_DMEM
 	bool "Device memory controller (DMEM)"
 	select PAGE_COUNTER
@@ -1267,6 +1567,8 @@ config CGROUP_DMEM
 	  As an example, it allows you to restrict VRAM usage for applications
 	  in the DRM subsystem.
 
+# 提供旧版 cgroup v1 freezer controller，按组冻结/解冻任务。cgroup v2 已在
+# 统一层级内置冻结接口，使用纯 v2 的系统无需再开启这个 legacy 控制器。
 config CGROUP_FREEZER
 	bool "Freezer controller"
 	help
@@ -1278,6 +1580,9 @@ config CGROUP_FREEZER
 
 	  If you're using cgroup2, say N.
 
+# 为 HugeTLB 页提供层级配额并复用 PAGE_COUNTER。HugeTLB 不可回收，配额在
+# page fault 时强制执行，超额访问会向应用发送 SIGBUS；应用必须预先规划用量。
+# 控制组指针占用第三个 page lru 指针，因此小于三个基础页的 huge page 不适用。
 config CGROUP_HUGETLB
 	bool "HugeTLB controller"
 	depends on HUGETLB_PAGE
@@ -1294,6 +1599,9 @@ config CGROUP_HUGETLB
 	  control group is tracked in the third page lru pointer. This means
 	  that we cannot use the controller with huge page less than 3 pages.
 
+# 在 SMP/NUMA 系统中把 CPU 与内存节点动态划成集合，并限制任务只在所属集合
+# 运行/分配。它选择 union-find 维护分区关系和 CPU isolation 迁移 housekeeping
+# 噪声，是动态资源分区而非仅设置单个任务的 sched affinity。
 config CPUSETS
 	bool "Cpuset controller"
 	depends on SMP
@@ -1307,6 +1615,8 @@ config CPUSETS
 
 	  Say N if unsure.
 
+# 保留已弃用的 cgroup v1 cpuset 文件系统和 `/proc/<pid>/cpuset` 语义；新部署
+# 应使用 cgroup v2 partition 接口，只有旧应用依赖 v1 ABI 时才开启。
 config CPUSETS_V1
 	bool "Legacy cgroup v1 cpusets controller"
 	depends on CPUSETS
@@ -1321,23 +1631,30 @@ config CPUSETS_V1
 
 	  Say N if unsure.
 
+# CPUSETS_V1 启用时默认保留 legacy `/proc/<pid>/cpuset` 文件，向旧工具报告
+# 任务所在的 v1 cpuset 路径；纯 v2 配置不创建该兼容文件。
 config PROC_PID_CPUSET
 	bool "Include legacy /proc/<pid>/cpuset file"
 	depends on CPUSETS_V1
 	default y
 
+# 设备控制器按 cgroup 维护设备访问白名单，限制成员进程可 mknod 或 open 的
+# 设备类型/主次设备号；它控制访问授权，不负责创建设备或驱动绑定。
 config CGROUP_DEVICE
 	bool "Device controller"
 	help
 	  Provides a cgroup controller implementing whitelists for
 	  devices which a process in the cgroup can mknod or open.
 
+# 简单累计 cgroup 中所有任务消耗的 CPU 时间，仅提供观测，不实施权重或带宽限制。
 config CGROUP_CPUACCT
 	bool "Simple CPU accounting controller"
 	help
 	  Provides a simple controller for monitoring the
 	  total CPU consumed by the tasks in a cgroup.
 
+# 把 perf 的 per-CPU 监控限定到指定 cgroup 在该 CPU 上运行的线程，或把
+# cgroup ID 写入样本以便跨组分析；依赖完整 perf events 基础设施。
 config CGROUP_PERF
 	bool "Perf controller"
 	depends on PERF_EVENTS
@@ -1349,6 +1666,9 @@ config CGROUP_PERF
 
 	  Say N if unsure.
 
+# 允许通过 bpf(BPF_PROG_ATTACH) 把 eBPF 程序挂到 cgroup。执行上下文由 attach
+# type 决定，例如 INET_INGRESS 在 socket 入站路径运行；选择 socket cgroup
+# 元数据，使网络钩子能稳定识别所属层级。
 config CGROUP_BPF
 	bool "Support for eBPF programs attached to cgroups"
 	depends on BPF_SYSCALL
@@ -1362,6 +1682,8 @@ config CGROUP_BPF
 	  BPF_CGROUP_INET_INGRESS will be executed on the ingress path of
 	  inet sockets.
 
+# 为无法归入 CPU/内存/I/O 等标准模型的主机标量资源提供统一层级计数和上限；
+# 资源提供方负责注册容量，控制器只完成归属、统计与限制，默认关闭。
 config CGROUP_MISC
 	bool "Misc resource controller"
 	default n
@@ -1376,6 +1698,8 @@ config CGROUP_MISC
 	  For more information, please check misc cgroup section in
 	  /Documentation/admin-guide/cgroup-v2.rst.
 
+# DEBUG_KERNEL 下可选的 cgroup 内部调试控制器，导出框架诊断信息。接口不稳定，
+# 只能用于内核开发排障，不能作为生产用户态 ABI。
 config CGROUP_DEBUG
 	bool "Debug controller"
 	default n
@@ -1388,12 +1712,17 @@ config CGROUP_DEBUG
 
 	  Say N.
 
+# 隐藏能力：在 socket 上保存 cgroup 关联数据，供 cgroup BPF 等网络路径快速
+# 查询。默认关闭，由真正需要该字段的功能选择，避免所有 socket 承担成本。
 config SOCK_CGROUP_DATA
 	bool
 	default n
 
 endif # CGROUPS
 
+# namespace 核心让不同任务对相同数字/名称看到不同对象，是容器隔离的身份
+# 分派基础。它依赖多用户凭据模型；非 EXPERT 配置默认开启，EXPERT 用户才
+# 能看到并裁掉整个能力，关闭会同时隐藏所有下方 namespace 类型。
 menuconfig NAMESPACES
 	bool "Namespaces support" if EXPERT
 	depends on MULTIUSER
@@ -1406,6 +1735,8 @@ menuconfig NAMESPACES
 
 if NAMESPACES
 
+# 隔离 uname() 可见的 hostname/domainname 等 UTS 身份；每个 UTS namespace
+# 持有独立 utsname，默认随 namespace 核心启用。
 config UTS_NS
 	bool "UTS namespace"
 	default y
@@ -1413,6 +1744,8 @@ config UTS_NS
 	  In this namespace tasks see different info provided with the
 	  uname() system call
 
+# 为 namespace 提供 boottime 和 monotonic 时钟偏移；各 namespace 的时钟仍
+# 以相同速率前进，只改变观察到的起点/偏移，不虚拟化硬件计时频率。
 config TIME_NS
 	bool "TIME namespace"
 	default y
@@ -1420,9 +1753,13 @@ config TIME_NS
 	  In this namespace boottime and monotonic clocks can be set.
 	  The time will keep going with the same pace.
 
+# TIME_NS 与通用 gettimeofday VDSO 同时存在时，自动编入 namespace-aware
+# VDSO 数据/切换支持，使用户态快速读时钟也应用正确偏移而不必总陷入内核。
 config TIME_NS_VDSO
 	def_bool TIME_NS && GENERIC_GETTIMEOFDAY
 
+# 当 System V IPC 或 POSIX mqueue 至少一种存在时，隔离 IPC ID 到各自对象集合；
+# 不同 namespace 可复用相同 ID 而不会访问彼此的队列、信号量或共享内存。
 config IPC_NS
 	bool "IPC namespace"
 	depends on (SYSVIPC || POSIX_MQUEUE)
@@ -1431,6 +1768,9 @@ config IPC_NS
 	  In this namespace tasks work with IPC ids which correspond to
 	  different IPC objects in different namespaces.
 
+# 隔离 UID/GID 与 capability 映射，使容器内身份可映射到外部非特权用户。
+# 非特权用户能创建层级和消耗内核对象，因此默认关闭；启用时建议配合 MEMCG
+# 和用户态 cgroup 限额，避免未受控内存消耗。
 config USER_NS
 	bool "User namespace"
 	default n
@@ -1445,6 +1785,8 @@ config USER_NS
 
 	  If unsure, say N.
 
+# 隔离进程 ID 映射，使不同 PID namespace 可各自拥有 PID 1 并复用相同数值；
+# task 仍是同一内核对象，只是从不同层级观察到的 pid 不同，是容器基础能力。
 config PID_NS
 	bool "PID Namespaces"
 	default y
@@ -1453,6 +1795,8 @@ config PID_NS
 	  processes with the same pid as long as they are in different
 	  pid namespaces.  This is a building block of containers.
 
+# 在网络栈存在时，为路由、设备、socket、协议状态等建立近似独立实例；用户态
+# 看到多个网络环境，但共享同一内核和底层物理资源。
 config NET_NS
 	bool "Network namespace"
 	depends on NET
@@ -1463,6 +1807,9 @@ config NET_NS
 
 endif # NAMESPACES
 
+# 为 CRIU 等 checkpoint/restore 工具增加设置进程 text/data/heap 布局的 prctl、
+# 额外 `/proc` 信息以及资源比较能力。它依赖 procfs，并选择 children 列表和
+# kcmp；这些接口扩大恢复能力，默认不向普通系统开放。
 config CHECKPOINT_RESTORE
 	bool "Checkpoint/restore support"
 	depends on PROC_FS
@@ -1477,6 +1824,9 @@ config CHECKPOINT_RESTORE
 
 	  If unsure, say N here.
 
+# 按 task session 自动创建 FAIR task group，把桌面交互进程与编译等 CPU 密集
+# 会话分开竞争。它会自动选择 cgroup 核心、CPU controller 和 FAIR group，
+# 无需用户态预先创建层级，但分组依据只到 session 粒度。
 config SCHED_AUTOGROUP
 	bool "Automatic process group scheduling"
 	select CGROUPS
@@ -1489,6 +1839,8 @@ config SCHED_AUTOGROUP
 	  desktop applications.  Task group autogeneration is currently based
 	  upon task session.
 
+# 编入高吞吐内核到用户态 relay channel，常由 debugfs 等文件系统暴露分 CPU
+# 缓冲区；选择 irq_work 完成异步通知。它适合大量事件流，不等同于 printk 日志。
 config RELAY
 	bool "Kernel->user space relay support (formerly relayfs)"
 	select IRQ_WORK
@@ -1501,6 +1853,9 @@ config RELAY
 
 	  If unsure, say N.
 
+# 编入 early userspace 支持：启动加载器提供的 cpio initramfs 先解包到 ramfs
+# 作为初始 root，用于加载挂载真实 root 所需模块/工具；若同时有 BLK_DEV_RAM，
+# 还支持传统块设备 initrd，代价约 15 KiB 或随架构更高。
 config BLK_DEV_INITRD
 	bool "Initial RAM filesystem and RAM disk (initramfs/initrd) support"
 	help
@@ -1518,10 +1873,14 @@ config BLK_DEV_INITRD
 
 if BLK_DEV_INITRD
 
+# 仅在 early userspace 解包器存在时嵌入 usr/ 的内建 initramfs 来源、压缩等配置。
 source "usr/Kconfig"
 
 endif
 
+# 支持在普通 kernel cmdline 之外传递结构化 bootconfig。外置文件附在 initramfs
+# 尾部并带 checksum、size、magic；若不选择内嵌模式，本项自动选择 initrd
+# 支持以取得并解析该尾部数据。
 config BOOT_CONFIG
 	bool "Boot config support"
 	select BLK_DEV_INITRD if !BOOT_CONFIG_EMBED
@@ -1534,6 +1893,8 @@ config BOOT_CONFIG
 
 	  If unsure, say Y.
 
+# 无论命令行是否包含 `bootconfig` 都处理已提供的 bootconfig；内嵌文件默认
+# 强制生效。开启后用户无法用省略启动参数让内核忽略其中追加的启动参数。
 config BOOT_CONFIG_FORCE
 	bool "Force unconditional bootconfig processing"
 	depends on BOOT_CONFIG
@@ -1547,6 +1908,8 @@ config BOOT_CONFIG_FORCE
 
 	  If unsure, say N.
 
+# 在构建期把指定 bootconfig 直接嵌入内核，供无法传递 initrd 的平台使用；
+# 若启动时另有 initrd bootconfig，实际选择仍按实现的来源优先级处理。
 config BOOT_CONFIG_EMBED
 	bool "Embed bootconfig file in the kernel"
 	depends on BOOT_CONFIG
@@ -1558,6 +1921,8 @@ config BOOT_CONFIG_EMBED
 
 	  If unsure, say N.
 
+# 指向构建机上的内嵌 bootconfig 文件。它只在内嵌模式可见，并在没有 initrd
+# 或 initrd 未携带 bootconfig 时作为启动配置来源。
 config BOOT_CONFIG_EMBED_FILE
 	string "Embedded bootconfig file path"
 	depends on BOOT_CONFIG_EMBED
@@ -1566,6 +1931,9 @@ config BOOT_CONFIG_EMBED_FILE
 	  This bootconfig will be used if there is no initrd or no other
 	  bootconfig in the initrd.
 
+# 控制启动日志中 `Kernel command line: ` 消息尝试换行的理想字符数，范围
+# 0～1021、默认 1021。实现优先在空格断行；找不到空格可超过理想值。设 0
+# 禁止主动换行，但单条 printk 的 1021 字符上限可能截断可观察日志。
 config CMDLINE_LOG_WRAP_IDEAL_LEN
 	int "Length to try to wrap the cmdline when logged at boot"
 	default 1021
@@ -1584,6 +1952,8 @@ config CMDLINE_LOG_WRAP_IDEAL_LEN
 	  length of a log message (1021 characters) may cause the cmdline to
 	  be truncated.
 
+# 解包 cpio 时把条目 mtime 写入生成对象；目录时间延迟到其所有子项创建后
+# 再设置，防止创建子文件再次改变目录 mtime。默认保留归档时间元数据。
 config INITRAMFS_PRESERVE_MTIME
 	bool "Preserve cpio archive mtimes in initramfs"
 	depends on BLK_DEV_INITRD
@@ -1595,6 +1965,8 @@ config INITRAMFS_PRESERVE_MTIME
 
 	  If unsure, say Y.
 
+# 把 initramfs cpio 解包 KUnit 用例编入内核。要求解包器存在且 KUnit 内建为 y，
+# 避免测试调用内建启动代码时出现模块生命周期问题；KUNIT_ALL_TESTS 可默认选择。
 config INITRAMFS_TEST
 	bool "Test initramfs cpio archive extraction" if !KUNIT_ALL_TESTS
 	depends on BLK_DEV_INITRD && KUNIT=y
@@ -1602,10 +1974,13 @@ config INITRAMFS_TEST
 	help
 	  Build KUnit tests for initramfs. See Documentation/dev-tools/kunit
 
+# 编译优化级别二选一：-O2 优先运行性能和告警质量，-Os 用可能的性能代价
+# 换取更小镜像；这是全局编译策略，不改变源代码功能契约。
 choice
 	prompt "Compiler optimization level"
 	default CC_OPTIMIZE_FOR_PERFORMANCE
 
+# 默认使用 -O2，兼顾内核运行性能以及编译器在该级别提供的诊断能力。
 config CC_OPTIMIZE_FOR_PERFORMANCE
 	bool "Optimize for performance (-O2)"
 	help
@@ -1613,6 +1988,7 @@ config CC_OPTIMIZE_FOR_PERFORMANCE
 	  with the "-O2" compiler flag for best performance and most
 	  helpful compile-time warnings.
 
+# 使用 -Os 让编译器倾向减小代码体积，适合存储/内存受限系统。
 config CC_OPTIMIZE_FOR_SIZE
 	bool "Optimize for size (-Os)"
 	help
@@ -1621,6 +1997,9 @@ config CC_OPTIMIZE_FOR_SIZE
 
 endchoice
 
+# 架构选择该能力前，必须保护所有外部入口不被 gc-sections 丢弃，并保证链接
+# 脚本把 `.text.*`/`.data.*`/`.bss.*` 合并到正确输出 section、不会误吞
+# `.text.init` 等无关 section；这是正确性声明，不只是链接器支持检测。
 config HAVE_LD_DEAD_CODE_DATA_ELIMINATION
 	bool
 	help
@@ -1631,6 +2010,9 @@ config HAVE_LD_DEAD_CODE_DATA_ELIMINATION
 	  sections (e.g., '.text.init'). Typically '.' in section names
 	  is used to distinguish them from label names / C identifiers.
 
+# 用 `-ffunction-sections -fdata-sections` 将符号拆分，再由 `--gc-sections` 删除
+# 不可达代码/数据，可缩小小配置的磁盘和内存体积。只有架构声明安全、编译器
+# 和链接器参数均可用、且 EXPERT 明确承担漏标入口导致静默损坏风险时才开放。
 config LD_DEAD_CODE_DATA_ELIMINATION
 	bool "Dead code and data elimination (EXPERIMENTAL)"
 	depends on HAVE_LD_DEAD_CODE_DATA_ELIMINATION
@@ -1649,29 +2031,38 @@ config LD_DEAD_CODE_DATA_ELIMINATION
 	  present. This option is not well tested yet, so use at your
 	  own risk.
 
+# 架构要求检查 orphan section 且链接器同时支持 warn/error 模式时自动启用，
+# 用于发现未被链接脚本明确归类、可能落入错误权限或生命周期区域的输入 section。
 config LD_ORPHAN_WARN
 	def_bool y
 	depends on ARCH_WANT_LD_ORPHAN_WARN
 	depends on $(ld-option,--orphan-handling=warn)
 	depends on $(ld-option,--orphan-handling=error)
 
+# orphan section 的处理级别随全局 WERROR 选择 error，否则仅 warn；能力不存在
+# 时本字符串隐藏，避免向不支持的链接器传递参数。
 config LD_ORPHAN_WARN_LEVEL
 	string
 	depends on LD_ORPHAN_WARN
 	default "error" if WERROR
 	default "warn"
 
+# 通用 sysctl 注册和 `/proc/sys` 基础能力，由实际需要运行期调参的子系统选择。
 config SYSCTL
 	bool
 
+# 架构选择该能力，声明仍提供旧 16 位 UID/GID 系统调用 ABI。
 config HAVE_UID16
 	bool
 
+# 编入 `/proc/sys/debug/exception-trace` 调节项，让管理员运行期控制异常跟踪输出。
 config SYSCTL_EXCEPTION_TRACE
 	bool
 	help
 	  Enable support for /proc/sys/debug/exception-trace.
 
+# 架构选择后提供 `/proc/sys/kernel/ignore-unaligned-usertrap`，通过
+# `no_unaligned_warning` 控制是否警告内核暗中模拟的用户态未对齐访问。
 config SYSCTL_ARCH_UNALIGN_NO_WARN
 	bool
 	help
@@ -1679,6 +2070,8 @@ config SYSCTL_ARCH_UNALIGN_NO_WARN
 	  Allows arch to define/use @no_unaligned_warning to possibly warn
 	  about unaligned access emulation going on under the hood.
 
+# 架构选择后提供 `/proc/sys/kernel/unaligned-trap`，通过 `unaligned_enabled`
+# 运行期开关未对齐访问模拟；parisc 实现是当前契约参考。
 config SYSCTL_ARCH_UNALIGN_ALLOW
 	bool
 	help
@@ -1687,6 +2080,8 @@ config SYSCTL_ARCH_UNALIGN_ALLOW
 	  the unaligned access emulation.
 	  see arch/parisc/kernel/unaligned.c for reference
 
+# 保留已被 libc 放弃的旧 `sys_sysfs` 系统调用，仅用于兼容仍调用它的老系统。
+# 默认关闭可减少攻击面；这与现代 sysfs 文件系统是否存在不是同一个开关。
 config SYSFS_SYSCALL
 	bool "Sysfs syscall support"
 	default n
@@ -1697,12 +2092,16 @@ config SYSFS_SYSCALL
 
 	  If unsure say N here.
 
+# 平台选择该能力，声明可注册内置 PC speaker platform device。
 config HAVE_PCSPKR_PLATFORM
 	bool
 
+# 向专家开放通常默认启用且不建议关闭的基础能力，以及实验性构建取舍。选择
+# DEBUG_KERNEL 的目的是解除默认隐藏、显示调试选项，并不表示自动启用全部调试。
 menuconfig EXPERT
 	bool "Configure standard kernel features (expert users)"
 	# Unhide debug options, to make the on-by-default options visible
+	# 选择调试配置总入口以解除隐藏，让默认开启的调试相关选项可见并可裁剪。
 	select DEBUG_KERNEL
 	help
 	  This option allows certain base kernel options and settings
@@ -1710,6 +2109,8 @@ menuconfig EXPERT
 	  environments which can tolerate a "non-standard" kernel.
 	  Only use this if you really know what you are doing.
 
+# 在架构和多用户模型均支持时，默认保留 legacy 16 位 UID/GID syscall wrapper；
+# EXPERT 可为不运行旧二进制的系统裁掉这些 ABI。
 config UID16
 	bool "Enable 16-bit UID system calls" if EXPERT
 	depends on HAVE_UID16 && MULTIUSER
@@ -1717,6 +2118,9 @@ config UID16
 	help
 	  This enables the legacy 16-bit UID syscall wrappers.
 
+# 编入非 root 用户、组和 capability 模型以及 setuid/setgid/capset 等系统调用。
+# 关闭后所有进程都以 UID/GID 0 和全部 capability 运行，只适合严格受控的
+# 单用途系统；它不是“更简单的权限隔离”，而是基本取消多用户权限边界。
 config MULTIUSER
 	bool "Multiple users, groups and capabilities support" if EXPERT
 	default y
@@ -1731,6 +2135,8 @@ config MULTIUSER
 
 	  If unsure, say Y here.
 
+# 保留 libc 已不支持的 sgetmask/ssetmask 旧信号掩码 syscall；若干老架构默认
+# 开启以兼容历史二进制，EXPERT 可按目标用户态 ABI 决定是否裁掉。
 config SGETMASK_SYSCALL
 	bool "sgetmask/ssetmask syscalls support" if EXPERT
 	default PARISC || M68K || PPC || MIPS || X86 || SPARC || MICROBLAZE || SUPERH
@@ -1741,6 +2147,8 @@ config SGETMASK_SYSCALL
 
 	  If unsure, leave the default option here.
 
+# 提供 name_to_handle_at/open_by_handle_at，让用户态文件服务器以不随 rename
+# 改变的文件句柄重新打开对象；选择 EXPORTFS 取得文件系统句柄转换契约。
 config FHANDLE
 	bool "open by fhandle syscalls" if EXPERT
 	select EXPORTFS
@@ -1754,6 +2162,9 @@ config FHANDLE
 	  get renamed. Enables open_by_handle_at(2) and name_to_handle_at(2)
 	  syscalls.
 
+# 编入完整 POSIX timer/clock ABI。关闭可缩小嵌入式镜像，但会移除 timer_*、
+# clock_adjtime、get/setitimer、alarm 等调用，并把剩余 clock_* 限制在 realtime、
+# monotonic 和 boottime，普通用户态通常依赖它所以默认开启。
 config POSIX_TIMERS
 	bool "Posix Clocks & timers" if EXPERT
 	default y
@@ -1771,6 +2182,8 @@ config POSIX_TIMERS
 
 	  If unsure say y.
 
+# 编入常规 printk 格式字符串、环形缓冲与输出路径，并选择 irq_work 完成延迟
+# 工作。关闭能显著减小且静默化镜像，但也几乎失去启动/故障诊断能力。
 config PRINTK
 	default y
 	bool "Enable support for printk" if EXPERT
@@ -1782,6 +2195,8 @@ config PRINTK
 	  very difficult to diagnose system problems, saying N here is
 	  strongly discouraged.
 
+# 在 printk 与 KUnit 可用时构建 ringbuffer 单元测试；KUNIT_ALL_TESTS 决定默认值，
+# 可作为模块或内建测试，生产配置通常关闭。
 config PRINTK_RINGBUFFER_KUNIT_TEST
 	tristate "KUnit Test for the printk ringbuffer" if !KUNIT_ALL_TESTS
 	depends on PRINTK && KUNIT
@@ -1794,6 +2209,8 @@ config PRINTK_RINGBUFFER_KUNIT_TEST
 
 	  If unsure, say N.
 
+# 保留 BUG/WARN 条件和报告路径。关闭可节省镜像空间，却可能把致命不变量破坏
+# 静默忽略，只适合完全没有错误报告设施且接受诊断损失的极小嵌入式系统。
 config BUG
 	bool "BUG() support" if EXPERT
 	default y
@@ -1804,6 +2221,8 @@ config BUG
 	  option for embedded systems with no facilities for reporting errors.
 	  Just say Y.
 
+# 通用 COREDUMP 核心存在时，默认允许生成 ELF core 文件；关闭约节省 4 KiB，
+# 同时用户态崩溃将失去这种完整地址空间诊断产物。
 config ELF_CORE
 	depends on COREDUMP
 	default y
@@ -1812,6 +2231,8 @@ config ELF_CORE
 	  Enable support for generating core dumps. Disabling saves about 4k.
 
 
+# 平台声明有 PC speaker 时默认注册其 platform device，并选择 i8253 锁协调
+# 共享计时硬件；EXPERT 可为无蜂鸣器需求的镜像裁掉少量内存。
 config PCSPKR_PLATFORM
 	bool "Enable PC-Speaker support" if EXPERT
 	depends on HAVE_PCSPKR_PLATFORM
@@ -1821,6 +2242,8 @@ config PCSPKR_PLATFORM
 	  This option allows to disable the internal PC-Speaker
 	  support, saving some memory.
 
+# 选择更小容量/更紧凑的若干核心数据结构以节省小机器内存，代价可能是更高
+# 冲突、扩展或查找成本；同时会影响 printk 等其他配置的默认容量。
 config BASE_SMALL
 	bool "Enable smaller-sized data structures for core" if EXPERT
 	help
@@ -1828,6 +2251,9 @@ config BASE_SMALL
 	  kernel data structures. This saves memory on small machines,
 	  but may reduce performance.
 
+# 编入 futex 系统调用，使无竞争锁完全在用户态完成，只有等待/唤醒和竞争路径
+# 进入内核。glibc 的线程同步广泛依赖它，默认开启；SPARC32 SMP 因实现约束排除，
+# 并以 imply 建议启用 RT mutex，而不强迫所有配置必须接受优先级继承代码。
 config FUTEX
 	bool "Enable futex support" if EXPERT
 	depends on !(SPARC32 && SMP)
@@ -1838,27 +2264,37 @@ config FUTEX
 	  support for "fast userspace mutexes".  The resulting kernel may not
 	  run glibc-based applications correctly.
 
+# FUTEX 与 RT_MUTEXES 同时存在时默认编入 PI futex，让内核通过 rt_mutex 把高
+# 优先级等待者的优先级传给锁持有者，限制用户态锁的优先级反转。
 config FUTEX_PI
 	bool
 	depends on FUTEX && RT_MUTEXES
 	default y
 
+# MMU 且非 BASE_SMALL 的 futex 配置默认为进程私有 futex 使用独立 hash，减少
+# 与跨进程共享 futex 的桶竞争；小内存配置关闭以节省表空间。
 config FUTEX_PRIVATE_HASH
 	bool
 	depends on FUTEX && !BASE_SMALL && MMU
 	default y
 
+# NUMA 系统默认允许 futex 哈希/对象分配遵循内存策略，以改善等待队列访问局部性。
 config FUTEX_MPOL
 	bool
 	depends on FUTEX && NUMA
 	default y
 
+# 架构选择该能力，声明其用户返回/退出路径具备实现 robust futex unlock 的契约。
 config HAVE_FUTEX_ROBUST_UNLOCK
 	bool
 
+# 仅当 futex、通用 VDSO、通用 IRQ entry、rseq 和架构能力全部具备时，自动
+# 启用 robust unlock 快速协作路径；这些依赖共同保证用户/内核边界状态可恢复。
 config FUTEX_ROBUST_UNLOCK
 	def_bool FUTEX && HAVE_GENERIC_VDSO && GENERIC_IRQ_ENTRY && RSEQ && HAVE_FUTEX_ROBUST_UNLOCK
 
+# 编入 epoll 系列系统调用，以一个可轮询 fd 高效维护大量被监控 fd 的就绪集；
+# 普通事件循环和服务端运行库广泛依赖，默认开启。
 config EPOLL
 	bool "Enable eventpoll support" if EXPERT
 	default y
@@ -1866,6 +2302,8 @@ config EPOLL
 	  Disabling this option will cause the kernel to be built without
 	  support for epoll family of system calls.
 
+# 将进程信号作为 fd 记录读取，使其能与 epoll 等统一事件循环组合；传统 signal
+# delivery 语义仍存在，调用者需先按 signalfd 契约屏蔽相应信号。
 config SIGNALFD
 	bool "Enable signalfd() system call" if EXPERT
 	default y
@@ -1875,6 +2313,7 @@ config SIGNALFD
 
 	  If unsure, say Y.
 
+# 将定时器到期次数通过 fd 暴露，可纳入 poll/epoll 事件循环；默认保留该 ABI。
 config TIMERFD
 	bool "Enable timerfd() system call" if EXPERT
 	default y
@@ -1884,6 +2323,8 @@ config TIMERFD
 
 	  If unsure, say Y.
 
+# 提供 64 位计数器 fd，供用户态线程或 KAIO 等内核生产者发出轻量通知；它是
+# 多个子系统的通用完成信号原语，因此默认开启。
 config EVENTFD
 	bool "Enable eventfd() system call" if EXPERT
 	default y
@@ -1893,6 +2334,8 @@ config EVENTFD
 
 	  If unsure, say Y.
 
+# 使用支持 swap、资源限制和 tmpfs 导出的完整 shmem 内部文件系统。关闭时由
+# 简单 ramfs 替代，适合无 swap 小系统，但失去换出和完整资源控制；仅 MMU 可用。
 config SHMEM
 	bool "Use full shmem filesystem" if EXPERT
 	default y
@@ -1904,6 +2347,8 @@ config SHMEM
 	  option replaces shmem and tmpfs with the much simpler ramfs code,
 	  which may be appropriate on small systems without swap.
 
+# 编入传统 Linux/POSIX 异步 I/O ABI，供高性能应用提交内核异步请求；默认
+# 开启以兼容既有程序，完全不使用它的极小系统可关闭并节省约 7 KiB。
 config AIO
 	bool "Enable AIO support" if EXPERT
 	default y
@@ -1912,6 +2357,8 @@ config AIO
 	  by some high performance threaded applications. Disabling
 	  this option saves about 7k.
 
+# 编入共享 submission/completion ring 的 io_uring ABI，并选择 IO_WQ 承担需要
+# 工作线程的阻塞操作。用户态与内核通过环共享批量请求/完成，减少系统调用开销。
 config IO_URING
 	bool "Enable IO uring support" if EXPERT
 	select IO_WQ
@@ -1921,6 +2368,8 @@ config IO_URING
 	  applications to submit and complete IO through submission and
 	  completion rings that are shared between the kernel and application.
 
+# 对 io_uring 子系统启用 GCOV 覆盖率插桩，仅用于测试未覆盖路径；插桩会明显
+# 扰动其性能热路径，因此要求 GCOV 核心且默认关闭。
 config GCOV_PROFILE_URING
 	bool "Enable GCOV profiling on the io_uring subsystem"
 	depends on IO_URING && GCOV_KERNEL
@@ -1934,6 +2383,8 @@ config GCOV_PROFILE_URING
 	  the io_uring subsystem, hence this should only be enabled for
 	  specific test purposes.
 
+# 构建实验性的 io_uring mock file 测试对象，可为模块；其 ABI 尚可能变化，
+# 只应在专项测试中开启，不能作为稳定生产接口依赖。
 config IO_URING_MOCK_FILE
 	tristate "Enable io_uring mock files (Experimental)" if EXPERT
 	default n
@@ -1945,6 +2396,8 @@ config IO_URING_MOCK_FILE
 
 	  If unsure, say N.
 
+# 保留 madvise/fadvise 系统调用，让应用向内核提示未来内存或文件访问模式以
+# 改善回收/预读。没有任何应用使用这些 ABI 的嵌入式镜像可关闭以节省空间。
 config ADVISE_SYSCALLS
 	bool "Enable madvise/fadvise syscalls" if EXPERT
 	default y
@@ -1955,6 +2408,9 @@ config ADVISE_SYSCALLS
 	  applications use these syscalls, you can disable this option to save
 	  space.
 
+# 提供 membarrier() 跨线程内存屏障 ABI，把用户态常见路径的屏障成本转移到
+# 少见的显式系统调用：普通路径可只用 compiler barrier，需要发布时由调用方
+# 请求内核使相关线程越过同步点。它不是单纯的编译器重排屏障。
 config MEMBARRIER
 	bool "Enable membarrier() system call" if EXPERT
 	default y
@@ -1967,6 +2423,8 @@ config MEMBARRIER
 
 	  If unsure, say Y.
 
+# 提供 kcmp()，让有权限的用户态比较两个进程是否共享 file、mm 等内核资源；
+# 返回的是资源同一性比较，不转移对象引用，也不允许绕过进程访问检查。
 config KCMP
 	bool "Enable kcmp() system call" if EXPERT
 	help
@@ -1977,6 +2435,9 @@ config KCMP
 
 	  If unsure, say N.
 
+# 提供 restartable sequences ABI：内核向用户态共享当前 CPU 等状态，并在抢占、
+# 迁移或信号打断临界区时调整控制流，使用户态能低成本操作 per-CPU 数据。
+# 它要求架构支持并选择 MEMBARRIER，保证注册/同步协议具备跨线程内存序基础。
 config RSEQ
 	bool "Enable rseq() system call" if EXPERT
 	default y
@@ -1991,6 +2452,9 @@ config RSEQ
 
 	  If unsure, say Y.
 
+# 允许用户态在中断返回前请求有限延长当前时间片，以完成 rseq 临界区并尽快
+# 释放冲突资源，避免线程被换出后阻塞其他参与者。它要求高精度定时器、通用
+# entry/TIF 能力；延长受内核上限约束，不是用户可无限阻止调度的权限。
 config RSEQ_SLICE_EXTENSION
 	bool "Enable rseq-based time slice extension mechanism"
 	depends on RSEQ && HIGH_RES_TIMERS && GENERIC_ENTRY && HAVE_GENERIC_TIF_BITS
@@ -2003,6 +2467,8 @@ config RSEQ_SLICE_EXTENSION
 
 	  If unsure, say N.
 
+# 在 debugfs 导出轻量 rseq 操作计数，帮助分析重启/扩展频率；即使较轻仍会
+# 增加用户/内核转换路径代码和计数工作，因此默认关闭。
 config RSEQ_STATS
 	default n
 	bool "Enable lightweight statistics of restartable sequences" if EXPERT
@@ -2015,6 +2481,8 @@ config RSEQ_STATS
 
 	  If unsure, say N.
 
+# 默认打开 rseq debug static branch；即使编入也可通过 `rseq_debug=0/1` 或
+# debugfs 在运行期切换，默认关闭避免普通系统承担额外检查。
 config RSEQ_DEBUG_DEFAULT_ENABLE
 	default n
 	bool "Enable restartable sequences debug mode by default" if EXPERT
@@ -2028,6 +2496,8 @@ config RSEQ_DEBUG_DEFAULT_ENABLE
 
 	  If unsure, say N.
 
+# 在非 GENERIC_ENTRY 架构上编入额外 rseq syscall 检查，并强制默认启用调试
+# static branch。它依赖 DEBUG_KERNEL，仅用于发现 entry/ABI 状态错误。
 config DEBUG_RSEQ
 	default n
 	bool "Enable debugging of rseq() system call" if EXPERT
@@ -2038,6 +2508,8 @@ config DEBUG_RSEQ
 
 	  If unsure, say N.
 
+# 提供 cachestat() 查询文件 page cache 中已缓存、dirty、writeback 和近期逐出
+# 页数量；它只返回观测快照，不固定 folio 状态或阻止并发回收。
 config CACHESTAT_SYSCALL
 	bool "Enable cachestat() system call" if EXPERT
 	default y
@@ -2048,6 +2520,8 @@ config CACHESTAT_SYSCALL
 
 	  If unsure say Y here.
 
+# 把内核函数符号名压缩保存进镜像，使 OOPS、stack trace 和调试工具能把地址
+# 还原为名称。默认开启以保留故障可诊断性，代价是镜像中增加符号数据。
 config KALLSYMS
 	bool "Load all symbols for debugging/ksymoops" if EXPERT
 	default y
@@ -2056,6 +2530,8 @@ config KALLSYMS
 	  symbolic stack backtraces. This increases the size of the kernel
 	  somewhat, as all symbols have to be loaded into the kernel image.
 
+# 启动后自测 kallsyms_lookup_name 等接口和性能，并计算当前符号集的压缩率；
+# 结果通过 dmesg 输出，以最后的 `finish` 表示完成。只用于验证，默认关闭。
 config KALLSYMS_SELFTEST
 	bool "Test the basic functions and performance of kallsyms"
 	depends on KALLSYMS
@@ -2069,6 +2545,8 @@ config KALLSYMS_SELFTEST
 	  "dmesg | grep kallsyms_selftest" to collect test results. "finish" is
 	  displayed in the last line, indicating that the test is complete.
 
+# 默认 kallsyms 只保存 text/inittext 函数符号，足以解释大多数回溯；本项再加入
+# data 等所有 section 的变量符号，供 livepatch/调试器使用，常增加约数百 KiB。
 config KALLSYMS_ALL
 	bool "Include all symbols in kallsyms"
 	depends on DEBUG_KERNEL && KALLSYMS
@@ -2088,13 +2566,19 @@ config KALLSYMS_ALL
 	  Say N unless you really need all symbols, or kernel live patching.
 
 # end of the "standard kernel features (expert users)" menu
+# 至此结束“标准内核功能（专家用户）”区域；后续恢复为架构/子系统能力和菜单。
 
+# 架构选择后，membarrier 可在需要时调用架构回调完成线程切换相关同步。
 config ARCH_HAS_MEMBARRIER_CALLBACKS
 	bool
 
+# 架构选择后，支持 membarrier 的 sync-core 命令，让目标线程执行指令流核心同步。
 config ARCH_HAS_MEMBARRIER_SYNC_CORE
 	bool
 
+# 架构确认特殊系统映射在进程生命周期内不会被 unmap/remap，并已给这些映射
+# 标注 sealing flag 后选择此项。该声明使发行版可开放 MSEAL_SYSTEM_MAPPINGS；
+# 仅支持 64 位内核，不要求特殊 CPU 指令，关键是架构映射生命周期契约稳定。
 config ARCH_SUPPORTS_MSEAL_SYSTEM_MAPPINGS
 	bool
 	help
@@ -2117,26 +2601,36 @@ config ARCH_SUPPORTS_MSEAL_SYSTEM_MAPPINGS
 	  For complete descriptions of memory sealing, please see
 	  Documentation/userspace-api/mseal.rst
 
+# 架构选择该能力，声明提供 perf event 所需 PMU/中断或通用接入基础；用户仍
+# 通过 PERF_EVENTS 决定是否编入完整子系统。
 config HAVE_PERF_EVENTS
 	bool
 	help
 	  See tools/perf/design.txt for details.
 
+# 在 perf 基础存在时，架构/虚拟化栈可选择 guest 事件统计能力。
 config GUEST_PERF_EVENTS
 	bool
 	depends on HAVE_PERF_EVENTS
 
+# guest perf 存在时，声明 PMU 由宿主/虚拟化层中介而非直接暴露硬件状态。
 config PERF_GUEST_MEDIATED_PMU
 	bool
 	depends on GUEST_PERF_EVENTS
 
+# 选择后让 perf mmap ring buffer 使用 vmalloc backing；通常由架构需求或下方
+# 调试项选择，调用者必须处理虚拟连续而非物理连续页。
 config PERF_USE_VMALLOC
 	bool
 	help
 	  See tools/perf/design.txt for details
 
+# perf 菜单汇聚软/硬件事件、每任务/每 CPU 计数和采样缓冲区支持。
 menu "Kernel Performance Events And Counters"
 
+# 编入 perf_event_open ABI 和统一事件抽象：软件事件来自内核/tracepoint，硬件
+# PMU 统计指令、cache miss、分支等并可溢出中断采样。它选择 irq_work 完成
+# 延迟处理；PROFILING 开启时默认启用，但最终仍要求架构 HAVE_PERF_EVENTS。
 config PERF_EVENTS
 	bool "Kernel performance events and counters"
 	default y if PROFILING
@@ -2165,6 +2659,8 @@ config PERF_EVENTS
 
 	  Say Y if unsure.
 
+# 在非 PPC 调试配置中强制 perf mmap buffer 走 vmalloc，用 perf 压力路径测试
+# vmalloc backing；主要是实现验证，不代表平台正常运行必须使用它。
 config DEBUG_PERF_USE_VMALLOC
 	default n
 	bool "Debug: use vmalloc to back perf mmap() buffers"
@@ -2180,6 +2676,9 @@ config DEBUG_PERF_USE_VMALLOC
 
 endmenu
 
+# 提供以系统 trusted keyring 公钥验证 PKCS#7 消息的通用能力，供模块、kexec
+# 镜像和 firmware blob 验签复用。选择链建立 key、RSA/公钥密码、ASN.1/OID、
+# X.509 与 PKCS#7 解析器；该隐藏项由真正需要验签的功能选择，默认 n。
 config SYSTEM_DATA_VERIFICATION
 	def_bool n
 	select SYSTEM_TRUSTED_KEYRING
@@ -2198,12 +2697,18 @@ config SYSTEM_DATA_VERIFICATION
 	  module verification, kexec image verification and firmware blob
 	  verification.
 
+# 开启供 profiler 使用的扩展 profiling 基础机制；它还会让 PERF_EVENTS 在架构
+# 支持时默认启用，但不等于自动启动任何采样会话。
 config PROFILING
 	bool "Profiling support"
 	help
 	  Say Y here to enable the extended profiling support mechanisms used
 	  by profilers.
 
+# 编入内核 Rust 语言支持并允许选择 Rust 驱动/加载外部 Rust 模块。除架构
+# HAVE_RUST 和完整工具链探测外，还要求 modversion、randstruct、BTF/LTO、CFI、
+# KASAN 组合具有已实现兼容路径；启用 CFI 时同步选择整数归一化 ABI，software
+# tag KASAN 还要求 rustc 至少 1.96.0。任一 depends 不满足都会隐藏/禁止本项。
 config RUST
 	bool "Rust support"
 	depends on HAVE_RUST
@@ -2230,8 +2735,11 @@ config RUST
 
 	  If unsure, say N.
 
+# 在 Rust 支持区域嵌入内核 Rust KUnit/测试配置；测试项自身继续约束 CONFIG_RUST。
 source "rust/kernel/Kconfig.test"
 
+# 像 CC_VERSION_TEXT 一样记录 rustc 完整版本文本，使工具链变化能触发配置依赖
+# 更新与必要重编译；只在 Rust 实际启用时保存。
 config RUSTC_VERSION_TEXT
 	string
 	depends on RUST
@@ -2239,6 +2747,8 @@ config RUSTC_VERSION_TEXT
 	help
 	  See `CC_VERSION_TEXT`.
 
+# 记录 bindgen --version 输出，用于依赖追踪和诊断生成 C 绑定所用工具版本；
+# stderr 被丢弃，探测失败时不会把错误文本写进配置值。
 config BINDGEN_VERSION_TEXT
 	string
 	depends on RUST
@@ -2247,29 +2757,39 @@ config BINDGEN_VERSION_TEXT
 #
 # Place an empty function call at each tracepoint site. Can be
 # dynamically changed for a probe function.
+# 在每个 tracepoint 位置放置空函数调用槽，运行期可动态替换为 probe 回调；
+# 选择 TASKS_TRACE_RCU，保证任务上下文中的回调移除与读侧执行安全同步。
 #
 config TRACEPOINTS
 	bool
 	select TASKS_TRACE_RCU
 
+# 嵌入 kexec/kdump 配置以及 liveupdate 配置，随后结束 General setup 主菜单。
 source "kernel/Kconfig.kexec"
 
 source "kernel/liveupdate/Kconfig"
 
 endmenu		# General setup
 
+# General setup 结束后嵌入当前架构的通用扩展配置；架构可选择下方能力符号。
 source "arch/Kconfig"
 
+# PREEMPT_RT 默认需要 rt_mutex 核心；其他功能也可选择/暗示它以实现 PI 锁。
 config RT_MUTEXES
 	bool
 	default y if PREEMPT_RT
 
+# 模块签名格式的隐藏汇聚项；被模块签名功能选择后再选择系统数据验签栈，
+# 使模块 PKCS#7/X.509 验证与其他验签使用同一基础设施。
 config MODULE_SIG_FORMAT
 	def_bool n
 	select SYSTEM_DATA_VERIFICATION
 
+# 嵌入完整模块加载、卸载、版本和签名策略配置。
 source "kernel/module/Kconfig"
 
+# 兼容历史架构对 cpu_possible_mask 初值的差异：选择后把所有 CPU 预先标为
+# possible。集中 CPU mask 实现时保留该开关，避免一次性改变旧架构启动语义。
 config INIT_ALL_POSSIBLE
 	bool
 	help
@@ -2279,15 +2799,20 @@ config INIT_ALL_POSSIBLE
 	  it was better to provide this option than to break all the archs
 	  and have several arch maintainers pursuing me down dark alleys.
 
+# 嵌入块层、I/O scheduler 和块设备通用配置。
 source "block/Kconfig"
 
+# 架构/虚拟化功能选择后，编入任务抢占前后通知回调基础设施。
 config PREEMPT_NOTIFIERS
 	bool
 
+# SMP 下可选择 padata 并行数据处理框架，把可并行阶段分散到 CPU、再按顺序提交。
 config PADATA
 	depends on SMP
 	bool
 
+# 构建简单 ASN.1 grammar compiler，把语法编译成字节码；运行期 stream decoder
+# 按字节码验证期望 tag 并调用语义动作。tristate 允许使用者以内建或模块方式依赖。
 config ASN1
 	tristate
 	help
@@ -2296,14 +2821,18 @@ config ASN1
 	  inform it as to what tags are to be expected in a stream and what
 	  functions to call on what tags.
 
+# 嵌入锁实现、调试及架构锁能力配置。
 source "kernel/Kconfig.locks"
 
+# 架构选择后声明用户虚拟地址空间互不重叠，可让通用代码采用相应优化/检查。
 config ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE
 	bool
 
+# 架构选择后提供生成“准备同步核心”命令的能力，供跨线程代码修改协议使用。
 config ARCH_HAS_PREPARE_SYNC_CORE_CMD
 	bool
 
+# 架构选择后保证返回用户态前可执行所需 core synchronization。
 config ARCH_HAS_SYNC_CORE_BEFORE_USERMODE
 	bool
 
@@ -2314,5 +2843,8 @@ config ARCH_HAS_SYNC_CORE_BEFORE_USERMODE
 # macros for not-implemented syscalls in kernel/sys_ni.c and
 # kernel/time/posix-stubs.c. All these overrides need to be available in
 # <asm/syscall_wrapper.h>.
+# 架构可能需要用不同调用约定覆盖 SYSCALL_DEFINE/__SYSCALL_DEFINEx、compat 变体
+# 以及未实现 syscall 的包装宏；所有覆盖必须统一放在 asm/syscall_wrapper.h，
+# 让通用声明和 stub 看到同一 ABI。选择该能力只声明架构提供包装器，不生成实现。
 config ARCH_HAS_SYSCALL_WRAPPER
 	def_bool n
