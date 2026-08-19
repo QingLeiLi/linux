@@ -2,55 +2,73 @@
 #
 # Timer subsystem related configuration options
 #
+# 本文件同时包含两类开关：前半部是由体系结构或其他子系统 select 的隐藏能力位，后半部菜单才是
+# 用户可选择的 tick/NO_HZ/hrtimer 策略。能力位描述“平台能否做到”，策略位决定“内核是否使用”。
 
 # Options selectable by arch Kconfig
+# 以下无 prompt 的符号不直接显示在配置界面；体系结构必须在满足实现契约后 select，用户不能靠
+# menuconfig 强行打开。这样可避免通用时间代码调用平台并未提供的底层能力。
 
 # Watchdog function for clocksources to detect instabilities
+# clocksource watchdog 周期比较候选时钟与参考时钟，发现漂移、停滞或回退后把不稳定源降级。
 config CLOCKSOURCE_WATCHDOG
 	bool
 
 # Architecture has extra clocksource init called from registration
+# 平台若需在 clocksource 注册期间执行额外初始化便选择此项；通用层据此编译架构 hook。
 config ARCH_CLOCKSOURCE_INIT
 	bool
 
+# 允许架构要求把 clocksource 读取包装内联到调用点，减少热路径调用开销；它是代码生成能力声明。
 config ARCH_WANTS_CLOCKSOURCE_READ_INLINE
 	bool
 
 # The generic clock events infrastructure
+# 未使用 legacy tick 的平台默认获得通用 clockevent 状态机；它管理 shutdown/periodic/oneshot
+# 切换并为 tick 层选择设备，和“连续读周期”的 clocksource 是不同硬件角色。
 config GENERIC_CLOCKEVENTS
 	def_bool !LEGACY_TIMER_TICK
 
 # Architecture can handle broadcast in a driver-agnostic way
+# 表示架构允许通用层在本地 timer 随深 idle 停止时，用共享设备向多个 CPU 广播 tick。
 config ARCH_HAS_TICK_BROADCAST
 	bool
 
 # Clockevents broadcasting infrastructure
+# 编译通用广播管理；依赖通用 clockevents，因为广播设备也遵守同一设备状态和编程接口。
 config GENERIC_CLOCKEVENTS_BROADCAST
 	bool
 	depends on GENERIC_CLOCKEVENTS
 
 # Handle broadcast in default_idle_call()
+# 由默认 idle 入口负责加入/退出广播集合，适用于不在独立驱动回调中处理该协议的平台。
 config GENERIC_CLOCKEVENTS_BROADCAST_IDLE
 	bool
 	depends on GENERIC_CLOCKEVENTS_BROADCAST
 
 # Automatically adjust the min. reprogramming time for
 # clock event device
+# 若硬件频繁拒绝过近 deadline，通用层动态抬高最小重编程间隔，避免不断失败重试。
 config GENERIC_CLOCKEVENTS_MIN_ADJUST
 	bool
 
+# 某些 clockevent 设备由一组 CPU 共享且编程相互耦合；该能力打开通用 coupled 协调代码。
 config GENERIC_CLOCKEVENTS_COUPLED
 	bool
 
+# 要求 coupled helper 内联的架构变体；select 同时保证基础 coupled 实现存在。
 config GENERIC_CLOCKEVENTS_COUPLED_INLINE
 	select GENERIC_CLOCKEVENTS_COUPLED
 	bool
 
 # Generic update of CMOS clock
+# 允许 timekeeping 用通用周期工作把校准后的墙钟时间回写传统 CMOS/RTC。
 config GENERIC_CMOS_UPDATE
 	bool
 
 # Deferred rearming of the hrtimer interrupt
+# 当高分辨率调度 tick 到期而通用入口尚未完成时，把 hrtimer 硬件重编程推迟到安全的退出阶段；
+# 只有通用 entry、通用 TIF 位、HIGH_RES_TIMERS 与 SCHED_HRTICK 同时存在才自动启用。
 config HRTIMER_REARM_DEFERRED
        def_bool y
        depends on GENERIC_ENTRY && HAVE_GENERIC_TIF_BITS
@@ -58,20 +76,26 @@ config HRTIMER_REARM_DEFERRED
 
 # Select to handle posix CPU timers from task_work
 # and not from the timer interrupt context
+# 架构能力位表示可把 POSIX CPU timer 的昂贵处理移到目标任务 task_work，而非留在 timer 中断。
 config HAVE_POSIX_CPU_TIMERS_TASK_WORK
 	bool
 
+# 实际策略在 POSIX timer 与上述能力同时具备时默认开启；隐藏 bool 让依赖方只判断最终选择结果。
 config POSIX_CPU_TIMERS_TASK_WORK
 	bool
 	default y if POSIX_TIMERS && HAVE_POSIX_CPU_TIMERS_TASK_WORK
 
+# 传统平台缺少通用 clockevent 框架时选择此兼容入口；新平台应提供通用设备状态机而不使用它。
 config LEGACY_TIMER_TICK
 	bool
 	help
 	  The legacy timer tick helper is used by platforms that
 	  lack support for the generic clockevent framework.
 	  New platforms should use generic clockevents instead.
+	  旧式 timer tick helper 只服务缺少通用 clockevent 框架的平台；新平台应改用
+	  generic clockevents，以共享设备选择、oneshot 和广播等通用机制。
 
+# 构建 kernel/time 的 KUnit 测试对象；KUNIT_ALL_TESTS 可批量默认开启，独立配置时不确定应选 N。
 config TIME_KUNIT_TEST
 	tristate "KUnit test for kernel/time functions" if !KUNIT_ALL_TESTS
 	depends on KUNIT
@@ -80,15 +104,20 @@ config TIME_KUNIT_TEST
 	  Enable this option to test RTC library functions.
 
 	  If unsure, say N.
+	  开启后测试 kernel/time 使用的 RTC/时间转换函数；它依赖 KUnit 测试框架，
+	  只增加测试代码而不改变生产时间路径。不确定时选择 N。
 
+# context tracking 总开关是多个具体跟踪模式共享的隐藏基础设施，单独启用不代表跟踪任何上下文。
 config CONTEXT_TRACKING
 	bool
 
+# idle 跟踪替 RCU 标记 CPU 进入/离开扩展静止态，使宽限期判断不必等待处于 idle 的 CPU。
 config CONTEXT_TRACKING_IDLE
 	bool
 	select CONTEXT_TRACKING
 	help
 	  Tracks idle state on behalf of RCU.
+	  代表 RCU 跟踪 idle 状态；select 会自动带入通用 CONTEXT_TRACKING 基础设施。
 
 menu "Timers subsystem"
 
@@ -96,23 +125,30 @@ if GENERIC_CLOCKEVENTS
 # Core internal switch. Selected by NO_HZ_COMMON / HIGH_RES_TIMERS. This is
 # only related to the tick functionality. Oneshot clockevent devices
 # are supported independent of this.
+# 这是 tick 层的内部 oneshot 使用开关，由 NO_HZ_COMMON 或 HIGH_RES_TIMERS 选择；它不表示硬件是否
+# 支持 oneshot。设备能力始终可独立注册，只有通用 tick 要切换到动态编程模式时才需要此符号。
 config TICK_ONESHOT
 	bool
 
+# NO_HZ 的共享实现基础，统一选择 tick oneshot；idle/full 两种策略在此之上复用停 tick 机制。
 config NO_HZ_COMMON
 	bool
 	select TICK_ONESHOT
 
+# 三个选项互斥决定调度 tick 策略；旧 NO_HZ 配置存在时默认映射到 idle dynticks，保持兼容。
 choice
 	prompt "Timer tick handling"
 	default NO_HZ_IDLE if NO_HZ
 
+# 始终保持固定频率 tick，行为直观但空闲 CPU 仍被周期中断唤醒，增加功耗。
 config HZ_PERIODIC
 	bool "Periodic timer ticks (constant rate, no dynticks)"
 	help
 	  This option keeps the tick running periodically at a constant
 	  rate, even when the CPU doesn't need it.
+	  即使 CPU 当前没有工作，也以固定频率持续产生 tick；不使用动态停 tick。
 
+# idle dynticks 只在 CPU 空闲时停止周期 tick，并把硬件编程到最近到期事件，通常是通用默认选择。
 config NO_HZ_IDLE
 	bool "Idle dynticks system (tickless idle)"
 	select NO_HZ_COMMON
@@ -122,14 +158,18 @@ config NO_HZ_IDLE
 	  This is usually interesting for energy saving.
 
 	  Most of the time you want to say Y here.
+	  系统空闲时 timer 中断只按实际期限触发，主要收益是省电；大多数系统应选择 Y。
 
+# full dynticks 还尝试在 CPU 运行单个用户任务时停 tick，面向 CPU 隔离和低抖动工作负载。
 config NO_HZ_FULL
 	bool "Full dynticks system (tickless)"
 	# NO_HZ_COMMON dependency
 	# We need at least one periodic CPU for timekeeping
+	# select NO_HZ_COMMON 提供共享实现；SMP 还必须保留至少一个 housekeeping CPU 周期推进时间。
 	depends on SMP
 	depends on HAVE_CONTEXT_TRACKING_USER
 	# VIRT_CPU_ACCOUNTING_GEN dependency
+	# 停止周期 tick 后不能靠 tick 采样记账，因此要求用户/内核上下文跟踪和通用虚拟 CPU 记账。
 	depends on HAVE_VIRT_CPU_ACCOUNTING_GEN
 	select NO_HZ_COMMON
 	select RCU_NOCB_CPU
@@ -152,8 +192,13 @@ config NO_HZ_FULL
 
 	 If you're a distro say Y.
 
+	 full dynticks 会在条件允许时连运行中 CPU 的 tick 也关闭，通常要求该 CPU 只运行一个任务、
+	 主要停留在用户态且少进入内核。实际 CPU 范围由 nohz_full= 启动参数指定；用户/内核切换
+	 因额外上下文跟踪而有开销。未传参数时行为退化为 NO_HZ_IDLE，发行版通常可选 Y。
+
 endchoice
 
+# 用户态上下文跟踪的最终隐藏开关；架构先声明后端能力，本项再带入公共 tracking 核心。
 config CONTEXT_TRACKING_USER
 	bool
 	depends on HAVE_CONTEXT_TRACKING_USER
@@ -162,7 +207,10 @@ config CONTEXT_TRACKING_USER
 	  Track transitions between kernel and user on behalf of RCU and
 	  tickless cputime accounting. The former case relies on context
 	  tracking to enter/exit RCU extended quiescent states.
+	  为 RCU 和无 tick CPU 时间记账跟踪用户态/内核态切换；RCU 借此把长时间用户态执行
+	  视为扩展静止态，并在重新进入内核前退出该状态。
 
+# 开发用强制模式在所有 CPU 开启用户上下文跟踪，用来单独验证尚未满足 NO_HZ_FULL 全部条件的架构。
 config CONTEXT_TRACKING_USER_FORCE
 	bool "Force user context tracking"
 	depends on CONTEXT_TRACKING_USER
@@ -189,13 +237,20 @@ config CONTEXT_TRACKING_USER_FORCE
 	  Say N otherwise, this option brings an overhead that you
 	  don't want in production.
 
+	  full dynticks 的首要前提是用户上下文跟踪，但还需要其他能力。架构后端开发期间若尚不能
+	  打开 NO_HZ_FULL，可用此项强制所有 CPU 跟踪，以测试 RCU 用户态扩展静止态和 tickless
+	  记账。它给每次用户/内核切换增加开销，只应由后端开发者选择，生产环境应选 N。
+
+# 保留旧配置文件兼容性的别名入口，只影响 choice 的默认项；新配置应直接选择 NO_HZ_IDLE。
 config NO_HZ
 	bool "Old Idle dynticks config"
 	help
 	  This is the old config entry that enables dynticks idle.
 	  We keep it around for a little while to enforce backward
 	  compatibility with older config files.
+	  这是旧版启用 idle dynticks 的配置名，暂时保留以兼容历史 .config。
 
+# 启用纳秒级 hrtimer 与动态 clockevent 编程；硬件不支持时不会获得精度收益，只会增加镜像体积。
 config HIGH_RES_TIMERS
 	bool "High Resolution Timer Support"
 	select TICK_ONESHOT
@@ -203,9 +258,12 @@ config HIGH_RES_TIMERS
 	  This option enables high resolution timer support. If your
 	  hardware is not capable then this option only increases
 	  the size of the kernel image.
+	  打开高分辨率定时器支持并选择 TICK_ONESHOT；若硬件无法提供相应 clockevent 能力，
+	  此选项只会增大内核镜像。
 
 endif
 
+# 辅助 POSIX clock 允许独立 PTP 等时间域拥有自己的调频和无锁读取基准，不与核心 TAI/NTP 同步。
 config POSIX_AUX_CLOCKS
 	bool "Enable auxiliary POSIX clocks"
 	depends on POSIX_TIMERS
@@ -216,5 +274,8 @@ config POSIX_AUX_CLOCKS
 	  provide e.g. lockless time accessors to independent PTP clocks
 	  and other clock domains, which are not correlated to the TAI/NTP
 	  notion of time.
+	  辅助 POSIX 时钟可独立于核心 timekeeper 校准；核心 timekeeper 管理 MONOTONIC、REALTIME、
+	  BOOTTIME 与 TAI。该能力适合为独立 PTP 或其他不关联 TAI/NTP 的时钟域提供无锁读取接口，
+	  因接口属于 POSIX clock/timer 框架，所以依赖 POSIX_TIMERS。
 
 endmenu

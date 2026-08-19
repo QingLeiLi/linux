@@ -57,14 +57,87 @@
 - [x] `kernel/locking/rtmutex_common.h`
 - [x] `kernel/locking/rtmutex.c`
 - [x] `kernel/locking/rtmutex_api.c`
-- [ ] `kernel/locking/rwbase_rt.c`
+- [x] `kernel/locking/rwbase_rt.c`
 
 ### 睡眠读写同步与验证工具
 
-- [ ] `kernel/locking/rwsem.c`
-- [ ] `kernel/locking/percpu-rwsem.c`
-- [ ] `kernel/locking/semaphore.c`
-- [ ] `kernel/locking/locktorture.c`
+- [x] `kernel/locking/rwsem.c`
+- [x] `kernel/locking/percpu-rwsem.c`
+  - 文件职责：以每 CPU `read_count` 承载无写者时的低争用读快路径，以 `rcu_sync` 在写者到来时
+    强制后续读者切换到慢路径，再由集中式 `block` 同时完成写者互斥和新读者门控；慢路径通过
+    `rcuwait writer` 等待旧读者排空，并用 `waiters` FIFO 队列在释放时批量交付读者或单独交付写者。
+  - 第 17 章验收：完整复读最终 500 行。13 个函数定义 13/13 均有紧邻专属契约，另为
+    `per_cpu_sum` 语句表达式宏补齐适用前提；覆盖动态初始化/兼容销毁、读写 trylock、统一等待队列
+    取锁、唤醒回调、读写阻塞入口、读状态查询、读者归零检查和读写释放。契约逐项说明参数、返回、
+    可睡眠性、禁止抢占前提、队列锁/任务引用/锁所有权交付及失败保证，未发现错位契约。
+  - 实体与英文注释验收：实体清单覆盖 `rss`、`read_count`、`writer`、`waiters`、`block`、
+    `dep_map`，等待项的 `WQ_FLAG_EXCLUSIVE`/`WQ_FLAG_CUSTOM`、`private` 交付信号，以及 A/D、B/C
+    两组屏障。原文件 319 行与 27 处块/行尾注释标记全部按序保留，非豁免英文均有紧邻翻译和机制
+    补充；初始化字段定义虽位于头文件，也已结合公开读侧包装器解释其生命周期与快慢路径作用。
+  - 路径与并发验收：抽查读路径，可复述快速每 CPU 计数、写者活跃后的先增计数再查 `block`、
+    失败撤销及 FIFO 入队；抽查写路径，可复述 `rcu_sync_enter()` 关闭快路径并等待宽限期、原子设置
+    `block`、求和等待读者清空；抽查释放路径，可复述 release 清 `block`、回调替任务取锁、连续放行
+    readers/单个 writer 和宽限期后恢复快路径。并发清单覆盖 A/D 的“看见门闩或看见计数”保证、
+    B/C 的“看见递减也看见读临界区”保证、waiters.lock 防丢唤醒、private release/acquire 交付，
+    以及禁止抢占保证同一 CPU 增减配对。
+  - 关联读取：`include/linux/percpu-rwsem.h` 的结构、静态初始化器、公开读侧快/慢路径包装与 lockdep
+    接口，`kernel/rcu/sync.c` 的 enter/exit/回调状态机和宽限期语义，`include/linux/rcuwait.h` 的单任务
+    等待接口与隐含屏障；这些区域学习注释缺失，关联文件均未修改。
+  - 修改安全：新增 181 行、删除 0 行，新增非注释行 0；禁用模板前缀扫描无命中，`git diff --check`
+    通过。完整文件 checkpatch 为 0 errors/0 warnings（另有 49 个检查项：48 个中文 UTF-8 视觉行宽
+    及原有宏参数复用提示）；增量为 0 errors/48 个中文 UTF-8 视觉行宽 warnings。工作树无 `.config`，
+    未执行目标内核配置构建。已按方法论第 17 章完成强制验收，状态为“全文件完成”。
+- [x] `kernel/locking/semaphore.c`
+  - 文件职责：实现无严格 owner 的计数信号量。`count` 表示仍可直接分配的许可数，`lock` 串行保护
+    许可和以 `first_waiter` 锚定的环形 FIFO；争用时 `up()` 不增加 count，而是把许可直接交给队首，
+    在锁内加入本地 wake_q、锁外真正唤醒，兼顾中断上下文可调用性和任务生命周期。
+  - 第 17 章验收：完整复读最终 473 行。按条件编译展开共 21 个函数定义，21/21 均有紧邻专属契约；
+    覆盖 hung-task 最近持有者及关闭配置 stubs、许可扣减、六个公开 down/up 入口、waiter 删除、统一
+    睡眠/跟踪状态机、四种 down 慢路径适配器和队首直接交付。契约说明返回值、TASK 状态、超时单位、
+    中断上下文边界、内部锁/IRQ 前后条件、许可归属、栈上 waiter 与 task 引用责任，未发现错位契约。
+  - 实体与英文注释验收：实体清单覆盖 `lock`、`count`、`first_waiter`、可选 `last_holder`，
+    `semaphore_waiter` 的环节点/task/up 三字段，四种等待状态/期限以及 wake_q。原文件 354 行与 10 处
+    块注释起点全部按序保留，版权作者豁免，其余英文均有紧邻翻译和机制补充；特别强调
+    `down_trylock()` 的 0 成功/1 失败反向约定及 semaphore 与 mutex 的 owner 差异。
+  - 路径与并发验收：抽查快路径，可复述 irqsave 内 count>0 扣减；抽查 `___down_common()`，可复述
+    栈上 waiter 尾插、锁内信号/超时仲裁、设状态后开 IRQ 调度、重取锁后检查直接交付；抽查 `up()`，
+    可复述无等待者加 count、有等待者摘队置 up、wake_q 持引用、解锁后唤醒。并发清单覆盖 sem->lock
+    对 count/队列/up 标志的串行保护，状态设置与 wake_q 唤醒屏障，信号/超时失败不消耗许可，
+    `last_holder` 仅为可能过时的诊断线索而非所有权协议。
+  - 关联读取：`include/linux/semaphore.h` 的对象布局、初始化器、无 owner/中断上下文契约；
+    `include/linux/sched/wake_q.h` 与 `kernel/sched/core.c` 的 wake_q 去重、引用转移和锁外消费；
+    `include/linux/hung_task.h`、`kernel/hung_task.c` 的 blocker 编码与 semaphore 最近持有者报告。
+    关联文件均未修改，其中调度器 wake_q 实现已有充分学习注释，其余所读区域注释不足。
+  - 修改安全：新增 119 行、删除 0 行，新增非注释行 0；禁用模板前缀扫描无命中，`git diff --check`
+    通过。完整文件 checkpatch 为 0 errors/0 warnings（另有 29 个检查项：28 个中文 UTF-8 视觉行宽
+    及原有函数参数对齐提示）；增量为 0 errors/28 个中文 UTF-8 视觉行宽 warnings。工作树无 `.config`，
+    未执行目标内核配置构建。已按方法论第 17 章完成强制验收，状态为“全文件完成”。
+- [x] `kernel/locking/locktorture.c`
+  - 文件职责：以 `lock_torture_ops` 将 spin/raw-spin/rqspin/rwlock、mutex/ww_mutex/rtmutex、rwsem 和
+    percpu-rwsem 适配到统一 writer/reader 压力线程；通过临界区延迟、嵌套锁链、RT 优先级扰动、
+    CPU 热插拔/shuffle/stutter、RCU 自续回调链和互斥断言组合制造并观测高强度并发交错。
+  - 第 17 章验收：完整复读最终 1681 行。71 个函数定义 71/71 均有紧邻专属契约；覆盖 cpumask 参数、
+    busted 对照、各锁类型获取/延迟/释放适配器、嵌套 mutex/rtmutex、ww_mutex 伤口等待回退、writer/
+    reader/stats kthread、RCU 链、幂等 cleanup 和 init/unwind 主状态机。契约说明 tid/lockset/随机状态、
+    返回与失败语义、持锁/IRQ/调度状态、类型资源生命周期、任务/回调 ownership 和停止条件。
+  - 实体与英文注释验收：实体清单覆盖 19 个模块参数、reader/writer CPU 掩码、共享读写持有标志、
+    `lock_stress_stats`、`call_rcu_chain`、`lock_torture_ops` 全回调/flags/name、全局 cxt 及每种锁对象/
+    ops 表。原文件 1450 行与 62 处块/行尾注释标记全部按序保留，SPDX/版权作者豁免，其余英文均有
+    紧邻翻译和机制补充；busted 的故意错误、try 型返回、常见路径、优先级复位和线程创建策略均明确。
+  - 路径与并发验收：抽查 writer/reader，可复述随机嵌套、偶发跳过中心锁、重复 writer/读写重叠
+    检测、延迟和逆序释放；抽查 ww_mutex，可复述 -EDEADLK 后释放已持锁、slow 获取冲突锁、重排再
+    继续；抽查 init/unwind，可复述操作表选择、默认线程数、类型 init、各通用压力子系统、交错建线程
+    及任一点失败统一 cleanup。并发清单覆盖正确锁原语对共享验证标志的保护、data_race 统计近似快照、
+    crc_stop release/acquire 停链、rcu_barrier 回调排空、先停 stats 再最终打印及 cleanup 唯一执行权。
+  - 关联读取：`include/linux/torture.h` 的参数宏、随机状态、线程创建/停止、热插拔/shuffle/stutter/
+    shutdown 接口，`kernel/torture.c` 的 init/cleanup fullstop 状态机、停止条件和 kthread 退出协议；
+    各 ops 所调用的锁实现均已在本清单前序文件完成学习注释，rqspinlock 也已结合 BPF 适配路径复核。
+    关联文件均未修改；torture 公共框架所读区域学习注释不足，建议另立目录任务。
+  - 修改安全：新增 231 行、删除 0 行，新增非注释行 0；禁用模板前缀扫描无命中，`git diff --check`
+    通过。增量 checkpatch 为 0 errors/46 个中文 UTF-8 视觉行宽 warnings；完整文件为 1 error/9 warnings，
+    均落在未改原代码（既有三元运算符空格、C 文件 extern、函数名字符串、OOM 日志和缩进标签），
+    另有 62 个检查项。工作树无 `.config`，未执行目标内核配置构建。已按方法论第 17 章完成强制验收，
+    状态为“全文件完成”。
 
 ## 已完成文件
 
@@ -594,7 +667,65 @@
     基线屏障告警 1 条，其余 39 条均为中文 UTF-8 行计宽。工作树无 `.config`，未执行目标内核配置
     构建。已完成内容验收和修改安全检查，本文件状态为“全文件完成”。
 
+- [x] `kernel/locking/rwbase_rt.c`
+  - 文件职责：作为被 `rwsem.c` 与 `spinlock_rt.c` 文本包含的公共状态机，以 `readers` 中的
+    `READER_BIAS`/活跃 reader 数/`WRITER_BIAS` 编码读写状态；reader 通过 acquire CAS 走无锁快路径，
+    writer 先取得支持 PI/DL 的 rtmutex、移除 bias，再等待读者清空。算法刻意不保证 writer 公平，
+    但保持 RT waiter 对 rtmutex owner 的优先级继承。
+  - 第 17 章验收：完整复读最终 530 行。11/11 个函数均有紧邻专属契约：`rwbase_read_trylock()`
+    （82～100）、`__rwbase_read_lock()`（118～209）、`rwbase_read_lock()`（220～230）、
+    `__rwbase_read_unlock()`（246～275）、`rwbase_read_unlock()`（287～305）、
+    `__rwbase_write_unlock()`（320～338）、`rwbase_write_unlock()`（349～359）、
+    `rwbase_write_downgrade()`（371～382）、`__rwbase_write_trylock()`（394～414）、
+    `rwbase_write_lock()`（431～496）和 `rwbase_write_trylock()`（509～530）。参数、返回、睡眠上下文、
+    内部锁 ownership、rwsem/RT rwlock 配置差异及后续配对均已逐项覆盖。
+  - 实体与英文注释验收：文件不定义结构体或全局变量；契约/变量地图覆盖借用 `rwb`、内嵌 `rtm`、
+    状态字 `readers`、等待状态 `state`、IRQ `flags`、CAS 快照 `r`、结果 `ret`、owner 快照及两类
+    wake queue。原文件 15 处注释中 SPDX 豁免，其余 14 处英文均逐字保留并有紧邻翻译与机制补充；
+    310 条原始行全部按序保留。
+  - 路径与并发验收：抽查读慢路径，可复述持 `wait_lock` 入 rtmutex 慢锁如何闭合 reader/writer 竞态；
+    抽查阻塞写路径，可复述 rtmutex→移除 bias→等待读者归零→信号加回 bias 的完整成功/回滚流程；
+    抽查 trylock/降级路径，可复述“失败等同未尝试”和写转读计数。并发清单覆盖读 CAS acquire 与写
+    恢复 bias release、最后 reader release 与 writer acquire、wait_lock 下 owner/wake_q 稳定、
+    preempt disable/enable 唤醒配对及 writer 非公平边界。
+  - 关联读取：`include/linux/rwbase_rt.h` 的 bias、结构体、初始化与状态查询（学习注释缺失，建议后续
+    补注该短头文件）；`rwsem.c` 1451～1565 行的宏适配与公开包装（学习注释缺失，下一文件处理）；
+    `spinlock_rt.c` 229～432 行的 RT rwlock 适配与包装、`rtmutex.c` 的 wake_q、普通/RT 慢锁，
+    `kernel/sched/core.c` 的 pre/schedule/post hook 及 `include/linux/sched.h` 的保存任务状态宏（所读
+    区域学习注释充分）。关联文件均未修改。
+  - 修改安全：新增 220 行、删除 0 行，新增非注释行 0；禁用模板前缀扫描无命中，`git diff --check`
+    通过。完整文件 checkpatch 为 0 errors/0 warnings；增量为 0 errors/134 个中文 UTF-8 视觉行宽
+    warnings。工作树无 `.config`，未执行目标内核配置构建。已按方法论第 17 章完成强制验收，状态为
+    “全文件完成”。
+
+- [x] `kernel/locking/rwsem.c`
+  - 文件职责：实现可睡眠读写信号量。非 RT 分支以 `count` 位域编码 writer/waiter/handoff/reader，
+    以 `wait_lock` 维护环形 waiter 队列、phase-fair reader 批授予和 writer 强制 handoff，并可通过
+    OSQ 对 owner 乐观自旋；PREEMPT_RT 分支把相同公开 API 适配到 `rwbase_rt`/rtmutex。
+  - 第 17 章验收：完整复读最终 2365 行。按条件编译展开共 78 个函数定义，78/78 均有紧邻专属契约；
+    覆盖 owner/count helper、waiter 删除/遍历/唤醒、writer handoff、OSQ 自旋及关闭配置 stubs、读写
+    慢路径、非 RT/RT 两套内部包装、公开/trylock/nested/non-owner API。函数头逐项说明参数、返回、
+    睡眠状态、锁与引用 ownership、成功/信号失败保证和后续配对，未发现错位契约。
+  - 实体与英文注释验收：实体清单覆盖 owner/count 全部位域宏、调试宏、`rwsem_waiter_type`、
+    `rwsem_waiter` 五字段、三种 wake type、等待超时/reader 批量上限、四种 owner state、OSQ 与 RT
+    adapter 宏；参数和重要局部快照/临时链表/wake_q 均在契约或阶段块解释。原文件 1786 行与 99 处
+    注释起点/行尾说明全部按序保留，非豁免英文均有紧邻翻译和机制补充；明确修正原文不存在的
+    `RWSEM_READ_OWNED` 宏名及方向相反的 `#else /* !CONFIG_PREEMPT_RT */` 尾注释。
+  - 路径与并发验收：抽查 `rwsem_mark_wake()`，可复述首 reader 预授予、phase-fair 两遍批处理、先
+    task 引用后 release 清 NULL、锁外唤醒；抽查 `rwsem_down_read_slowpath()`，可复述预加 bias、偷锁、
+    入队撤销、signal 与授予的 wait_lock 仲裁；抽查 `rwsem_down_write_slowpath()`，可复述 OSQ、入队、
+    RT/DL/超时 handoff、自旋交接与信号删队。并发清单覆盖 count acquire/release、owner 裸指针的
+    preempt-disabled RCU 生命周期、barrier 后解引用、wait_lock 队列保护及 downgrade 发布边界。
+  - 关联读取：`include/linux/rwsem.h` 的两种结构布局、初始化/查询/公开声明（学习注释缺失，建议另立
+    头文件任务）；`include/linux/osq_lock.h` 接口与 `osq_lock.c` 获取/取消/解锁协议（实现学习注释
+    充分，头文件缺失）；`rwbase_rt.c`、`rtmutex.c` 的 RT adapter 目标（学习注释充分）；已完成的
+    lock events 文件提供统计编号语义。关联文件均未修改。
+  - 修改安全：新增 579 行、删除 0 行，新增非注释行 0；禁用模板前缀扫描无命中，`git diff --check`
+    通过。完整文件 checkpatch 为 0 errors/2 warnings，均落在未改原代码（调试宏缩进、既有 acquire
+    屏障提示）；增量为 0 errors/226 个中文 UTF-8 视觉行宽 warnings。工作树无 `.config`，未执行
+    目标配置构建。已按方法论第 17 章完成强制验收，状态为“全文件完成”。
+
 ## 目录状态
 
-- [~] `kernel/locking` 已完成 28/33 个文件；`rtmutex_api.c` 已闭环，下一项为 `rwbase_rt.c`；
-  按用户要求在当前文件阶段完成后立即暂停，目录尚未达到第 17 章完成标准。
+- [x] `kernel/locking` 清单 33/33 个文件均已完成单文件闭环；目录级复核未发现 `[ ]` 或 `[~]` 遗留，
+  所有目标文件均已按方法论第 17 章记录内容验收、修改安全边界和不可用的构建验证，状态为“全文件完成”。
