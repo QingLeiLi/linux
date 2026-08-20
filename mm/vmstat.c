@@ -10,6 +10,84 @@
  *		Christoph Lameter <cl@gentwo.org>
  *  Copyright (C) 2008-2014 Christoph Lameter
  */
+/*
+ * ============================================================================
+ * 【vmstat - 虚拟内存统计（Virtual Memory Statistics）】
+ *
+ * 【文件功能】
+ * 管理和导出 Linux 内核的虚拟内存统计信息，提供内存使用情况的实时监控。
+ *
+ * 【核心功能】
+ * 1. 统计收集：收集各种内存相关的统计数据
+ *    - 页面分配/释放计数
+ *    - 页面回收统计
+ *    - 内存区域（zone）统计
+ *    - NUMA 节点统计
+ *    - 页面迁移统计
+ *
+ * 2. Per-CPU 计数器：使用 per-CPU 变量减少锁竞争
+ *    - 每个 CPU 独立维护计数器
+ *    - 定期合并到全局计数器
+ *    - 提供差分阈值机制
+ *
+ * 3. 统计导出：通过多种接口导出统计信息
+ *    - /proc/vmstat: 全局虚拟内存统计
+ *    - /proc/zoneinfo: 各内存区域详细信息
+ *    - /proc/pagetypeinfo: 按页面类型统计
+ *    - /sys/devices/system/node/nodeN/vmstat: NUMA 节点统计
+ *
+ * 【统计类型】
+ *
+ * 1. 全局计数器（vm_event_states）
+ *    - pgalloc_*: 页面分配次数
+ *    - pgfree: 页面释放次数
+ *    - pgfault: 页面错误次数
+ *    - pgmajfault: 主页面错误（需要磁盘 I/O）
+ *
+ * 2. Zone 计数器（zone->vm_stat）
+ *    - nr_free_pages: 空闲页面数
+ *    - nr_inactive_anon: 非活动匿名页面数
+ *    - nr_active_file: 活动文件页面数
+ *
+ * 3. Node 计数器（pglist_data->vm_stat）
+ *    - nr_writeback: 正在回写的页面数
+ *    - nr_slab_reclaimable: 可回收的 slab 页面数
+ *
+ * 4. NUMA 统计（numa_event）
+ *    - numa_hit: NUMA 本地分配成功
+ *    - numa_miss: NUMA 远程分配
+ *    - numa_foreign: 其他节点的远程访问
+ *
+ * 【Per-CPU 差分机制】
+ * 为了性能，统计更新使用 per-CPU 差分：
+ * 1. 每次更新只修改本地 CPU 的差分值（无锁）
+ * 2. 差分累积到阈值时，批量合并到全局计数器（需锁）
+ * 3. 阈值动态调整（基于内存区域大小和 CPU 数量）
+ *
+ * 【刷新机制】
+ * 1. 主动刷新：读取统计信息时触发（如读 /proc/vmstat）
+ * 2. 被动刷新：差分达到阈值时自动刷新
+ * 3. 定期刷新：vmstat 工作队列定期合并计数器
+ *
+ * 【使用场景】
+ * - 系统监控：通过 vmstat、sar 等工具监控内存
+ * - 性能分析：分析页面分配/回收模式
+ * - 故障诊断：查看内存压力、页面错误等
+ * - 容量规划：了解内存使用趋势
+ *
+ * 【相关工具】
+ * - vmstat: 报告虚拟内存统计
+ * - sar: 系统活动报告
+ * - /proc/meminfo: 内存信息概览
+ * - atop/htop: 实时系统监控
+ *
+ * 【性能考虑】
+ * - Per-CPU 计数器：避免缓存行乒乓
+ * - 差分阈值：减少全局更新频率
+ * - 延迟合并：批量处理减少开销
+ * - 静态键优化：NUMA 统计可动态开关
+ * ============================================================================
+ */
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/err.h>
@@ -33,41 +111,99 @@
 
 #ifdef CONFIG_PROC_FS
 #ifdef CONFIG_NUMA
+/*
+ * ============================================================================
+ * 【NUMA 统计管理】
+ *
+ * NUMA（Non-Uniform Memory Access）统计用于监控跨节点的内存访问模式。
+ * ============================================================================
+ */
+
 #define ENABLE_NUMA_STAT 1
 static int sysctl_vm_numa_stat = ENABLE_NUMA_STAT;
+/* NUMA 统计开关
+ * - 1: 启用 NUMA 统计（默认）
+ * - 0: 禁用 NUMA 统计（降低开销）
+ *
+ * 【性能影响】
+ * NUMA 统计有一定开销，在不需要时可以禁用。
+ *
+ * 【控制接口】
+ * /proc/sys/vm/numa_stat
+ */
 
 /* zero numa counters within a zone */
+/*
+ * 【函数】zero_zone_numa_counters - 清零单个 zone 的 NUMA 计数器
+ * @zone: 要清零的内存区域
+ *
+ * 【工作内容】
+ * 1. 清零 zone 的全局 NUMA 计数器
+ * 2. 清零所有 CPU 的 per-CPU NUMA 计数器
+ */
 static void zero_zone_numa_counters(struct zone *zone)
 {
 	int item, cpu;
 
 	for (item = 0; item < NR_VM_NUMA_EVENT_ITEMS; item++) {
 		atomic_long_set(&zone->vm_numa_event[item], 0);
+		/* 清零全局计数器
+		 * vm_numa_event 包含：
+		 * - NUMA_HIT: 本地节点分配成功
+		 * - NUMA_MISS: 远程节点分配
+		 * - NUMA_FOREIGN: 其他节点对本节点的访问
+		 * - NUMA_INTERLEAVE_HIT: 交错分配命中
+		 * - NUMA_LOCAL: 本地 CPU 本地节点分配
+		 * - NUMA_OTHER: 本地 CPU 远程节点分配
+		 */
+
 		for_each_online_cpu(cpu) {
 			per_cpu_ptr(zone->per_cpu_zonestats, cpu)->vm_numa_event[item]
 						= 0;
 		}
+		/* 清零每个 CPU 的差分计数器 */
 	}
 }
 
 /* zero numa counters of all the populated zones */
+/*
+ * 【函数】zero_zones_numa_counters - 清零所有已填充 zone 的 NUMA 计数器
+ *
+ * 【使用场景】
+ * 禁用 NUMA 统计时，清理旧数据。
+ */
 static void zero_zones_numa_counters(void)
 {
 	struct zone *zone;
 
 	for_each_populated_zone(zone)
 		zero_zone_numa_counters(zone);
+	/* 遍历所有已填充的内存区域并清零
+	 * populated zone: 包含实际物理内存的 zone
+	 */
 }
 
 /* zero global numa counters */
+/*
+ * 【函数】zero_global_numa_counters - 清零全局 NUMA 计数器
+ *
+ * 清零系统级别的 NUMA 统计（跨所有 node 和 zone）。
+ */
 static void zero_global_numa_counters(void)
 {
 	int item;
 
 	for (item = 0; item < NR_VM_NUMA_EVENT_ITEMS; item++)
 		atomic_long_set(&vm_numa_event[item], 0);
+	/* vm_numa_event: 全局 NUMA 事件计数器数组 */
 }
 
+/*
+ * 【函数】invalid_numa_statistics - 使 NUMA 统计失效（清零）
+ *
+ * 【调用时机】
+ * 禁用 NUMA 统计时调用，确保旧数据不会误导用户。
+ */
 static void invalid_numa_statistics(void)
 {
 	zero_zones_numa_counters();
@@ -75,7 +211,39 @@ static void invalid_numa_statistics(void)
 }
 
 static DEFINE_MUTEX(vm_numa_stat_lock);
+/* NUMA 统计配置锁
+ * 保护 sysctl_vm_numa_stat 的并发修改
+ */
 
+/*
+ * 【函数】sysctl_vm_numa_stat_handler - NUMA 统计 sysctl 处理函数
+ * @table:  sysctl 表项
+ * @write:  是否是写操作
+ * @buffer: 用户缓冲区
+ * @length: 缓冲区长度
+ * @ppos:   文件位置
+ *
+ * 返回值：0=成功，负值=失败
+ *
+ * 【功能】
+ * 处理 /proc/sys/vm/numa_stat 的读写：
+ * - 读：返回当前值（0 或 1）
+ * - 写：启用或禁用 NUMA 统计
+ *
+ * 【工作流程】
+ * 1. 加锁保护
+ * 2. 保存旧值（如果是写操作）
+ * 3. 调用标准处理函数（proc_dointvec_minmax）
+ * 4. 如果值改变：
+ *    - 启用：打开静态键，开始收集统计
+ *    - 禁用：关闭静态键，清零计数器
+ * 5. 解锁
+ *
+ * 【静态键优化】
+ * 使用静态键（static key）实现零开销的条件编译：
+ * - 启用时：NUMA 统计代码正常执行
+ * - 禁用时：NUMA 统计代码被编译为 nop（无操作）
+ */
 static int sysctl_vm_numa_stat_handler(const struct ctl_table *table, int write,
 		void *buffer, size_t *length, loff_t *ppos)
 {
@@ -84,19 +252,37 @@ static int sysctl_vm_numa_stat_handler(const struct ctl_table *table, int write,
 	mutex_lock(&vm_numa_stat_lock);
 	if (write)
 		oldval = sysctl_vm_numa_stat;
+	/* 保存旧值，用于检测是否改变 */
+
 	ret = proc_dointvec_minmax(table, write, buffer, length, ppos);
+	/* 调用标准 sysctl 处理函数
+	 * proc_dointvec_minmax: 处理有范围限制的整数
+	 */
+
 	if (ret || !write)
 		goto out;
+	/* 如果失败或是读操作，直接返回 */
 
 	if (oldval == sysctl_vm_numa_stat)
 		goto out;
+	/* 值未改变，无需操作 */
+
 	else if (sysctl_vm_numa_stat == ENABLE_NUMA_STAT) {
 		static_branch_enable(&vm_numa_stat_key);
 		pr_info("enable numa statistics\n");
+		/* 启用 NUMA 统计
+		 * static_branch_enable: 将静态键设为"真"，
+		 * NUMA 统计代码开始执行
+		 */
 	} else {
 		static_branch_disable(&vm_numa_stat_key);
 		invalid_numa_statistics();
 		pr_info("disable numa statistics, and clear numa counters\n");
+		/* 禁用 NUMA 统计
+		 * 1. 关闭静态键（NUMA 代码变为 nop）
+		 * 2. 清零所有 NUMA 计数器（避免显示陈旧数据）
+		 * 3. 打印日志通知管理员
+		 */
 	}
 
 out:
