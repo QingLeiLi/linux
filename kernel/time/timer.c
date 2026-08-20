@@ -17,6 +17,11 @@
  *                              Copyright (C) 2000, 2001, 2002  Ingo Molnar
  *              Designed by David S. Miller, Alexey Kuznetsov and Ingo Molnar
  */
+/*
+ * 本文件实现内核低精度 timer 子系统：从早期全局 tick 计时演进为可扩展的
+ * per-CPU 分层时间轮，并把 NTP/timekeeping、进程 tick 记账和 SMP timer
+ * 迁移的历史入口保留在同一编排层。上方变更记录逐字保留，便于理解接口来源。
+ */
 
 #include <linux/kernel_stat.h>
 #include <linux/export.h>
@@ -380,6 +385,7 @@ static int timer_migration_handler(const struct ctl_table *table, int write,
 	return ret;
 }
 
+/* timer_sysctl 是启动后供 sysctl core 借用的只读表，data 指向常驻迁移策略变量。 */
 static const struct ctl_table timer_sysctl[] = {
 	/* 只接受 0/1；表项在 init 后长期只读，data 指向全局策略值。 */
 	{
@@ -393,6 +399,7 @@ static const struct ctl_table timer_sysctl[] = {
 	},
 };
 
+/* timer_sysctl_init() 注册常驻 kernel.timer_migration 表项，固定返回 0，仅启动进程上下文调用。 */
 static int __init timer_sysctl_init(void)
 {
 	/* init 阶段注册表；无可回滚资源，注册接口负责其长期生命周期。 */
@@ -403,6 +410,7 @@ device_initcall(timer_sysctl_init);
 #endif /* CONFIG_SYSCTL */
 #else /* CONFIG_SMP */
 /* UP 配置没有跨 CPU 迁移，保留同名空入口使调用者无需条件编译。 */
+/* timers_update_migration() 的 UP 桩无参数、无返回和副作用，也不需要锁。 */
 static inline void timers_update_migration(void) { }
 #endif /* !CONFIG_SMP */
 
@@ -433,12 +441,14 @@ void timers_update_nohz(void)
 }
 
 /* 热路径只查询已发布的 static key；不加锁、不睡眠。 */
+/* is_timers_nohz_active() 返回当前 NO_HZ 激活提示，不取得引用，也不产生副作用。 */
 static inline bool is_timers_nohz_active(void)
 {
 	return static_branch_unlikely(&timers_nohz_active);
 }
 #else
 /* 未配置 NO_HZ 时查询恒为 false；无入参、无副作用。 */
+/* is_timers_nohz_active() 的配置关闭桩恒返回 false，可在原子上下文调用。 */
 static inline bool is_timers_nohz_active(void) { return false; }
 #endif /* NO_HZ_COMMON */
 
@@ -483,8 +493,10 @@ static unsigned long round_jiffies_common(unsigned long j, int cpu,
 	 * “绝不提前”契约。其余情况向上到下一秒。
 	 */
 	if (rem < HZ/4 && !force_up) /* round down */
+		/* round down：靠近整秒且允许提前时向下聚合。 */
 		j = j - rem;
 	else /* round up */
+		/* round up：其余期限向下一整秒边界聚合。 */
 		j = j - rem + HZ;
 
 	/* now that we have rounded, subtract the extra skew again */
@@ -524,6 +536,7 @@ static unsigned long round_jiffies_common(unsigned long j, int cpu,
  * 回相对延迟。调用者仍拥有全部状态；无锁、不可睡眠。返回近似整秒的相对值，
  * 不保证严格向上取整，但保证计算出的绝对期限仍在未来。
  */
+/* __round_jiffies_relative() 返回按指定 CPU 错峰后的相对 jiffy，不修改 timer 状态。 */
 unsigned long __round_jiffies_relative(unsigned long j, int cpu)
 {
 	unsigned long j0 = jiffies;
@@ -553,6 +566,7 @@ EXPORT_SYMBOL_GPL(__round_jiffies_relative);
  * 中文契约：对绝对 @j 取整，CPU 使用当前处理器；返回仍在未来的绝对 jiffy。
  * 这是 wrapper，无状态副作用；可用于允许轻微提前/延后的周期性后台任务。
  */
+/* round_jiffies() 使用当前 CPU 的错峰相位，返回近似整秒的绝对期限。 */
 unsigned long round_jiffies(unsigned long j)
 {
 	return round_jiffies_common(j, raw_smp_processor_id(), false);
@@ -578,6 +592,7 @@ EXPORT_SYMBOL_GPL(round_jiffies);
  * 中文契约：对当前 CPU 上的相对延迟 @j 取整；返回相对 jiffy。当前 CPU 只用于
  * 选择错峰相位，函数不固定 timer 的最终 CPU。
  */
+/* round_jiffies_relative() 返回当前 CPU 相位下的相对期限，不入队也不加锁。 */
 unsigned long round_jiffies_relative(unsigned long j)
 {
 	return __round_jiffies_relative(j, raw_smp_processor_id());
@@ -598,6 +613,7 @@ EXPORT_SYMBOL_GPL(round_jiffies_relative);
  * 中文契约：与 __round_jiffies_relative() 相同，但 @force_up=true，故不会
  * 因聚合而提前触发；适合“可以晚、不能早”的超时。返回相对 jiffy。
  */
+/* __round_jiffies_up_relative() 按指定 CPU 向上聚合相对期限，绝不因取整提前。 */
 unsigned long __round_jiffies_up_relative(unsigned long j, int cpu)
 {
 	unsigned long j0 = jiffies;
@@ -618,6 +634,7 @@ EXPORT_SYMBOL_GPL(__round_jiffies_up_relative);
  * early.
  */
 /* 中文契约：当前 CPU 版本的绝对期限向上取整 wrapper；无副作用。 */
+/* round_jiffies_up() 返回当前 CPU 相位下不早于 @j 的绝对整秒近似期限。 */
 unsigned long round_jiffies_up(unsigned long j)
 {
 	return round_jiffies_common(j, raw_smp_processor_id(), true);
@@ -634,6 +651,7 @@ EXPORT_SYMBOL_GPL(round_jiffies_up);
  * early.
  */
 /* 中文契约：当前 CPU 版本的相对期限向上取整 wrapper；返回相对 jiffy。 */
+/* round_jiffies_up_relative() 不修改对象，返回不会因聚合缩短的相对期限。 */
 unsigned long round_jiffies_up_relative(unsigned long j)
 {
 	return __round_jiffies_up_relative(j, raw_smp_processor_id());
@@ -736,6 +754,7 @@ static int calc_wheel_index(unsigned long expires, unsigned long clk,
 	return idx;
 }
 
+/* trigger_dyntick_cpu() 在持 @base->lock 时判断远端 idle 唤醒；不睡眠且不取得对象引用。 */
 static void
 trigger_dyntick_cpu(struct timer_base *base, struct timer_list *timer)
 {
@@ -842,8 +861,10 @@ static void internal_add_timer(struct timer_base *base, struct timer_list *timer
 
 #ifdef CONFIG_DEBUG_OBJECTS_TIMERS
 
+/* timer_debug_descr 前置声明连接 fixup 回调与稍后的常驻只读描述符定义。 */
 static const struct debug_obj_descr timer_debug_descr;
 
+/* timer_hint 描述 wrapper callback 到容器真实 work callback 的只读诊断映射。 */
 struct timer_hint {
 	/*
 	 * debugobjects 报错时，function 是 timer wrapper 回调；offset 指向其容器中
@@ -860,6 +881,7 @@ struct timer_hint {
 			    offsetof(container, timr)		\
 	}
 
+/* timer_hints 是编译期固定映射数组，debug 查询只借用其中条目且从不释放。 */
 static const struct timer_hint timer_hints[] = {
 	/* 已知 wrapper 到真实 callback 的静态映射表，进程全生命周期只读。 */
 	TIMER_HINT(delayed_work_timer_fn,
@@ -912,6 +934,7 @@ static bool timer_is_static_object(void *addr)
  * 状态重置为 initialized。@state 是诊断状态；返回 true 表示修复已完成。
  * 该路径仅为错误恢复，不能成为正常同步手段。
  */
+/* timer_fixup_init() 仅处理 ODEBUG_STATE_ACTIVE，成功同步删除并重置时返回 true。 */
 static bool timer_fixup_init(void *addr, enum debug_obj_state state)
 {
 	struct timer_list *timer = addr;
@@ -928,6 +951,7 @@ static bool timer_fixup_init(void *addr, enum debug_obj_state state)
 
 /* Stub timer callback for improperly used timers. */
 /* 非法使用 timer 的替代回调：只告警，不尝试猜测或继续原业务。 */
+/* stub_timer() 忽略借用参数，在 timer 回调上下文触发一次 WARN，无返回值且不可睡眠。 */
 static void stub_timer(struct timer_list *unused)
 {
 	WARN_ON(1);
@@ -942,6 +966,7 @@ static void stub_timer(struct timer_list *unused)
  * 激活未初始化对象时安装 stub 使后续执行可诊断；重复激活仅告警，
  * 不擅自删除现有 timer。返回值表示 debugobjects 是否完成了修复。
  */
+/* timer_fixup_activate() 只修复未知对象；active 重入告警并返回 false。 */
 static bool timer_fixup_activate(void *addr, enum debug_obj_state state)
 {
 	struct timer_list *timer = addr;
@@ -967,6 +992,7 @@ static bool timer_fixup_activate(void *addr, enum debug_obj_state state)
  * 释放 active timer 是 UAF 风险，故先 timer_delete_sync() 等待回调
  * 结束，再把诊断对象标记 free。返回 true 表示危险状态已被收敛。
  */
+/* timer_fixup_free() 仅对 active 对象同步停表并解除诊断登记，其他状态返回 false。 */
 static bool timer_fixup_free(void *addr, enum debug_obj_state state)
 {
 	struct timer_list *timer = addr;
@@ -986,6 +1012,7 @@ static bool timer_fixup_free(void *addr, enum debug_obj_state state)
  * - an untracked/uninit-ed object is found
  */
 /* 断言遇到未知对象时安装 stub 并初始化，避免带垃圾回调继续运行。 */
+/* timer_fixup_assert_init() 修复未登记对象时返回 true，其余状态不改变对象并返回 false。 */
 static bool timer_fixup_assert_init(void *addr, enum debug_obj_state state)
 {
 	struct timer_list *timer = addr;
@@ -999,6 +1026,7 @@ static bool timer_fixup_assert_init(void *addr, enum debug_obj_state state)
 	}
 }
 
+/* timer_debug_descr 是 debugobjects core 在整个运行期借用的 timer 类型操作表。 */
 static const struct debug_obj_descr timer_debug_descr = {
 	/* timer 类型的 debugobjects 操作表；静态只读，由通用框架间接调用。 */
 	.name			= "timer_list",
@@ -1010,24 +1038,28 @@ static const struct debug_obj_descr timer_debug_descr = {
 	.fixup_assert_init	= timer_fixup_assert_init,
 };
 
+/* debug_timer_init() 把借用 @timer 发布为已初始化诊断对象，不改变其时间轮归属。 */
 static inline void debug_timer_init(struct timer_list *timer)
 {
 	/* 向 debugobjects 发布“已初始化”；框架借用 timer，不取得业务所有权。 */
 	debug_object_init(timer, &timer_debug_descr);
 }
 
+/* debug_timer_activate() 在入队前发布 active 诊断状态，无返回值且不取得对象所有权。 */
 static inline void debug_timer_activate(struct timer_list *timer)
 {
 	/* 入队前把诊断状态转为 active，重复激活会由 fixup 报告。 */
 	debug_object_activate(timer, &timer_debug_descr);
 }
 
+/* debug_timer_deactivate() 在摘链时撤销 active 诊断状态，不负责链表操作。 */
 static inline void debug_timer_deactivate(struct timer_list *timer)
 {
 	/* 摘链时转回 inactive；这不负责实际链表删除。 */
 	debug_object_deactivate(timer, &timer_debug_descr);
 }
 
+/* debug_timer_assert_init() 验证借用 @timer 已初始化，异常状态交给 fixup 处理。 */
 static inline void debug_timer_assert_init(struct timer_list *timer)
 {
 	/* 所有公开操作入口先验证 timer 已经过初始化。 */
@@ -1069,12 +1101,16 @@ EXPORT_SYMBOL_GPL(timer_destroy_on_stack);
 
 #else
 /* release 配置下初始化诊断为空操作，timer 业务状态仍由 do_init_timer() 建立。 */
+/* debug_timer_init() 的配置关闭桩不读取或修改 @timer。 */
 static inline void debug_timer_init(struct timer_list *timer) { }
 /* release 配置下激活诊断为空操作，不改变实际入队协议。 */
+/* debug_timer_activate() 的配置关闭桩无返回和副作用。 */
 static inline void debug_timer_activate(struct timer_list *timer) { }
 /* release 配置下撤销诊断为空操作，实际链表仍由 detach_timer() 摘除。 */
+/* debug_timer_deactivate() 的配置关闭桩无返回和副作用。 */
 static inline void debug_timer_deactivate(struct timer_list *timer) { }
 /* release 配置下初始化断言为空操作，调用者仍必须遵守初始化契约。 */
+/* debug_timer_assert_init() 的配置关闭桩不提供运行期验证。 */
 static inline void debug_timer_assert_init(struct timer_list *timer) { }
 #endif
 /*
@@ -1090,6 +1126,7 @@ static inline void debug_init(struct timer_list *timer)
 }
 
 /* 摘链路径同步更新 debugobjects 状态并发出 cancel trace。 */
+/* debug_deactivate() 不负责实际摘链，也不转移 @timer 所有权。 */
 static inline void debug_deactivate(struct timer_list *timer)
 {
 	debug_timer_deactivate(timer);
@@ -1097,6 +1134,7 @@ static inline void debug_deactivate(struct timer_list *timer)
 }
 
 /* 操作入口的统一初始化断言；release 配置下可能为空。 */
+/* debug_assert_init() 只执行诊断验证，不改变 timer 的 pending 状态。 */
 static inline void debug_assert_init(struct timer_list *timer)
 {
 	debug_timer_assert_init(timer);
@@ -1139,6 +1177,7 @@ static void do_init_timer(struct timer_list *timer,
  * timer 仍归调用者所有，函数只建立回调、flags、CPU 归属和 lockdep/debug 状态；
  * 不入队、不执行回调、不可用于覆盖一个仍 pending/running 的对象。
  */
+/* timer_init_key() 建立普通 timer 的初始状态；调用者保有对象并负责停止后的释放。 */
 void timer_init_key(struct timer_list *timer,
 		    void (*func)(struct timer_list *), unsigned int flags,
 		    const char *name, struct lock_class_key *key)
@@ -1514,6 +1553,7 @@ out_unlock:
  * shutdown 返回 0，active 返回 1。函数不等待 callback，调用者必须另外管理
  * timer 所在对象的生命周期。适合“若仍在等就续期，但不要重新启动”的协议。
  */
+/* mod_timer_pending() 返回入口 timer 是否 active，只续期 pending 实例且不等待回调。 */
 int mod_timer_pending(struct timer_list *timer, unsigned long expires)
 {
 	return __mod_timer(timer, expires, MOD_TIMER_PENDING_ONLY);
@@ -1552,6 +1592,7 @@ EXPORT_SYMBOL(mod_timer_pending);
  * 并发使用者不会看到中间 inactive 窗口。返回值描述入口是否 active，不代表
  * callback 是否曾经/正在运行；function==NULL 的 shutdown 对象静默返回 0。
  */
+/* mod_timer() 原子启动或重排 @timer，返回入口是否 active，不构成 callback 完成屏障。 */
 int mod_timer(struct timer_list *timer, unsigned long expires)
 {
 	return __mod_timer(timer, expires, 0);
@@ -1583,6 +1624,7 @@ EXPORT_SYMBOL(mod_timer);
  * 多个路径都只想“收紧 deadline”时可避免较晚请求覆盖较早请求。返回类别与
  * mod_timer() 相同，且不提供 callback 完成保证。
  */
+/* timer_reduce() 只接受更早的 active deadline，inactive 时启动，shutdown 时静默丢弃。 */
 int timer_reduce(struct timer_list *timer, unsigned long expires)
 {
 	return __mod_timer(timer, expires, MOD_TIMER_REDUCE);
@@ -1614,6 +1656,7 @@ EXPORT_SYMBOL(timer_reduce);
  * callback 在 TIMER_SOFTIRQ 中执行。重复 add 是调用者 bug 并告警；已过期期限
  * 被排到下一次 tick；shutdown timer 的请求被丢弃。无直接返回值。
  */
+/* add_timer() 仅启动 inactive @timer；调用者保有对象且必须保证 callback 期间有效。 */
 void add_timer(struct timer_list *timer)
 {
 	if (WARN_ON_ONCE(timer_pending(timer)))
@@ -1634,6 +1677,7 @@ EXPORT_SYMBOL(add_timer);
  * 中文契约：与 add_timer() 相同，但设置 TIMER_PINNED，使本轮归当前 CPU 的
  * LOCAL base；这约束执行位置，不等于禁止 CPU hotplug 时的必要迁移。
  */
+/* add_timer_local() 把 inactive timer 固定到当前 CPU 的 LOCAL base，无返回值。 */
 void add_timer_local(struct timer_list *timer)
 {
 	if (WARN_ON_ONCE(timer_pending(timer)))
@@ -1655,6 +1699,7 @@ EXPORT_SYMBOL(add_timer_local);
  * 中文契约：清除 TIMER_PINNED 后启动，使 timer 可放入 GLOBAL base 并参与
  * NO_HZ timer migration。用于显式撤销上轮 local/on-CPU 固定属性。
  */
+/* add_timer_global() 清 pinned 位并把 inactive timer 放入可迁移 GLOBAL base。 */
 void add_timer_global(struct timer_list *timer)
 {
 	if (WARN_ON_ONCE(timer_pending(timer)))
@@ -1681,6 +1726,7 @@ EXPORT_SYMBOL(add_timer_global);
  * 验证可用的 CPU 编号；无返回值。不等待旧 callback；若 timer 已 shutdown 则
  * 锁内静默退出。跨 base 时以 MIGRATING 协议保证查找者不会拿错锁。
  */
+/* add_timer_on() 固定到显式 @cpu；调用者必须保证 CPU 编号和 timer 生命周期有效。 */
 void add_timer_on(struct timer_list *timer, int cpu)
 {
 	struct timer_base *new_base, *base;
@@ -1753,6 +1799,7 @@ EXPORT_SYMBOL_GPL(add_timer_on);
  * 置 NULL，形成不可重启边界。返回 1 表示曾 pending，0 表示未 pending。
  * 不等待已经执行中的 callback，所以不会保证其关联对象可立即释放。
  */
+/* __timer_delete() 在线性化的 base 锁内摘链，并可通过 @shutdown 永久封死 rearm。 */
 static int __timer_delete(struct timer_list *timer, bool shutdown)
 {
 	struct timer_base *base;
@@ -1806,6 +1853,7 @@ static int __timer_delete(struct timer_list *timer, bool shutdown)
  * 中文契约：只取消 pending，不等并发 callback，也不阻止随后 rearm。返回值
  * 仅在调用者已串行化所有 rearm 时有意义；因此它不能单独作为释放容器的屏障。
  */
+/* timer_delete() 返回是否摘除 pending 实例，不等待 running callback。 */
 int timer_delete(struct timer_list *timer)
 {
 	return __timer_delete(timer, false);
@@ -1832,6 +1880,7 @@ EXPORT_SYMBOL(timer_delete);
  * 上下文/锁约束无法同步等待、且容器生命周期另有保障的 teardown；若要释放
  * 容器优先用 timer_shutdown_sync()。
  */
+/* timer_shutdown() 封死 rearm 但不等待 callback，返回此前是否 pending。 */
 int timer_shutdown(struct timer_list *timer)
 {
 	return __timer_delete(timer, true);
@@ -1863,6 +1912,7 @@ EXPORT_SYMBOL_GPL(timer_shutdown);
  * 返回 -1 表示 callback 正在执行，0/1 分别表示未 pending/成功摘除。shutdown
  * 只有在未 running 时才写 NULL；调用者负责遇到 -1 后等待并重试。
  */
+/* __try_to_del_timer_sync() 返回 -1/0/1 表示 running、inactive 或成功摘链。 */
 static int __try_to_del_timer_sync(struct timer_list *timer, bool shutdown)
 {
 	struct timer_base *base;
@@ -1904,6 +1954,7 @@ static int __try_to_del_timer_sync(struct timer_list *timer, bool shutdown)
  * 中文契约：非阻塞的同步删除尝试。成功的 0/1 同时保证返回瞬间 callback 未在
  * 任一 CPU 运行；-1 要求调用者稍后重试。它仍不能阻止返回后的并发 rearm。
  */
+/* timer_delete_sync_try() 是不可阻塞的完成性探测，不阻止返回后的重新入队。 */
 int timer_delete_sync_try(struct timer_list *timer)
 {
 	return __try_to_del_timer_sync(timer, false);
@@ -1917,16 +1968,19 @@ EXPORT_SYMBOL(timer_delete_sync_try);
  * init 仅启动期调用；lock/unlock 借用 @base。非 RT 为空操作。该锁不保护时间轮
  * 数据，那仍由 raw base->lock 负责；它只在可抢占 callback 与等待者间传递进度。
  */
+/* timer_base_init_expiry_lock() 在启动期初始化 RT 等待锁和 waiter 计数所属状态。 */
 static __init void timer_base_init_expiry_lock(struct timer_base *base)
 {
 	spin_lock_init(&base->expiry_lock);
 }
 
+/* timer_base_lock_expiry() 取得可睡眠 RT expiry_lock，调用点不得位于硬中断。 */
 static inline void timer_base_lock_expiry(struct timer_base *base)
 {
 	spin_lock(&base->expiry_lock);
 }
 
+/* timer_base_unlock_expiry() 释放与上方 helper 配对的 RT expiry_lock。 */
 static inline void timer_base_unlock_expiry(struct timer_base *base)
 {
 	spin_unlock(&base->expiry_lock);
@@ -1944,6 +1998,7 @@ static inline void timer_base_unlock_expiry(struct timer_base *base)
  * 把锁，让高优先级 waiter 获得运行机会。函数返回时恢复“expiry_lock 后
  * base->lock”的原持锁状态，不把所有权交给调用者。
  */
+/* timer_sync_wait_running() 仅在存在 waiter 时让出并重取两锁，返回时锁状态不变。 */
 static void timer_sync_wait_running(struct timer_base *base)
 	__releases(&base->lock) __releases(&base->expiry_lock)
 	__acquires(&base->expiry_lock) __acquires(&base->lock)
@@ -1971,6 +2026,7 @@ static void timer_sync_wait_running(struct timer_base *base)
  * 的线程。非 IRQSAFE、非迁移 timer 通过 expiry_lock 睡眠等待一次回调临界区；
  * timer_waiters 通知 callback 端必须让锁。它可能睡眠。
  */
+/* del_timer_wait_running() 为非 IRQSAFE RT timer 等待一次 callback 临界区通过。 */
 static void del_timer_wait_running(struct timer_list *timer)
 {
 	u32 tf;
@@ -1999,14 +2055,19 @@ static void del_timer_wait_running(struct timer_list *timer)
 }
 #else
 /* 非 RT 配置没有额外 expiry_lock；初始化为空操作。 */
+/* timer_base_init_expiry_lock() 的非 RT 桩无副作用。 */
 static inline void timer_base_init_expiry_lock(struct timer_base *base) { }
 /* 非 RT 配置只依赖 raw base->lock；加 expiry 锁为空操作。 */
+/* timer_base_lock_expiry() 的非 RT 桩不改变锁状态。 */
 static inline void timer_base_lock_expiry(struct timer_base *base) { }
 /* 与上面的空加锁配对，无状态副作用。 */
+/* timer_base_unlock_expiry() 的非 RT 桩不改变锁状态。 */
 static inline void timer_base_unlock_expiry(struct timer_base *base) { }
 /* 非 RT callback 不需向可睡眠 waiter 主动让 expiry_lock。 */
+/* timer_sync_wait_running() 的非 RT 桩保持 base 锁状态不变。 */
 static inline void timer_sync_wait_running(struct timer_base *base) { }
 /* 非 RT 同步删除通过重试和 cpu_relax 等待，无可睡眠慢路径。 */
+/* del_timer_wait_running() 的非 RT 桩立即返回。 */
 static inline void del_timer_wait_running(struct timer_list *timer) { }
 #endif
 /* 非 RT 内核 callback 不会被 RT 调度规则阻塞，空 helper 保留统一控制流。 */
@@ -2039,6 +2100,7 @@ static inline void del_timer_wait_running(struct timer_list *timer) { }
  * 返回 0/1 表示入口最终观察到的 pending 状态；调用者必须阻止普通 delete_sync
  * 返回后的并发 rearm。
  */
+/* __timer_delete_sync() 等待 callback 退出并摘链；@shutdown 还把 rearm 永久失效。 */
 static int __timer_delete_sync(struct timer_list *timer, bool shutdown)
 {
 	int ret;
@@ -2135,6 +2197,7 @@ static int __timer_delete_sync(struct timer_list *timer, bool shutdown)
  * rearm，且不能持 callback 获取的锁。英文示例展示典型死锁：删除者持
  * somelock 等 softirq，而 softirq 被一个同样等 somelock 的 IRQ 打断。
  */
+/* timer_delete_sync() 返回时不 pending 且不 running，但调用者仍须排除并发 rearm。 */
 int timer_delete_sync(struct timer_list *timer)
 {
 	return __timer_delete_sync(timer, false);
@@ -2182,6 +2245,7 @@ EXPORT_SYMBOL(timer_delete_sync);
  * 以后 rearm 静默失败”；0/1 只报告此前是否 pending。timer/work 相互重启时，
  * 必须先封死 timer，再销毁 workqueue，随后才可释放共同容器。
  */
+/* timer_shutdown_sync() 是最终 teardown 屏障，返回后所有 rearm 都被静默拒绝。 */
 int timer_shutdown_sync(struct timer_list *timer)
 {
 	return __timer_delete_sync(timer, true);
@@ -2351,6 +2415,7 @@ static int collect_expired_timers(struct timer_base *base,
  * 层在 pending_map 的起点；返回相对当前位置的桶距离，-1 表示该层为空。
  * 调用者持有 base->lock，故两段位图扫描之间桶集合不会变化。
  */
+/* next_pending_bucket() 返回本层相对桶距离或 -1，纯查询且不修改位图。 */
 static int next_pending_bucket(struct timer_base *base, unsigned offset,
 			       unsigned clk)
 {
@@ -2376,6 +2441,7 @@ static int next_pending_bucket(struct timer_base *base, unsigned offset,
  * “离本层当前位置多少桶”换算回绝对 jiffy，选最早值；无 timer 时使用
  * base->clk+TIMER_NEXT_MAX_DELTA 哨兵。完成后清 next_expiry_recalc。
  */
+/* timer_recalc_next_expiry() 必须持 base 锁，重建最早期限和 pending 可信缓存。 */
 static void timer_recalc_next_expiry(struct timer_base *base)
 {
 	unsigned long clk, next, adj;
@@ -2622,6 +2688,7 @@ static unsigned long fetch_next_timer_interrupt(unsigned long basej, u64 basem,
  * timer_lock_remote_bases() 持两锁且关闭 IRQ；字段为空时保持 KTIME_MAX。
  * 函数不解锁、不取得 timer 引用。
  */
+/* fetch_next_timer_interrupt_remote() 只在调用者持有远端双 base 锁时填充 @tevt。 */
 void fetch_next_timer_interrupt_remote(unsigned long basej, u64 basem,
 				       struct timer_events *tevt,
 				       unsigned int cpu)
@@ -2650,6 +2717,7 @@ void fetch_next_timer_interrupt_remote(unsigned long basej, u64 basem,
 /*
  * 中文契约：按加锁逆序释放 @cpu 的 GLOBAL、LOCAL base；IRQ 状态由外层管理。
  */
+/* timer_unlock_remote_bases() 不恢复 IRQ，必须与同一 CPU 的 remote lock helper 配对。 */
 void timer_unlock_remote_bases(unsigned int cpu)
 	__releases(timer_bases[BASE_LOCAL]->lock)
 	__releases(timer_bases[BASE_GLOBAL]->lock)
@@ -2674,6 +2742,7 @@ void timer_unlock_remote_bases(unsigned int cpu)
  * 第二把使用 nested subclass 告诉 lockdep 这是规定的同类锁嵌套；调用者必须
  * 配对 timer_unlock_remote_bases()。
  */
+/* timer_lock_remote_bases() 要求 IRQ 已关，返回时持 LOCAL 和 GLOBAL 两把 raw lock。 */
 void timer_lock_remote_bases(unsigned int cpu)
 	__acquires(timer_bases[BASE_LOCAL]->lock)
 	__acquires(timer_bases[BASE_GLOBAL]->lock)
@@ -2695,6 +2764,7 @@ void timer_lock_remote_bases(unsigned int cpu)
  * Returns value of local timer base is_idle value.
  */
 /* 中文契约：无锁读取当前 CPU LOCAL base 的 idle 标记；仅作状态提示，不是同步屏障。 */
+/* timer_base_is_idle() 返回本 CPU LOCAL base 的瞬时 idle 值，不取得锁或引用。 */
 bool timer_base_is_idle(void)
 {
 	return __this_cpu_read(timer_bases[BASE_LOCAL].is_idle);
@@ -2712,6 +2782,7 @@ static void __run_timer_base(struct timer_base *base);
  * 中文契约：在当前 CPU 上驱动远端 @cpu 的 GLOBAL base 到期处理。只处理可迁移
  * timer，不触碰其 LOCAL/pinned base；内部自行加锁并执行 callback。
  */
+/* timer_expire_remote() 可在迁移代理路径执行远端 GLOBAL callback，不返回状态。 */
 void timer_expire_remote(unsigned int cpu)
 {
 	struct timer_base *base = per_cpu_ptr(&timer_bases[BASE_GLOBAL], cpu);
@@ -2760,6 +2831,7 @@ static void timer_use_tmigr(unsigned long basej, u64 basem,
 	}
 }
 # else
+/* timer_use_tmigr() 的 UP 实现不建迁移层级，只把 global 最早期限并入本地输出。 */
 static void timer_use_tmigr(unsigned long basej, u64 basem,
 			    unsigned long *nextevt, bool *tick_stop_path,
 			    bool timer_base_idle, struct timer_events *tevt)
@@ -2909,6 +2981,7 @@ static inline u64 __get_next_timer_interrupt(unsigned long basej, u64 basem,
  * @basem（纳秒）必须对应同一时刻。返回 tick 对齐的 monotonic 期限；无事件
  * 返回 KTIME_MAX。已交给迁移层级代理的 global timer 通常不计入本 CPU。
  */
+/* get_next_timer_interrupt() 是无 idle 提交的查询包装，返回 monotonic 纳秒期限。 */
 u64 get_next_timer_interrupt(unsigned long basej, u64 basem)
 {
 	return __get_next_timer_interrupt(basej, basem, NULL);
@@ -2930,6 +3003,7 @@ u64 get_next_timer_interrupt(unsigned long basej, u64 basem)
  * 表示 tick 已停，直接返回 KTIME_MAX；否则锁内尝试发布 base->is_idle 并写回。
  * 返回下一 monotonic 期限。调用者继续负责实际时钟事件编程。
  */
+/* timer_base_try_to_set_idle() 以 @idle 输入输出提交本 CPU base idle 状态。 */
 u64 timer_base_try_to_set_idle(unsigned long basej, u64 basem, bool *idle)
 {
 	if (*idle)
@@ -2948,6 +3022,7 @@ u64 timer_base_try_to_set_idle(unsigned long basej, u64 basem, bool *idle)
  * 关闭、不可迁移的本地上下文调用；无返回值。无锁写允许一次多余 IPI，换取
  * idle 热路径不拿 raw spinlock。
  */
+/* timer_clear_idle() 要求本 CPU IRQ 已关闭，清 idle 并激活迁移层级，无返回值。 */
 void timer_clear_idle(void)
 {
 	int this_cpu = smp_processor_id();
@@ -2983,6 +3058,7 @@ void timer_clear_idle(void)
  * 轮重新检查 jiffies/next_expiry。running_timer 非 NULL 表示同 base 已有执行者，
  * 当前调用直接退出以避免并行执行同一时间轮。
  */
+/* __run_timers() 在持锁入口内收集到期桶，执行 callback 时临时释放 base 锁。 */
 static inline void __run_timers(struct timer_base *base)
 {
 	struct hlist_head heads[LVL_DEPTH];
@@ -3066,6 +3142,7 @@ static void run_timer_base(int index)
  * migration 执行本 CPU 代理的远端 global timer。softirq 上下文不可睡眠；
  * callback 的 IRQ 开关策略由 TIMER_IRQSAFE 决定。
  */
+/* run_timer_softirq() 在不可睡眠 softirq 上下文驱动三类 base 和远端代理。 */
 static __latent_entropy void run_timer_softirq(void)
 {
 	run_timer_base(BASE_LOCAL);
@@ -3086,6 +3163,7 @@ static __latent_entropy void run_timer_softirq(void)
  * 低精度 base 是否需要 raise TIMER_SOFTIRQ。这里不直接执行普通 callback，
  * 将较长工作推迟到底半部以缩短硬中断临界段。
  */
+/* run_local_timers() 在本地 tick 硬中断中运行 hrtimer 并按需 raise TIMER_SOFTIRQ。 */
 static void run_local_timers(void)
 {
 	struct timer_base *base = this_cpu_ptr(&timer_bases[BASE_LOCAL]);
@@ -3149,6 +3227,7 @@ static void run_local_timers(void)
  * work/调度器和 POSIX CPU timer。顺序确保当前 tick 的 CPU 时间先入账，再让
  * 调度与 CPU timer 基于更新后的统计做决定。
  */
+/* update_process_times() 在 tick IRQ 中记账并驱动各子系统；@user_tick 只描述被中断态。 */
 void update_process_times(int user_tick)
 {
 	struct task_struct *p = current;
