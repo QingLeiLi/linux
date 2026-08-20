@@ -5,6 +5,105 @@
  * Copyright (C) 2019, Google LLC.
  * Author: Brendan Higgins <brendanhiggins@google.com>
  */
+/*
+ * ============================================================================
+ * 【KUnit - Linux 内核单元测试框架】
+ *
+ * 【什么是 KUnit？】
+ * KUnit 是 Linux 内核的轻量级单元测试框架，类似于用户空间的 JUnit、pytest。
+ * 它允许开发者为内核代码编写和运行单元测试，提高代码质量和可维护性。
+ *
+ * 【核心特性】
+ * 1. 内核内测试：在内核空间运行，无需用户空间工具
+ * 2. TAP 输出：遵循 Test Anything Protocol，易于集成 CI/CD
+ * 3. 断言宏：EXPECT/ASSERT 风格的测试断言
+ * 4. 测试套件：组织相关测试用例
+ * 5. 参数化测试：用不同参数运行同一测试
+ * 6. 模拟和隔离：支持测试替身（test doubles）
+ * 7. 快速反馈：编译时和运行时快速检测问题
+ *
+ * 【基本概念】
+ *
+ * 1. 测试用例（Test Case）
+ *    - 单个测试函数：void test_func(struct kunit *test)
+ *    - 包含多个断言（expectations/assertions）
+ *    - 使用 KUNIT_CASE() 宏定义
+ *
+ * 2. 测试套件（Test Suite）
+ *    - 相关测试用例的集合
+ *    - 可以有 init/exit 函数（setup/teardown）
+ *    - 使用 kunit_test_suite() 宏注册
+ *
+ * 3. 断言类型
+ *    - EXPECT: 失败后继续执行（软断言）
+ *    - ASSERT: 失败后立即停止测试（硬断言）
+ *
+ * 【工作流程】
+ * 1. 编写测试：定义测试函数和套件
+ * 2. 编译：CONFIG_KUNIT=y，编译测试到内核
+ * 3. 运行：启动内核或加载模块，自动运行测试
+ * 4. 查看结果：dmesg 或 /sys/kernel/debug/kunit/<suite>/results
+ *
+ * 【使用示例】
+ * ```c
+ * #include <kunit/test.h>
+ *
+ * // 测试函数
+ * static void example_add_test(struct kunit *test)
+ * {
+ *     KUNIT_EXPECT_EQ(test, 2, 1 + 1);
+ *     KUNIT_EXPECT_NE(test, 3, 1 + 1);
+ * }
+ *
+ * // 测试用例数组
+ * static struct kunit_case example_test_cases[] = {
+ *     KUNIT_CASE(example_add_test),
+ *     {}  // 终止符
+ * };
+ *
+ * // 测试套件
+ * static struct kunit_suite example_test_suite = {
+ *     .name = "example",
+ *     .test_cases = example_test_cases,
+ * };
+ *
+ * // 注册套件
+ * kunit_test_suite(example_test_suite);
+ * ```
+ *
+ * 【运行测试】
+ * 1. 命令行工具：tools/testing/kunit/kunit.py run
+ * 2. 内核参数：kunit.enable=1
+ * 3. 模块加载：modprobe kunit-example-test
+ *
+ * 【输出格式（TAP）】
+ * ```
+ * TAP version 14
+ * 1..1
+ *   # Subtest: example
+ *   1..1
+ *     ok 1 example_add_test
+ * ok 1 example
+ * ```
+ *
+ * 【最佳实践】
+ * 1. 每个函数一个测试文件（如 foo.c -> foo_test.c）
+ * 2. 测试应该快速、独立、可重复
+ * 3. 优先使用 EXPECT（更多信息），必要时用 ASSERT
+ * 4. 使用有意义的测试名称（描述测试内容）
+ * 5. 一个测试只验证一个行为
+ *
+ * 【与其他测试框架的对比】
+ * - kselftest: 用户空间测试，测试整个内核功能
+ * - KUnit: 内核空间单元测试，测试单个函数/模块
+ * - LTP: 大规模系统测试
+ *
+ * 【配置选项】
+ * - CONFIG_KUNIT: 启用 KUnit 框架
+ * - CONFIG_KUNIT_DEBUGFS: debugfs 接口
+ * - CONFIG_KUNIT_EXAMPLE_TEST: 示例测试
+ * ============================================================================
+ */
 
 #ifndef _KUNIT_TEST_H
 #define _KUNIT_TEST_H
@@ -32,20 +131,45 @@
 
 /* Static key: true if any KUnit tests are currently running */
 DECLARE_STATIC_KEY_FALSE(kunit_running);
+/* 静态键：是否有 KUnit 测试正在运行
+ *
+ * 【用途】
+ * 代码可以检查此键，在测试运行时改变行为：
+ * - 启用额外的调试检查
+ * - 跳过某些可能干扰测试的操作
+ * - 注入错误（fault injection）
+ *
+ * 【使用】
+ * if (static_branch_unlikely(&kunit_running)) {
+ *     // 测试模式下的特殊处理
+ * }
+ *
+ * 【性能】
+ * 静态键编译为 nop 指令（当测试未运行时），零开销。
+ */
 
 struct kunit;
 struct string_stream;
 
 /* Maximum size of parameter description string. */
 #define KUNIT_PARAM_DESC_SIZE 128
+/* 参数描述字符串的最大大小
+ * 用于参数化测试中描述当前参数
+ */
 
 /* Maximum size of a status comment. */
 #define KUNIT_STATUS_COMMENT_SIZE 256
+/* 状态注释的最大大小
+ * TAP 输出中附加的诊断信息
+ */
 
 /*
  * TAP specifies subtest stream indentation of 4 spaces, 8 spaces for a
  * sub-subtest.  See the "Subtests" section in
  * https://node-tap.org/tap-protocol/
+ */
+/*
+ * TAP 协议规定子测试缩进 4 个空格，子子测试缩进 8 个空格。
  */
 #define KUNIT_INDENT_LEN		4
 #define KUNIT_SUBTEST_INDENT		"    "
@@ -57,13 +181,43 @@ struct string_stream;
  * @KUNIT_FAILURE: Denotes the test has failed.
  * @KUNIT_SKIPPED: Denotes the test has been skipped.
  */
+/*
+ * 【枚举】kunit_status - 测试或测试套件的结果类型
+ */
 enum kunit_status {
 	KUNIT_SUCCESS,
+	/* 成功：测试通过，没有失败或跳过
+	 *
+	 * 【含义】
+	 * 所有断言都通过，没有错误发生。
+	 */
+
 	KUNIT_FAILURE,
+	/* 失败：测试失败
+	 *
+	 * 【原因】
+	 * - 断言失败（EXPECT/ASSERT 条件不满足）
+	 * - 代码崩溃（段错误、panic）
+	 * - 超时（测试执行时间过长）
+	 */
+
 	KUNIT_SKIPPED,
+	/* 跳过：测试被跳过
+	 *
+	 * 【原因】
+	 * - 前提条件不满足（如硬件不支持）
+	 * - 明确调用 kunit_skip()
+	 * - 配置不满足（如 CONFIG_XXX 未启用）
+	 *
+	 * 【与失败的区别】
+	 * 跳过不算测试失败，通常表示测试不适用于当前环境。
+	 */
 };
 
 /* Attribute struct/enum definitions */
+/*
+ * 属性结构体和枚举定义
+ */
 
 /*
  * Speed Attribute is stored as an enum and separated into categories of
@@ -72,17 +226,63 @@ enum kunit_status {
  *
  * Note: unset speed attribute acts as default of KUNIT_SPEED_NORMAL.
  */
+/*
+ * 【枚举】kunit_speed - 测试速度属性
+ *
+ * 速度属性分为三类：非常慢、慢、正常。
+ * 这些速度是相对于其他 KUnit 测试而言的。
+ *
+ * 【用途】
+ * - 过滤测试：只运行快速测试（CI 中）
+ * - 优先级：优先运行慢测试（及早发现问题）
+ * - 超时设置：慢测试允许更长的超时时间
+ */
 enum kunit_speed {
 	KUNIT_SPEED_UNSET,
+	/* 未设置：默认为 KUNIT_SPEED_NORMAL */
+
 	KUNIT_SPEED_VERY_SLOW,
+	/* 非常慢：通常超过 1 秒
+	 *
+	 * 【示例】
+	 * - 大量数据处理
+	 * - 复杂算法测试
+	 * - 硬件初始化测试
+	 */
+
 	KUNIT_SPEED_SLOW,
+	/* 慢：通常 100ms - 1 秒
+	 *
+	 * 【示例】
+	 * - I/O 操作测试
+	 * - 多次迭代测试
+	 */
+
 	KUNIT_SPEED_NORMAL,
+	/* 正常：通常小于 100ms
+	 *
+	 * 【示例】
+	 * - 简单函数测试
+	 * - 数据结构操作测试
+	 * - 大多数单元测试
+	 */
+
 	KUNIT_SPEED_MAX = KUNIT_SPEED_NORMAL,
+	/* 最大速度值（用于验证） */
 };
 
 /* Holds attributes for each test case and suite */
+/*
+ * 【结构体】kunit_attributes - 测试用例和套件的属性
+ */
 struct kunit_attributes {
 	enum kunit_speed speed;
+	/* 速度属性
+	 *
+	 * 【设置方式】
+	 * KUNIT_CASE_SLOW(test_func)  // 慢测试
+	 * KUNIT_CASE(test_func)        // 正常速度（默认）
+	 */
 };
 
 /**
@@ -125,19 +325,211 @@ struct kunit_attributes {
  *	};
  *
  */
+/*
+ * 【结构体】kunit_case - 表示单个测试用例
+ *
+ * 测试用例是 KUnit 的基本单元，每个测试用例测试一个特定的行为。
+ */
 struct kunit_case {
 	void (*run_case)(struct kunit *test);
+	/* 测试函数指针
+	 *
+	 * 【函数签名】
+	 * void test_func(struct kunit *test)
+	 *
+	 * 【函数职责】
+	 * 1. 执行被测代码
+	 * 2. 使用断言验证结果（KUNIT_EXPECT_* / KUNIT_ASSERT_*）
+	 * 3. 记录日志（kunit_info / kunit_warn）
+	 *
+	 * 【执行上下文】
+	 * - 进程上下文（可睡眠）
+	 * - 在 kunit 工作线程中运行
+	 * - 有独立的栈空间
+	 *
+	 * 【测试隔离】
+	 * 每个测试用例独立运行，不应该依赖其他测试的状态。
+	 * 使用 init/exit 函数设置/清理共享资源。
+	 *
+	 * 【示例】
+	 * static void test_list_add(struct kunit *test)
+	 * {
+	 *     struct list_head list;
+	 *     struct item *item;
+	 *
+	 *     INIT_LIST_HEAD(&list);
+	 *     item = kunit_kzalloc(test, sizeof(*item), GFP_KERNEL);
+	 *     KUNIT_ASSERT_NOT_NULL(test, item);
+	 *
+	 *     list_add(&item->node, &list);
+	 *     KUNIT_EXPECT_FALSE(test, list_empty(&list));
+	 *     KUNIT_EXPECT_PTR_EQ(test, &item->node, list.next);
+	 * }
+	 */
+
 	const char *name;
+	/* 测试用例名称
+	 *
+	 * 【命名规则】
+	 * - 描述性：说明测试什么（如 "test_list_add_empty"）
+	 * - 小写字母和下划线
+	 * - 前缀：通常以被测函数名开头
+	 *
+	 * 【使用】
+	 * - TAP 输出中显示
+	 * - debugfs 中标识测试
+	 * - 过滤测试时使用（kunit.filter="name_pattern"）
+	 *
+	 * 【由宏自动设置】
+	 * KUNIT_CASE(test_func) 自动将 name 设为 "test_func"
+	 */
+
 	const void* (*generate_params)(struct kunit *test,
 				       const void *prev, char *desc);
+	/* 参数生成器（用于参数化测试）
+	 *
+	 * 【参数化测试】
+	 * 用不同参数多次运行同一测试函数，避免重复代码。
+	 *
+	 * 【函数签名】
+	 * const void *generate(struct kunit *test, const void *prev, char *desc)
+	 *
+	 * @test: 当前测试上下文
+	 * @prev: 前一个参数（NULL 表示第一次调用）
+	 * @desc: 输出参数，填写参数描述（最大 KUNIT_PARAM_DESC_SIZE）
+	 * 返回值：下一个参数指针，NULL 表示没有更多参数
+	 *
+	 * 【工作原理】
+	 * KUnit 反复调用 generate_params，每次返回一个新参数：
+	 * 1. 第一次调用：prev = NULL，返回第一个参数
+	 * 2. 后续调用：prev = 上次返回值，返回下一个参数
+	 * 3. 结束：返回 NULL
+	 *
+	 * 【参数访问】
+	 * 测试函数通过 test->param_value 访问当前参数。
+	 *
+	 * 【示例】
+	 * struct test_param {
+	 *     int input;
+	 *     int expected;
+	 * };
+	 *
+	 * static const struct test_param params[] = {
+	 *     { .input = 0, .expected = 0 },
+	 *     { .input = 1, .expected = 1 },
+	 *     { .input = 5, .expected = 120 },
+	 * };
+	 *
+	 * static const void *factorial_gen_params(struct kunit *test,
+	 *                                         const void *prev, char *desc)
+	 * {
+	 *     const struct test_param *param = prev;
+	 *     int idx = param ? (param - params + 1) : 0;
+	 *
+	 *     if (idx >= ARRAY_SIZE(params))
+	 *         return NULL;
+	 *
+	 *     snprintf(desc, KUNIT_PARAM_DESC_SIZE, "input=%d", params[idx].input);
+	 *     return &params[idx];
+	 * }
+	 *
+	 * static void test_factorial(struct kunit *test)
+	 * {
+	 *     const struct test_param *param = test->param_value;
+	 *     KUNIT_EXPECT_EQ(test, param->expected, factorial(param->input));
+	 * }
+	 *
+	 * static struct kunit_case math_test_cases[] = {
+	 *     KUNIT_CASE_PARAM(test_factorial, factorial_gen_params),
+	 *     {}
+	 * };
+	 */
+
 	struct kunit_attributes attr;
+	/* 测试属性
+	 *
+	 * 【当前支持的属性】
+	 * - speed: 测试速度（normal, slow, very_slow）
+	 *
+	 * 【用途】
+	 * - 过滤：只运行特定速度的测试
+	 * - 调度：慢测试可能有更长超时
+	 * - 报告：按速度分类测试结果
+	 */
+
 	int (*param_init)(struct kunit *test);
+	/* 参数初始化函数（可选）
+	 *
+	 * 【调用时机】
+	 * 在参数化测试的每次迭代之前调用（在 run_case 之前）。
+	 *
+	 * 【函数签名】
+	 * int init(struct kunit *test)
+	 *
+	 * 返回值：0=成功，负值=失败（跳过此参数）
+	 *
+	 * 【用途】
+	 * 为特定参数准备资源：
+	 * - 分配内存
+	 * - 初始化数据结构
+	 * - 设置硬件状态
+	 *
+	 * 【与套件 init 的区别】
+	 * - 套件 init: 整个套件运行前调用一次
+	 * - param_init: 每个参数运行前调用一次
+	 *
+	 * 【示例】
+	 * static int param_init(struct kunit *test)
+	 * {
+	 *     struct my_context *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	 *     KUNIT_ASSERT_NOT_NULL(test, ctx);
+	 *     test->priv = ctx;
+	 *     return 0;
+	 * }
+	 */
+
 	void (*param_exit)(struct kunit *test);
+	/* 参数清理函数（可选）
+	 *
+	 * 【调用时机】
+	 * 在参数化测试的每次迭代之后调用（在 run_case 之后）。
+	 *
+	 * 【函数签名】
+	 * void exit(struct kunit *test)
+	 *
+	 * 【用途】
+	 * 清理参数特定的资源：
+	 * - 释放内存
+	 * - 关闭文件
+	 * - 恢复状态
+	 *
+	 * 【注意】
+	 * 使用 kunit_kzalloc 等 KUnit 管理的资源会自动释放，
+	 * 无需在 param_exit 中手动释放。
+	 *
+	 * 【示例】
+	 * static void param_exit(struct kunit *test)
+	 * {
+	 *     struct my_context *ctx = test->priv;
+	 *     cleanup_context(ctx);
+	 * }
+	 */
 
 	/* private: internal use only. */
 	enum kunit_status status;
+	/* 测试状态（内部使用）
+	 * 记录测试结果：SUCCESS, FAILURE, SKIPPED
+	 */
+
 	char *module_name;
+	/* 模块名称（内部使用）
+	 * 测试所属的内核模块名
+	 */
+
 	struct string_stream *log;
+	/* 日志流（内部使用）
+	 * 存储测试执行过程中的日志消息
+	 */
 };
 
 static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
@@ -151,6 +543,15 @@ static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
 	}
 	return "invalid";
 }
+/* 将状态转换为 TAP 协议的 "ok"/"not ok"
+ * @status: 测试状态
+ *
+ * 返回值：TAP 状态字符串
+ *
+ * 【TAP 协议】
+ * - "ok": 测试通过或跳过
+ * - "not ok": 测试失败
+ */
 
 /**
  * KUNIT_CASE - A helper for creating a &struct kunit_case
@@ -160,6 +561,22 @@ static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
  * Takes a symbol for a function representing a test case and creates a
  * &struct kunit_case object from it. See the documentation for
  * &struct kunit_case for an example on how to use it.
+ */
+/*
+ * 【宏】KUNIT_CASE - 创建测试用例的辅助宏
+ *
+ * 这是定义测试用例的标准方式。
+ *
+ * 【使用示例】
+ * static void test_addition(struct kunit *test)
+ * {
+ *     KUNIT_EXPECT_EQ(test, 4, 2 + 2);
+ * }
+ *
+ * static struct kunit_case math_test_cases[] = {
+ *     KUNIT_CASE(test_addition),
+ *     {}  // 终止符
+ * };
  */
 #define KUNIT_CASE(test_name)			\
 		{ .run_case = test_name, .name = #test_name,	\
@@ -173,6 +590,21 @@ static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
  * @attributes: a reference to a struct kunit_attributes object containing
  * test attributes
  */
+/*
+ * 【宏】KUNIT_CASE_ATTR - 创建带属性的测试用例
+ *
+ * 允许为测试用例指定自定义属性。
+ *
+ * 【使用示例】
+ * static struct kunit_attributes my_attrs = {
+ *     .speed = KUNIT_SPEED_SLOW,
+ * };
+ *
+ * static struct kunit_case math_test_cases[] = {
+ *     KUNIT_CASE_ATTR(test_slow_operation, my_attrs),
+ *     {}
+ * };
+ */
 #define KUNIT_CASE_ATTR(test_name, attributes)			\
 		{ .run_case = test_name, .name = #test_name,	\
 		  .attr = attributes, .module_name = KBUILD_MODNAME}
@@ -182,6 +614,21 @@ static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
  * with the slow attribute
  *
  * @test_name: a reference to a test case function.
+ */
+/*
+ * 【宏】KUNIT_CASE_SLOW - 创建慢速测试用例的快捷方式
+ *
+ * 等价于 KUNIT_CASE_ATTR，但自动设置 speed = KUNIT_SPEED_SLOW。
+ *
+ * 【使用场景】
+ * 标记执行时间较长的测试（通常 > 100ms）。
+ *
+ * 【使用示例】
+ * static struct kunit_case math_test_cases[] = {
+ *     KUNIT_CASE(test_fast),
+ *     KUNIT_CASE_SLOW(test_slow),
+ *     {}
+ * };
  */
 
 #define KUNIT_CASE_SLOW(test_name)			\
@@ -205,6 +652,57 @@ static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
  * Optionally write a string into @desc (size of KUNIT_PARAM_DESC_SIZE)
  * describing the parameter.
  */
+/*
+ * 【宏】KUNIT_CASE_PARAM - 创建参数化测试用例
+ *
+ * 参数化测试允许用不同参数多次运行同一测试函数。
+ *
+ * 【参数生成器要求】
+ * const void *gen_params(struct kunit *test, const void *prev, char *desc)
+ * - prev: 前一个参数（首次调用为 NULL）
+ * - desc: 输出参数描述（可选，最大 KUNIT_PARAM_DESC_SIZE）
+ * - 返回值：下一个参数指针，NULL 表示结束
+ *
+ * 【使用示例】
+ * // 参数结构
+ * struct math_param {
+ *     int a, b, expected;
+ * };
+ *
+ * static const struct math_param params[] = {
+ *     { 1, 1, 2 },
+ *     { 2, 3, 5 },
+ *     { -1, 1, 0 },
+ * };
+ *
+ * // 参数生成器
+ * static const void *add_gen_params(struct kunit *test,
+ *                                   const void *prev, char *desc)
+ * {
+ *     const struct math_param *p = prev;
+ *     int idx = p ? (p - params + 1) : 0;
+ *
+ *     if (idx >= ARRAY_SIZE(params))
+ *         return NULL;
+ *
+ *     snprintf(desc, KUNIT_PARAM_DESC_SIZE, "%d+%d",
+ *              params[idx].a, params[idx].b);
+ *     return &params[idx];
+ * }
+ *
+ * // 测试函数
+ * static void test_add(struct kunit *test)
+ * {
+ *     const struct math_param *p = test->param_value;
+ *     KUNIT_EXPECT_EQ(test, p->expected, p->a + p->b);
+ * }
+ *
+ * // 注册
+ * static struct kunit_case math_test_cases[] = {
+ *     KUNIT_CASE_PARAM(test_add, add_gen_params),
+ *     {}
+ * };
+ */
 #define KUNIT_CASE_PARAM(test_name, gen_params)			\
 		{ .run_case = test_name, .name = #test_name,	\
 		  .generate_params = gen_params, .module_name = KBUILD_MODNAME}
@@ -217,6 +715,11 @@ static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
  * @gen_params: a reference to a parameter generator function.
  * @attributes: a reference to a struct kunit_attributes object containing
  * test attributes
+ */
+/*
+ * 【宏】KUNIT_CASE_PARAM_ATTR - 创建带属性的参数化测试用例
+ *
+ * 结合参数化测试和自定义属性。
  */
 #define KUNIT_CASE_PARAM_ATTR(test_name, gen_params, attributes)	\
 		{ .run_case = test_name, .name = #test_name,	\
@@ -241,6 +744,45 @@ static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
  * Note: If you are registering a parameter array in param_init() with
  * kunit_register_param_array() then you need to pass kunit_array_gen_params()
  * to this as the generator function.
+ */
+/*
+ * 【宏】KUNIT_CASE_PARAM_WITH_INIT - 创建带初始化/清理的参数化测试用例
+ *
+ * 为参数化测试提供额外的设置和清理钩子。
+ *
+ * 【使用场景】
+ * 每个参数需要独立的资源准备：
+ * - 分配参数特定的内存
+ * - 打开参数特定的文件
+ * - 初始化参数特定的硬件状态
+ *
+ * 【执行顺序】
+ * 对于每个参数：
+ * 1. param_init(test)
+ * 2. run_case(test)  // 测试函数
+ * 3. param_exit(test)
+ *
+ * 【使用示例】
+ * static int param_init(struct kunit *test)
+ * {
+ *     struct my_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+ *     KUNIT_ASSERT_NOT_NULL(test, ctx);
+ *     // 根据 test->param_value 初始化 ctx
+ *     test->priv = ctx;
+ *     return 0;
+ * }
+ *
+ * static void param_exit(struct kunit *test)
+ * {
+ *     struct my_ctx *ctx = test->priv;
+ *     // 清理 ctx（如果未使用 KUnit 资源管理）
+ * }
+ *
+ * static struct kunit_case test_cases[] = {
+ *     KUNIT_CASE_PARAM_WITH_INIT(test_func, gen_params,
+ *                                param_init, param_exit),
+ *     {}
+ * };
  */
 #define KUNIT_CASE_PARAM_WITH_INIT(test_name, gen_params, init, exit)		\
 		{ .run_case = test_name, .name = #test_name,			\
@@ -270,30 +812,238 @@ static inline char *kunit_status_to_ok_not_ok(enum kunit_status status)
  * Every &struct kunit_case must be associated with a kunit_suite for KUnit
  * to run it.
  */
+/*
+ * 【结构体】kunit_suite - 测试套件（相关测试用例的集合）
+ *
+ * 测试套件是 KUnit 的组织单元，将相关的测试用例组合在一起。
+ * 类似于其他测试框架（JUnit、pytest）中的测试类或测试夹具。
+ */
 struct kunit_suite {
 	const char name[256];
+	/* 套件名称
+	 *
+	 * 【命名规则】
+	 * - 描述性：说明测试的模块或功能（如 "list_test"）
+	 * - 小写字母和下划线
+	 * - 通常以被测模块名开头
+	 *
+	 * 【用途】
+	 * - TAP 输出中显示
+	 * - 过滤测试（kunit.filter="suite_name"）
+	 * - debugfs 路径（/sys/kernel/debug/kunit/suite_name）
+	 */
+
 	int (*suite_init)(struct kunit_suite *suite);
+	/* 套件初始化函数（可选）
+	 *
+	 * 【调用时机】
+	 * 在运行套件中的任何测试用例之前调用一次。
+	 *
+	 * 【函数签名】
+	 * int suite_init(struct kunit_suite *suite)
+	 *
+	 * 返回值：0=成功，负值=失败（跳过整个套件）
+	 *
+	 * 【用途】
+	 * 准备整个套件共享的资源：
+	 * - 初始化全局状态
+	 * - 分配共享内存
+	 * - 设置硬件环境
+	 * - 创建测试数据
+	 *
+	 * 【与 init 的区别】
+	 * - suite_init: 整个套件运行前调用一次
+	 * - init: 每个测试用例运行前调用一次
+	 *
+	 * 【失败处理】
+	 * 如果 suite_init 失败，整个套件被跳过，
+	 * 但 suite_exit 仍然会被调用（需要处理部分初始化的状态）。
+	 *
+	 * 【示例】
+	 * static int my_suite_init(struct kunit_suite *suite)
+	 * {
+	 *     // 初始化全局测试数据
+	 *     global_test_data = kzalloc(sizeof(*global_test_data), GFP_KERNEL);
+	 *     if (!global_test_data)
+	 *         return -ENOMEM;
+	 *     return 0;
+	 * }
+	 */
+
 	void (*suite_exit)(struct kunit_suite *suite);
+	/* 套件清理函数（可选）
+	 *
+	 * 【调用时机】
+	 * 在运行完套件中的所有测试用例之后调用一次。
+	 *
+	 * 【函数签名】
+	 * void suite_exit(struct kunit_suite *suite)
+	 *
+	 * 【用途】
+	 * 清理 suite_init 分配的资源：
+	 * - 释放全局内存
+	 * - 关闭文件
+	 * - 恢复硬件状态
+	 *
+	 * 【重要】
+	 * 即使 suite_init 失败，suite_exit 也会被调用！
+	 * 必须能够处理部分初始化的状态。
+	 *
+	 * 【示例】
+	 * static void my_suite_exit(struct kunit_suite *suite)
+	 * {
+	 *     // 清理全局测试数据
+	 *     kfree(global_test_data);
+	 *     global_test_data = NULL;
+	 * }
+	 */
+
 	int (*init)(struct kunit *test);
+	/* 测试用例初始化函数（可选）
+	 *
+	 * 【调用时机】
+	 * 在每个测试用例运行之前调用。
+	 *
+	 * 【函数签名】
+	 * int init(struct kunit *test)
+	 *
+	 * 返回值：0=成功，负值=失败（跳过该测试用例）
+	 *
+	 * 【用途】
+	 * 为每个测试用例准备独立的环境：
+	 * - 分配测试特定的资源
+	 * - 初始化被测对象
+	 * - 设置测试前提条件
+	 *
+	 * 【test->priv 的使用】
+	 * 通常在 init 中分配上下文数据，存储到 test->priv，
+	 * 测试函数和 exit 可以通过 test->priv 访问。
+	 *
+	 * 【失败处理】
+	 * 如果 init 失败，测试用例被跳过，
+	 * 但 exit 仍然会被调用。
+	 *
+	 * 【示例】
+	 * struct my_test_context {
+	 *     struct list_head list;
+	 *     int test_value;
+	 * };
+	 *
+	 * static int my_init(struct kunit *test)
+	 * {
+	 *     struct my_test_context *ctx;
+	 *
+	 *     ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	 *     KUNIT_ASSERT_NOT_NULL(test, ctx);
+	 *
+	 *     INIT_LIST_HEAD(&ctx->list);
+	 *     ctx->test_value = 42;
+	 *     test->priv = ctx;
+	 *
+	 *     return 0;
+	 * }
+	 */
+
 	void (*exit)(struct kunit *test);
+	/* 测试用例清理函数（可选）
+	 *
+	 * 【调用时机】
+	 * 在每个测试用例运行之后调用。
+	 *
+	 * 【函数签名】
+	 * void exit(struct kunit *test)
+	 *
+	 * 【用途】
+	 * 清理 init 分配的资源：
+	 * - 释放内存
+	 * - 关闭文件
+	 * - 重置状态
+	 *
+	 * 【重要】
+	 * 即使 init 或测试函数失败，exit 也会被调用！
+	 *
+	 * 【KUnit 资源管理】
+	 * 使用 kunit_kzalloc、kunit_kmalloc 等分配的资源会自动释放，
+	 * 无需在 exit 中手动释放。只有手动分配的资源才需要在 exit 中清理。
+	 *
+	 * 【示例】
+	 * static void my_exit(struct kunit *test)
+	 * {
+	 *     struct my_test_context *ctx = test->priv;
+	 *     // kunit_kzalloc 分配的 ctx 会自动释放
+	 *     // 如果有手动分配的资源，在这里清理
+	 * }
+	 */
+
 	struct kunit_case *test_cases;
+	/* 测试用例数组
+	 *
+	 * 【格式】
+	 * 以 NULL 结尾的 kunit_case 数组。
+	 *
+	 * 【定义示例】
+	 * static struct kunit_case my_test_cases[] = {
+	 *     KUNIT_CASE(test_func1),
+	 *     KUNIT_CASE(test_func2),
+	 *     KUNIT_CASE_SLOW(test_slow_func),
+	 *     KUNIT_CASE_PARAM(test_param_func, gen_params),
+	 *     {}  // 终止符，必须有！
+	 * };
+	 */
+
 	struct kunit_attributes attr;
+	/* 套件属性
+	 *
+	 * 【当前支持的属性】
+	 * - speed: 套件的速度属性（影响所有测试用例）
+	 *
+	 * 【用途】
+	 * 为整个套件设置默认属性，单个测试用例可以覆盖。
+	 */
 
 	/* private: internal use only */
 	char status_comment[KUNIT_STATUS_COMMENT_SIZE];
+	/* 状态注释（内部使用）
+	 * 存储套件级别的诊断信息
+	 */
+
 	struct dentry *debugfs;
+	/* debugfs 目录项（内部使用）
+	 * /sys/kernel/debug/kunit/<suite_name>
+	 */
+
 	struct string_stream *log;
+	/* 日志流（内部使用）
+	 * 存储套件级别的日志消息
+	 */
+
 	int suite_init_err;
+	/* 套件初始化错误码（内部使用）
+	 * 记录 suite_init 的返回值
+	 */
+
 	bool is_init;
+	/* 是否已初始化标志（内部使用） */
 };
 
 /* Stores an array of suites, end points one past the end */
+/*
+ * 【结构体】kunit_suite_set - 存储套件数组
+ *
+ * 用于批量管理多个测试套件。
+ */
 struct kunit_suite_set {
 	struct kunit_suite * const *start;
+	/* 套件数组的起始指针 */
+
 	struct kunit_suite * const *end;
+	/* 套件数组的结束指针（指向最后一个元素之后） */
 };
 
 /* Stores the pointer to the parameter array and its metadata. */
+/*
+ * 【结构体】kunit_params - 存储参数数组及其元数据
+ */
 struct kunit_params {
 	/*
 	 * Reference to the parameter array for a parameterized test. This
@@ -301,10 +1051,30 @@ struct kunit_params {
 	 * parameterized test context struct kunit via kunit_register_params_array().
 	 */
 	const void *params;
+	/* 参数数组指针
+	 * 如果未通过 kunit_register_params_array() 注册，则为 NULL
+	 */
+
 	/* Reference to a function that gets the description of a parameter. */
 	void (*get_description)(struct kunit *test, const void *param, char *desc);
+	/* 获取参数描述的函数指针
+	 *
+	 * 【函数签名】
+	 * void get_description(struct kunit *test, const void *param, char *desc)
+	 *
+	 * @test:  测试上下文
+	 * @param: 当前参数
+	 * @desc:  输出参数描述（最大 KUNIT_PARAM_DESC_SIZE）
+	 *
+	 * 【用途】
+	 * 为 TAP 输出生成参数的可读描述
+	 */
+
 	size_t num_params;
+	/* 参数数量 */
+
 	size_t elem_size;
+	/* 每个参数的大小（字节）*/
 };
 
 /**
@@ -322,19 +1092,100 @@ struct kunit_params {
  * @params_array which can be used by the test writer to store arbitrary data,
  * access the parent context, and to store the parameter array, respectively.
  */
+/*
+ * 【结构体】kunit - 表示正在运行的测试实例
+ *
+ * 这是测试函数接收的主要参数，包含测试的所有上下文信息。
+ */
 struct kunit {
 	void *priv;
+	/* 用户私有数据指针
+	 *
+	 * 【用途】
+	 * 存储测试特定的上下文数据，通常在 init 函数中分配：
+	 * - 测试夹具（test fixture）
+	 * - 被测对象实例
+	 * - 共享的测试数据
+	 *
+	 * 【生命周期】
+	 * - init: 分配并初始化，存储到 test->priv
+	 * - 测试函数: 通过 test->priv 访问
+	 * - exit: 清理（如果未使用 KUnit 资源管理）
+	 *
+	 * 【示例】
+	 * struct my_context {
+	 *     struct device *dev;
+	 *     int test_value;
+	 * };
+	 *
+	 * static int my_init(struct kunit *test)
+	 * {
+	 *     struct my_context *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	 *     test->priv = ctx;
+	 *     return 0;
+	 * }
+	 *
+	 * static void test_something(struct kunit *test)
+	 * {
+	 *     struct my_context *ctx = test->priv;
+	 *     KUNIT_EXPECT_EQ(test, 42, ctx->test_value);
+	 * }
+	 */
+
 	struct kunit *parent;
+	/* 父测试上下文
+	 *
+	 * 【用途】
+	 * 访问父级测试的资源（在嵌套测试或参数化测试中）。
+	 *
+	 * 【使用场景】
+	 * - 子测试访问父测试的 priv 数据
+	 * - 共享父测试初始化的资源
+	 * - 层次化测试结构
+	 *
+	 * 【注意】
+	 * 对于顶层测试，parent 为 NULL。
+	 */
+
 	struct kunit_params params_array;
+	/* 参数数组（用于参数化测试）
+	 *
+	 * 【用途】
+	 * 存储通过 kunit_register_param_array() 注册的参数数组。
+	 */
 
 	/* private: internal use only. */
 	const char *name; /* Read only after initialization! */
+	/* 测试名称（内部使用，初始化后只读） */
+
 	struct string_stream *log; /* Points at case log after initialization */
+	/* 日志流（内部使用）
+	 * 指向测试用例的日志，初始化后设置
+	 */
+
 	struct kunit_try_catch try_catch;
+	/* try-catch 机制（内部使用）
+	 * 用于捕获测试中的异常（如段错误、panic）
+	 */
+
 	/* param_value is the current parameter value for a test case. */
 	const void *param_value;
+	/* 当前参数值（参数化测试中使用）
+	 *
+	 * 【访问方式】
+	 * 在参数化测试函数中：
+	 * const struct my_param *param = test->param_value;
+	 *
+	 * 【生命周期】
+	 * 每次参数化测试迭代时，KUnit 设置 param_value 为当前参数。
+	 */
+
 	/* param_index stores the index of the parameter in parameterized tests. */
 	int param_index;
+	/* 参数索引（参数化测试中使用）
+	 * 当前参数在参数数组中的索引（从 0 开始）
+	 */
+
 	/*
 	 * success starts as true, and may only be set to false during a
 	 * test case; thus, it is safe to update this across multiple
@@ -343,23 +1194,65 @@ struct kunit {
 	 * with the test case have terminated.
 	 */
 	spinlock_t lock; /* Guards all mutable test state. */
+	/* 自旋锁（内部使用）
+	 * 保护所有可变的测试状态
+	 *
+	 * 【并发安全】
+	 * 测试状态的更新使用 WRITE_ONCE 和此锁保护，
+	 * 支持多线程测试（虽然不常见）。
+	 */
+
 	enum kunit_status status; /* Read only after test_case finishes! */
+	/* 测试状态（内部使用）
+	 * SUCCESS, FAILURE, 或 SKIPPED
+	 *
+	 * 【注意】
+	 * 只有在测试用例完成后才能安全读取（所有线程终止后）
+	 */
+
 	/*
 	 * Because resources is a list that may be updated multiple times (with
 	 * new resources) from any thread associated with a test case, we must
 	 * protect it with some type of lock.
 	 */
 	struct list_head resources; /* Protected by lock. */
+	/* 资源链表（内部使用）
+	 * 存储测试分配的所有资源（通过 kunit_add_resource）
+	 *
+	 * 【资源管理】
+	 * KUnit 跟踪测试分配的资源，测试结束后自动释放：
+	 * - kunit_kzalloc/kunit_kmalloc 分配的内存
+	 * - 通过 kunit_add_resource 注册的自定义资源
+	 *
+	 * 【并发保护】
+	 * 由 lock 保护，因为资源可能从多个线程添加。
+	 */
 
 	char status_comment[KUNIT_STATUS_COMMENT_SIZE];
+	/* 状态注释（内部使用）
+	 * 存储测试失败或跳过的原因（诊断信息）
+	 */
+
 	/* Saves the last seen test. Useful to help with faults. */
 	struct kunit_loc last_seen;
+	/* 最后看到的位置（内部使用）
+	 * 用于故障诊断，记录最后一次断言的位置
+	 */
 };
 
 static inline void kunit_set_failure(struct kunit *test)
 {
 	WRITE_ONCE(test->status, KUNIT_FAILURE);
 }
+/* 设置测试失败状态
+ * @test: 测试上下文
+ *
+ * 【使用】
+ * 在自定义断言或测试辅助函数中标记测试失败。
+ *
+ * 【注意】
+ * 通常不需要手动调用，KUNIT_EXPECT_*/KUNIT_ASSERT_* 会自动设置。
+ */
 
 bool kunit_enabled(void);
 bool kunit_autorun(void);
