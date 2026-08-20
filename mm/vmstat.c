@@ -293,21 +293,68 @@ out:
 #endif /* CONFIG_PROC_FS */
 
 #ifdef CONFIG_VM_EVENT_COUNTERS
+/*
+ * ============================================================================
+ * 【VM 事件计数器（VM Event Counters）】
+ *
+ * VM 事件计数器跟踪内存管理子系统中的各种事件。
+ * 使用 per-CPU 变量以提高性能。
+ * ============================================================================
+ */
+
 DEFINE_PER_CPU(struct vm_event_state, vm_event_states) = {{0}};
 EXPORT_PER_CPU_SYMBOL(vm_event_states);
+/* Per-CPU VM 事件状态
+ *
+ * 【结构】
+ * struct vm_event_state {
+ *     unsigned long event[NR_VM_EVENT_ITEMS];
+ * };
+ *
+ * 【事件类型】
+ * - pgalloc_*: 页面分配事件（按 zone 类型）
+ * - pgfree: 页面释放事件
+ * - pgfault: 页面错误（缺页中断）
+ * - pgmajfault: 主页面错误（需要磁盘 I/O）
+ * - pgrefill: 页面重新填充到 LRU
+ * - pgscan_*: 页面扫描（用于回收）
+ * - pgsteal_*: 页面窃取（回收成功）
+ * - pswpin/pswpout: 页面交换进/出
+ * - 等等...
+ *
+ * 【Per-CPU 的好处】
+ * - 无锁更新：每个 CPU 只修改自己的计数器
+ * - 避免缓存行乒乓：不同 CPU 访问不同的缓存行
+ * - 高性能：内存管理路径上的开销最小化
+ */
 
+/*
+ * 【函数】sum_vm_events - 汇总所有 CPU 的 VM 事件计数器
+ * @ret: 输出数组，存储汇总后的事件计数
+ *
+ * 【工作内容】
+ * 1. 清零输出数组
+ * 2. 遍历所有在线 CPU
+ * 3. 累加每个事件的计数
+ *
+ * 【注意】
+ * 结果是近似值，可能在执行过程中变化（其他 CPU 继续更新）。
+ */
 static void sum_vm_events(unsigned long *ret)
 {
 	int cpu;
 	int i;
 
 	memset(ret, 0, NR_VM_EVENT_ITEMS * sizeof(unsigned long));
+	/* 清零输出数组 */
 
 	for_each_online_cpu(cpu) {
 		struct vm_event_state *this = &per_cpu(vm_event_states, cpu);
+		/* 获取该 CPU 的事件状态 */
 
 		for (i = 0; i < NR_VM_EVENT_ITEMS; i++)
 			ret[i] += this->event[i];
+		/* 累加所有事件类型 */
 	}
 }
 
@@ -316,13 +363,38 @@ static void sum_vm_events(unsigned long *ret)
  * The result is unavoidably approximate - it can change
  * during and after execution of this function.
 */
+/*
+ * 【函数】all_vm_events - 获取所有 CPU 的 VM 事件累计值
+ * @ret: 输出数组，存储累计的事件计数
+ *
+ * 【功能】
+ * 跨所有 CPU 累计 VM 事件计数器。
+ *
+ * 【注意】
+ * 结果不可避免地是近似值——在函数执行期间和之后可能会变化。
+ *
+ * 【CPU hotplug 保护】
+ * 使用 cpus_read_lock/unlock 防止 CPU 在统计过程中上线/下线。
+ *
+ * 【调用者】
+ * - /proc/vmstat 读取时
+ * - 内核内部需要查看全局统计时
+ */
 void all_vm_events(unsigned long *ret)
 {
 	cpus_read_lock();
+	/* 获取 CPU hotplug 读锁
+	 * 防止在统计过程中 CPU 上线或下线
+	 */
+
 	sum_vm_events(ret);
+	/* 汇总所有 CPU 的事件计数 */
+
 	cpus_read_unlock();
+	/* 释放 CPU hotplug 读锁 */
 }
 EXPORT_SYMBOL_GPL(all_vm_events);
+/* 导出符号，供模块使用（GPL 许可） */
 
 /*
  * Fold the foreign cpu events into our own.
@@ -330,14 +402,42 @@ EXPORT_SYMBOL_GPL(all_vm_events);
  * This is adding to the events on one processor
  * but keeps the global counts constant.
  */
+/*
+ * 【函数】vm_events_fold_cpu - 将外部 CPU 的事件合并到当前 CPU
+ * @cpu: 要合并的 CPU 编号
+ *
+ * 【功能】
+ * 将指定 CPU 的事件计数器折叠（fold）到全局计数器。
+ *
+ * 【使用场景】
+ * - CPU 下线前：将其事件计数转移到全局，避免丢失
+ * - 周期性合并：定期将 per-CPU 计数合并到全局
+ *
+ * 【工作原理】
+ * 1. 读取指定 CPU 的事件计数
+ * 2. 将计数添加到全局计数器（通过 count_vm_events）
+ * 3. 清零该 CPU 的计数
+ *
+ * 【保持不变性】
+ * 这是将事件从一个处理器转移到全局，
+ * 全局总计数保持不变。
+ */
 void vm_events_fold_cpu(int cpu)
 {
 	struct vm_event_state *fold_state = &per_cpu(vm_event_states, cpu);
+	/* 获取要折叠的 CPU 的事件状态 */
+
 	int i;
 
 	for (i = 0; i < NR_VM_EVENT_ITEMS; i++) {
 		count_vm_events(i, fold_state->event[i]);
+		/* 将该 CPU 的计数添加到全局
+		 * count_vm_events: 更新当前 CPU 的事件计数
+		 * （这会将计数分散到当前活动的 CPU 上）
+		 */
+
 		fold_state->event[i] = 0;
+		/* 清零原 CPU 的计数（已转移） */
 	}
 }
 
@@ -348,42 +448,182 @@ void vm_events_fold_cpu(int cpu)
  *
  * vm_stat contains the global counters
  */
+/*
+ * ============================================================================
+ * 【Zone 和 Node 全局计数器】
+ *
+ * 这些计数器跟踪内存区域（zone）和 NUMA 节点（node）级别的统计信息。
+ * ============================================================================
+ */
+
 atomic_long_t vm_zone_stat[NR_VM_ZONE_STAT_ITEMS] __cacheline_aligned_in_smp;
+/* Zone 级别的全局统计数组
+ *
+ * 【包含的统计项】
+ * - NR_FREE_PAGES: 空闲页面数
+ * - NR_ZONE_INACTIVE_ANON: 非活动匿名页面
+ * - NR_ZONE_ACTIVE_ANON: 活动匿名页面
+ * - NR_ZONE_INACTIVE_FILE: 非活动文件页面
+ * - NR_ZONE_ACTIVE_FILE: 活动文件页面
+ * - NR_ZONE_UNEVICTABLE: 不可回收页面
+ * - NR_ZONE_WRITE_PENDING: 待写回页面
+ * 等等...
+ *
+ * 【缓存行对齐】
+ * __cacheline_aligned_in_smp: 在 SMP 系统中对齐到缓存行边界，
+ * 避免伪共享（false sharing）提高性能。
+ *
+ * 【原子操作】
+ * 使用 atomic_long_t 支持无锁的原子更新。
+ */
+
 atomic_long_t vm_node_stat[NR_VM_NODE_STAT_ITEMS] __cacheline_aligned_in_smp;
+/* Node 级别的全局统计数组
+ *
+ * 【包含的统计项】
+ * - NR_INACTIVE_ANON: 节点级非活动匿名页面
+ * - NR_ACTIVE_ANON: 节点级活动匿名页面
+ * - NR_INACTIVE_FILE: 节点级非活动文件页面
+ * - NR_ACTIVE_FILE: 节点级活动文件页面
+ * - NR_UNEVICTABLE: 节点级不可回收页面
+ * - NR_SLAB_RECLAIMABLE: 可回收的 slab 页面
+ * - NR_SLAB_UNRECLAIMABLE: 不可回收的 slab 页面
+ * - NR_ISOLATED_ANON: 隔离的匿名页面
+ * - NR_ISOLATED_FILE: 隔离的文件页面
+ * - NR_PAGES_SCANNED: 扫描的页面数
+ * - WORKINGSET_*: 工作集相关统计
+ * 等等...
+ *
+ * 【Zone vs Node】
+ * - Zone 统计：特定内存区域的统计（DMA, DMA32, Normal, Movable）
+ * - Node 统计：NUMA 节点级别的统计（跨该节点的所有 zone）
+ */
+
 atomic_long_t vm_numa_event[NR_VM_NUMA_EVENT_ITEMS] __cacheline_aligned_in_smp;
+/* 全局 NUMA 事件计数器数组
+ *
+ * 【包含的事件】
+ * - NUMA_HIT: 本地节点分配成功
+ * - NUMA_MISS: 请求本地但实际分配在远程
+ * - NUMA_FOREIGN: 其他节点请求本节点
+ * - NUMA_INTERLEAVE_HIT: 交错策略分配成功
+ * - NUMA_LOCAL: 本地 CPU 本地节点分配
+ * - NUMA_OTHER: 本地 CPU 远程节点分配
+ */
+
 EXPORT_SYMBOL(vm_zone_stat);
 EXPORT_SYMBOL(vm_node_stat);
+/* 导出符号，供模块访问统计数据 */
 
 #ifdef CONFIG_NUMA
+/*
+ * 【函数】fold_vm_zone_numa_events - 折叠指定 zone 的 NUMA 事件
+ * @zone: 要折叠的内存区域
+ *
+ * 【功能】
+ * 将该 zone 在所有 CPU 上的 per-CPU NUMA 事件计数器合并到全局。
+ *
+ * 【工作流程】
+ * 1. 创建临时数组累计所有 CPU 的 NUMA 事件
+ * 2. 遍历所有在线 CPU
+ * 3. 使用 xchg 原子交换读取并清零每个 CPU 的计数
+ * 4. 将累计值添加到全局 NUMA 事件计数器
+ *
+ * 【xchg 的作用】
+ * - 原子操作：读取并清零在一个操作中完成
+ * - 避免竞态：保证不会丢失计数
+ * - 性能考虑：避免锁的开销
+ */
 static void fold_vm_zone_numa_events(struct zone *zone)
 {
 	unsigned long zone_numa_events[NR_VM_NUMA_EVENT_ITEMS] = { 0, };
+	/* 临时数组，用于累计该 zone 的 NUMA 事件 */
+
 	int cpu;
 	enum numa_stat_item item;
 
 	for_each_online_cpu(cpu) {
 		struct per_cpu_zonestat *pzstats;
+		/* per-CPU zone 统计结构 */
 
 		pzstats = per_cpu_ptr(zone->per_cpu_zonestats, cpu);
+		/* 获取该 CPU 在此 zone 的统计数据指针 */
+
 		for (item = 0; item < NR_VM_NUMA_EVENT_ITEMS; item++)
 			zone_numa_events[item] += xchg(&pzstats->vm_numa_event[item], 0);
+		/* 原子交换：读取当前值并设为 0
+		 * 累加到临时数组中
+		 */
 	}
 
 	for (item = 0; item < NR_VM_NUMA_EVENT_ITEMS; item++)
 		zone_numa_event_add(zone_numa_events[item], zone, item);
+	/* 将累计的事件添加到全局 NUMA 事件计数器 */
 }
 
+/*
+ * 【函数】fold_vm_numa_events - 折叠所有 zone 的 NUMA 事件
+ *
+ * 【功能】
+ * 遍历所有已填充（populated）的 zone，将其 NUMA 事件合并到全局。
+ *
+ * 【调用时机】
+ * - 周期性统计刷新
+ * - /proc/vmstat 读取前
+ * - 需要准确 NUMA 统计信息时
+ *
+ * 【为什么只处理 populated zone】
+ * 空的 zone 没有内存页面，不会产生 NUMA 事件。
+ */
 void fold_vm_numa_events(void)
 {
 	struct zone *zone;
 
 	for_each_populated_zone(zone)
 		fold_vm_zone_numa_events(zone);
+	/* 遍历每个已填充的 zone 并折叠其 NUMA 事件 */
 }
 #endif
 
 #ifdef CONFIG_SMP
 
+/*
+ * ============================================================================
+ * 【阈值计算（Threshold Calculation）】
+ *
+ * vmstat 使用阈值机制来平衡准确性和性能：
+ * - per-CPU 计数器累积变化
+ * - 当变化超过阈值时，才同步到全局计数器
+ * - 阈值根据系统配置动态计算
+ * ============================================================================
+ */
+
+/*
+ * 【函数】calculate_pressure_threshold - 计算压力阈值
+ * @zone: 内存区域
+ * @return: 压力阈值（页面数）
+ *
+ * 【功能】
+ * 计算用于内存压力检测的阈值。
+ *
+ * 【设计考虑】
+ * vmstat 不是实时更新的，估计值和实际值之间存在漂移（drift）。
+ * 对于高阈值和大量 CPU 的系统，即使估计值看起来正常，
+ * 最小水位线（min watermark）也可能被突破。
+ *
+ * 【压力阈值的作用】
+ * 这是一个减小的阈值，即使最大漂移量也不会意外突破最小水位线。
+ *
+ * 【计算公式】
+ * threshold = (low_wmark - min_wmark) / num_online_cpus()
+ * - 基于水位线距离（watermark distance）
+ * - 除以 CPU 数量：更多 CPU = 更大的潜在漂移
+ * - 至少为 1，最多为 125
+ *
+ * 【为什么需要压力阈值】
+ * 当内存接近最小水位线时，需要更保守的阈值，
+ * 以便及时触发内存回收，防止分配失败。
+ */
 int calculate_pressure_threshold(struct zone *zone)
 {
 	int threshold;
@@ -397,21 +637,75 @@ int calculate_pressure_threshold(struct zone *zone)
 	 * that even the maximum amount of drift will not accidentally breach
 	 * the min watermark
 	 */
+	/*
+	 * 由于 vmstat 不是实时的，估计值和实际值之间存在漂移。
+	 * 对于高阈值和大量 CPU，当估计值看起来正常时，
+	 * 最小水位线可能已被突破。压力阈值是一个减小的值，
+	 * 即使最大漂移量也不会意外突破最小水位线。
+	 */
+
 	watermark_distance = low_wmark_pages(zone) - min_wmark_pages(zone);
+	/* 计算低水位和最小水位之间的距离（页面数）
+	 * 这是内存压力的"缓冲区"
+	 */
+
 	threshold = max(1, (int)(watermark_distance / num_online_cpus()));
+	/* 阈值 = 水位距离 / CPU 数量
+	 * 每个 CPU 可能独立地导致漂移，所以要除以 CPU 数
+	 * 至少为 1 页，避免阈值为 0
+	 */
 
 	/*
 	 * Maximum threshold is 125
+	 */
+	/*
+	 * 最大阈值是 125
+	 * （经验值，平衡性能和响应性）
 	 */
 	threshold = min(125, threshold);
 
 	return threshold;
 }
 
+/*
+ * 【函数】calculate_normal_threshold - 计算正常阈值
+ * @zone: 内存区域
+ * @return: 正常阈值（页面数）
+ *
+ * 【功能】
+ * 计算 per-CPU 计数器的正常同步阈值。
+ *
+ * 【阈值缩放规则】
+ * 阈值根据处理器数量和每个 zone 的内存量进行缩放：
+ * - 更多内存：可以延迟更新更长时间
+ * - 更多处理器：可能导致更多竞争
+ *
+ * 【fls() 函数】
+ * fls (find last set) 用于廉价的对数缩放。
+ * fls(x) 返回 x 中最高位 1 的位置（从 1 开始）。
+ * 例如：fls(1)=1, fls(2)=2, fls(4)=3, fls(8)=4
+ *
+ * 【计算公式】
+ * threshold = 2 * fls(num_online_cpus) * (1 + fls(mem))
+ * 其中 mem = zone_managed_pages >> (27 - PAGE_SHIFT)
+ *       （内存大小，以 128MB 为单位）
+ *
+ * 【阈值示例】（见下表）
+ * 展示了不同 CPU 数量和内存大小下的阈值：
+ * - 少量内存 + 少量 CPU：小阈值（如 4-10）
+ * - 大量内存 + 大量 CPU：大阈值（如 108-125）
+ * - 最大阈值限制为 125
+ *
+ * 【为什么需要动态阈值】
+ * 1. 小系统：低阈值保证统计准确性
+ * 2. 大系统：高阈值减少全局计数器竞争，提高性能
+ * 3. 对数缩放：避免阈值增长过快
+ */
 int calculate_normal_threshold(struct zone *zone)
 {
 	int threshold;
 	int mem;	/* memory in 128 MB units */
+	            /* 内存大小，以 128MB 为单位 */
 
 	/*
 	 * The threshold scales with the number of processors and the amount
@@ -442,13 +736,50 @@ int calculate_normal_threshold(struct zone *zone)
 	 * 125		1024		10	8-16 GB		8
 	 * 125		1024		10	16-32 GB	9
 	 */
+	/*
+	 * 阈值根据处理器数量和每个 zone 的内存量进行缩放。
+	 * 更多内存意味着我们可以延迟更新更长时间，
+	 * 更多处理器可能导致更多竞争。
+	 * fls() 用于廉价的对数缩放。
+	 *
+	 * 阈值示例表格（见上）：
+	 * 列说明：
+	 * - Threshold: 计算出的阈值
+	 * - Processors: CPU 数量
+	 * - (fls): fls(num_online_cpus) 的值
+	 * - Zonesize: zone 的内存大小
+	 * - fls(mem)+1: fls(mem)+1 的值
+	 */
 
 	mem = zone_managed_pages(zone) >> (27 - PAGE_SHIFT);
+	/* 将 zone 管理的页面数转换为 128MB 单位
+	 * 27 = log2(128MB) = log2(128*1024*1024) = log2(2^27)
+	 * >> (27 - PAGE_SHIFT): 右移得到以 128MB 为单位的内存大小
+	 *
+	 * 例如（PAGE_SHIFT = 12，即 4KB 页面）：
+	 * - 1GB = 262144 页
+	 * - >> (27-12) = >> 15 = 8（即 8 个 128MB 单位）
+	 */
 
 	threshold = 2 * fls(num_online_cpus()) * (1 + fls(mem));
+	/* 阈值计算公式：
+	 * 2 * fls(CPU数) * (1 + fls(内存/128MB))
+	 *
+	 * 示例计算：
+	 * - 2 个 CPU, 1GB 内存:
+	 *   fls(2)=2, mem=8, fls(8)=4
+	 *   threshold = 2 * 2 * (1+4) = 20
+	 * - 64 个 CPU, 4GB 内存:
+	 *   fls(64)=7, mem=32, fls(32)=6
+	 *   threshold = 2 * 7 * (1+6) = 98
+	 */
 
 	/*
 	 * Maximum threshold is 125
+	 */
+	/*
+	 * 最大阈值是 125
+	 * 限制阈值上限，避免过大的漂移
 	 */
 	threshold = min(125, threshold);
 
@@ -458,6 +789,29 @@ int calculate_normal_threshold(struct zone *zone)
 /*
  * Refresh the thresholds for each zone.
  */
+/*
+ * 【函数】refresh_zone_stat_thresholds - 刷新每个 zone 的阈值
+ *
+ * 【功能】
+ * 重新计算并设置所有 zone 和 node 的统计阈值。
+ *
+ * 【调用时机】
+ * - 系统初始化时
+ * - CPU 热插拔事件（上线/下线）
+ * - 内存热插拔事件
+ * - 系统配置变化时
+ *
+ * 【工作流程】
+ * 1. 清零所有 node 的阈值
+ * 2. 遍历所有已填充的 zone
+ * 3. 为每个 zone 计算正常阈值
+ * 4. 设置每个 CPU 的 zone 和 node 阈值
+ * 5. 计算并设置 percpu_drift_mark（漂移标记）
+ *
+ * 【percpu_drift_mark 的含义】
+ * 这是一个危险水位线，当空闲页面数低于此值时，
+ * 表示 per-CPU 计数器的漂移可能导致最小水位线被突破。
+ */
 void refresh_zone_stat_thresholds(void)
 {
 	struct pglist_data *pgdat;
@@ -466,28 +820,45 @@ void refresh_zone_stat_thresholds(void)
 	int threshold;
 
 	/* Zero current pgdat thresholds */
+	/* 清零当前 pgdat（node）的阈值 */
 	for_each_online_pgdat(pgdat) {
+		/* 遍历所有在线的 NUMA 节点 */
+
 		for_each_online_cpu(cpu) {
 			per_cpu_ptr(pgdat->per_cpu_nodestats, cpu)->stat_threshold = 0;
+			/* 将该节点在每个 CPU 上的统计阈值设为 0 */
 		}
 	}
 
 	for_each_populated_zone(zone) {
+		/* 遍历所有已填充的内存区域 */
+
 		struct pglist_data *pgdat = zone->zone_pgdat;
+		/* 获取该 zone 所属的 NUMA 节点 */
+
 		unsigned long max_drift, tolerate_drift;
 
 		threshold = calculate_normal_threshold(zone);
+		/* 计算该 zone 的正常阈值 */
 
 		for_each_online_cpu(cpu) {
 			int pgdat_threshold;
 
 			per_cpu_ptr(zone->per_cpu_zonestats, cpu)->stat_threshold
 							= threshold;
+			/* 设置该 zone 在每个 CPU 上的统计阈值 */
 
 			/* Base nodestat threshold on the largest populated zone. */
+			/* 节点统计阈值基于最大的已填充 zone */
 			pgdat_threshold = per_cpu_ptr(pgdat->per_cpu_nodestats, cpu)->stat_threshold;
+			/* 获取当前节点阈值 */
+
 			per_cpu_ptr(pgdat->per_cpu_nodestats, cpu)->stat_threshold
 				= max(threshold, pgdat_threshold);
+			/* 节点阈值取所有 zone 阈值的最大值
+			 * 原因：节点级统计是所有 zone 的聚合，
+			 * 需要使用最大 zone 的阈值来保证准确性
+			 */
 		}
 
 		/*
@@ -495,14 +866,57 @@ void refresh_zone_stat_thresholds(void)
 		 * NR_FREE_PAGES reports the low watermark is ok when in fact
 		 * the min watermark could be breached by an allocation
 		 */
+		/*
+		 * 仅当存在危险时才设置 percpu_drift_mark：
+		 * 即 NR_FREE_PAGES 报告低水位线正常，
+		 * 但实际上最小水位线可能被分配突破。
+		 */
 		tolerate_drift = low_wmark_pages(zone) - min_wmark_pages(zone);
+		/* 可容忍的漂移量 = 低水位 - 最小水位
+		 * 这是"安全缓冲区"的大小
+		 */
+
 		max_drift = num_online_cpus() * threshold;
+		/* 最大漂移量 = CPU数 × 阈值
+		 * 每个 CPU 的 per-CPU 计数器最多可能漂移 threshold 页
+		 * 所有 CPU 的总漂移 = CPU数 × threshold
+		 */
+
 		if (max_drift > tolerate_drift)
 			zone->percpu_drift_mark = high_wmark_pages(zone) +
 					max_drift;
+		/* 如果最大漂移超过可容忍范围：
+		 * 设置漂移标记 = 高水位 + 最大漂移
+		 *
+		 * 【解释】
+		 * 当空闲页面降到 percpu_drift_mark 以下时，
+		 * 即使考虑最坏情况的漂移（所有 per-CPU 计数器都未同步），
+		 * 实际空闲页面也可能低于最小水位线。
+		 * 此时需要强制同步 per-CPU 计数器。
+		 *
+		 * 【为什么加上 high_wmark】
+		 * 在高水位线以上时系统是安全的，
+		 * 加上 max_drift 确保即使有最大漂移也不会破坏最小水位线。
+		 */
 	}
 }
 
+/*
+ * 【函数】set_pgdat_percpu_threshold - 设置 node 的 per-CPU 阈值
+ * @pgdat: NUMA 节点
+ * @calculate_pressure: 压力阈值计算函数指针
+ *
+ * 【功能】
+ * 为指定节点的所有 zone 设置基于压力的 per-CPU 阈值。
+ *
+ * 【使用场景】
+ * 当系统内存压力增大时，需要降低阈值以提高统计准确性，
+ * 从而更及时地触发内存回收。
+ *
+ * 【calculate_pressure 函数】
+ * 通常是 calculate_pressure_threshold，
+ * 计算比正常阈值更小的压力阈值。
+ */
 void set_pgdat_percpu_threshold(pg_data_t *pgdat,
 				int (*calculate_pressure)(struct zone *))
 {
@@ -512,27 +926,77 @@ void set_pgdat_percpu_threshold(pg_data_t *pgdat,
 	int i;
 
 	for (i = 0; i < pgdat->nr_zones; i++) {
+		/* 遍历该节点的所有 zone */
+
 		zone = &pgdat->node_zones[i];
 		if (!zone->percpu_drift_mark)
 			continue;
+		/* 跳过没有设置漂移标记的 zone
+		 * （说明该 zone 的漂移不是问题）
+		 */
 
 		threshold = (*calculate_pressure)(zone);
+		/* 使用压力计算函数计算该 zone 的阈值 */
+
 		for_each_online_cpu(cpu)
 			per_cpu_ptr(zone->per_cpu_zonestats, cpu)->stat_threshold
 							= threshold;
+		/* 为每个在线 CPU 设置该 zone 的阈值 */
 	}
 }
+
+/*
+ * ============================================================================
+ * 【Per-CPU 统计更新函数】
+ *
+ * 这些函数用于更新 per-CPU 统计计数器。
+ * 它们实现了差分（differential）机制：
+ * - 变化累积在 per-CPU 计数器中
+ * - 当累积值超过阈值时，同步到全局计数器
+ * ============================================================================
+ */
 
 /*
  * For use when we know that interrupts are disabled,
  * or when we know that preemption is disabled and that
  * particular counter cannot be updated from interrupt context.
  */
+/*
+ * 【函数】__mod_zone_page_state - 修改 zone 页面状态计数器
+ * @zone: 内存区域
+ * @item: 统计项
+ * @delta: 变化量（可正可负）
+ *
+ * 【使用场景】
+ * 当我们知道中断已禁用，或者我们知道抢占已禁用且
+ * 特定计数器不能从中断上下文更新时使用。
+ *
+ * 【差分机制】
+ * 1. 将 delta 加到 per-CPU 差分计数器
+ * 2. 如果差分的绝对值超过阈值，同步到全局
+ * 3. 否则保留在 per-CPU 计数器中
+ *
+ * 【为什么需要 RMW（Read-Modify-Write）】
+ * 准确的 vmstat 更新需要原子的读-改-写操作。
+ *
+ * 【不同内核的原子性保证】
+ * - 非 PREEMPT_RT 内核：通过禁用 IRQ 提供原子性
+ *   （显式禁用或通过 local_lock_irq）
+ * - PREEMPT_RT 内核：local_lock_irq 只禁用 CPU 迁移，
+ *   抢占可能破坏计数器，因此需要禁用抢占。
+ */
 void __mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
 			   long delta)
 {
 	struct per_cpu_zonestat __percpu *pcp = zone->per_cpu_zonestats;
+	/* 获取该 zone 的 per-CPU 统计结构 */
+
 	s8 __percpu *p = pcp->vm_stat_diff + item;
+	/* 获取该统计项的差分计数器指针
+	 * s8: 8 位有符号整数，范围 -128 到 +127
+	 * 足够存储阈值范围内的差分值
+	 */
+
 	long x;
 	long t;
 
@@ -543,42 +1007,101 @@ void __mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
 	 * CPU migrations and preemption potentially corrupts a counter so
 	 * disable preemption.
 	 */
+	/*
+	 * 准确的 vmstat 更新需要 RMW（读-改-写）。
+	 * 在非 PREEMPT_RT 内核上，原子性由禁用 IRQ 提供
+	 * （显式禁用或通过 local_lock_irq）。
+	 * 在 PREEMPT_RT 上，local_lock_irq 只禁用 CPU 迁移，
+	 * 抢占可能破坏计数器，因此需要禁用抢占。
+	 */
 	preempt_disable_nested();
+	/* 禁用抢占（嵌套版本，支持多层禁用）
+	 * 确保在操作期间不会被抢占到其他 CPU
+	 */
 
 	x = delta + __this_cpu_read(*p);
+	/* 读取当前 CPU 的差分计数器并加上新的变化量
+	 * __this_cpu_read: 快速访问当前 CPU 的 per-CPU 变量
+	 * 不需要禁用抢占（我们已经禁用了）
+	 */
 
 	t = __this_cpu_read(pcp->stat_threshold);
+	/* 读取当前 CPU 的阈值 */
 
 	if (unlikely(abs(x) > t)) {
+		/* 如果差分的绝对值超过阈值 */
+
 		zone_page_state_add(x, zone, item);
+		/* 将累积的差分值添加到全局计数器
+		 * 这是一个原子操作，更新 zone 的全局统计
+		 */
+
 		x = 0;
+		/* 重置差分计数器为 0（已同步到全局） */
 	}
 	__this_cpu_write(*p, x);
+	/* 写回差分计数器
+	 * 如果未超过阈值，x 保留累积值
+	 * 如果已同步，x 为 0
+	 */
 
 	preempt_enable_nested();
+	/* 恢复抢占 */
 }
 EXPORT_SYMBOL(__mod_zone_page_state);
+/* 导出符号，供内核其他部分使用 */
 
+/*
+ * 【函数】__mod_node_page_state - 修改 node 页面状态计数器
+ * @pgdat: NUMA 节点
+ * @item: 统计项
+ * @delta: 变化量
+ *
+ * 【功能】
+ * 类似 __mod_zone_page_state，但操作节点级别的统计。
+ *
+ * 【特殊处理：字节单位的统计项】
+ * 某些统计项以字节为单位（如 cgroup 的子页面统计）。
+ * 在全局级别，这些项仍以整页为单位变化。
+ * 内部以页面为单位存储，保持 per-CPU 计数器紧凑。
+ */
 void __mod_node_page_state(struct pglist_data *pgdat, enum node_stat_item item,
 				long delta)
 {
 	struct per_cpu_nodestat __percpu *pcp = pgdat->per_cpu_nodestats;
+	/* 获取该节点的 per-CPU 统计结构 */
+
 	s8 __percpu *p = pcp->vm_node_stat_diff + item;
+	/* 获取该统计项的差分计数器指针 */
+
 	long x;
 	long t;
 
 	if (vmstat_item_in_bytes(item)) {
+		/* 如果该统计项以字节为单位 */
+
 		/*
 		 * Only cgroups use subpage accounting right now; at
 		 * the global level, these items still change in
 		 * multiples of whole pages. Store them as pages
 		 * internally to keep the per-cpu counters compact.
 		 */
+		/*
+		 * 目前只有 cgroup 使用子页面统计；
+		 * 在全局级别，这些项仍以整页的倍数变化。
+		 * 内部以页面为单位存储，保持 per-CPU 计数器紧凑。
+		 */
 		VM_WARN_ON_ONCE(delta & (PAGE_SIZE - 1));
+		/* 警告：delta 应该是 PAGE_SIZE 的倍数
+		 * (delta & (PAGE_SIZE - 1)) 检查是否有余数
+		 */
+
 		delta >>= PAGE_SHIFT;
+		/* 转换为页面数：delta / PAGE_SIZE */
 	}
 
 	/* See __mod_zone_page_state() */
+	/* 参见 __mod_zone_page_state() */
 	preempt_disable_nested();
 
 	x = delta + __this_cpu_read(*p);
@@ -587,6 +1110,7 @@ void __mod_node_page_state(struct pglist_data *pgdat, enum node_stat_item item,
 
 	if (unlikely(abs(x) > t)) {
 		node_page_state_add(x, pgdat, item);
+		/* 同步到节点的全局计数器 */
 		x = 0;
 	}
 	__this_cpu_write(*p, x);
@@ -618,27 +1142,101 @@ EXPORT_SYMBOL(__mod_node_page_state);
  * in between and therefore the atomicity vs. interrupt cannot be exploited
  * in a useful way here.
  */
+/*
+ * ============================================================================
+ * 【优化的递增/递减函数】
+ *
+ * 这些函数针对单页操作进行了优化。
+ *
+ * 【优化点】
+ * 1. 只处理单页：可以接受 struct page * 参数而不是 struct zone *
+ *    允许编译器内联 page_zone(page) 的代码
+ * 2. 无需溢出检查：递增/递减量已知（±1），
+ *    可以省略一个边界检查
+ * 3. 允许编译器生成更好的代码
+ *
+ * 【性能敏感】
+ * 注意：这些函数对性能非常敏感。只能小心修改。
+ *
+ * 【为什么不能利用原子 inc/dec 指令】
+ * 某些处理器有对中断原子的 inc/dec 指令。
+ * 然而，代码必须首先根据处理器编号确定 zone 中的差分位置，
+ * 然后再 inc/dec 计数器。
+ * 如果不禁用抢占，无法保证处理器在此期间不会改变，
+ * 因此无法有效利用对中断的原子性。
+ * ============================================================================
+ */
+
+/*
+ * 【函数】__inc_zone_state - 递增 zone 状态计数器
+ * @zone: 内存区域
+ * @item: 统计项
+ *
+ * 【优化】
+ * 专门针对递增 1 页的情况优化。
+ *
+ * 【overstep（过冲）机制】
+ * 当差分值刚超过阈值时，不是清零，而是设为负的 overstep。
+ * 这样下次更新时可以直接累加，减少同步频率。
+ *
+ * 【为什么 overstep = t >> 1】
+ * 过冲值为阈值的一半，这样：
+ * - 实际同步的值 = v + overstep（略多于阈值）
+ * - 差分计数器 = -overstep（负值）
+ * - 下次更新时从负值开始，需要更多递增才会再次超过阈值
+ * 这减少了同步频率，提高性能。
+ */
 void __inc_zone_state(struct zone *zone, enum zone_stat_item item)
 {
 	struct per_cpu_zonestat __percpu *pcp = zone->per_cpu_zonestats;
 	s8 __percpu *p = pcp->vm_stat_diff + item;
 	s8 v, t;
+	/* s8: 8 位有符号整数，适合存储差分值和阈值 */
 
 	/* See __mod_zone_page_state() */
+	/* 参见 __mod_zone_page_state() */
 	preempt_disable_nested();
 
 	v = __this_cpu_inc_return(*p);
+	/* 原子递增并返回新值
+	 * 相当于 ++(*p) 但针对 per-CPU 变量优化
+	 */
+
 	t = __this_cpu_read(pcp->stat_threshold);
+	/* 读取阈值 */
+
 	if (unlikely(v > t)) {
+		/* 如果新值超过阈值（注意：只检查正向超过） */
+
 		s8 overstep = t >> 1;
+		/* 过冲值 = 阈值 / 2 */
 
 		zone_page_state_add(v + overstep, zone, item);
+		/* 同步到全局：实际值 + 过冲值
+		 * 这样会多同步一些，为下次更新留出空间
+		 */
+
 		__this_cpu_write(*p, -overstep);
+		/* 差分计数器设为负的过冲值
+		 * 下次递增时会从负值开始累加
+		 * 需要更多次递增才会再次超过阈值
+		 */
 	}
 
 	preempt_enable_nested();
 }
 
+/*
+ * 【函数】__inc_node_state - 递增 node 状态计数器
+ * @pgdat: NUMA 节点
+ * @item: 统计项
+ *
+ * 【功能】
+ * 类似 __inc_zone_state，但操作节点级别的统计。
+ *
+ * 【限制】
+ * 不支持以字节为单位的统计项（会发出警告）。
+ */
 void __inc_node_state(struct pglist_data *pgdat, enum node_stat_item item)
 {
 	struct per_cpu_nodestat __percpu *pcp = pgdat->per_cpu_nodestats;
@@ -646,8 +1244,12 @@ void __inc_node_state(struct pglist_data *pgdat, enum node_stat_item item)
 	s8 v, t;
 
 	VM_WARN_ON_ONCE(vmstat_item_in_bytes(item));
+	/* 警告：此函数不应用于字节单位的统计项
+	 * 因为递增 1 对于字节单位的项没有意义
+	 */
 
 	/* See __mod_zone_page_state() */
+	/* 参见 __mod_zone_page_state() */
 	preempt_disable_nested();
 
 	v = __this_cpu_inc_return(*p);
@@ -662,18 +1264,50 @@ void __inc_node_state(struct pglist_data *pgdat, enum node_stat_item item)
 	preempt_enable_nested();
 }
 
+/*
+ * 【函数】__inc_zone_page_state - 递增页面所属 zone 的状态计数器
+ * @page: 页面
+ * @item: 统计项
+ *
+ * 【功能】
+ * 便利函数，根据页面自动确定所属 zone 并递增计数器。
+ */
 void __inc_zone_page_state(struct page *page, enum zone_stat_item item)
 {
 	__inc_zone_state(page_zone(page), item);
+	/* page_zone(page): 获取页面所属的 zone */
 }
 EXPORT_SYMBOL(__inc_zone_page_state);
 
+/*
+ * 【函数】__inc_node_page_state - 递增页面所属 node 的状态计数器
+ * @page: 页面
+ * @item: 统计项
+ *
+ * 【功能】
+ * 便利函数，根据页面自动确定所属 node 并递增计数器。
+ */
 void __inc_node_page_state(struct page *page, enum node_stat_item item)
 {
 	__inc_node_state(page_pgdat(page), item);
+	/* page_pgdat(page): 获取页面所属的 NUMA 节点 */
 }
 EXPORT_SYMBOL(__inc_node_page_state);
 
+/*
+ * 【函数】__dec_zone_state - 递减 zone 状态计数器
+ * @zone: 内存区域
+ * @item: 统计项
+ *
+ * 【功能】
+ * 专门针对递减 1 页的情况优化。
+ *
+ * 【负向 overstep】
+ * 当差分值变得太负（< -t）时：
+ * - 同步到全局：v - overstep（更负的值）
+ * - 差分计数器设为正的 overstep
+ * - 下次递减时从正值开始，需要更多递减才会再次超过阈值
+ */
 void __dec_zone_state(struct zone *zone, enum zone_stat_item item)
 {
 	struct per_cpu_zonestat __percpu *pcp = zone->per_cpu_zonestats;
@@ -681,20 +1315,42 @@ void __dec_zone_state(struct zone *zone, enum zone_stat_item item)
 	s8 v, t;
 
 	/* See __mod_zone_page_state() */
+	/* 参见 __mod_zone_page_state() */
 	preempt_disable_nested();
 
 	v = __this_cpu_dec_return(*p);
+	/* 原子递减并返回新值 */
+
 	t = __this_cpu_read(pcp->stat_threshold);
+
 	if (unlikely(v < - t)) {
+		/* 如果新值小于负阈值（太负了） */
+
 		s8 overstep = t >> 1;
+		/* 过冲值 = 阈值 / 2 */
 
 		zone_page_state_add(v - overstep, zone, item);
+		/* 同步到全局：v - overstep（更负）
+		 * 多同步一些负值
+		 */
+
 		__this_cpu_write(*p, overstep);
+		/* 差分计数器设为正的过冲值
+		 * 下次递减时从正值开始
+		 */
 	}
 
 	preempt_enable_nested();
 }
 
+/*
+ * 【函数】__dec_node_state - 递减 node 状态计数器
+ * @pgdat: NUMA 节点
+ * @item: 统计项
+ *
+ * 【功能】
+ * 类似 __dec_zone_state，但操作节点级别的统计。
+ */
 void __dec_node_state(struct pglist_data *pgdat, enum node_stat_item item)
 {
 	struct per_cpu_nodestat __percpu *pcp = pgdat->per_cpu_nodestats;
@@ -702,6 +1358,7 @@ void __dec_node_state(struct pglist_data *pgdat, enum node_stat_item item)
 	s8 v, t;
 
 	VM_WARN_ON_ONCE(vmstat_item_in_bytes(item));
+	/* 不支持字节单位的统计项 */
 
 	/* See __mod_zone_page_state() */
 	preempt_disable_nested();
@@ -718,12 +1375,22 @@ void __dec_node_state(struct pglist_data *pgdat, enum node_stat_item item)
 	preempt_enable_nested();
 }
 
+/*
+ * 【函数】__dec_zone_page_state - 递减页面所属 zone 的状态计数器
+ * @page: 页面
+ * @item: 统计项
+ */
 void __dec_zone_page_state(struct page *page, enum zone_stat_item item)
 {
 	__dec_zone_state(page_zone(page), item);
 }
 EXPORT_SYMBOL(__dec_zone_page_state);
 
+/*
+ * 【函数】__dec_node_page_state - 递减页面所属 node 的状态计数器
+ * @page: 页面
+ * @item: 统计项
+ */
 void __dec_node_page_state(struct page *page, enum node_stat_item item)
 {
 	__dec_node_state(page_pgdat(page), item);
@@ -731,6 +1398,15 @@ void __dec_node_page_state(struct page *page, enum node_stat_item item)
 EXPORT_SYMBOL(__dec_node_page_state);
 
 #ifdef CONFIG_HAVE_CMPXCHG_LOCAL
+/*
+ * ============================================================================
+ * 【基于 CMPXCHG 的优化版本】
+ *
+ * 如果硬件支持 cmpxchg_local，可以避免 local_irq_save/restore 的开销。
+ * 使用 this_cpu_try_cmpxchg() 实现无锁的统计更新。
+ * ============================================================================
+ */
+
 /*
  * If we have cmpxchg_local support then we do not need to incur the overhead
  * that comes with local_irq_save/restore if we use this_cpu_try_cmpxchg().
@@ -743,6 +1419,37 @@ EXPORT_SYMBOL(__dec_node_page_state);
  *     1       Overstepping half of threshold
  *     -1      Overstepping minus half of threshold
 */
+/*
+ * 如果我们有 cmpxchg_local 支持，
+ * 使用 this_cpu_try_cmpxchg() 就不需要承担
+ * local_irq_save/restore 的开销。
+ *
+ * mod_state() 通过原子的 per-CPU 操作修改 zone 计数器状态。
+ *
+ * Overstep 模式指定如何处理过冲：
+ *     0       无过冲
+ *     1       过冲阈值的一半
+ *     -1      过冲负的阈值一半
+ *
+ * 【函数】mod_zone_state - 修改 zone 状态（CMPXCHG 版本）
+ * @zone: 内存区域
+ * @item: 统计项
+ * @delta: 变化量
+ * @overstep_mode: 过冲模式（0/1/-1）
+ *
+ * 【CMPXCHG 优势】
+ * - 无需禁用中断
+ * - 使用硬件原子指令（Compare-And-Swap）
+ * - 更低的开销
+ *
+ * 【工作原理】
+ * 1. 读取当前差分值 o
+ * 2. 计算新值 n = delta + o
+ * 3. 如果超过阈值，计算需要同步到全局的值 z
+ * 4. 使用 cmpxchg 原子地更新差分值（如果 o 未变）
+ * 5. 如果 cmpxchg 失败（o 已被其他操作改变），重试
+ * 6. 如果有溢出（z != 0），同步到全局
+ */
 static inline void mod_zone_state(struct zone *zone,
        enum zone_stat_item item, long delta, int overstep_mode)
 {
@@ -752,8 +1459,11 @@ static inline void mod_zone_state(struct zone *zone,
 	s8 o;
 
 	o = this_cpu_read(*p);
+	/* 读取当前差分值（旧值） */
+
 	do {
 		z = 0;  /* overflow to zone counters */
+		        /* 溢出到 zone 计数器（默认无溢出） */
 
 		/*
 		 * The fetching of the stat_threshold is racy. We may apply
@@ -765,42 +1475,100 @@ static inline void mod_zone_state(struct zone *zone,
 		 * Most of the time the thresholds are the same anyways
 		 * for all cpus in a zone.
 		 */
+		/*
+		 * 获取 stat_threshold 是有竞争的。
+		 * 如果我们在这里执行时被重新调度，
+		 * 可能会将计数器阈值应用到错误的 CPU。
+		 * 然而，下次计数器更新会再次应用阈值，
+		 * 从而再次将计数器带回阈值以下。
+		 *
+		 * 大多数时候，zone 中所有 CPU 的阈值都是相同的。
+		 */
 		t = this_cpu_read(pcp->stat_threshold);
+		/* 读取阈值（可能在重调度后读到不同 CPU 的阈值，但影响不大） */
 
 		n = delta + (long)o;
+		/* 计算新的差分值 */
 
 		if (abs(n) > t) {
+			/* 如果新值的绝对值超过阈值 */
+
 			int os = overstep_mode * (t >> 1) ;
+			/* 计算过冲量：
+			 * overstep_mode = 0: os = 0（无过冲）
+			 * overstep_mode = 1: os = t/2（正过冲）
+			 * overstep_mode = -1: os = -t/2（负过冲）
+			 */
 
 			/* Overflow must be added to zone counters */
+			/* 溢出必须添加到 zone 计数器 */
 			z = n + os;
+			/* 要同步到全局的值 = 新值 + 过冲量 */
+
 			n = -os;
+			/* 差分计数器设为负的过冲量
+			 * 这样下次更新时需要更多变化才会再次超过阈值
+			 */
 		}
 	} while (!this_cpu_try_cmpxchg(*p, &o, n));
+	/* 尝试原子地将 *p 从 o 更新为 n
+	 * 如果成功（*p 仍然等于 o）：返回 true，循环结束
+	 * 如果失败（*p 已被改变）：o 被更新为 *p 的当前值，重试
+	 *
+	 * 【为什么需要循环】
+	 * 在读取 o 和 cmpxchg 之间，其他操作可能已经修改了 *p。
+	 * cmpxchg 检测到这种情况并失败，我们需要用新的 o 值重新计算。
+	 */
 
 	if (z)
 		zone_page_state_add(z, zone, item);
+	/* 如果有溢出，同步到全局计数器 */
 }
 
+/*
+ * 【函数】mod_zone_page_state - 修改 zone 页面状态（CMPXCHG 版本）
+ * @zone: 内存区域
+ * @item: 统计项
+ * @delta: 变化量
+ *
+ * 【功能】
+ * 无过冲模式（overstep_mode = 0）。
+ */
 void mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
 			 long delta)
 {
 	mod_zone_state(zone, item, delta, 0);
+	/* 调用底层函数，overstep_mode = 0（无过冲） */
 }
 EXPORT_SYMBOL(mod_zone_page_state);
 
+/*
+ * 【函数】inc_zone_page_state - 递增 zone 页面状态（CMPXCHG 版本）
+ */
 void inc_zone_page_state(struct page *page, enum zone_stat_item item)
 {
 	mod_zone_state(page_zone(page), item, 1, 1);
+	/* delta = 1, overstep_mode = 1（正过冲） */
 }
 EXPORT_SYMBOL(inc_zone_page_state);
 
+/*
+ * 【函数】dec_zone_page_state - 递减 zone 页面状态（CMPXCHG 版本）
+ */
 void dec_zone_page_state(struct page *page, enum zone_stat_item item)
 {
 	mod_zone_state(page_zone(page), item, -1, -1);
+	/* delta = -1, overstep_mode = -1（负过冲） */
 }
 EXPORT_SYMBOL(dec_zone_page_state);
 
+/*
+ * 【函数】mod_node_state - 修改 node 状态（CMPXCHG 版本）
+ * @pgdat: NUMA 节点
+ * @item: 统计项
+ * @delta: 变化量
+ * @overstep_mode: 过冲模式
+ */
 static inline void mod_node_state(struct pglist_data *pgdat,
        enum node_stat_item item, int delta, int overstep_mode)
 {
@@ -810,11 +1578,18 @@ static inline void mod_node_state(struct pglist_data *pgdat,
 	s8 o;
 
 	if (vmstat_item_in_bytes(item)) {
+		/* 如果是字节单位的统计项 */
+
 		/*
 		 * Only cgroups use subpage accounting right now; at
 		 * the global level, these items still change in
 		 * multiples of whole pages. Store them as pages
 		 * internally to keep the per-cpu counters compact.
+		 */
+		/*
+		 * 目前只有 cgroup 使用子页面统计；
+		 * 在全局级别，这些项仍以整页的倍数变化。
+		 * 内部以页面为单位存储，保持 per-CPU 计数器紧凑。
 		 */
 		VM_WARN_ON_ONCE(delta & (PAGE_SIZE - 1));
 		delta >>= PAGE_SHIFT;
@@ -823,6 +1598,7 @@ static inline void mod_node_state(struct pglist_data *pgdat,
 	o = this_cpu_read(*p);
 	do {
 		z = 0;  /* overflow to node counters */
+		        /* 溢出到 node 计数器 */
 
 		/*
 		 * The fetching of the stat_threshold is racy. We may apply
@@ -834,6 +1610,13 @@ static inline void mod_node_state(struct pglist_data *pgdat,
 		 * Most of the time the thresholds are the same anyways
 		 * for all cpus in a node.
 		 */
+		/*
+		 * 获取 stat_threshold 是有竞争的。
+		 * 如果在此期间被重新调度，可能应用到错误的 CPU。
+		 * 但下次更新会再次应用阈值，将计数器带回阈值以下。
+		 *
+		 * 大多数时候，节点中所有 CPU 的阈值都是相同的。
+		 */
 		t = this_cpu_read(pcp->stat_threshold);
 
 		n = delta + (long)o;
@@ -842,6 +1625,7 @@ static inline void mod_node_state(struct pglist_data *pgdat,
 			int os = overstep_mode * (t >> 1) ;
 
 			/* Overflow must be added to node counters */
+			/* 溢出必须添加到 node 计数器 */
 			z = n + os;
 			n = -os;
 		}
@@ -851,6 +1635,9 @@ static inline void mod_node_state(struct pglist_data *pgdat,
 		node_page_state_add(z, pgdat, item);
 }
 
+/*
+ * 【函数】mod_node_page_state - 修改 node 页面状态（CMPXCHG 版本）
+ */
 void mod_node_page_state(struct pglist_data *pgdat, enum node_stat_item item,
 					long delta)
 {
@@ -858,12 +1645,18 @@ void mod_node_page_state(struct pglist_data *pgdat, enum node_stat_item item,
 }
 EXPORT_SYMBOL(mod_node_page_state);
 
+/*
+ * 【函数】inc_node_page_state - 递增 node 页面状态（CMPXCHG 版本）
+ */
 void inc_node_page_state(struct page *page, enum node_stat_item item)
 {
 	mod_node_state(page_pgdat(page), item, 1, 1);
 }
 EXPORT_SYMBOL(inc_node_page_state);
 
+/*
+ * 【函数】dec_node_page_state - 递减 node 页面状态（CMPXCHG 版本）
+ */
 void dec_node_page_state(struct page *page, enum node_stat_item item)
 {
 	mod_node_state(page_pgdat(page), item, -1, -1);
@@ -871,7 +1664,22 @@ void dec_node_page_state(struct page *page, enum node_stat_item item)
 EXPORT_SYMBOL(dec_node_page_state);
 #else
 /*
+ * ============================================================================
+ * 【基于中断禁用的版本】
+ *
+ * 如果没有 CMPXCHG 支持，使用中断禁用来序列化计数器更新。
+ * ============================================================================
+ */
+
+/*
  * Use interrupt disable to serialize counter updates
+ */
+/*
+ * 使用禁用中断来序列化计数器更新
+ */
+
+/*
+ * 【函数】mod_zone_page_state - 修改 zone 页面状态（中断禁用版本）
  */
 void mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
 			 long delta)
@@ -879,11 +1687,19 @@ void mod_zone_page_state(struct zone *zone, enum zone_stat_item item,
 	unsigned long flags;
 
 	local_irq_save(flags);
+	/* 保存中断标志并禁用中断 */
+
 	__mod_zone_page_state(zone, item, delta);
+	/* 调用底层函数（假设中断已禁用） */
+
 	local_irq_restore(flags);
+	/* 恢复中断标志 */
 }
 EXPORT_SYMBOL(mod_zone_page_state);
 
+/*
+ * 【函数】inc_zone_page_state - 递增 zone 页面状态（中断禁用版本）
+ */
 void inc_zone_page_state(struct page *page, enum zone_stat_item item)
 {
 	unsigned long flags;
@@ -896,6 +1712,9 @@ void inc_zone_page_state(struct page *page, enum zone_stat_item item)
 }
 EXPORT_SYMBOL(inc_zone_page_state);
 
+/*
+ * 【函数】dec_zone_page_state - 递减 zone 页面状态（中断禁用版本）
+ */
 void dec_zone_page_state(struct page *page, enum zone_stat_item item)
 {
 	unsigned long flags;
@@ -906,6 +1725,9 @@ void dec_zone_page_state(struct page *page, enum zone_stat_item item)
 }
 EXPORT_SYMBOL(dec_zone_page_state);
 
+/*
+ * 【函数】mod_node_page_state - 修改 node 页面状态（中断禁用版本）
+ */
 void mod_node_page_state(struct pglist_data *pgdat, enum node_stat_item item,
 					long delta)
 {
@@ -917,6 +1739,9 @@ void mod_node_page_state(struct pglist_data *pgdat, enum node_stat_item item,
 }
 EXPORT_SYMBOL(mod_node_page_state);
 
+/*
+ * 【函数】inc_node_page_state - 递增 node 页面状态（中断禁用版本）
+ */
 void inc_node_page_state(struct page *page, enum node_stat_item item)
 {
 	unsigned long flags;
@@ -929,6 +1754,9 @@ void inc_node_page_state(struct page *page, enum node_stat_item item)
 }
 EXPORT_SYMBOL(inc_node_page_state);
 
+/*
+ * 【函数】dec_node_page_state - 递减 node 页面状态（中断禁用版本）
+ */
 void dec_node_page_state(struct page *page, enum node_stat_item item)
 {
 	unsigned long flags;
@@ -941,8 +1769,29 @@ EXPORT_SYMBOL(dec_node_page_state);
 #endif
 
 /*
+ * ============================================================================
+ * 【差分折叠（Differential Folding）】
+ *
+ * 将 per-CPU 差分计数器同步到全局计数器。
+ * ============================================================================
+ */
+
+/*
  * Fold a differential into the global counters.
  * Returns whether counters were updated.
+ */
+/*
+ * 【函数】fold_diff - 将差分折叠到全局计数器
+ * @zone_diff: zone 差分数组
+ * @node_diff: node 差分数组
+ * @return: 计数器是否被更新（bool）
+ *
+ * 【功能】
+ * 将 per-CPU 差分值累加到全局计数器。
+ *
+ * 【返回值】
+ * - true: 至少有一个计数器被更新
+ * - false: 所有差分都为 0，没有更新
  */
 static int fold_diff(int *zone_diff, int *node_diff)
 {
@@ -952,6 +1801,7 @@ static int fold_diff(int *zone_diff, int *node_diff)
 	for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++) {
 		if (zone_diff[i]) {
 			atomic_long_add(zone_diff[i], &vm_zone_stat[i]);
+			/* 原子地添加到全局 zone 统计 */
 			changed = true;
 		}
 	}
@@ -959,6 +1809,7 @@ static int fold_diff(int *zone_diff, int *node_diff)
 	for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++) {
 		if (node_diff[i]) {
 			atomic_long_add(node_diff[i], &vm_node_stat[i]);
+			/* 原子地添加到全局 node 统计 */
 			changed = true;
 		}
 	}
@@ -982,16 +1833,52 @@ static int fold_diff(int *zone_diff, int *node_diff)
  *
  * The function returns whether global counters were updated.
  */
+/*
+ * 【函数】refresh_cpu_vm_stats - 刷新当前 CPU 的 VM 统计
+ * @do_pagesets: 是否处理 pageset 操作
+ * @return: 全局计数器是否被更新
+ *
+ * 【功能】
+ * 更新当前 CPU 的 zone 计数器。
+ *
+ * 【内存访问优化】
+ * refresh_cpu_vm_stats 努力只访问节点本地内存。
+ * 远程 zone 上的 per-CPU pageset 被放置在使用该 pageset 的处理器本地内存中。
+ * 因此对所有 zone 的循环将访问处理器本地的一系列缓存行。
+ *
+ * 【缓存行抖动】
+ * 对 zone_page_state_add 的调用会更新：
+ * - 远程 zone 结构中的统计缓存行
+ * - 全局计数器的全局缓存行
+ * 这些可能导致远程节点缓存行抖动（cache line bouncing），
+ * 因此必须仅在必要时执行。
+ *
+ * 【工作流程】
+ * 1. 遍历所有已填充的 zone
+ * 2. 使用 xchg 原子地读取并清零差分计数器
+ * 3. 将差分添加到 zone 和全局计数器
+ * 4. 如果 do_pagesets 为 true，处理 PCP（Per-CPU Pageset）：
+ *    - 衰减 PCP 高水位
+ *    - 处理远程 pageset 排空
+ * 5. 遍历所有在线节点并折叠 node 统计
+ * 6. 折叠全局差分
+ */
 static bool refresh_cpu_vm_stats(bool do_pagesets)
 {
 	struct pglist_data *pgdat;
 	struct zone *zone;
 	int i;
 	int global_zone_diff[NR_VM_ZONE_STAT_ITEMS] = { 0, };
+	/* 全局 zone 差分累加数组 */
+
 	int global_node_diff[NR_VM_NODE_STAT_ITEMS] = { 0, };
+	/* 全局 node 差分累加数组 */
+
 	bool changed = false;
 
 	for_each_populated_zone(zone) {
+		/* 遍历所有已填充的 zone */
+
 		struct per_cpu_zonestat __percpu *pzstats = zone->per_cpu_zonestats;
 		struct per_cpu_pages __percpu *pcp = zone->per_cpu_pageset;
 
@@ -999,22 +1886,48 @@ static bool refresh_cpu_vm_stats(bool do_pagesets)
 			int v;
 
 			v = this_cpu_xchg(pzstats->vm_stat_diff[i], 0);
+			/* 原子交换：读取差分值并清零
+			 * xchg: 原子地交换值（设为 0）并返回旧值
+			 */
+
 			if (v) {
+				/* 如果差分不为 0 */
 
 				atomic_long_add(v, &zone->vm_stat[i]);
+				/* 添加到 zone 的统计计数器 */
+
 				global_zone_diff[i] += v;
+				/* 累加到全局差分数组（稍后一次性更新全局计数器） */
+
 #ifdef CONFIG_NUMA
 				/* 3 seconds idle till flush */
+				/* 3 秒空闲后刷新 */
 				__this_cpu_write(pcp->expire, 3);
+				/* 重置过期计数器为 3
+				 * 用于远程 pageset 的排空机制
+				 */
 #endif
 			}
 		}
 
 		if (do_pagesets) {
+			/* 如果需要处理 pageset */
+
 			cond_resched();
+			/* 条件性重新调度：如果需要调度则让出 CPU
+			 * 避免长时间持有 CPU
+			 */
 
 			if (decay_pcp_high(zone, this_cpu_ptr(pcp)))
 				changed = true;
+			/* 衰减 PCP 高水位
+			 * 如果高水位被调整，标记为有变化
+			 *
+			 * 【PCP 高水位衰减】
+			 * PCP（Per-CPU Pageset）有一个动态的高水位，
+			 * 定期衰减以释放不再需要的缓存页面。
+			 */
+
 #ifdef CONFIG_NUMA
 			/*
 			 * Deal with draining the remote pageset of this
@@ -1023,25 +1936,59 @@ static bool refresh_cpu_vm_stats(bool do_pagesets)
 			 * Check if there are pages remaining in this pageset
 			 * if not then there is nothing to expire.
 			 */
+			/*
+			 * 处理排空此处理器的远程 pageset
+			 *
+			 * 检查此 pageset 中是否还有剩余页面，
+			 * 如果没有，则没有需要过期的内容。
+			 */
 			if (!__this_cpu_read(pcp->expire) ||
 			       !__this_cpu_read(pcp->count))
 				continue;
+			/* 如果过期计数器为 0 或 pageset 为空，跳过
+			 * expire: 过期倒计时（每次刷新递减）
+			 * count: pageset 中的页面数
+			 */
 
 			/*
 			 * We never drain zones local to this processor.
 			 */
+			/*
+			 * 我们永不排空本处理器本地的 zone。
+			 */
 			if (zone_to_nid(zone) == numa_node_id()) {
+				/* 如果 zone 属于本地 NUMA 节点 */
+
 				__this_cpu_write(pcp->expire, 0);
+				/* 重置过期计数器
+				 * 本地 zone 不需要排空机制
+				 */
 				continue;
 			}
 
 			if (__this_cpu_dec_return(pcp->expire)) {
+				/* 递减过期计数器并返回新值
+				 * 如果返回值非零（还未到期）
+				 */
 				changed = true;
 				continue;
+				/* 继续下一个 zone */
 			}
 
 			if (__this_cpu_read(pcp->count)) {
+				/* 如果 pageset 中有页面 */
+
 				drain_zone_pages(zone, this_cpu_ptr(pcp));
+				/* 排空该 zone 的页面
+				 * 将 PCP 中的页面返回给伙伴系统
+				 *
+				 * 【为什么排空远程 pageset】
+				 * 远程 zone 的页面缓存在本地 CPU 的 pageset 中，
+				 * 长时间不使用会造成内存浪费。
+				 * 定期排空可以将页面返回给伙伴系统，
+				 * 供其他 CPU 或分配使用。
+				 */
+
 				changed = true;
 			}
 #endif
@@ -1049,28 +1996,61 @@ static bool refresh_cpu_vm_stats(bool do_pagesets)
 	}
 
 	for_each_online_pgdat(pgdat) {
+		/* 遍历所有在线的 NUMA 节点 */
+
 		struct per_cpu_nodestat __percpu *p = pgdat->per_cpu_nodestats;
 
 		for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++) {
 			int v;
 
 			v = this_cpu_xchg(p->vm_node_stat_diff[i], 0);
+			/* 原子交换：读取并清零 node 差分计数器 */
+
 			if (v) {
 				atomic_long_add(v, &pgdat->vm_stat[i]);
+				/* 添加到节点的统计计数器 */
+
 				global_node_diff[i] += v;
+				/* 累加到全局差分数组 */
 			}
 		}
 	}
 
 	if (fold_diff(global_zone_diff, global_node_diff))
 		changed = true;
+	/* 将累积的全局差分折叠到全局计数器
+	 * 如果有变化，标记 changed
+	 */
+
 	return changed;
+	/* 返回是否有计数器被更新 */
 }
 
 /*
  * Fold the data for an offline cpu into the global array.
  * There cannot be any access by the offline cpu and therefore
  * synchronization is simplified.
+ */
+/*
+ * 【函数】cpu_vm_stats_fold - 折叠下线 CPU 的数据到全局数组
+ * @cpu: 下线的 CPU 编号
+ *
+ * 【功能】
+ * 将下线 CPU 的统计数据折叠到全局数组。
+ *
+ * 【同步简化】
+ * 下线的 CPU 不可能访问这些数据，因此同步被简化。
+ * 不需要原子操作或锁来读取下线 CPU 的 per-CPU 数据。
+ *
+ * 【调用时机】
+ * CPU 热插拔：CPU 下线前调用此函数保存其统计数据。
+ *
+ * 【工作流程】
+ * 1. 遍历所有 zone，读取该 CPU 的差分计数器并清零
+ * 2. 将差分添加到 zone 和全局计数器
+ * 3. 处理 NUMA 事件计数器
+ * 4. 遍历所有 node，处理 node 统计
+ * 5. 折叠全局差分
  */
 void cpu_vm_stats_fold(int cpu)
 {
@@ -1084,14 +2064,23 @@ void cpu_vm_stats_fold(int cpu)
 		struct per_cpu_zonestat *pzstats;
 
 		pzstats = per_cpu_ptr(zone->per_cpu_zonestats, cpu);
+		/* 获取下线 CPU 在该 zone 的统计数据
+		 * 因为 CPU 已下线，可以安全地直接访问
+		 */
 
 		for (i = 0; i < NR_VM_ZONE_STAT_ITEMS; i++) {
 			if (pzstats->vm_stat_diff[i]) {
 				int v;
 
 				v = pzstats->vm_stat_diff[i];
+				/* 读取差分值（不需要原子操作） */
+
 				pzstats->vm_stat_diff[i] = 0;
+				/* 清零 */
+
 				atomic_long_add(v, &zone->vm_stat[i]);
+				/* 添加到 zone 统计（需要原子操作，因为其他 CPU 可能访问） */
+
 				global_zone_diff[i] += v;
 			}
 		}
@@ -1103,15 +2092,19 @@ void cpu_vm_stats_fold(int cpu)
 				v = pzstats->vm_numa_event[i];
 				pzstats->vm_numa_event[i] = 0;
 				zone_numa_event_add(v, zone, i);
+				/* 添加 NUMA 事件到 zone */
 			}
 		}
 #endif
 	}
 
 	for_each_online_pgdat(pgdat) {
+		/* 遍历所有在线节点 */
+
 		struct per_cpu_nodestat *p;
 
 		p = per_cpu_ptr(pgdat->per_cpu_nodestats, cpu);
+		/* 获取下线 CPU 在该节点的统计数据 */
 
 		for (i = 0; i < NR_VM_NODE_STAT_ITEMS; i++)
 			if (p->vm_node_stat_diff[i]) {
@@ -1125,11 +2118,28 @@ void cpu_vm_stats_fold(int cpu)
 	}
 
 	fold_diff(global_zone_diff, global_node_diff);
+	/* 折叠全局差分 */
 }
 
 /*
  * this is only called if !populated_zone(zone), which implies no other users of
  * pset->vm_stat_diff[] exist.
+ */
+/*
+ * 【函数】drain_zonestat - 排空 zone 统计
+ * @zone: 内存区域
+ * @pzstats: per-CPU zone 统计结构
+ *
+ * 【调用条件】
+ * 仅当 !populated_zone(zone) 时调用，
+ * 这意味着 pset->vm_stat_diff[] 不存在其他用户。
+ *
+ * 【使用场景】
+ * zone 即将变为非填充状态（如内存热插拔移除），
+ * 需要将其统计数据完全排空到全局。
+ *
+ * 【安全性】
+ * 因为没有其他用户，不需要同步机制。
  */
 void drain_zonestat(struct zone *zone, struct per_cpu_zonestat *pzstats)
 {
