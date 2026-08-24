@@ -29,6 +29,11 @@
  * Approximate:
  *   val * y^n,    where y^32 ~= 0.5 (~1 scheduling period)
  */
+/*
+ * 中文释义：按 n 个 PELT 小周期衰减 val，其中每 32 段约减半。先用移位处理完整
+ * 32 段，再查表乘余数，可在常数时间完成；超过 63 个半衰期直接归零，既避免
+ * 无意义精度也限制移位范围。本函数只做定点运算，不修改跟踪对象。
+ */
 static u64 decay_load(u64 val, u64 n)
 {
 	unsigned int local_n;
@@ -55,6 +60,10 @@ static u64 decay_load(u64 val, u64 n)
 	return val;
 }
 
+/*
+ * 计算跨越 period 边界时新增的三段贡献：旧周期尾 d1 要衰减 periods 次，中间
+ * 完整周期用等比级数求和，当前周期头 d3 权重为 1。返回值尚未乘实体负载或容量。
+ */
 static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
 {
 	u32 c1, c2, c3 = d3; /* y^0 == 1 */
@@ -99,6 +108,11 @@ static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
  *      d1 y^p + 1024 \Sum y^n + d3 y^0		(Step 2)
  *                     n=1
  */
+/*
+ * 中文释义：把上次更新后的残段、跨过的完整 1024us 段和当前残段合并。先衰减
+ * 三个历史 sum，再只对状态有效的维度增加新贡献；period_contrib 保存当前段位置。
+ * 返回跨过的完整周期数，0 表示 sum 可更新但 avg 尚无需重新除法同步。
+ */
 static __always_inline u32
 accumulate_sum(u64 delta, struct sched_avg *sa,
 	       unsigned long load, unsigned long runnable, int running)
@@ -112,6 +126,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
 	/*
 	 * Step 1: decay old *_sum if we crossed period boundaries.
 	 */
+	/* 中文释义：只有越过段边界，旧历史才整体多乘相应次数的衰减因子。 */
 	if (periods) {
 		sa->load_sum = decay_load(sa->load_sum, periods);
 		sa->runnable_sum =
@@ -121,6 +136,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
 		/*
 		 * Step 2
 		 */
+		/* 中文释义：随后把三段新增时间按各自年龄权重加入本次贡献。 */
 		delta %= 1024;
 		if (load) {
 			/*
@@ -133,6 +149,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
 			 * the below usage of @contrib to disappear entirely,
 			 * so no point in calculating it.
 			 */
+			/* 中文释义：load 为 0 时另外两种状态已被入口清零，故无需计算 contrib。 */
 			contrib = __accumulate_pelt_segments(periods,
 					1024 - sa->period_contrib, delta);
 		}
@@ -177,6 +194,11 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
  *   load_avg = u_0` + y*(u_0 + u_1*y + u_2*y^2 + ... )
  *            = u_0 + u_1*y + u_2*y^2 + ... [re-labeling u_i --> u_{i+1}]
  */
+/*
+ * 中文释义：PELT 将历史按约 1ms 分段并以 y^32=0.5 加权，越旧的 runnable 时间
+ * 影响越小。入口先处理 sched_clock 初始化期间的倒退，再把纳秒换成 1024ns 单位；
+ * 只有跨过完整 PELT 段才返回 1，提示调用者把 sum 同步成 avg。
+ */
 static __always_inline int
 ___update_load_sum(u64 now, struct sched_avg *sa,
 		  unsigned long load, unsigned long runnable, int running)
@@ -188,6 +210,7 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	 * This should only happen when time goes backwards, which it
 	 * unfortunately does during sched clock init when we swap over to TSC.
 	 */
+	/* 中文释义：时钟倒退时只重置基准并拒绝用负时间累计，避免制造巨大的无符号 delta。 */
 	if ((s64)delta < 0) {
 		sa->last_update_time = now;
 		return 0;
@@ -197,6 +220,7 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	 * Use 1024ns as the unit of measurement since it's a reasonable
 	 * approximation of 1us and fast to compute.
 	 */
+	/* 中文释义：右移 10 以低成本量化；不足一个单位的尾数留在 last_update_time 中。 */
 	delta >>= 10;
 	if (!delta)
 		return 0;
@@ -213,6 +237,10 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	 * sched_balance_update_blocked_averages().
 	 *
 	 * Also see the comment in accumulate_sum().
+	 */
+	/*
+	 * 中文释义：running 必须是 runnable/load 的子集；实体已脱队但 curr 指针尚未清除
+	 * 等角落状态以 load==0 为准，同时清空 runnable/running，防止凭旧指针继续计费。
 	 */
 	if (!load)
 		runnable = running = 0;
@@ -254,6 +282,12 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
  * the period_contrib of cfs_rq when updating the sched_avg of a sched_entity
  * if it's more convenient.
  */
+/*
+ * 中文释义：除数必须包含当前分段已走过的位置，否则尚未发生的段尾会被误当成空闲，
+ * 使满载结果在 1002..1024 间振荡。实体和所属 cfs_rq 共用时钟，因而段位置可对齐。
+ * load_avg 额外乘权重，runnable/util 已在 sum 中按容量刻度表示；util 用 WRITE_ONCE
+ * 发布，避免并发观察者读到编译器拆分或重复访问的值。
+ */
 static __always_inline void
 ___update_load_avg(struct sched_avg *sa, unsigned long load)
 {
@@ -293,6 +327,11 @@ ___update_load_avg(struct sched_avg *sa, unsigned long load)
  *   load_avg = \Sum se->avg.load_avg
  */
 
+/*
+ * 脱队/阻塞实体没有新的 load、runnable 或 running 时间，只衰减已有历史；跨段后
+ * 才重算平均值并发 trace。返回 1 表示 avg 数值已同步，0 表示未跨完整段。
+ */
+
 int __update_load_avg_blocked_se(u64 now, struct sched_entity *se)
 {
 	if (___update_load_sum(now, &se->avg, 0, 0, 0)) {
@@ -304,6 +343,10 @@ int __update_load_avg_blocked_se(u64 now, struct sched_entity *se)
 	return 0;
 }
 
+/*
+ * 按实体当前 on_rq、层级 runnable 和是否为 cfs_rq->curr 三个状态累计 PELT；跨段
+ * 后用实体权重生成 load_avg，并通知利用率变化钩子。调用者须提供同一 rq 时钟域。
+ */
 int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	if (___update_load_sum(now, &se->avg, !!se->on_rq, se_runnable(se),
@@ -318,6 +361,10 @@ int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se
 	return 0;
 }
 
+/*
+ * 更新整个 CFS 运行队列的聚合 PELT：load 是缩放后的总权重，runnable 是层级可运行
+ * 实体数，running 表示当前有 CFS 实体执行；聚合 sum 已含权重，故平均阶段乘数为 1。
+ */
 int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq)
 {
 	if (___update_load_sum(now, &cfs_rq->avg,
@@ -344,6 +391,11 @@ int __update_load_avg_cfs_rq(u64 now, struct cfs_rq *cfs_rq)
  *
  */
 
+/*
+ * RT 队列只跟踪 CPU 是否正在执行 RT 类的二值时间信号；load/runnable/running 同值，
+ * 因而 util_sum、runnable_sum 与容量刻度下的 load_sum 等价。返回是否跨段并更新 avg。
+ */
+
 int update_rt_rq_load_avg(u64 now, struct rq *rq, int running)
 {
 	if (___update_load_sum(now, &rq->avg_rt,
@@ -368,6 +420,11 @@ int update_rt_rq_load_avg(u64 now, struct rq *rq, int running)
  *
  *   load_avg and runnable_avg are not supported and meaningless.
  *
+ */
+
+/*
+ * DL 队列与 RT 使用相同的二值 CPU 时间模型，但状态保存在独立 avg_dl 中，避免不同
+ * 调度类的利用率历史混合；调用者以当前 donor 调度类决定 running。
  */
 
 int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
@@ -401,6 +458,12 @@ int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
  *			capped capacity a cpu due to a HW event.
  */
 
+/*
+ * 中文释义：硬件压力不是“是否运行”的二值时间，而是硬件事件造成的容量差，因此
+ * 用 capacity 作为连续权重累计到 load_avg；配置关闭时本入口不存在，由头文件 stub
+ * 令调用者得到未更新结果。
+ */
+
 int update_hw_load_avg(u64 now, struct rq *rq, u64 capacity)
 {
 	if (___update_load_sum(now, &rq->avg_hw,
@@ -428,6 +491,12 @@ int update_hw_load_avg(u64 now, struct rq *rq, u64 capacity)
  *
  */
 
+/*
+ * IRQ 时间不包含在 clock_task/clock_pelt 中，先按频率与 CPU 容量换算成实际计算量，
+ * 再把 [上次更新, clock-running) 当普通上下文衰减、把末尾 running 当中断忙碌时间。
+ * 这是偏保守的时间放置近似；任一阶段跨段就重算平均并发 trace。
+ */
+
 int update_irq_load_avg(struct rq *rq, u64 running)
 {
 	int ret = 0;
@@ -437,6 +506,7 @@ int update_irq_load_avg(struct rq *rq, u64 running)
 	 * clock_task. Instead we directly scale the running time to
 	 * reflect the real amount of computation
 	 */
+	/* 中文释义：两次 cap_scale 消除当前频率和异构 CPU 原始算力差异。 */
 	running = cap_scale(running, arch_scale_freq_capacity(cpu_of(rq)));
 	running = cap_scale(running, arch_scale_cpu_capacity(cpu_of(rq)));
 
@@ -450,6 +520,10 @@ int update_irq_load_avg(struct rq *rq, u64 running)
 	 * interrupt context time.
 	 * We can safely remove running from rq->clock because
 	 * rq->clock += delta with delta >= running
+	 */
+	/*
+	 * 中文释义：无法还原中断在区间内的精确位置，按“紧邻本次更新”放置会让近期
+	 * 压力不被过早衰减；rq 时钟增量覆盖 running，故减法不会倒退。
 	 */
 	ret = ___update_load_sum(rq->clock - running, &rq->avg_irq,
 				0,
@@ -473,6 +547,11 @@ int update_irq_load_avg(struct rq *rq, u64 running)
  * Load avg and utiliztion metrics need to be updated periodically and before
  * consumption. This function updates the metrics for all subsystems except for
  * the fair class. @rq must be locked and have its clock updated.
+ */
+/*
+ * 中文释义：在持 rq 锁且时钟已更新的前提下，一次推进 RT、DL、硬件压力和 IRQ
+ * 四类 PELT。位或而非逻辑或保证所有更新都执行，返回任一子系统是否跨段；硬件
+ * 压力用 task 时钟以保持真实时间权重，不参与 PELT 频率不变性缩放。
  */
 bool update_other_load_avgs(struct rq *rq)
 {

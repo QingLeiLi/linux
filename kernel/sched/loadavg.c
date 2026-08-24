@@ -6,6 +6,7 @@
  * figure. Its a silly number but people think its important. We go through
  * great pains to make it work on big machines and tickless kernels.
  */
+/* 本文件以分布式增量和定点指数衰减计算全局 1/5/15 分钟 loadavg，并兼容 NO_HZ。 */
 #include <linux/sched/nohz.h>
 #include "sched.h"
 
@@ -55,12 +56,20 @@
  *
  *  This covers the NO_HZ=n code, for extra head-aches, see the comment below.
  */
+/*
+ * 全局负载是 nr_running+nr_uninterruptible 的指数移动平均。为避免每 5 秒扫描所有 CPU，
+ * 每个 rq 只折叠相对上次样本的 delta 到全局原子量，并给所有 CPU 10 tick 完成；迟到不会
+ * 丢 delta，但会污染本次样本。uninterruptible 在睡眠 CPU 加、唤醒 CPU 减，只有全局和正确。
+ * 以下先描述普通 tick；NO_HZ 另用双缓冲 delta 保留停 tick CPU 的贡献。
+ */
 
 /* Variables and functions for calc_load */
+/* 全局 active 增量累计、下个采样窗和三个 FSHIFT 定点 loadavg；读者接受近似值。 */
 atomic_long_t calc_load_tasks;
 unsigned long calc_load_update;
 unsigned long avenrun[3];
 EXPORT_SYMBOL(avenrun); /* should be removed */
+/* 原注释：此导出历史上应移除；当前仍是 ABI，学习补注不改变它。 */
 
 /**
  * get_avenrun - get the load average array
@@ -70,6 +79,10 @@ EXPORT_SYMBOL(avenrun); /* should be removed */
  *
  * These values are estimates at best, so no need for locking.
  */
+/*
+ * 把三个近似 loadavg 复制到调用者 @loads，先加 @offset 再左移 @shift；不加锁是因为
+ * 这些值本就为估计，三个元素可来自不同更新时刻。无返回值，调用者保证数组容量。
+ */
 void get_avenrun(unsigned long *loads, unsigned long offset, int shift)
 {
 	loads[0] = (avenrun[0] + offset) << shift;
@@ -77,6 +90,11 @@ void get_avenrun(unsigned long *loads, unsigned long offset, int shift)
 	loads[2] = (avenrun[2] + offset) << shift;
 }
 
+/*
+ * 在持有 @this_rq 锁的采样路径计算 active=nr_running-adjust+nr_uninterruptible，返回
+ * 相对 rq->calc_load_active 的有符号 delta，并提交新基线；无变化返回 0。adjust 用于
+ * 排除当前事件的已知偏差。无睡眠，局部 nr_uninterruptible 可负但全局和有效。
+ */
 long calc_load_fold_active(struct rq *this_rq, long adjust)
 {
 	long nr_active, delta = 0;
@@ -106,6 +124,10 @@ long calc_load_fold_active(struct rq *this_rq, long adjust)
  * we find: x^n := x^(\Sum n_i * 2^i) := \Prod x^(n_i * 2^i), which is
  * of course trivially computable in O(log_2 n), the length of our binary
  * vector.
+ */
+/*
+ * 用平方求幂在 O(log n) 内计算 Q@frac_bits 定点 x^n。result 从 1.0 开始；每次乘法
+ * 加半单位再右移实现四舍五入。参数纯值，n=0 返回 1<<frac_bits，无失败或副作用。
  */
 static unsigned long
 fixed_power_int(unsigned long x, unsigned int frac_bits, unsigned int n)
@@ -153,6 +175,10 @@ fixed_power_int(unsigned long x, unsigned int frac_bits, unsigned int n)
  *              n         1 - x^(n+1)
  *     S_n := \Sum x^i = -------------
  *             i=0          1 - x
+ */
+/*
+ * 上述等比级数把连续 n 次相同 active 的 EMA 合并为一次：旧 load 乘 exp^n，新 active
+ * 乘 1-exp^n。用于 NO_HZ 跨多个采样周期追赶；输入/返回均为 FSHIFT 定点值。
  */
 unsigned long
 calc_load_n(unsigned long load, unsigned long exp,
@@ -204,9 +230,19 @@ calc_load_n(unsigned long load, unsigned long exp,
  *
  * When making the ILB scale, we should try to pull this in as well.
  */
+/*
+ * NO_HZ 停止 per-CPU tick，CPU 入 idle 前把 active delta 写入全局双缓冲。采样窗开始时
+ * 翻转读写槽：本窗消费旧贡献，同时新 idle 贡献写另一槽，避免窗内入 idle 抵消样本。
+ * 窗内唤醒则把该 CPU 的下一采样点向后推，继续使用开窗时已折叠的 NO_HZ delta。
+ */
+/* 两个原子槽保存旧/新 NO_HZ delta；idx 由全局采样者翻转。 */
 static atomic_long_t calc_load_nohz[2];
 static int calc_load_idx;
 
+/*
+ * 选择 NO_HZ writer 槽。先读 idx、rmb，再读 calc_load_update；若采样窗已开始则写下一
+ * 槽。屏障与 calc_global_nohz 的“先更新时间、wmb、再翻 idx”配对，避免双翻转。
+ */
 static inline int calc_load_write_idx(void)
 {
 	int idx = calc_load_idx;
@@ -215,6 +251,7 @@ static inline int calc_load_write_idx(void)
 	 * See calc_global_nohz(), if we observe the new index, we also
 	 * need to observe the new update time.
 	 */
+	/* 观察到新 idx 时也必须观察到对应的新采样时间。 */
 	smp_rmb();
 
 	/*
@@ -227,11 +264,13 @@ static inline int calc_load_write_idx(void)
 	return idx & 1;
 }
 
+/* 返回当前 reader 槽；仅全局采样路径消费，无额外屏障。 */
 static inline int calc_load_read_idx(void)
 {
 	return calc_load_idx & 1;
 }
 
+/* 在 rq 锁保护下折叠 @rq active delta，并原子加到当前 NO_HZ writer 槽。 */
 static void calc_load_nohz_fold(struct rq *rq)
 {
 	long delta;
@@ -244,12 +283,14 @@ static void calc_load_nohz_fold(struct rq *rq)
 	}
 }
 
+/* 当前 CPU 进入 NO_HZ 前把尚未上报的 active delta 折叠；无参数/返回值。 */
 void calc_load_nohz_start(void)
 {
 	/*
 	 * We're going into NO_HZ mode, if there's any pending delta, fold it
 	 * into the pending NO_HZ delta.
 	 */
+	/* 进入 NO_HZ 前提交 pending delta，之后即使无 tick 也不会丢失。 */
 	calc_load_nohz_fold(this_rq());
 }
 
@@ -257,11 +298,16 @@ void calc_load_nohz_start(void)
  * Keep track of the load for NOHZ_FULL, must be called between
  * calc_load_nohz_{start,stop}().
  */
+/* NOHZ_FULL 远程维护期间折叠指定 @rq；调用者保证位于 start/stop 区间及 rq 稳定。 */
 void calc_load_nohz_remote(struct rq *rq)
 {
 	calc_load_nohz_fold(rq);
 }
 
+/*
+ * 当前 CPU 离开 NO_HZ 时同步本 rq 的下一采样时间。若仍早于窗口直接返回；若在窗口
+ * 及 10 tick 宽限内唤醒，则跳过本 CPU 本周期 tick 样本并推进一周期，避免重复计入。
+ */
 void calc_load_nohz_stop(void)
 {
 	struct rq *this_rq = this_rq();
@@ -269,6 +315,7 @@ void calc_load_nohz_stop(void)
 	/*
 	 * If we're still before the pending sample window, we're done.
 	 */
+	/* 先复制全局窗口；尚未到达则无需修正。 */
 	this_rq->calc_load_update = READ_ONCE(calc_load_update);
 	if (time_before(jiffies, this_rq->calc_load_update))
 		return;
@@ -278,10 +325,12 @@ void calc_load_nohz_stop(void)
 	 * accounted through the nohz accounting, so skip the entire deal and
 	 * sync up for the next window.
 	 */
+	/* 窗内唤醒已由 NO_HZ delta 代表，推进本地窗口避免 tick 再折叠一次。 */
 	if (time_before(jiffies, this_rq->calc_load_update + 10))
 		this_rq->calc_load_update += LOAD_FREQ;
 }
 
+/* 原子读取并清空当前 reader 槽；空槽快速返回 0，xchg 保证每份 delta 只消费一次。 */
 static long calc_load_nohz_read(void)
 {
 	int idx = calc_load_read_idx();
@@ -302,6 +351,11 @@ static long calc_load_nohz_read(void)
  * Once we've updated the global active value, we need to apply the exponential
  * weights adjusted to the number of cycles missed.
  */
+/*
+ * 处理 NO_HZ 跨越多个 LOAD_FREQ 的追赶。超过窗口+10 tick 后计算遗漏周期 n，用当前
+ * active 一次性推进三条 EMA，并更新 calc_load_update；随后 wmb 后翻槽，使 writer 看到
+ * 新时间再看到新 idx。仅全局 timer 调用，无返回值。
+ */
 static void calc_global_nohz(void)
 {
 	unsigned long sample_window;
@@ -312,6 +366,7 @@ static void calc_global_nohz(void)
 		/*
 		 * Catch-up, fold however many we are behind still
 		 */
+		/* 计算至少一个仍欠缺的完整周期并批量衰减。 */
 		delta = jiffies - sample_window - 10;
 		n = 1 + (delta / LOAD_FREQ);
 
@@ -332,11 +387,13 @@ static void calc_global_nohz(void)
 	 * calc_load_write_idx() will see the new time when it reads the new
 	 * index, this avoids a double flip messing things up.
 	 */
+	/* 先发布新时间，再翻 NO_HZ 槽；与 writer 的 rmb 配对。 */
 	smp_wmb();
 	calc_load_idx++;
 }
 #else /* !CONFIG_NO_HZ_COMMON: */
 
+/* 无 NO_HZ 时没有额外 delta 或追赶工作。 */
 static inline long calc_load_nohz_read(void) { return 0; }
 static inline void calc_global_nohz(void) { }
 
@@ -347,6 +404,11 @@ static inline void calc_global_nohz(void) { }
  * CPUs have updated calc_load_tasks.
  *
  * Called from the global timer code.
+ */
+/*
+ * 全局 timer 在窗口后 10 tick 调用：消费旧 NO_HZ delta，读取 active 原子和并夹到非负，
+ * 更新三条定点 EMA并推进窗口，再让 calc_global_nohz 批量追赶遗漏周期。无锁近似统计；
+ * 10 tick 宽限允许各 CPU tick 完成 delta 折叠。
  */
 void calc_global_load(void)
 {
@@ -360,6 +422,7 @@ void calc_global_load(void)
 	/*
 	 * Fold the 'old' NO_HZ-delta to include all NO_HZ CPUs.
 	 */
+	/* 消费旧槽并合入全局 active，使停 tick CPU 参与本次样本。 */
 	delta = calc_load_nohz_read();
 	if (delta)
 		atomic_long_add(delta, &calc_load_tasks);
@@ -377,12 +440,17 @@ void calc_global_load(void)
 	 * In case we went to NO_HZ for multiple LOAD_FREQ intervals
 	 * catch up in bulk.
 	 */
+	/* 长期 NO_HZ 可能跨多周期，使用合并公式追赶而非逐周期循环。 */
 	calc_global_nohz();
 }
 
 /*
  * Called from sched_tick() to periodically update this CPU's
  * active count.
+ */
+/*
+ * 每 CPU sched_tick 到达本 rq 采样点时折叠 active delta 到全局原子量，并推进本地
+ * LOAD_FREQ。入口持 rq 锁；尚未到期快速返回。迟到不会丢 delta，但本次全局样本可能偏差。
  */
 void calc_global_load_tick(struct rq *this_rq)
 {
