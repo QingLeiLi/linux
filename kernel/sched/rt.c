@@ -70,6 +70,12 @@ static const struct ctl_table sched_rt_sysctls[] = {
 };
 
 /* 启动期注册 RT period/runtime 与 RR timeslice sysctl；注册失败不向外传播。 */
+/*
+ * 业务背景：启动阶段把 RT 带宽周期、运行额度和 RR 时间片暴露为 kernel sysctl。
+ * 入参：无。
+ * 出参/返回：恒返回 0，无输出参；尝试注册 sched_rt_sysctls 表。
+ * 注意事项：仅 CONFIG_SYSCTL 下存在并由 late_initcall 调用；注册失败不会传播，不能在运行期重复注册。
+ */
 static int __init sched_rt_sysctl_init(void)
 {
 	register_sysctl_init("kernel", sched_rt_sysctls);
@@ -79,6 +85,12 @@ late_initcall(sched_rt_sysctl_init);
 #endif /* CONFIG_SYSCTL */
 
 /* 初始化空 rt_rq 的优先级队列/哨兵位、pushable 集及可选带宽锁和计数。 */
+/*
+ * 业务背景：每 CPU 或每 task-group 的 RT runqueue 在接收实体前必须建立位图队列、迁移列表和带宽初态。
+ * 入参：rt_rq 是不可空输出对象，须指向已分配但尚未投入并发使用的 struct rt_rq。
+ * 出参/返回：无直接返回值；初始化 active、优先级缓存、pushable_tasks、排队标志及组调度字段。
+ * 注意事项：调用期不得有并发读写；函数不分配内存、不睡眠，CONFIG_RT_GROUP_SCHED 决定带宽字段是否存在。
+ */
 void init_rt_rq(struct rt_rq *rt_rq)
 {
 	struct rt_prio_array *array;
@@ -113,6 +125,12 @@ void init_rt_rq(struct rt_rq *rt_rq)
 static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun);
 
 /* period hard hrtimer 追赶 overrun 并补充各 rt_rq；全 idle 时停止，否则重启。 */
+/*
+ * 业务背景：RT 带宽周期到期时需按遗漏周期数补充 runtime，并在仍有受控队列时继续计时。
+ * 入参：timer 是不可空已触发 hard hrtimer，由 container_of 反查所属 rt_bandwidth。
+ * 出参/返回：全部队列空闲返回 HRTIMER_NORESTART，否则返回 HRTIMER_RESTART；无输出参。
+ * 注意事项：硬中断上下文运行，不能睡眠；rt_runtime_lock 保护 period_active，扫描各 rq 时临时解锁以避免锁嵌套。
+ */
 static enum hrtimer_restart sched_rt_period_timer(struct hrtimer *timer)
 {
 	struct rt_bandwidth *rt_b =
@@ -138,6 +156,12 @@ static enum hrtimer_restart sched_rt_period_timer(struct hrtimer *timer)
 }
 
 /* 初始化 bandwidth 的纳秒 period/runtime、锁和 pinned hard hrtimer。 */
+/*
+ * 业务背景：每个 RT 带宽域需要独立周期、额度和固定 CPU 的 hard hrtimer 执行补充。
+ * 入参：rt_b 是不可空未发布输出对象；period/runtime 均以纳秒计，runtime 可为 RUNTIME_INF。
+ * 出参/返回：无直接返回值；写入 period/runtime，初始化锁和 CLOCK_MONOTONIC hrtimer。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；初始化时无并发，函数不启动 timer，调用者负责对象生命周期长于回调。
+ */
 void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime)
 {
 	rt_b->rt_period = ns_to_ktime(period);
@@ -150,6 +174,12 @@ void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime)
 }
 
 /* runtime_lock 下仅首次激活 period timer，并立即 forward 修复 DL 已消耗的旧周期。 */
+/*
+ * 业务背景：首个受限 RT task 入队时启动周期计时，并修正 DL 已经推进带宽但未重置 RT period 的情况。
+ * 入参：rt_b 是不可空输入/输出带宽对象，timer 已由 init_rt_bandwidth() 初始化。
+ * 出参/返回：无直接返回值；首次调用设置 period_active 并启动 timer，已激活时无变化。
+ * 注意事项：内部持 rt_runtime_lock、不可睡眠；hrtimer 使用 ABS_PINNED_HARD，对象销毁前必须同步取消。
+ */
 static inline void do_start_rt_bandwidth(struct rt_bandwidth *rt_b)
 {
 	raw_spin_lock(&rt_b->rt_runtime_lock);
@@ -171,6 +201,12 @@ static inline void do_start_rt_bandwidth(struct rt_bandwidth *rt_b)
 }
 
 /* 仅在全局带宽启用且 runtime 有限时启动周期计时器。 */
+/*
+ * 业务背景：无限额度或全局禁用带宽控制时不需要周期补充，其他队列首次运行必须启动 timer。
+ * 入参：rt_b 是不可空输入/输出带宽对象。
+ * 出参/返回：无直接返回值；满足条件时可能激活 rt_b 的周期 timer。
+ * 注意事项：可在调度路径调用且不睡眠；runtime 读取需由上层配置串行保证，实际激活由 runtime_lock 防重。
+ */
 static void start_rt_bandwidth(struct rt_bandwidth *rt_b)
 {
 	if (!rt_bandwidth_enabled() || rt_b->rt_runtime == RUNTIME_INF)
@@ -180,6 +216,12 @@ static void start_rt_bandwidth(struct rt_bandwidth *rt_b)
 }
 
 /* 同步取消 bandwidth hrtimer，返回后回调不再访问 @rt_b。 */
+/*
+ * 业务背景：task group 销毁前必须阻止周期回调继续访问即将释放的 rt_bandwidth。
+ * 入参：rt_b 是不可空输入/输出带宽对象，timer 已初始化且可能活动。
+ * 出参/返回：无直接返回值；同步取消 timer，无输出参。
+ * 注意事项：hrtimer_cancel() 可能等待正在运行的回调，须在可睡眠上下文且不持回调所需锁时调用。
+ */
 static void destroy_rt_bandwidth(struct rt_bandwidth *rt_b)
 {
 	hrtimer_cancel(&rt_b->rt_period_timer);
@@ -188,6 +230,12 @@ static void destroy_rt_bandwidth(struct rt_bandwidth *rt_b)
 #define rt_entity_is_task(rt_se) (!(rt_se)->my_q)
 
 /* 由叶子 rt entity 反查 task；group entity 属于调用错误并 WARN。 */
+/*
+ * 业务背景：叶子 sched_rt_entity 内嵌于 task_struct，迁移和调度路径需恢复拥有它的 task。
+ * 入参：rt_se 是不可空、必须满足 rt_entity_is_task() 的借用实体。
+ * 出参/返回：返回包含该实体的 task_struct 借用指针，不增加引用、无输出参。
+ * 注意事项：group entity 会 WARN 且 container_of 结果不可用；调用者须以 rq/RCU 或 task 引用保证生命周期。
+ */
 static inline struct task_struct *rt_task_of(struct sched_rt_entity *rt_se)
 {
 	WARN_ON_ONCE(!rt_entity_is_task(rt_se));
@@ -196,6 +244,12 @@ static inline struct task_struct *rt_task_of(struct sched_rt_entity *rt_se)
 }
 
 /* 从顶层或组 rt_rq 找到所属 CPU rq；调用者必须处于对应锁/RCU 保护。 */
+/*
+ * 业务背景：层级 RT 队列最终都归属某个物理 CPU rq，带宽和迁移逻辑需回到该顶层对象。
+ * 入参：rt_rq 是不可空借用队列，已由 init_tg_rt_entry() 绑定 rq。
+ * 出参/返回：返回所属 struct rq 借用指针，不增加引用、无输出参。
+ * 注意事项：组调度关闭却传非 root group 会 WARN；调用者负责 rq 锁或热插拔稳定性，函数不睡眠。
+ */
 static inline struct rq *rq_of_rt_rq(struct rt_rq *rt_rq)
 {
 	/* Cannot fold with non-CONFIG_RT_GROUP_SCHED version, layout */
@@ -204,6 +258,12 @@ static inline struct rq *rq_of_rt_rq(struct rt_rq *rt_rq)
 }
 
 /* 返回 entity 当前排队的 rt_rq，task/group 两类共用。 */
+/*
+ * 业务背景：实体的 enqueue/dequeue 操作必须定位其当前层级的父 rt_rq。
+ * 入参：rt_se 是不可空借用实体，其 rt_rq 已完成初始化且生命周期稳定。
+ * 出参/返回：返回 rt_se->rt_rq 借用指针，不增加引用、无输出参。
+ * 注意事项：组调度关闭时非 root 布局会 WARN；不取锁，调用者须在 rq 锁下防止层级关系变化。
+ */
 static inline struct rt_rq *rt_rq_of_se(struct sched_rt_entity *rt_se)
 {
 	WARN_ON(!rt_group_sched_enabled() && rt_se->rt_rq->tg != &root_task_group);
@@ -211,6 +271,12 @@ static inline struct rt_rq *rt_rq_of_se(struct sched_rt_entity *rt_se)
 }
 
 /* 经 entity 的 rt_rq 返回底层 CPU rq。 */
+/*
+ * 业务背景：实体级操作需要把层级节点映射回负责串行调度状态的 CPU runqueue。
+ * 入参：rt_se 是不可空借用实体，rt_se->rt_rq 必须已绑定底层 rq。
+ * 出参/返回：返回所属 struct rq 借用指针，不增加引用、无输出参。
+ * 注意事项：不取锁、不校验空指针；非预期组布局会 WARN，调用者须保证实体和 rq 生命周期。
+ */
 static inline struct rq *rq_of_rt_se(struct sched_rt_entity *rt_se)
 {
 	struct rt_rq *rt_rq = rt_se->rt_rq;
@@ -220,6 +286,12 @@ static inline struct rq *rq_of_rt_se(struct sched_rt_entity *rt_se)
 }
 
 /* 从每 CPU rt_rq 摘除 @tg 的父 entity，阻止新任务沿该组进入 RT 层级。 */
+/*
+ * 业务背景：RT task group 注销时先停止其周期回调，才能安全进入后续 per-CPU 对象释放阶段。
+ * 入参：tg 是不可空输入/输出 task group，可能是组调度禁用时的占位对象。
+ * 出参/返回：无直接返回值、无输出参；启用组调度且已分配 rt_se 时同步销毁带宽 timer。
+ * 注意事项：调用者须先阻止新任务/引用进入；destroy 可能等待回调，不能持其 runtime/rq 锁。
+ */
 void unregister_rt_sched_group(struct task_group *tg)
 {
 	if (!rt_group_sched_enabled())
@@ -230,6 +302,12 @@ void unregister_rt_sched_group(struct task_group *tg)
 }
 
 /* 释放 @tg 所有 per-CPU rt_rq/entity 数组；调用前必须已注销且无引用。 */
+/*
+ * 业务背景：task group 最终销毁阶段回收每个 possible CPU 的 RT 队列、父实体和索引数组。
+ * 入参：tg 是不可空输入/输出 task group，其 RT timer 已注销且成员不再引用这些对象。
+ * 出参/返回：无直接返回值；释放 tg->rt_rq/rt_se 所拥有内存，无输出参。
+ * 注意事项：可睡眠；不清空指针且不处理并发，重复调用或尚有引用时会产生 UAF/双重释放。
+ */
 void free_rt_sched_group(struct task_group *tg)
 {
 	int i;
@@ -249,6 +327,12 @@ void free_rt_sched_group(struct task_group *tg)
 }
 
 /* 初始化 @cpu 的组 rt_rq 和连接 parent 的 rt entity；root 没有父 entity。 */
+/*
+ * 业务背景：组调度为每 CPU 构造 rt_rq，并用 group entity 把子队列递归挂到父组队列。
+ * 入参：tg/rt_rq 是不可空输入/输出对象；rt_se 可为空表示 root；cpu 是有效 possible CPU；parent 可为空表示挂到 rq 根 RT 队列。
+ * 出参/返回：无直接返回值；写 tg 的 per-CPU 槽、rt_rq 归属及 rt_se 的父子链接。
+ * 注意事项：仅初始化阶段调用、不得并发；不取得所有权外引用，所有对象必须至少活到 task group 注销。
+ */
 void init_tg_rt_entry(struct task_group *tg, struct rt_rq *rt_rq,
 		struct sched_rt_entity *rt_se, int cpu,
 		struct sched_rt_entity *parent)
@@ -277,6 +361,12 @@ void init_tg_rt_entry(struct task_group *tg, struct rt_rq *rt_rq,
 }
 
 /* 分配并逐 CPU 初始化组 RT 状态；失败逆序释放，成功返回 1。 */
+/*
+ * 业务背景：新 task group 需一次性建立所有 possible CPU 的 RT 队列和层级实体，任一分配失败都不能发布半成品。
+ * 入参：tg 是不可空输出 task group；parent 是不可空只读父组，其 rt_se 数组已初始化。
+ * 出参/返回：成功返回 1 并由 tg 拥有所有数组/对象，失败返回 0；组调度禁用时视为无需分配而成功。
+ * 注意事项：使用 GFP_KERNEL 可睡眠；失败路径依赖 task-group 上层清理已写数组槽，调用时不得并发访问 tg。
+ */
 int alloc_rt_sched_group(struct task_group *tg, struct task_group *parent)
 {
 	struct rt_rq *rt_rq;
@@ -323,16 +413,34 @@ err:
 
 #define rt_entity_is_task(rt_se) (1)
 
+/*
+ * 业务背景：未启用组调度时所有 RT entity 都是 task 叶子，可直接反查拥有者。
+ * 入参：rt_se 是不可空、内嵌于 task_struct 的借用实体。
+ * 出参/返回：返回所属 task_struct 借用指针，不增加引用、无输出参。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；错误传入非 task 内存会产生非法 container_of 结果。
+ */
 static inline struct task_struct *rt_task_of(struct sched_rt_entity *rt_se)
 {
 	return container_of(rt_se, struct task_struct, rt);
 }
 
+/*
+ * 业务背景：无组层级时 rt_rq 直接内嵌于 CPU rq，可用固定布局反查。
+ * 入参：rt_rq 是不可空、必须内嵌于 struct rq 的借用对象。
+ * 出参/返回：返回所属 struct rq 借用指针，不增加引用、无输出参。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；调用者须以 rq 锁或 hotplug 约束保证生命周期。
+ */
 static inline struct rq *rq_of_rt_rq(struct rt_rq *rt_rq)
 {
 	return container_of(rt_rq, struct rq, rt);
 }
 
+/*
+ * 业务背景：无组调度时 entity 所属 CPU rq 等同其 task 当前 rq。
+ * 入参：rt_se 是不可空 task entity 借用指针。
+ * 出参/返回：返回 task 当前 rq 借用指针，不增加引用、无输出参。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；迁移可改变结果，调用者必须持相应 rq/pi 锁。
+ */
 static inline struct rq *rq_of_rt_se(struct sched_rt_entity *rt_se)
 {
 	struct task_struct *p = rt_task_of(rt_se);
@@ -340,6 +448,12 @@ static inline struct rq *rq_of_rt_se(struct sched_rt_entity *rt_se)
 	return task_rq(p);
 }
 
+/*
+ * 业务背景：无组调度时从 task entity 的 CPU rq 取得唯一顶层 RT 队列。
+ * 入参：rt_se 是不可空 task entity 借用指针。
+ * 出参/返回：返回所属 rq->rt 借用指针，不增加引用、无输出参。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；调用者须锁定 task rq，避免并发迁移改变归属。
+ */
 static inline struct rt_rq *rt_rq_of_se(struct sched_rt_entity *rt_se)
 {
 	struct rq *rq = rq_of_rt_se(rt_se);
@@ -347,10 +461,28 @@ static inline struct rt_rq *rt_rq_of_se(struct sched_rt_entity *rt_se)
 	return &rq->rt;
 }
 
+/*
+ * 业务背景：未启用 RT 组调度时没有 per-group timer 需要注销，保留统一生命周期接口。
+ * 入参：tg 是未使用输入，可为 NULL，因为 stub 不解引用。
+ * 出参/返回：无直接返回值、无输出参和副作用。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；必须保持不可睡眠的中性语义。
+ */
 void unregister_rt_sched_group(struct task_group *tg) { }
 
+/*
+ * 业务背景：未启用 RT 组调度时没有 per-group RT 内存需要释放。
+ * 入参：tg 是未使用输入，可为 NULL，因为 stub 不解引用。
+ * 出参/返回：无直接返回值、无输出参和副作用。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；不获取所有权、不睡眠。
+ */
 void free_rt_sched_group(struct task_group *tg) { }
 
+/*
+ * 业务背景：未启用 RT 组调度时 task group 创建无需分配 RT 层级对象，但上层仍使用统一成功约定。
+ * 入参：tg/parent 均为未使用输入，可为 NULL，因为 stub 不解引用。
+ * 出参/返回：恒返回 1 表示无需资源且初始化成功；无输出参。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；不分配内存、不睡眠。
+ */
 int alloc_rt_sched_group(struct task_group *tg, struct task_group *parent)
 {
 	return 1;
@@ -358,6 +490,12 @@ int alloc_rt_sched_group(struct task_group *tg, struct task_group *parent)
 #endif /* !CONFIG_RT_GROUP_SCHED */
 
 /* 当前 RT 优先级降低且 root_domain overload 时返回 true，请求稍后 pull。 */
+/*
+ * 业务背景：当前 task 离开或降优先级后，本 rq 可能需要从其他 overload CPU 拉取更高优先级 RT task。
+ * 入参：rq 是不可空当前 CPU 队列；prev 是不可空刚切出的 task，二者均为只读借用。
+ * 出参/返回：rq 在线且当前最高 RT prio 数值大于 prev->prio 时返回 true，否则 false；无输出参。
+ * 注意事项：调用者须持 rq 锁；结果只是安排 pull callback 的条件，不能证明远端存在可迁移任务。
+ */
 static inline bool need_pull_rt_task(struct rq *rq, struct task_struct *prev)
 {
 	/* Try to pull RT tasks here if we lower this rq's prio */
@@ -365,12 +503,24 @@ static inline bool need_pull_rt_task(struct rq *rq, struct task_struct *prev)
 }
 
 /* 无锁读取 root_domain 中 overload rt_rq 数；与发布屏障配对后再扫 mask。 */
+/*
+ * 业务背景：pull 路径先用 root_domain 计数快速判断是否值得扫描 overload CPU mask。
+ * 入参：rq 是不可空借用 CPU runqueue，其 rd 生命周期由调度域/RCU 上下文保证。
+ * 出参/返回：返回当前 overload rt_rq 原子计数，0 表示无需扫描；无输出参。
+ * 注意事项：无锁快照可立即变化；非零后读取 rto_mask 必须执行与 rt_set_overload() 配对的屏障。
+ */
 static inline int rt_overloaded(struct rq *rq)
 {
 	return atomic_read(&rq->rd->rto_count);
 }
 
 /* rq 锁下先置 rto_mask 再发布 overload count，使 pull reader 不漏掉该 CPU。 */
+/*
+ * 业务背景：当一个 rq 出现多个可运行 RT task 时，将其发布到 root_domain 供其他 CPU 拉取。
+ * 入参：rq 是不可空输入/输出 runqueue，调用者必须持有 rq 锁。
+ * 出参/返回：无直接返回值；在线 rq 的 CPU 位加入 rto_mask 并递增 rto_count。
+ * 注意事项：先写 mask、smp_wmb() 后增计数；必须只在未标记到已标记转换时调用，否则计数失衡。
+ */
 static inline void rt_set_overload(struct rq *rq)
 {
 	if (!rq->online)
@@ -391,6 +541,12 @@ static inline void rt_set_overload(struct rq *rq)
 }
 
 /* rq 锁下撤销 overload CPU 位和计数，保持二者最终一致。 */
+/*
+ * 业务背景：rq 不再有多余可迁移 RT task 时，从 root_domain overload 集合撤销发布。
+ * 入参：rq 是不可空输入/输出 runqueue，调用者必须持有 rq 锁。
+ * 出参/返回：无直接返回值；在线 rq 的 rto_count 减一并清除 rto_mask CPU 位。
+ * 注意事项：只能与先前 rt_set_overload() 一一配对；离线 rq 不修改共享域状态，误配会使计数失真。
+ */
 static inline void rt_clear_overload(struct rq *rq)
 {
 	if (!rq->online)
@@ -402,6 +558,12 @@ static inline void rt_clear_overload(struct rq *rq)
 }
 
 /* 返回 pushable plist 是否非空；无锁调用只能作为需要加 rq 锁复核的提示。 */
+/*
+ * 业务背景：RT balance callback 需快速判断本 rq 是否存在非当前、可迁移的 RT task。
+ * 入参：rq 是不可空只读借用 runqueue。
+ * 出参/返回：pushable_tasks 非空返回 1，否则 0；无输出参。
+ * 注意事项：通常应在 rq 锁下读取；无锁结果仅作提示，真正迁移必须重新验证 task 状态和 affinity。
+ */
 static inline int has_pushable_tasks(struct rq *rq)
 {
 	return !plist_head_empty(&rq->rt.pushable_tasks);
@@ -414,6 +576,12 @@ static void push_rt_tasks(struct rq *);
 static void pull_rt_task(struct rq *);
 
 /* 将 push balance callback 挂到 rq，出锁后的 callback 迁移多余 RT task。 */
+/*
+ * 业务背景：rq 出现可迁移 RT task 时延后到安全的 balance callback 阶段执行 push，缩短当前锁区。
+ * 入参：rq 是不可空输入/输出 runqueue，调用者持 rq 锁。
+ * 出参/返回：无直接返回值；存在 pushable task 时把 per-CPU rt_push_head 排入 callback 链。
+ * 注意事项：queue helper 负责去重；任务状态仍可能变化，push_rt_tasks() 必须再次验证。
+ */
 static inline void rt_queue_push_tasks(struct rq *rq)
 {
 	if (!has_pushable_tasks(rq))
@@ -423,12 +591,24 @@ static inline void rt_queue_push_tasks(struct rq *rq)
 }
 
 /* 将 pull callback 挂到 rq，低优先级切入时从其他 overload rq 拉取任务。 */
+/*
+ * 业务背景：本 rq 可接纳更高优先级 RT task 时，延迟扫描 root_domain 并尝试从 overload rq 拉取。
+ * 入参：rq 是不可空输入/输出 runqueue，调用者持 rq 锁。
+ * 出参/返回：无直接返回值；把 per-CPU rt_pull_head 排入 rq 的 balance callback 链。
+ * 注意事项：只安排工作、不保证迁移成功；callback 执行时需用屏障、双 rq 锁和 affinity 重新验证。
+ */
 static inline void rt_queue_pull_task(struct rq *rq)
 {
 	queue_balance_callback(rq, &per_cpu(rt_pull_head, rq->cpu), pull_rt_task);
 }
 
 /* 把非当前且可迁移 @p 按 priority 加入 pushable plist，并更新 next highest。 */
+/*
+ * 业务背景：SMP RT 均衡按优先级维护可从本 rq 推走的 task，供 push 路径 O(1) 取得最高优先候选。
+ * 入参：rq 是不可空输入/输出 runqueue；p 是不可空可迁移 RT task，调用者持 rq 锁且保证 p 不为 current。
+ * 出参/返回：无直接返回值；重插 p 的 plist 节点，更新 next priority，并在首次 overload 时发布 rq。
+ * 注意事项：不取得 task 引用；重复节点先 del 再 add，误把 current/单 CPU task 加入会破坏迁移候选不变量。
+ */
 static void enqueue_pushable_task(struct rq *rq, struct task_struct *p)
 {
 	plist_del(&p->pushable_tasks, &rq->rt.pushable_tasks);
@@ -446,6 +626,12 @@ static void enqueue_pushable_task(struct rq *rq, struct task_struct *p)
 }
 
 /* 从 pushable plist 摘 @p，并用新表头刷新 highest_prio.next。 */
+/*
+ * 业务背景：task 运行、阻塞或失去迁移资格时必须从 pushable 集撤销，并维护 root-domain overload 状态。
+ * 入参：rq 是不可空输入/输出 runqueue；p 是不可空且当前已在 rq->rt.pushable_tasks 的 task。
+ * 出参/返回：无直接返回值；删除 p，刷新 next，列表变空时清 overload 发布。
+ * 注意事项：调用者持 rq 锁；函数会复用局部 p 指向新表头，不改变调用者变量，未入表调用会破坏 plist。
+ */
 static void dequeue_pushable_task(struct rq *rq, struct task_struct *p)
 {
 	plist_del(&p->pushable_tasks, &rq->rt.pushable_tasks);
@@ -469,6 +655,12 @@ static void enqueue_top_rt_rq(struct rt_rq *rt_rq);
 static void dequeue_top_rt_rq(struct rt_rq *rt_rq, unsigned int count);
 
 /* run_list 非空表示 entity 当前在某个 priority 队列中。 */
+/*
+ * 业务背景：层级 enqueue/dequeue 需要快速判断 entity 是否已经发布到父 rt_rq。
+ * 入参：rt_se 是不可空只读借用实体。
+ * 出参/返回：rt_se->on_rq 非零返回真值，否则 0；无输出参。
+ * 注意事项：无锁读取，调用者通常须持所属 rq 锁；仅表示 RT 队列成员关系，不等同 task_on_rq 状态。
+ */
 static inline int on_rt_rq(struct sched_rt_entity *rt_se)
 {
 	return rt_se->on_rq;
@@ -490,6 +682,12 @@ static inline int on_rt_rq(struct sched_rt_entity *rt_se)
  * > uclamp_max.
  */
 /* 在非对称容量系统判断 @cpu 是否满足 RT task uclamp/容量需求；否则恒 true。 */
+/*
+ * 业务背景：异构 CPU 选核时应避免把 RT task 放到低于其有效 uclamp_min 的 CPU。
+ * 入参：p 是不可空只读 task；cpu 是有效 online CPU 编号，仅输入。
+ * 出参/返回：对称系统或 cpu capacity 不低于 min(effective min,max) 时返回 true，否则 false；无输出参。
+ * 注意事项：仅 CONFIG_UCLAMP_TASK 实现；无锁快照只用于候选排序，最终放置仍受 affinity/hotplug 复核。
+ */
 static inline bool rt_task_fits_capacity(struct task_struct *p, int cpu)
 {
 	unsigned int min_cap;
@@ -508,6 +706,12 @@ static inline bool rt_task_fits_capacity(struct task_struct *p, int cpu)
 	return cpu_cap >= min(min_cap, max_cap);
 }
 #else /* !CONFIG_UCLAMP_TASK: */
+/*
+ * 业务背景：未启用 uclamp 时 RT 选核没有容量下限门禁，保留统一调用点。
+ * 入参：p/cpu 均为未使用输入，p 可为 NULL，因为 stub 不解引用。
+ * 出参/返回：恒返回 true；无输出参和副作用。
+ * 注意事项：仅 !CONFIG_UCLAMP_TASK 下存在；不校验 cpu 范围、不取锁、不睡眠。
+ */
 static inline bool rt_task_fits_capacity(struct task_struct *p, int cpu)
 {
 	return true;
@@ -517,12 +721,24 @@ static inline bool rt_task_fits_capacity(struct task_struct *p, int cpu)
 #ifdef CONFIG_RT_GROUP_SCHED
 
 /* 返回 @rt_rq 所属 bandwidth 的每周期 runtime 纳秒。 */
+/*
+ * 业务背景：RT 计费路径需要读取当前组在此 CPU 上可用的本地 runtime 配额。
+ * 入参：rt_rq 是不可空只读借用队列。
+ * 出参/返回：返回 rt_rq->rt_runtime，单位纳秒，可为 RUNTIME_INF；无输出参。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；锁外读取可能是借用调整中的快照，精确修改须持 runtime_lock。
+ */
 static inline u64 sched_rt_runtime(struct rt_rq *rt_rq)
 {
 	return rt_rq->rt_runtime;
 }
 
 /* 返回 @rt_rq 所属 bandwidth 的 period 纳秒。 */
+/*
+ * 业务背景：带宽借用和超额判断需把 task group 的 hrtimer 周期转换成纳秒标量。
+ * 入参：rt_rq 是不可空只读借用队列，其 tg/bandwidth 已初始化。
+ * 出参/返回：返回所属 task group 的 RT period 纳秒值；无输出参。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；不取锁，配置更新期间只保证调用上下文允许的快照。
+ */
 static inline u64 sched_rt_period(struct rt_rq *rt_rq)
 {
 	return ktime_to_ns(rt_rq->tg->rt_bandwidth.rt_period);
@@ -531,6 +747,12 @@ static inline u64 sched_rt_period(struct rt_rq *rt_rq)
 typedef struct task_group *rt_rq_iter_t;
 
 /* RCU 下按深度优先次序返回下一个 task_group，用于遍历各层 rt_rq。 */
+/*
+ * 业务背景：带宽 timer 与 CPU hotplug 要遍历所有非 autogroup 的 task group RT 队列。
+ * 入参：tg 是不可空当前 task group 借用指针，必须位于全局 task_groups RCU 链表。
+ * 出参/返回：返回下一个非 autogroup 借用指针，遍历结束返回 NULL；无输出参。
+ * 注意事项：调用者须持 RCU 读锁；组调度运行时禁用会 WARN/返回 NULL，返回指针不得带出保护期。
+ */
 static inline struct task_group *next_task_group(struct task_group *tg)
 {
 	if (!rt_group_sched_enabled()) {
@@ -558,6 +780,12 @@ static inline struct task_group *next_task_group(struct task_group *tg)
 	for (; rt_se; rt_se = rt_se->parent)
 
 /* group entity 返回其子 rt_rq；task entity 返回 NULL。 */
+/*
+ * 业务背景：层级代码用 my_q 区分代表 task 的叶子实体与代表子 task group 的父实体。
+ * 入参：rt_se 是不可空只读借用实体。
+ * 出参/返回：group entity 返回其子 rt_rq 借用指针，task entity 返回 NULL；无输出参。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；调用者以 rq 锁/RCU 保证实体与子队列生命周期。
+ */
 static inline struct rt_rq *group_rt_rq(struct sched_rt_entity *rt_se)
 {
 	return rt_se->my_q;
@@ -567,6 +795,12 @@ static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags);
 
 /* 子 rt_rq 有 runnable 且未 throttle 时把父 entity 逐层入队到 CPU rq。 */
+/*
+ * 业务背景：组内 RT 队列从不可选变为可运行时，必须把代表该组的 entity 向父层发布直到顶层 rq。
+ * 入参：rt_rq 是不可空输入/输出子队列，调用者持所属 CPU rq 锁。
+ * 出参/返回：无直接返回值；必要时入队父 entity/顶层计数，并可能请求 current 重调度。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；已 throttle 或无 runnable 时不发布，重复入队由 on_rt_rq 门禁避免。
+ */
 static void sched_rt_rq_enqueue(struct rt_rq *rt_rq)
 {
 	struct task_struct *donor = rq_of_rt_rq(rt_rq)->donor;
@@ -589,6 +823,12 @@ static void sched_rt_rq_enqueue(struct rt_rq *rt_rq)
 }
 
 /* 子 rt_rq 变空或 throttle 时逐层摘除父 entity，避免选择不可运行层级。 */
+/*
+ * 业务背景：组内 RT 队列失去可运行实体时，要撤销父层可选性；root 队列还需更新顶层计数和频率信号。
+ * 入参：rt_rq 是不可空输入/输出队列，调用者持所属 CPU rq 锁。
+ * 出参/返回：无直接返回值；摘除顶层 rt_rq 或已排队的父 entity，并可能通知 cpufreq。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；必须与 enqueue 层级不变量配对，不能在父 entity 未入队时强行删除。
+ */
 static void sched_rt_rq_dequeue(struct rt_rq *rt_rq)
 {
 	struct sched_rt_entity *rt_se;
@@ -606,12 +846,24 @@ static void sched_rt_rq_dequeue(struct rt_rq *rt_rq)
 }
 
 /* 只有 marked throttled 且没有 PI-boost entity 时才真正阻止选择。 */
+/*
+ * 业务背景：带宽耗尽通常 throttle RT 队列，但 PI boost task 必须继续运行以解除优先级反转。
+ * 入参：rt_rq 是不可空只读借用队列。
+ * 出参/返回：已标记 throttled 且 rt_nr_boosted 为 0 时返回真值，否则 0；无输出参。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；调用者须持 rq/runtime 允许的保护，结果可随 PI 状态变化。
+ */
 static inline int rt_rq_throttled(struct rt_rq *rt_rq)
 {
 	return rt_rq->rt_throttled && !rt_rq->rt_nr_boosted;
 }
 
 /* 沿 entity/parent 检查 task 是否因 PI 获得高于 normal_prio 的 RT 优先级。 */
+/*
+ * 业务背景：更新层级 boosted 计数时，需要判断 task 叶子或子组是否包含 PI 提升实体。
+ * 入参：rt_se 是不可空只读借用 task/group 实体。
+ * 出参/返回：group 返回子队列 rt_nr_boosted 是否非零，task 返回 prio!=normal_prio；无输出参。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；须在 rq/PI 锁协议内读取，普通策略差异不能误当永久 RT 配额。
+ */
 static int rt_se_boosted(struct sched_rt_entity *rt_se)
 {
 	struct rt_rq *rt_rq = group_rt_rq(rt_se);
@@ -625,6 +877,12 @@ static int rt_se_boosted(struct sched_rt_entity *rt_se)
 }
 
 /* bandwidth timer 需要扫描的 CPU 集；通常是 online CPU。 */
+/*
+ * 业务背景：共享 RT bandwidth 的周期回调只需扫描当前 root_domain span 内的 CPU 队列。
+ * 入参：无，隐式使用 this_rq() 的 root_domain。
+ * 出参/返回：返回 rd->span 的只读借用 cpumask 指针；无输出参。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；调用者须处于能稳定 root_domain 生命周期的调度/RCU 上下文。
+ */
 static inline const struct cpumask *sched_rt_period_mask(void)
 {
 	return this_rq()->rd->span;
@@ -632,18 +890,36 @@ static inline const struct cpumask *sched_rt_period_mask(void)
 
 static inline
 /* 由 bandwidth 与 @cpu 找到对应组/根 rt_rq；调用者只借用。 */
+/*
+ * 业务背景：周期和借用逻辑持有 bandwidth 时需定位同一 task group 在指定 CPU 上的 rt_rq。
+ * 入参：rt_b 是不可空且内嵌于 task_group 的借用对象；cpu 是有效 possible CPU 编号。
+ * 出参/返回：返回该 group 的 per-CPU rt_rq 借用指针，可能在未分配槽上为 NULL；无输出参。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；调用者须以 task-group/RCU 生命周期保证数组稳定。
+ */
 struct rt_rq *sched_rt_period_rt_rq(struct rt_bandwidth *rt_b, int cpu)
 {
 	return container_of(rt_b, struct task_group, rt_bandwidth)->rt_rq[cpu];
 }
 
 /* 返回 @rt_rq 所属 task_group 的共享 bandwidth 对象。 */
+/*
+ * 业务背景：per-CPU rt_rq 的计费和补充共享所属 task group 的 period/runtime 配置。
+ * 入参：rt_rq 是不可空只读借用队列，其 tg 已初始化。
+ * 出参/返回：返回 tg->rt_bandwidth 借用指针，不转移 ownership、无输出参。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；调用者负责 task group 生命周期和必要的 runtime_lock。
+ */
 static inline struct rt_bandwidth *sched_rt_bandwidth(struct rt_rq *rt_rq)
 {
 	return &rt_rq->tg->rt_bandwidth;
 }
 
 /* 判断当前 rt_rq 是否需要 runtime 计费；无限额度快速返回 false。 */
+/*
+ * 业务背景：update_curr_rt() 仅在周期 timer 活动或本地已消耗接近共享额度时才需走带宽记账路径。
+ * 入参：rt_rq 是不可空只读借用队列。
+ * 出参/返回：timer 活动或 rt_time 小于共享 runtime 时返回 true，否则 false；无输出参。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；无锁快照用于优化，真正超额判断在相应锁下再次完成。
+ */
 bool sched_rt_bandwidth_account(struct rt_rq *rt_rq)
 {
 	struct rt_bandwidth *rt_b = sched_rt_bandwidth(rt_rq);
@@ -656,6 +932,12 @@ bool sched_rt_bandwidth_account(struct rt_rq *rt_rq)
  * We ran out of runtime, see if we can borrow some from our neighbours.
  */
 /* 从同 root_domain 其他 rt_rq 的闲置额度借 runtime，所有转移在双方 runtime_lock 下。 */
+/*
+ * 业务背景：启用 RT_RUNTIME_SHARE 后，耗尽额度的 CPU 可按域内权重借用邻居尚未消费的同组 runtime。
+ * 入参：rt_rq 是不可空输入/输出目标队列，调用时其 runtime 不足且所属 rq/root_domain 稳定。
+ * 出参/返回：无直接返回值；可能减少邻居 runtime 并增加目标 runtime，最多补到一个 period。
+ * 注意事项：按 bandwidth 锁再逐个邻居 runtime_lock 的顺序，不睡眠；RUNTIME_INF 队列禁止参与借用。
+ */
 static void do_balance_runtime(struct rt_rq *rt_rq)
 {
 	struct rt_bandwidth *rt_b = sched_rt_bandwidth(rt_rq);
@@ -709,6 +991,12 @@ next:
  * Ensure this RQ takes back all the runtime it lend to its neighbours.
  */
 /* CPU offline 前归还本 rq 借入/借出的 runtime，恢复每个组的基准额度。 */
+/*
+ * 业务背景：CPU 停用前须从域内邻居回收曾借出的额度，并把本 CPU 标成无限以退出后续共享计算。
+ * 入参：rq 是不可空输入/输出离线 runqueue，调用者已串行 CPU hotplug 与调度状态。
+ * 出参/返回：无直接返回值；逐组平衡 runtime、清 throttle、设 RUNTIME_INF 并重新发布可运行队列。
+ * 注意事项：锁序为 bandwidth 后各 runtime_lock；回收不守恒会 WARN，scheduler 尚未运行时直接返回。
+ */
 static void __disable_runtime(struct rq *rq)
 {
 	struct root_domain *rd = rq->rd;
@@ -792,6 +1080,12 @@ balanced:
 }
 
 /* CPU online 时重新启用每个组 rt_rq 的 runtime 计费并清过期 throttle 状态。 */
+/*
+ * 业务背景：CPU 重新上线后要撤销离线阶段的 RUNTIME_INF 哨兵，恢复每组配置额度并从零开始计费。
+ * 入参：rq 是不可空输入/输出上线 runqueue，hotplug 上下文保证其层级队列稳定。
+ * 出参/返回：无直接返回值；重置各 rt_rq 的 runtime、rt_time 和 throttled。
+ * 注意事项：按 bandwidth→本地 runtime_lock 修改；scheduler 未启动时无操作，调用者负责之后的队列发布。
+ */
 static void __enable_runtime(struct rq *rq)
 {
 	rt_rq_iter_t iter;
@@ -817,6 +1111,12 @@ static void __enable_runtime(struct rq *rq)
 }
 
 /* runtime 不足且特性开启时尝试借额；无限/足额快速返回。 */
+/*
+ * 业务背景：本地 rt_time 超过 runtime 时，在真正 throttle 前可利用域内其他 CPU 的闲置额度。
+ * 入参：rt_rq 是不可空输入/输出队列，调用者进入时持有其 rt_runtime_lock。
+ * 出参/返回：无直接返回值；特性启用且超额时可能调整本地及邻居 runtime。
+ * 注意事项：函数临时释放本地 runtime_lock 以遵守全局锁序，返回前重新获取；调用者不能假定中间状态不变。
+ */
 static void balance_runtime(struct rt_rq *rt_rq)
 {
 	if (!sched_feat(RT_RUNTIME_SHARE))
@@ -830,6 +1130,12 @@ static void balance_runtime(struct rt_rq *rt_rq)
 }
 
 /* 按 @overrun 个周期补充所有 CPU rt_rq，解除可运行队列 throttle；全 idle 返回 1。 */
+/*
+ * 业务背景：period timer 每次触发要扣除跨过周期对应的已用时间，解除有新额度队列的 throttle 并判断能否停表。
+ * 入参：rt_b 是不可空输入/输出共享带宽；overrun 是大于 0 的逾期周期数。
+ * 出参/返回：无需继续 timer 返回 1，否则返回 0；无输出参，可能重置 runtime、rt_time、throttle 和入队状态。
+ * 注意事项：hard timer 上下文不可睡眠；逐 CPU 获取 runtime/rq 锁，root group 用 online mask 避免隔离 CPU 永久 throttle。
+ */
 static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun)
 {
 	int i, idle = 1, throttled = 0;
@@ -916,6 +1222,12 @@ static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun)
 }
 
 /* 更新已用 runtime，超配额时 throttle 并启动 period timer；PI boost 可临时绕过。 */
+/*
+ * 业务背景：RT 实体运行后检查本层队列是否耗尽周期额度，必要时从父层摘除以保护非 RT 任务。
+ * 入参：rt_rq 是不可空输入/输出队列，调用者持所属 rq 锁和 rt_runtime_lock。
+ * 出参/返回：队列最终被有效 throttle 返回 1，否则 0；无输出参，可能借额、置 throttle 或清零零额度 PI 时间。
+ * 注意事项：PI boosted 实体可绕过 throttle 以解除锁依赖；runtime>=period 或 RUNTIME_INF 表示不限制。
+ */
 static int sched_rt_runtime_exceeded(struct rt_rq *rt_rq)
 {
 	u64 runtime = sched_rt_runtime(rt_rq);
@@ -969,11 +1281,23 @@ typedef struct rt_rq *rt_rq_iter_t;
 #define for_each_sched_rt_entity(rt_se) \
 	for (; rt_se; rt_se = NULL)
 
+/*
+ * 业务背景：无 RT 组调度时不存在代表子队列的 entity，统一 helper 必须报告叶子语义。
+ * 入参：rt_se 是未使用输入，可为 NULL，因为 stub 不解引用。
+ * 出参/返回：恒返回 NULL，表示没有子 rt_rq；无输出参。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；不取锁、不睡眠。
+ */
 static inline struct rt_rq *group_rt_rq(struct sched_rt_entity *rt_se)
 {
 	return NULL;
 }
 
+/*
+ * 业务背景：无组层级时可运行 RT 数量直接映射到 CPU 顶层 rq，并立即请求重调度。
+ * 入参：rt_rq 是不可空输入/输出顶层队列，调用者持 rq 锁。
+ * 出参/返回：无直接返回值；非空时发布顶层计数并 resched current。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；空队列无副作用，重复发布由 enqueue_top_rt_rq 防护。
+ */
 static inline void sched_rt_rq_enqueue(struct rt_rq *rt_rq)
 {
 	struct rq *rq = rq_of_rt_rq(rt_rq);
@@ -985,33 +1309,75 @@ static inline void sched_rt_rq_enqueue(struct rt_rq *rt_rq)
 	resched_curr(rq);
 }
 
+/*
+ * 业务背景：无组层级时撤销 RT 可运行状态只需更新 CPU 顶层 rq 计数。
+ * 入参：rt_rq 是不可空输入/输出顶层队列，调用者持 rq 锁。
+ * 出参/返回：无直接返回值；按当前 rt_nr_running 撤销顶层发布。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；计数必须与先前 enqueue 配对。
+ */
 static inline void sched_rt_rq_dequeue(struct rt_rq *rt_rq)
 {
 	dequeue_top_rt_rq(rt_rq, rt_rq->rt_nr_running);
 }
 
+/*
+ * 业务背景：未启用组调度时本文件没有分层 RT runtime throttle，保留统一查询接口。
+ * 入参：rt_rq 是未使用输入，可为 NULL，因为 stub 不解引用。
+ * 出参/返回：恒返回 false；无输出参。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；全局 RT throttle 由其他配置路径体现，不能据此推断系统无限制。
+ */
 static inline int rt_rq_throttled(struct rt_rq *rt_rq)
 {
 	return false;
 }
 
+/*
+ * 业务背景：无组调度时若需要扫描 RT 周期对象，范围就是全部 online CPU。
+ * 入参：无。
+ * 出参/返回：返回 cpu_online_mask 只读借用指针；无输出参。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；mask 可随 hotplug 变化，调用者须在合适保护下遍历。
+ */
 static inline const struct cpumask *sched_rt_period_mask(void)
 {
 	return cpu_online_mask;
 }
 
 static inline
+/*
+ * 业务背景：无组层级时任意 bandwidth/CPU 组合都对应 CPU 顶层 rt_rq。
+ * 入参：rt_b 是未使用输入、可为 NULL；cpu 是有效 possible CPU 编号。
+ * 出参/返回：返回 cpu_rq(cpu)->rt 借用指针；无输出参。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；调用者保证 cpu 与 hotplug 生命周期稳定。
+ */
 struct rt_rq *sched_rt_period_rt_rq(struct rt_bandwidth *rt_b, int cpu)
 {
 	return &cpu_rq(cpu)->rt;
 }
 
+/*
+ * 业务背景：未启用组调度时 CPU online 不需要恢复 per-group runtime 状态。
+ * 入参：rq 是未使用输入，可为 NULL，因为 stub 不解引用。
+ * 出参/返回：无直接返回值、无输出参和副作用。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；不可睡眠。
+ */
 static void __enable_runtime(struct rq *rq) { }
+/*
+ * 业务背景：未启用组调度时 CPU offline 不需要回收 per-group runtime 借用。
+ * 入参：rq 是未使用输入，可为 NULL，因为 stub 不解引用。
+ * 出参/返回：无直接返回值、无输出参和副作用。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；不可睡眠。
+ */
 static void __disable_runtime(struct rq *rq) { }
 
 #endif /* !CONFIG_RT_GROUP_SCHED */
 
 /* 返回 task entity 的有效 prio，group entity 返回其子 rt_rq 当前最高 prio。 */
+/*
+ * 业务背景：priority 队列插入层级 entity 时，需要把 task prio 或子组最高 prio 归一为同一键。
+ * 入参：rt_se 是不可空只读 task/group entity 借用指针。
+ * 出参/返回：group 返回 my_q->highest_prio.curr，task 返回拥有者 p->prio；无输出参。
+ * 注意事项：调用者须持所属 rq 锁；组调度配置决定是否检查 my_q，空子组不应被调用。
+ */
 static inline int rt_se_prio(struct sched_rt_entity *rt_se)
 {
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -1029,6 +1395,12 @@ static inline int rt_se_prio(struct sched_rt_entity *rt_se)
  * are not in our scheduling class.
  */
 /* 用 rq clock_task 给当前 RT donor 累计运行时间/组 runtime，并在超额时请求重调度。 */
+/*
+ * 业务背景：每次调度时钟更新要把实际执行时间记入当前 RT task，并沿 task-group 层级扣减 runtime 配额。
+ * 入参：rq 是不可空输入/输出当前 runqueue，调用者持 rq 锁且已更新 rq clock。
+ * 出参/返回：无直接返回值；更新 donor 运行统计和各层 rt_time，超额时 throttle/resched 并启动 timer。
+ * 注意事项：非 RT donor 或非正 delta 快速返回；runtime_lock 嵌于 rq 锁内，函数不可睡眠。
+ */
 static void update_curr_rt(struct rq *rq)
 {
 	struct task_struct *donor = rq->donor;
@@ -1066,6 +1438,12 @@ static void update_curr_rt(struct rq *rq)
 }
 
 /* 顶层 rt_rq runnable 数减少 @count，首次变空时从 rq 调度类负载中注销。 */
+/*
+ * 业务背景：顶层 RT 队列被 throttle 或变空时，CPU rq 的总 runnable 计数必须同步扣除已发布实体数。
+ * 入参：rt_rq 是不可空输入/输出且必须为 rq->rt；count 是要扣除的已发布 runnable 数。
+ * 出参/返回：无直接返回值；已发布时 sub_nr_running(count) 并清 rt_queued。
+ * 注意事项：调用者持 rq 锁；非顶层或 rq 总数为零会 BUG，重复撤销由 rt_queued 快路径阻止。
+ */
 static void
 dequeue_top_rt_rq(struct rt_rq *rt_rq, unsigned int count)
 {
@@ -1084,6 +1462,12 @@ dequeue_top_rt_rq(struct rt_rq *rt_rq, unsigned int count)
 }
 
 /* 非 throttle 且首次变为 runnable 时把顶层 rt_rq 发布给 CPU rq。 */
+/*
+ * 业务背景：顶层 RT 队列首次拥有可运行实体时，要计入 CPU rq 总 runnable 数并通知 cpufreq。
+ * 入参：rt_rq 是不可空输入/输出且必须为 rq->rt，调用者持 rq 锁。
+ * 出参/返回：无直接返回值；未 throttle 且非空时 add_nr_running 并置 rt_queued，随后更新频率利用率。
+ * 注意事项：非顶层会 BUG；重复发布或 throttle 时不改计数，rt_nr_running 必须与层级维护一致。
+ */
 static void
 enqueue_top_rt_rq(struct rt_rq *rt_rq)
 {
@@ -1107,6 +1491,12 @@ enqueue_top_rt_rq(struct rt_rq *rt_rq)
 }
 
 /* SMP 下更新 highest curr/next、cpupri 与 overload 派生索引。 */
+/*
+ * 业务背景：顶层 RT 最高优先级提高时，要更新 root-domain cpupri，供其他 CPU 快速查找可迁移目标。
+ * 入参：rt_rq 是不可空输入/输出队列；prio 是新实体内部优先级；prev_prio 是更新前最高优先级。
+ * 出参/返回：无直接返回值；仅顶层、online rq 且优先级提高时更新 cpupri。
+ * 注意事项：调用者持 rq 锁；子组队列不能直接发布到 cpupri，prio 数值越小越高。
+ */
 static void
 inc_rt_prio_smp(struct rt_rq *rt_rq, int prio, int prev_prio)
 {
@@ -1123,6 +1513,12 @@ inc_rt_prio_smp(struct rt_rq *rt_rq, int prio, int prev_prio)
 }
 
 /* 最高优先级离开后刷新 curr/next 与 root-domain cpupri 候选。 */
+/*
+ * 业务背景：顶层 RT 最高优先级降低后必须刷新 cpupri，否则 push 可能选择已不合适的 CPU。
+ * 入参：rt_rq 是不可空输入/输出队列；prio 是离开实体优先级；prev_prio 是离开前最高值。
+ * 出参/返回：无直接返回值；顶层 online rq 的最高值发生变化时更新 cpupri。
+ * 注意事项：prio 只用于接口对称且本实现不读取；调用者持 rq 锁，cpupri 仍只是迁移候选索引。
+ */
 static void
 dec_rt_prio_smp(struct rt_rq *rt_rq, int prio, int prev_prio)
 {
@@ -1139,6 +1535,12 @@ dec_rt_prio_smp(struct rt_rq *rt_rq, int prio, int prev_prio)
 }
 
 /* entity 加入后将 @prio 合入 rt_rq 最高优先级。 */
+/*
+ * 业务背景：RT entity 入队时缓存数值最小的最高优先级，避免选取路径重复扫描位图。
+ * 入参：rt_rq 是不可空输入/输出队列；prio 是 [0,MAX_RT_PRIO) 的实体内部优先级。
+ * 出参/返回：无直接返回值；可能降低 highest_prio.curr 并同步顶层 cpupri。
+ * 注意事项：调用者持 rq 锁且 bitmap/计数已处于匹配阶段；非法 prio 会破坏候选索引。
+ */
 static void
 inc_rt_prio(struct rt_rq *rt_rq, int prio)
 {
@@ -1151,6 +1553,12 @@ inc_rt_prio(struct rt_rq *rt_rq, int prio)
 }
 
 /* 最后一个 @prio entity 离开时扫描 bitmap 并刷新最高优先级索引。 */
+/*
+ * 业务背景：RT entity 出队后若移走当前最高优先级，需要从 active bitmap 找到下一非空队列。
+ * 入参：rt_rq 是不可空输入/输出队列；prio 是刚移除实体的有效内部优先级。
+ * 出参/返回：无直接返回值；刷新 highest_prio.curr，空队列恢复哨兵，并同步 cpupri。
+ * 注意事项：调用者持 rq 锁且已更新 rt_nr_running/bitmap；prio 小于旧最高值会 WARN，状态不一致会误选任务。
+ */
 static void
 dec_rt_prio(struct rt_rq *rt_rq, int prio)
 {
@@ -1180,6 +1588,12 @@ dec_rt_prio(struct rt_rq *rt_rq, int prio)
 
 #ifdef CONFIG_RT_GROUP_SCHED
 
+/*
+ * 业务背景：entity 入队时把 PI boost 贡献累加到父 rt_rq，并确保所属 task group 的周期补充已启动。
+ * 入参：rt_se 是不可空只读 entity；rt_rq 是不可空输入/输出父队列。
+ * 出参/返回：无直接返回值；可能递增 rt_nr_boosted 并启动 bandwidth timer。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；调用者持 rq 锁，boost 判断须与 PI 状态一致。
+ */
 static void
 inc_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 {
@@ -1189,6 +1603,12 @@ inc_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 	start_rt_bandwidth(&rt_rq->tg->rt_bandwidth);
 }
 
+/*
+ * 业务背景：entity 出队时撤销其对父队列 PI boost 计数的贡献，维持 throttle 旁路判断。
+ * 入参：rt_se 是不可空只读 entity；rt_rq 是不可空输入/输出父队列。
+ * 出参/返回：无直接返回值；boosted entity 使 rt_nr_boosted 减一。
+ * 注意事项：仅 CONFIG_RT_GROUP_SCHED 下存在；调用者持 rq 锁，空队列仍有 boosted 计数会 WARN。
+ */
 static void
 dec_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 {
@@ -1200,17 +1620,35 @@ dec_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 
 #else /* !CONFIG_RT_GROUP_SCHED: */
 
+/*
+ * 业务背景：无组调度时无需维护父组 boosted 计数或启动 per-group timer。
+ * 入参：rt_se/rt_rq 均为未使用输入，可为 NULL，因为 stub 不解引用。
+ * 出参/返回：无直接返回值、无输出参和副作用。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；不可睡眠。
+ */
 static void
 inc_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 {
 }
 
 static inline
+/*
+ * 业务背景：无组调度时 entity 出队没有父组 boosted 计数需要撤销。
+ * 入参：rt_se/rt_rq 均为未使用输入，可为 NULL，因为 stub 不解引用。
+ * 出参/返回：无直接返回值、无输出参和副作用。
+ * 注意事项：仅 !CONFIG_RT_GROUP_SCHED 下存在；不可睡眠。
+ */
 void dec_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq) {}
 
 #endif /* !CONFIG_RT_GROUP_SCHED */
 
 /* task entity 贡献 1，group entity 贡献其子 rt_rq 的 runnable task 数。 */
+/*
+ * 业务背景：父 rt_rq 的 runnable 总数按叶子 task 数统计，group entity 需展开其子队列贡献。
+ * 入参：rt_se 是不可空只读 task/group entity。
+ * 出参/返回：task 返回 1，group 返回子 rt_rq->rt_nr_running；无输出参。
+ * 注意事项：调用者持 rq 锁保证层级计数稳定；返回 0 的空 group 不应处于父优先级列表。
+ */
 static inline
 unsigned int rt_se_nr_running(struct sched_rt_entity *rt_se)
 {
@@ -1223,6 +1661,12 @@ unsigned int rt_se_nr_running(struct sched_rt_entity *rt_se)
 }
 
 /* 返回 entity 覆盖的 SCHED_RR task 数。 */
+/*
+ * 业务背景：rq 需要单独统计 RR task 数，以决定 tick 是否执行时间片轮转逻辑。
+ * 入参：rt_se 是不可空只读 task/group entity。
+ * 出参/返回：group 返回子队列 rr_nr_running；task 为 SCHED_RR 返回 1，否则 0；无输出参。
+ * 注意事项：调用者持 rq 锁；task policy 并发变化必须由调度类切换协议串行。
+ */
 static inline
 unsigned int rt_se_rr_nr_running(struct sched_rt_entity *rt_se)
 {
@@ -1238,6 +1682,12 @@ unsigned int rt_se_rr_nr_running(struct sched_rt_entity *rt_se)
 }
 
 /* entity 入队时增加 runnable/RR/迁移计数并更新顶层/cpupri/overload。 */
+/*
+ * 业务背景：entity 成为父 rt_rq 成员时，所有派生计数、最高优先级和组带宽状态必须同步增加。
+ * 入参：rt_se 是不可空已入队 entity；rt_rq 是不可空输入/输出父队列。
+ * 出参/返回：无直接返回值；增加 runnable/RR/boosted 计数并更新 highest/cpupri、启动带宽。
+ * 注意事项：调用者持 rq 锁且只能对一次入队调用；非 RT prio 会 WARN，重复增加会破坏全局 nr_running。
+ */
 static inline
 void inc_rt_tasks(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 {
@@ -1252,6 +1702,12 @@ void inc_rt_tasks(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 }
 
 /* entity 出队时对称减少计数并撤销不再成立的 overload/cpupri 状态。 */
+/*
+ * 业务背景：entity 离开父 rt_rq 时要对称撤销其叶子、RR 和 boosted 贡献，并重新计算最高优先级。
+ * 入参：rt_se 是不可空正在出队 entity；rt_rq 是不可空输入/输出父队列。
+ * 出参/返回：无直接返回值；减少计数并更新 highest/cpupri 与组状态。
+ * 注意事项：调用者持 rq 锁且 entity 必须已计数；空计数或非 RT prio 会 WARN，下溢将破坏调度选择。
+ */
 static inline
 void dec_rt_tasks(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 {
@@ -1270,6 +1726,12 @@ void dec_rt_tasks(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
  * assumes ENQUEUE/DEQUEUE flags match
  */
 /* SAVE/RESTORE 属性更新时可保持队列位置，普通操作才真正移动 entity。 */
+/*
+ * 业务背景：调度属性更新可能只暂存 entity 状态而不改变同优先级 FIFO 顺序，需从通用 flags 判断是否移动链表节点。
+ * 入参：flags 是 ENQUEUE/DEQUEUE 标志位集合，仅输入。
+ * 出参/返回：仅 DEQUEUE_SAVE 且无 DEQUEUE_MOVE 时返回 false，其他组合返回 true；无输出参。
+ * 注意事项：调用方的 enqueue/dequeue flags 必须语义配对；误判会改变 FIFO/RR 公平顺序。
+ */
 static inline bool move_entity(unsigned int flags)
 {
 	if ((flags & (DEQUEUE_SAVE | DEQUEUE_MOVE)) == DEQUEUE_SAVE)
@@ -1279,6 +1741,12 @@ static inline bool move_entity(unsigned int flags)
 }
 
 /* 从 priority list 摘 entity；该优先级变空时清 bitmap 位。 */
+/*
+ * 业务背景：RT priority array 以链表保存同优先级 FIFO 顺序、以 bitmap 标记非空队列，两者必须原子维护。
+ * 入参：rt_se 是不可空且 on_list 的输入/输出 entity；array 是不可空所属优先级数组。
+ * 出参/返回：无直接返回值；摘除 run_list，必要时清 bitmap，并清 on_list。
+ * 注意事项：调用者持 rq 锁；entity 未在该 array 时调用会破坏链表，prio 必须在合法范围。
+ */
 static void __delist_rt_entity(struct sched_rt_entity *rt_se, struct rt_prio_array *array)
 {
 	list_del_init(&rt_se->run_list);
@@ -1290,6 +1758,12 @@ static void __delist_rt_entity(struct sched_rt_entity *rt_se, struct rt_prio_arr
 }
 
 static inline struct sched_statistics *
+/*
+ * 业务背景：schedstats 只存于 task_struct，RT group entity 没有可记录的独立统计对象。
+ * 入参：rt_se 是不可空只读 task/group entity。
+ * 出参/返回：task entity 返回其 stats 借用指针，group entity 返回 NULL；无输出参。
+ * 注意事项：不取锁、不增加 task 引用；调用者须在 rq/task 生命周期保护内使用返回指针。
+ */
 __schedstats_from_rt_se(struct sched_rt_entity *rt_se)
 {
 	/* schedstats is not supported for rt group. */
@@ -1300,6 +1774,12 @@ __schedstats_from_rt_se(struct sched_rt_entity *rt_se)
 }
 
 static inline void
+/*
+ * 业务背景：RT task 开始在队列等待时记录等待起点，供 schedstats 计算调度延迟。
+ * 入参：rt_rq 是不可空所属队列；rt_se 是不可空 task/group entity，均为输入/输出借用。
+ * 出参/返回：无直接返回值；schedstats 启用且为 task 时更新其 wait_start。
+ * 注意事项：调用者持 rq 锁；group entity 和禁用 schedstats 时无操作，不得把 NULL stats 传下层。
+ */
 update_stats_wait_start_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se)
 {
 	struct sched_statistics *stats;
@@ -1319,6 +1799,12 @@ update_stats_wait_start_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se)
 }
 
 static inline void
+/*
+ * 业务背景：睡眠唤醒的 RT task 再入队时需记录睡眠结束及等待开始相关统计。
+ * 入参：rt_rq 是不可空所属队列；rt_se 是不可空 task/group entity。
+ * 出参/返回：无直接返回值；schedstats 启用且为 task 时更新 enqueue-sleeper 统计。
+ * 注意事项：调用者持 rq 锁；group entity 无独立 schedstats，禁用统计时快速返回。
+ */
 update_stats_enqueue_sleeper_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se)
 {
 	struct sched_statistics *stats;
@@ -1338,6 +1824,12 @@ update_stats_enqueue_sleeper_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_
 }
 
 static inline void
+/*
+ * 业务背景：RT entity 入队统计只在真正的 wakeup 场景记录睡眠者延迟，避免内部重排重复计数。
+ * 入参：rt_rq/rt_se 是不可空所属队列和实体；flags 是入队原因标志。
+ * 出参/返回：无直接返回值；ENQUEUE_WAKEUP 时可能更新 task schedstats。
+ * 注意事项：调用者持 rq 锁；统计禁用或非 wakeup 时无副作用。
+ */
 update_stats_enqueue_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se,
 			int flags)
 {
@@ -1349,6 +1841,12 @@ update_stats_enqueue_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se,
 }
 
 static inline void
+/*
+ * 业务背景：RT task 被选中或离队时结束等待区间，累加其 runqueue 等待时长。
+ * 入参：rt_rq 是不可空所属队列；rt_se 是不可空 task/group entity。
+ * 出参/返回：无直接返回值；schedstats 启用且为 task 时更新 wait_end。
+ * 注意事项：调用者持 rq 锁；group entity 和关闭统计时无操作，时钟取自底层 CPU rq。
+ */
 update_stats_wait_end_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se)
 {
 	struct sched_statistics *stats;
@@ -1368,6 +1866,12 @@ update_stats_wait_end_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se)
 }
 
 static inline void
+/*
+ * 业务背景：RT task 离队时要结束排队等待；因睡眠离队还需区分可中断睡眠与不可中断阻塞起点。
+ * 入参：rt_rq/rt_se 是不可空所属队列和实体；flags 是 DEQUEUE_* 原因标志。
+ * 出参/返回：无直接返回值；可能更新 wait_end、sleep_start 或 block_start。
+ * 注意事项：调用者持 rq 锁；current 不重复结束等待，task state 用 READ_ONCE 取瞬时值，group 无睡眠统计。
+ */
 update_stats_dequeue_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se,
 			int flags)
 {
@@ -1399,6 +1903,12 @@ update_stats_dequeue_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se,
 }
 
 /* 将单层 entity 按 HEAD/尾部插入 priority list，并更新 bitmap 与计数。 */
+/*
+ * 业务背景：层级重建时把一个 task/group entity 发布到其直接父 rt_rq，并维护 FIFO 队列和所有派生计数。
+ * 入参：rt_se 是不可空输入/输出 entity；flags 控制是否移动及头/尾插入。
+ * 出参/返回：无直接返回值；可插入 run_list、置 bitmap/on_rq/on_list 并增加父队列计数。
+ * 注意事项：调用者持底层 rq 锁；throttled/空 group 不得发布，重复 on_list 会 WARN，SAVE 可只恢复计数不移动。
+ */
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct rt_rq *rt_rq = rt_rq_of_se(rt_se);
@@ -1434,6 +1944,12 @@ static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flag
 }
 
 /* 从单层 priority queue 摘 entity 并更新等待统计和 runnable 计数。 */
+/*
+ * 业务背景：层级拆除时从直接父 rt_rq 撤销一个 entity，保持链表、bitmap 与 runnable 计数对称。
+ * 入参：rt_se 是不可空输入/输出且 on_rq 的 entity；flags 控制是否实际移动链表节点。
+ * 出参/返回：无直接返回值；可能摘 run_list，清 on_rq 并减少父队列计数。
+ * 注意事项：调用者持 rq 锁；要求与先前 enqueue 配对，非 SAVE 路径发现 !on_list 会 WARN。
+ */
 static void __dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct rt_rq *rt_rq = rt_rq_of_se(rt_se);
@@ -1453,6 +1969,12 @@ static void __dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flag
  * entries, we must remove entries top - down.
  */
 /* 先从叶到根摘整条 entity 栈，避免父节点仍代表已变化的子队列。 */
+/*
+ * 业务背景：子队列最高优先级依赖叶子状态，修改前必须先按父到叶顺序撤销整条已发布层级，避免父键过期。
+ * 入参：rt_se 是不可空起始 entity；flags 是与后续重建配对的移动/保存标志。
+ * 出参/返回：无直接返回值；临时写各 entity->back，摘除所有 on_rq 层并撤销顶层计数。
+ * 注意事项：调用者持同一 CPU rq 锁；back 是临时链，不得并发使用，起始实体所属层级必须完整有效。
+ */
 static void dequeue_rt_stack(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct sched_rt_entity *back = NULL;
@@ -1474,6 +1996,12 @@ static void dequeue_rt_stack(struct sched_rt_entity *rt_se, unsigned int flags)
 }
 
 /* 层级安全入队：先清旧祖先位置，再按当前子队列状态自根向叶发布。 */
+/*
+ * 业务背景：task/group entity 入队会改变每级父 entity 的有效优先级，必须整栈摘除后按新状态重建。
+ * 入参：rt_se 是不可空输入/输出起始 entity；flags 是入队原因及顺序标志。
+ * 出参/返回：无直接返回值；更新统计、层级队列、bitmap/计数并发布顶层 rq。
+ * 注意事项：调用者持 rq 锁；会暂时让整条层级不可见，scope 内不得中途解锁，重复入队会破坏计数。
+ */
 static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct rq *rq = rq_of_rt_se(rt_se);
@@ -1487,6 +2015,12 @@ static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 }
 
 /* 层级安全出队：整栈摘除后按仍非空的子队列从根到叶重建。 */
+/*
+ * 业务背景：叶子离队后祖先 group 可能仍有其他 runnable task，需撤销旧层级再只重建非空节点。
+ * 入参：rt_se 是不可空输入/输出起始 entity；flags 描述睡眠、保存或移动原因。
+ * 出参/返回：无直接返回值；更新离队统计，撤销目标贡献并重新发布仍非空祖先和顶层 rq。
+ * 注意事项：调用者持 rq 锁；层级计数必须先由单层 dequeue 更新，空 group 不得重新入父队列。
+ */
 static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct rq *rq = rq_of_rt_se(rt_se);
@@ -1508,6 +2042,12 @@ static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
  * Adding/removing a task to/from a priority array:
  */
 /* rq 锁下更新 curr、加入 task entity/可 push 集并启动 bandwidth。 */
+/*
+ * 业务背景：RT task 变为 runnable 时需发布层级 entity、开始等待统计，并在 SMP 上登记可迁移候选。
+ * 入参：rq 是不可空输入/输出目标队列；p 是不可空输入/输出 RT task；flags 是入队原因和位置标志。
+ * 出参/返回：无直接返回值；更新 timeout/统计/层级队列，合格时加入 pushable 集。
+ * 注意事项：调用者持 rq 锁；blocked task 不进入 pushable，current 和单 CPU task 也不得发布为迁移候选。
+ */
 static void
 enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
@@ -1529,6 +2069,12 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 }
 
 /* rq 锁下结算 curr、摘 entity/pushable，并返回 task 是否仍在 class 队列。 */
+/*
+ * 业务背景：RT task 阻塞、迁移或换类时要结算执行时间并从层级及 pushable 两套索引对称撤销。
+ * 入参：rq 是不可空输入/输出所属队列；p 是不可空输入/输出 RT task；flags 是离队原因标志。
+ * 出参/返回：恒返回 true；无输出参，更新 runtime/统计并摘除实体和迁移节点。
+ * 注意事项：调用者持 rq 锁且 p 已入队；dequeue_pushable_task 要求其 plist 状态与调度核心约定一致。
+ */
 static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
@@ -1546,6 +2092,12 @@ static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
  * dequeue followed by enqueue.
  */
 /* 保持计数不变，把单层 entity 移到同优先级队头或队尾。 */
+/*
+ * 业务背景：FIFO/RR 轮转只需改变同优先级链表顺序，无需完整出入队和重新计算计数。
+ * 入参：rt_rq 是不可空所属队列；rt_se 是不可空输入/输出 entity；head 非零表示移到队头，否则队尾。
+ * 出参/返回：无直接返回值；entity on_rq 时调整 run_list 位置。
+ * 注意事项：调用者持 rq 锁；不改变 bitmap/计数，rt_se 必须属于 rt_rq 对应 priority queue。
+ */
 static void
 requeue_rt_entity(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se, int head)
 {
@@ -1561,6 +2113,12 @@ requeue_rt_entity(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se, int head)
 }
 
 /* 把 @p 及必要祖先移到同优先级头或尾，保持层级可选择性。 */
+/*
+ * 业务背景：task 的 FIFO/RR 顺序改变需沿层级移动代表它的 entity，确保父队列观察一致顺序。
+ * 入参：rq 是不可空所属 runqueue；p 是不可空输入/输出 RT task；head 非零队头、零为队尾。
+ * 出参/返回：无直接返回值；重排 p 及所有祖先 entity 的同优先级位置。
+ * 注意事项：调用者持 rq 锁；rq 参数用于契约/锁归属而函数体不解引用，错误层级会造成列表错位。
+ */
 static void requeue_task_rt(struct rq *rq, struct task_struct *p, int head)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
@@ -1573,6 +2131,12 @@ static void requeue_task_rt(struct rq *rq, struct task_struct *p, int head)
 }
 
 /* 当前 RT task 主动 yield 时移到同优先级队尾；独占时不保证换人运行。 */
+/*
+ * 业务背景：SCHED_RR/FIFO 的 yield 语义通过把 current 的层级 entity 移到同优先级队尾实现。
+ * 入参：rq 是不可空输入/输出当前 runqueue，隐式目标为 rq->donor。
+ * 出参/返回：无直接返回值、无输出参；重排 current 的 RT 队列位置。
+ * 注意事项：调用者持 rq 锁；无同优先级竞争者时仍可能继续运行，不能提供同步或进度保证。
+ */
 static void yield_task_rt(struct rq *rq)
 {
 	requeue_task_rt(rq, rq->donor, 0);
@@ -1581,6 +2145,12 @@ static void yield_task_rt(struct rq *rq)
 static int find_lowest_rq(struct task_struct *task);
 
 /* 唤醒/迁移时用 cpupri、亲和性与容量选候选 CPU，锁后路径仍会复核。 */
+/*
+ * 业务背景：RT task 唤醒时尽量避免压在已有高优先级 RT rq 上，并在异构系统满足 uclamp 容量需求。
+ * 入参：p 是不可空只读唤醒 task；cpu 是初始候选 CPU；flags 是 wake/fork 等选择原因。
+ * 出参/返回：返回建议 CPU 编号，找不到更优目标时返回原 cpu；无输出参。
+ * 注意事项：RCU 下无锁读取 curr/donor，结果是乐观候选；后续迁移锁路径必须复核 affinity、online 和优先级。
+ */
 static int
 select_task_rq_rt(struct task_struct *p, int cpu, int flags)
 {
@@ -1655,6 +2225,12 @@ out:
 }
 
 /* 同优先级唤醒时若 current 被固定而 @p 可迁移，resched 以创造 push 机会。 */
+/*
+ * 业务背景：同优先级新 task 无法迁移而 current 可迁移时，应先让调度器运行 push，为固定 task 腾出 CPU。
+ * 入参：rq 是不可空输入/输出当前队列；p 是不可空刚唤醒 RT task。
+ * 出参/返回：无直接返回值；满足不对称迁移条件时将 p 头插并请求 current 重调度。
+ * 注意事项：调用者持 rq 锁；cpupri 查询仅是候选，重排不保证 push 最终成功。
+ */
 static void check_preempt_equal_prio(struct rq *rq, struct task_struct *p)
 {
 	if (rq->curr->nr_cpus_allowed == 1 ||
@@ -1679,6 +2255,12 @@ static void check_preempt_equal_prio(struct rq *rq, struct task_struct *p)
 }
 
 /* pick 前在需要时临时出锁，从 overload CPU 拉取更高优先级 RT task。 */
+/*
+ * 业务背景：本 rq 优先级下降时，在正式 pick 前尝试拉取远端更高优先级 RT task，减少空闲或优先级反转。
+ * 入参：rq 是不可空输入/输出队列；rf 是不可空 rq 锁状态输出对象。
+ * 出参/返回：stop、DL 或 RT 任一仍 runnable 时返回非零，否则 0；可能在中途 pull task。
+ * 注意事项：函数会 unpin/repin rq 锁但保持中断/抢占约束；donor 可在锁丢失时变化，不能缓存跨越锁降级。
+ */
 static int balance_rt(struct rq *rq, struct rq_flags *rf)
 {
 	/*
@@ -1706,6 +2288,12 @@ static int balance_rt(struct rq *rq, struct rq_flags *rf)
  * Preempt the current task with a newly woken task if needed:
  */
 /* 新 RT task 更高优先级时立即 resched；相等时检查迁移/push 条件。 */
+/*
+ * 业务背景：RT 唤醒抢占按严格优先级执行，同优先级只在固定/可迁移不对称时创造 push 机会。
+ * 入参：rq 是不可空输入/输出目标队列；p 是不可空新唤醒 task；flags 是未使用唤醒标志输入。
+ * 出参/返回：无直接返回值；可能标记 current 需重调度或重排 p。
+ * 注意事项：调用者持 rq 锁；非 RT class 直接返回，flags 当前不解引用，等优先级不默认抢占 FIFO task。
+ */
 static void wakeup_preempt_rt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *donor = rq->donor;

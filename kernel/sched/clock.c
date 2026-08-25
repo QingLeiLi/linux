@@ -75,6 +75,12 @@
  * notrace：禁止 ftrace 插桩此函数，避免时钟读取本身触发 tracing 死递归。
  * __weak：允许架构用同名强符号覆盖此实现。
  */
+/*
+ * 业务背景：调度与 tracing 在架构高精度时钟尚不可用时仍需一个不会递归插桩的启动期时间源。
+ * 入参：无。
+ * 出参/返回：返回自 INITIAL_JIFFIES 起的近似纳秒数，无输出参数、状态副作用或 ownership 变化。
+ * 注意事项：精度只有一个 tick，基点不属于 ABI；架构强符号可覆盖，本函数在任意上下文均不睡眠。
+ */
 notrace unsigned long long __weak sched_clock(void)
 {
 	/* (jiffies - INITIAL_JIFFIES) 得到自启动以来的 tick 数，
@@ -124,24 +130,48 @@ struct sched_clock_data {
 static DEFINE_PER_CPU_SHARED_ALIGNED(struct sched_clock_data, sched_clock_data);
 
 /* 仅在当前 CPU 已被固定的上下文中取得本 CPU 数据；返回借用指针，不提供额外同步。 */
+/*
+ * 业务背景：不稳定时钟过滤器需快速定位当前 CPU 的独立快照，避免跨 CPU cacheline 争用。
+ * 入参：无。
+ * 出参/返回：返回当前 CPU sched_clock_data 的非空借用指针，无输出参数或引用获取。
+ * 注意事项：调用者必须已禁抢占/关中断以固定 CPU，并自行处理与 NMI/tick 的并发；函数不睡眠。
+ */
 static __always_inline struct sched_clock_data *this_scd(void)
 {
 	return this_cpu_ptr(&sched_clock_data);
 }
 
 /* 按编号取得任意 CPU 数据，远端字段必须由调用者用原子读改写协议访问。 */
+/*
+ * 业务背景：跨 CPU 时钟读取需要定位目标 CPU 的快照，再与本地时间线原子耦合。
+ * 入参：cpu 是纯输入的有效 possible CPU 编号，范围 0..nr_cpu_ids-1。
+ * 出参/返回：返回该 CPU sched_clock_data 的非空借用指针，不取得引用或改变 ownership。
+ * 注意事项：不验证编号，调用者负责目标存活语义；远端 u64 必须按架构宽度使用原子访问，函数不睡眠。
+ */
 notrace static inline struct sched_clock_data *cpu_sdc(int cpu)
 {
 	return &per_cpu(sched_clock_data, cpu);
 }
 
 /* static key 查询底层原始时钟是否已被最终判定为跨 CPU 稳定。 */
+/*
+ * 业务背景：读时钟、tick 和 idle 路径需用同一低开销裁决选择全局直读或 per-CPU 过滤实现。
+ * 入参：无。
+ * 出参/返回：稳定 static key 启用返回非零，否则返回 0；无输出参数和副作用。
+ * 注意事项：结果是瞬时配置状态而非锁；调用者不能据此推导其他字段的一致快照，函数不睡眠。
+ */
 notrace int sched_clock_stable(void)
 {
 	return static_branch_likely(&__sched_clock_stable);
 }
 
 /* 在调用者提供的关中断/固定 CPU 条件下，尽量相邻地记录 GTOD 与原始时钟样本。 */
+/*
+ * 业务背景：过滤器需要一对尽量同刻的 GTOD/raw 样本，才能用高分辨率增量约束漂移窗口。
+ * 入参：scd 是不可空、借用且可写的当前 CPU 快照对象。
+ * 出参/返回：无直接返回值；覆盖 tick_gtod/tick_raw，不修改 clock 或转移 ownership。
+ * 注意事项：调用者须关本地中断并固定 CPU，两个读取仍非真正原子；notrace 路径不可睡眠。
+ */
 notrace static void __scd_stamp(struct sched_clock_data *scd)
 {
 	scd->tick_gtod = ktime_get_ns();
@@ -152,10 +182,17 @@ notrace static void __scd_stamp(struct sched_clock_data *scd)
  * 完成不稳定到稳定的唯一精确切换：关本地中断读取配对样本，计算原始时钟偏移使
  * 切换前后连续，再启用稳定 static key 并允许 tick 停止 CLOCK_UNSTABLE 依赖。
  */
+/*
+ * 业务背景：驱动最终确认 TSC 可跨 CPU 信任后，需要无跳变地从 per-CPU 过滤切换到 raw 快路径。
+ * 入参：无。
+ * 出参/返回：无直接返回值；写全局 offset、启用稳定 static key 并清除 tick 不稳定依赖。
+ * 注意事项：仅在 init/稳定性裁决路径且入口 IRQ 开启时调用；函数无条件重开 IRQ，static key 不可在 NMI 更新。
+ */
 notrace static void __set_sched_clock_stable(void)
 {
 	struct sched_clock_data *scd;
 
+	/* 先冻结本 CPU tick 更新，读取同一代 GTOD/raw 基线并求连续切换偏移。 */
 	/*
 	 * Since we're still unstable and the tick is already running, we have
 	 * to disable IRQs in order to get a consistent scd->tick* reading.
@@ -168,6 +205,7 @@ notrace static void __set_sched_clock_stable(void)
 	__sched_clock_offset = (scd->tick_gtod + __gtod_offset) - (scd->tick_raw);
 	local_irq_enable();
 
+	/* offset 已发布后再记录裁决并启用快路径，读者不会看到尚未校准的稳定状态。 */
 	printk(KERN_INFO "sched_clock: Marking stable (%lld, %lld)->(%lld, %lld)\n",
 			scd->tick_gtod, __gtod_offset,
 			scd->tick_raw,  __sched_clock_offset);
@@ -191,6 +229,12 @@ notrace static void __set_sched_clock_stable(void)
  * 启动后才发现 TSC 不可靠时，既往时间可能已错误，无法完全修复。本工作项
  * 以当前 GTOD 重建一份统一快照并复制到所有 possible CPU，再关闭 irqtime 和稳定
  * static key；异步 work 上下文避免在报告不稳定的原子路径中直接修改 static key。
+ */
+/*
+ * 业务背景：晚发现不稳定时钟后必须在进程上下文重建各 CPU 基线并退出依赖 TSC 的快路径。
+ * 入参：work 是工作队列传入的 sched_clock_work 借用指针，本实现不读取其内容且不可为空。
+ * 出参/返回：无直接返回值；重写所有 possible CPU 快照、关闭 irqtime 和稳定 key，不转移 ownership。
+ * 注意事项：可在工作队列上下文运行但本身不主动睡眠；复制期间只能恢复一致起点，不能修复历史跳变。
  */
 notrace static void __sched_clock_work(struct work_struct *work)
 {
@@ -222,6 +266,12 @@ notrace static void __sched_clock_work(struct work_struct *work)
 static DECLARE_WORK(sched_clock_work, __sched_clock_work);
 
 /* 稳定键已启用时先阻止 CLOCK_UNSTABLE 下停 tick，再排队执行实际降级。 */
+/*
+ * 业务背景：原子稳定性报告路径不能直接修改 static key，需先保持 tick 活跃再把降级交给 workqueue。
+ * 入参：无。
+ * 出参/返回：无直接返回值；已不稳定时无副作用，否则设置 tick 依赖并排队一次降级工作。
+ * 注意事项：schedule_work 只保证工作已排队/在途，不等待完成；函数不可睡眠且可被重复报告调用。
+ */
 notrace static void __clear_sched_clock_stable(void)
 {
 	if (!sched_clock_stable())
@@ -234,6 +284,12 @@ notrace static void __clear_sched_clock_stable(void)
 /*
  * 记录早期“不稳定”裁决，并用屏障与 late init 互锁：若 late init 已完成则立即请求
  * 降级，否则由 late init 观察 early=0 后保持不稳定路径，保证两边不会都漏做更新。
+ */
+/*
+ * 业务背景：时钟驱动可在 late init 前后任意时刻判坏 TSC，本入口保证最终至少一方执行 static-key 降级。
+ * 入参：无。
+ * 出参/返回：无直接返回值；清 early 稳定标记，late init 已完成时还设置 tick 依赖并排队工作。
+ * 注意事项：smp_mb 与 late init 配对，不能改成普通顺序写；异步返回不表示降级工作已完成。
  */
 notrace void clear_sched_clock_stable(void)
 {
@@ -253,6 +309,12 @@ notrace void clear_sched_clock_stable(void)
  *
  * 即让两条时间线在当前时刻对齐，后续才能用 sched_clock() 的增量来提升
  * ktime 的分辨率，同时又保持与墙上时间的可对比性。
+ */
+/*
+ * 业务背景：raw sched_clock 与 GTOD 基点不同，过滤器必须先求偏移才能连续拼接高分辨率增量。
+ * 入参：无。
+ * 出参/返回：无直接返回值；更新当前 CPU tick 样本和全局 __gtod_offset，不取得或释放对象。
+ * 注意事项：调用者必须固定 CPU并关本地中断以缩小采样间隔；两次硬件读取仍可能有微小测量误差。
  */
 notrace static void __sched_clock_gtod_offset(void)
 {
@@ -280,6 +342,12 @@ notrace static void __sched_clock_gtod_offset(void)
  * 此时仍是 UP（单处理器）阶段，TSC 即使有轻微误差也不会跨 CPU 漂移，
  * 所以直接采样是安全的。
  */
+/*
+ * 业务背景：调度时钟从启动期 raw 读切到 per-CPU 过滤前，需要建立 GTOD 偏移并发布“已早期就绪”。
+ * 入参：无。
+ * 出参/返回：无直接返回值；计算 offset 并把 sched_clock_running 引用从 0 增至 1。
+ * 注意事项：仅启动期 UP 上下文调用且不睡眠；static key 计数与 late init 的第二次递增必须配对。
+ */
 void __init sched_clock_init(void)
 {
 	/*
@@ -306,6 +374,12 @@ void __init sched_clock_init(void)
  * 必须在所有内建驱动初始化完成后执行，因为 acpi_processor、intel_idle
  * 等驱动可能在初始化时调用 mark_tsc_unstable() 修改时钟稳定性标志。
  * 只有等它们跑完，这里才能做最终裁决：时钟到底稳不稳定。
+ */
+/*
+ * 业务背景：所有内建驱动完成稳定性报告后，late init 才能最终选择全局稳定或 per-CPU 过滤路径。
+ * 入参：无。
+ * 出参/返回：总返回 0 供 initcall 框架继续；递增 running key，并启用稳定路径或关闭 irqtime。
+ * 注意事项：只在 late_initcall 执行一次；全屏障与早期 set/clear 报告配对，函数不可重复调用。
  */
 static int __init sched_clock_init_late(void)
 {
@@ -344,6 +418,12 @@ late_initcall(sched_clock_init_late);
  */
 
 /* 把 u64 差值解释为有符号距离，在模 2^64 时间线上选择较早值，正确处理自然回绕。 */
+/*
+ * 业务背景：时钟值可自然回绕，普通无符号 min 无法表达回绕附近的先后顺序。
+ * 入参：x、y 是同一 u64 模时间线上的纯输入时间戳，二者距离必须小于 2^63。
+ * 出参/返回：返回按有符号环形距离判断的较早值，无输出参数或副作用。
+ * 注意事项：距离达到或超过半个 u64 空间时顺序无定义；仅做算术且不睡眠。
+ */
 
 static __always_inline u64 wrap_min(u64 x, u64 y)
 {
@@ -351,6 +431,12 @@ static __always_inline u64 wrap_min(u64 x, u64 y)
 }
 
 /* 与 wrap_min 对偶，在模 2^64 时间线上选择较晚值。 */
+/*
+ * 业务背景：过滤窗口还需在回绕时间线上选择较晚下界，保证公开时钟不会倒退。
+ * 入参：x、y 是同一 u64 模时间线上的纯输入时间戳，二者距离必须小于 2^63。
+ * 出参/返回：返回按有符号环形距离判断的较晚值，无输出参数、ownership 变化或副作用。
+ * 注意事项：半空间之外不能可靠排序；本 helper 不提供并发同步且不睡眠。
+ */
 static __always_inline u64 wrap_max(u64 x, u64 y)
 {
 	return (s64)(x - y) > 0 ? x : y;
@@ -367,12 +453,19 @@ static __always_inline u64 wrap_max(u64 x, u64 y)
  * 与 GTOD 基线较大者，上界是不超过一个 tick 的 GTOD 前沿或旧值。cmpxchg64 同时
  * 允许 NMI/普通上下文更新，失败便重新采样，成功返回该 CPU 新的单调值。
  */
+/*
+ * 业务背景：不稳定 raw 时钟仍要为同一 CPU 提供高分辨率单调值，并把漂移限制在 GTOD 的一个 tick 窗口。
+ * 入参：scd 是不可空、借用且可写的目标 CPU 快照；调用者保证对象永久存在且时间基线已初始化。
+ * 出参/返回：返回成功原子发布的新纳秒 clock，并可能更新 scd->clock；不转移 ownership。
+ * 注意事项：可与 NMI/tick 并发，必须保留 cmpxchg 重试；调用者固定相应 CPU/远端协议，函数不睡眠。
+ */
 static __always_inline u64 sched_clock_local(struct sched_clock_data *scd)
 {
 	u64 now, clock, old_clock, min_clock, max_clock, gtod;
 	s64 delta;
 
 again:
+	/* 每次重试重新读取 raw，负 delta 视作不稳定计数器倒退而不允许公开 clock 回退。 */
 	now = sched_clock_noinstr();
 	delta = now - scd->tick_raw;
 	if (unlikely(delta < 0))
@@ -386,6 +479,7 @@ again:
 	 *		      scd->tick_gtod + TICK_NSEC);
 	 */
 
+	/* 用 GTOD 基线构造候选值及单调下界、一个 tick 前沿上界。 */
 	gtod = scd->tick_gtod + __gtod_offset;
 	clock = gtod + delta;
 	min_clock = wrap_max(gtod, old_clock);
@@ -394,6 +488,7 @@ again:
 	clock = wrap_max(clock, min_clock);
 	clock = wrap_min(clock, max_clock);
 
+	/* NMI 或 tick 抢先发布时 old_clock 被刷新，携新基线回到 again 重新裁剪。 */
 	if (!raw_try_cmpxchg64(&scd->clock, &old_clock, clock))
 		goto again;
 
@@ -403,6 +498,12 @@ again:
 /*
  * noinstr 本地读取：稳定时直接返回 raw+offset；初始化前返回 raw；不稳定且已运行时
  * 通过 per-CPU 过滤器。调用者必须已经固定在当前 CPU，避免 this_scd() 指向变化。
+ */
+/*
+ * 业务背景：NMI/tracing 等不可插桩路径仍需读取当前 CPU 时钟，并依据初始化/稳定状态选择安全实现。
+ * 入参：无。
+ * 出参/返回：返回当前 CPU 纳秒调度时钟；不稳定路径可能原子推进本 CPU scd->clock，无 ownership 变化。
+ * 注意事项：调用者必须固定 CPU；noinstr 禁止引入可插桩或睡眠调用，跨 CPU 可比性仍有限。
  */
 noinstr u64 local_clock_noinstr(void)
 {
@@ -420,6 +521,12 @@ noinstr u64 local_clock_noinstr(void)
 }
 
 /* 用禁止抢占包住 noinstr 入口，为普通调用者提供当前 CPU 单调调度时钟。 */
+/*
+ * 业务背景：普通内核代码需要无需自行固定 CPU 的本地调度时间读取封装。
+ * 入参：无。
+ * 出参/返回：返回当前 CPU 纳秒调度时钟，无输出参数或 ownership 变化；读取可能推进 per-CPU 过滤值。
+ * 注意事项：短暂禁止抢占但不关中断，可在任意非睡眠读取上下文使用；不同 CPU 的值仍可能倒序。
+ */
 u64 local_clock(void)
 {
 	u64 now;
@@ -435,6 +542,12 @@ EXPORT_SYMBOL_GPL(local_clock);
  * 向较大值靠拢并返回该值。这样一次跨 CPU 同步不会倒退任一参与者；32 位内核需用
  * cmpxchg64 防止 u64 撕裂，并在失败后重新执行本地读取以容纳 NMI 更新。
  */
+/*
+ * 业务背景：读取另一 CPU 时要临时耦合两条各自单调的时间线，降低迁移/跨 CPU 事件出现倒退的概率。
+ * 入参：scd 是不可空、借用且可写的远端 CPU 快照；本地 CPU 由已固定的调用上下文隐式提供。
+ * 出参/返回：返回本地/远端较大纳秒值，并原子抬高较小一侧的 clock；对象 ownership 不变。
+ * 注意事项：调用者关本地中断并固定 CPU；32 位必须原子读 u64，cmpxchg 失败需完整重试，函数不睡眠。
+ */
 static notrace u64 sched_clock_remote(struct sched_clock_data *scd)
 {
 	struct sched_clock_data *my_scd = this_scd();
@@ -443,6 +556,7 @@ static notrace u64 sched_clock_remote(struct sched_clock_data *scd)
 
 #if BITS_PER_LONG != 64
 again:
+	/* 32 位必须分别以原子 helper 取得本地推进值和不撕裂的远端快照。 */
 	/*
 	 * Careful here: The local and the remote clock values need to
 	 * be read out atomic as we need to compare the values and
@@ -462,6 +576,7 @@ again:
 	 */
 	remote_clock = cmpxchg64(&scd->clock, 0, 0);
 #else
+	/* 64 位自然原子读取允许先推进本地，再在重试标签仅重读两侧 clock。 */
 	/*
 	 * On 64-bit kernels the read of [my]scd->clock is atomic versus the
 	 * update, so we can avoid the above 32-bit dance.
@@ -492,6 +607,7 @@ again:
 		val = remote_clock;
 	}
 
+	/* 只抬高较小一侧；失败说明并发更新已改变它，重新比较两条时间线。 */
 	if (!try_cmpxchg64(ptr, &old_val, val))
 		goto again;
 
@@ -507,6 +623,12 @@ again:
  * 原文契约要求调用者关闭本地中断；函数内部再禁止抢占以固定 this CPU。稳定/未初始化
  * 路径直接读取，目标为远端时执行双时钟耦合，本地时只推进自己的过滤状态。
  */
+/*
+ * 业务背景：调度器和 tracing 需要按 CPU 编号读取单调时钟，并在不稳定架构上处理远端漂移。
+ * 入参：cpu 是纯输入的有效 possible CPU 编号，范围 0..nr_cpu_ids-1。
+ * 出参/返回：返回目标 CPU 的纳秒调度时钟；不稳定远端路径可能原子抬高本地或远端 clock。
+ * 注意事项：调用者必须已关本地中断；函数不验证 cpu，结果不承诺任意两次独立跨 CPU 读取可全序。
+ */
 notrace u64 sched_clock_cpu(int cpu)
 {
 	struct sched_clock_data *scd;
@@ -518,6 +640,7 @@ notrace u64 sched_clock_cpu(int cpu)
 	if (!static_branch_likely(&sched_clock_running))
 		return sched_clock();
 
+	/* 完整过滤路径固定本 CPU，随后按目标是否远端选择单边推进或双边耦合。 */
 	preempt_disable_notrace();
 	scd = cpu_sdc(cpu);
 
@@ -535,6 +658,12 @@ EXPORT_SYMBOL_GPL(sched_clock_cpu);
  * 每个调度 tick 在关中断条件下刷新本 CPU raw/GTOD 样本并推进过滤 clock；稳定时无需
  * per-CPU 校准，初始化前也不访问尚未建立的快照。
  */
+/*
+ * 业务背景：不稳定时钟依赖周期 tick 刷新 GTOD 窗口，才能持续限制 raw 漂移并维持本 CPU 单调性。
+ * 入参：无。
+ * 出参/返回：无直接返回值；需要时覆盖本 CPU tick 样本并推进 clock，稳定/未初始化时无副作用。
+ * 注意事项：调用者必须关本地中断并固定 CPU；函数可从调度 tick 调用且不可睡眠。
+ */
 notrace void sched_clock_tick(void)
 {
 	struct sched_clock_data *scd;
@@ -545,6 +674,7 @@ notrace void sched_clock_tick(void)
 	if (!static_branch_likely(&sched_clock_running))
 		return;
 
+	/* 只有不稳定且已就绪时才要求 IRQ 契约并刷新本 CPU 三个时钟字段。 */
 	lockdep_assert_irqs_disabled();
 
 	scd = this_scd();
@@ -555,6 +685,12 @@ notrace void sched_clock_tick(void)
 /*
  * watchdog 在其锁内再次确认 TSC 稳定后更新 GTOD offset；若已经降级则不能再用坏
  * TSC 计算偏移。关中断保证两次底层采样不被本 CPU 的 tick 打断。
+ */
+/*
+ * 业务背景：clocksource watchdog 周期确认 TSC 仍可靠时，应重新校准 GTOD 偏移以限制长期基点漂移。
+ * 入参：无。
+ * 出参/返回：无直接返回值；稳定时刷新当前 CPU 样本和全局 GTOD offset，不稳定时无副作用。
+ * 注意事项：调用者持 watchdog_lock；本函数局部关中断且不可睡眠，判坏后禁止再用 TSC 计算偏移。
  */
 notrace void sched_clock_tick_stable(void)
 {
@@ -577,6 +713,12 @@ notrace void sched_clock_tick_stable(void)
  * We are going deep-idle (IRQs are disabled):
  */
 /* 进入深 idle 前在关中断状态推进一次本 CPU clock，保存停止计数器前的边界。 */
+/*
+ * 业务背景：深 idle 可能停止底层计数器，进入前必须封存最后一个可见时刻供唤醒后与 ktime 重同步。
+ * 入参：无。
+ * 出参/返回：无直接返回值；读取并可能推进当前 CPU 过滤 clock，无输出参数或 ownership 变化。
+ * 注意事项：调用者必须已关本地中断；只建立睡眠前边界，唤醒后的缺失时间由配对事件补齐。
+ */
 notrace void sched_clock_idle_sleep_event(void)
 {
 	sched_clock_cpu(smp_processor_id());
@@ -590,6 +732,12 @@ EXPORT_SYMBOL_GPL(sched_clock_idle_sleep_event);
  * idle 唤醒后，不稳定时钟通过 tick 与 ktime 重新对齐；timekeeping suspend
  * 期间 GTOD 不可作为有效基准而跳过。保存并恢复原中断状态，不假定调用点一定关中断。
  */
+/*
+ * 业务背景：底层计数器停走的 CPU 从深 idle 返回后，要用仍有效的 GTOD 重建过滤窗口避免时间停滞。
+ * 入参：无。
+ * 出参/返回：无直接返回值；不稳定且 timekeeping 活跃时刷新本 CPU 样本/clock，其余路径无副作用。
+ * 注意事项：timekeeping suspend 时必须跳过；函数保存恢复原 IRQ 状态，不睡眠且不保证补回历史精度。
+ */
 notrace void sched_clock_idle_wakeup_event(void)
 {
 	unsigned long flags;
@@ -600,6 +748,7 @@ notrace void sched_clock_idle_wakeup_event(void)
 	if (unlikely(timekeeping_suspended))
 		return;
 
+	/* 保存而非强假定 IRQ 状态，使 idle 调用点在不同体系结构上都能安全复用 tick 刷新。 */
 	local_irq_save(flags);
 	sched_clock_tick();
 	local_irq_restore(flags);
@@ -616,6 +765,12 @@ EXPORT_SYMBOL_GPL(sched_clock_idle_wakeup_event);
  *   1. 激活 sched_clock_running（引用计数 +1）；
  *   2. 调用 generic_sched_clock_init() 完成时钟注册和 wrap 定时器设置。
  */
+/*
+ * 业务背景：架构已保证全局同步时无需 per-CPU 漂移过滤，只需发布就绪并初始化通用回绕维护。
+ * 入参：无。
+ * 出参/返回：无直接返回值；递增 running static key 并初始化 generic sched_clock。
+ * 注意事项：仅 !CONFIG_HAVE_UNSTABLE_SCHED_CLOCK 的启动期调用一次；初始化时局部关中断且不睡眠。
+ */
 void __init sched_clock_init(void)
 {
 	/* 标记时钟就绪，后续 sched_clock_cpu() 不再返回 0 */
@@ -631,6 +786,12 @@ void __init sched_clock_init(void)
  *
  * 稳定时钟下所有 CPU 共享同一时间线，无需跨 CPU 补偿，
  * 直接返回 sched_clock() 即可。
+ */
+/*
+ * 业务背景：全局同步架构无需按目标 CPU 校正，保留统一 API 让调用者不必区分配置。
+ * 入参：cpu 是纯输入的 possible CPU 编号，但稳定实现不读取它且不取得任何引用。
+ * 出参/返回：未初始化返回 0，已初始化返回全局 sched_clock 纳秒值；无状态副作用或输出参数。
+ * 注意事项：调用者仍应传有效 CPU 并遵守公共接口的本地 IRQ 关闭契约；0 表示启动期而非错误码。
  */
 notrace u64 sched_clock_cpu(int cpu)
 {
@@ -656,6 +817,12 @@ notrace u64 sched_clock_cpu(int cpu)
 /*
  * running_clock 表示 guest 实际获准运行的时间，虚拟化实现应扣除 hypervisor
  * 挂起区间；裸机默认等同 local_clock。弱符号允许架构覆盖，函数不改变时钟状态。
+ */
+/*
+ * 业务背景：guest 性能统计要排除被 hypervisor 暂停的墙上时间，裸机则可直接复用本地调度时钟。
+ * 入参：无。
+ * 出参/返回：默认返回 local_clock 的纳秒值；无输出参数或 ownership 变化，架构可用强符号覆盖。
+ * 注意事项：默认实现未扣 guest steal/suspend 时间且不稳定路径可能推进 per-CPU 过滤值；基点不保证为 0。
  */
 notrace u64 __weak running_clock(void)
 {

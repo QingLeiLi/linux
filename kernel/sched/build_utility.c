@@ -55,6 +55,10 @@
 #include <linux/hashtable_api.h>
 #include <linux/irq.h>
 #include <linux/kobject_api.h>
+/*
+ * 这一段把策略输入和对象容器准备齐：cpumask/cpuset 限定可用 CPU，energy_model 提供
+ * 能耗比较依据，哈希表与 kobject 只提供承载机制；是否分配、发布或销毁仍由被聚合成员决定。
+ */
 #include <linux/membarrier.h>
 #include <linux/mempolicy.h>
 #include <linux/nmi.h>
@@ -63,6 +67,10 @@
 #include <linux/psi.h>
 #include <linux/ptrace_api.h>
 #include <linux/sched_clock.h>
+/*
+ * 从 membarrier 到 sched_clock 的接口跨越同步请求、NUMA/观测和时间戳来源；把它们集中包含
+ * 不会合并各自的同步域，调用点仍必须分别满足屏障、RCU、NMI 上下文和时钟稳定性契约。
+ */
 #include <linux/security.h>
 #include <linux/spinlock_api.h>
 #include <linux/swait_api.h>

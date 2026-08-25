@@ -209,6 +209,10 @@ int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
 			return -ESRCH;
 		}
 	}
+	/*
+	 * task 此时仍只是 RCU 保护的借用指针；在退出读侧前取得 task_struct 引用，
+	 * 后续权限检查和 cookie 更新才能跨越目标并发退出，最终由公共 out 配对 put。
+	 */
 	get_task_struct(task);
 	rcu_read_unlock();
 
@@ -262,11 +266,16 @@ int sched_core_share_pid(unsigned int cmd, pid_t pid, enum pid_type type,
 		__sched_core_set(current, cookie);
 		goto out;
 
+	/* SHARE_FROM 成功已经更新 current 并退出；落到 default 的只能是未定义命令值。 */
 	default:
 		err = -EINVAL;
 		goto out;
 	}
 
+	/*
+	 * 能走到这里的只剩 CREATE 或 SHARE_TO，cookie 都是一份由本函数持有的临时引用；
+	 * 单任务直接安装，组作用域则先做全员权限预检，再把同一对象逐个共享出去。
+	 */
 	if (type == PIDTYPE_PID) {
 		/* 单任务路径在此完成；临时 cookie 引用仍由公共 out 释放。 */
 		__sched_core_set(task, cookie);
@@ -313,6 +322,10 @@ void __sched_core_account_forceidle(struct rq *rq)
 	struct task_struct *p;
 	int i;
 
+	/*
+	 * smt_mask 限定同一物理 core 的兄弟；delta 是本轮待分摊纳秒数。
+	 * rq_i/p/i 只在后续遍历中借用每个兄弟 rq 及其实际选中任务，不取得任务引用。
+	 */
 	lockdep_assert_rq_held(rq);
 
 	WARN_ON_ONCE(!rq->core->core_forceidle_count);

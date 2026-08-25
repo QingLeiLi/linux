@@ -75,6 +75,10 @@ static void cpudl_heapify_down(struct cpudl *cp, int idx)
 			largest = l;
 			largest_dl = cp->elements[l].dl;
 		}
+		/*
+		 * 先以原节点和左孩子得出临时胜者，再让右孩子与该胜者比较；不能仍与
+		 * orig_dl 比较，否则左右孩子都更晚时可能选中较早的那个，破坏最大堆。
+		 */
 		if ((r < cp->size) && dl_time_before(largest_dl,
 						cp->elements[r].dl))
 			largest = r;

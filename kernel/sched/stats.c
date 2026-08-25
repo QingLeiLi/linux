@@ -210,6 +210,10 @@ static int show_schedstat(struct seq_file *seq, void *v)
 				    sd->lb_count[itype],
 				    sd->lb_balanced[itype],
 				    sd->lb_failed[itype],
+				    /*
+				     * 前三项记录尝试、已均衡和失败次数；下面四项分别累计
+				     * load/util/task/misfit 失衡量，最后四项记录拉取结果与失败原因。
+				     */
 				    sd->lb_imbalance_load[itype],
 				    sd->lb_imbalance_util[itype],
 				    sd->lb_imbalance_task[itype],

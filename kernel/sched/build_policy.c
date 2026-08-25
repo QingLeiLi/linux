@@ -58,6 +58,10 @@
 #include <linux/psi.h>
 #include <linux/rhashtable.h>
 #include <linux/seq_buf.h>
+/*
+ * 到这里的依赖主要提供对象容器与诊断输出：rhashtable 管理可并发查找的映射，seq_buf
+ * 只负责有界格式化。它们没有在本聚合层创建实例；具体成员必须自行建立锁、分配和销毁配对。
+ */
 #include <linux/seqlock_api.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
@@ -111,6 +115,10 @@
 # include "ext/internal.h"
 # include "ext/cid.h"
 # include "ext/arena.h"
+/*
+ * 前五个 include 先固定 SCX 的共享类型和子系统调用契约；下面才展开带状态的实现。
+ * 这个顺序使主实现能调用 cid/arena/idle 的声明，同时避免把文本顺序误解为运行时初始化顺序。
+ */
 # include "ext/idle.h"
 # include "ext/ext.c"
 # include "ext/cid.c"

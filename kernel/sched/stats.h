@@ -100,6 +100,7 @@ static inline void rq_sched_info_depart  (struct rq *rq, unsigned long long delt
 # define   schedstat_add(var, amt)	do { } while (0)
 # define __schedstat_set(var, val)	do { } while (0)
 # define   schedstat_set(var, val)	do { } while (0)
+/* 更新宏不求值参数；读取宏统一返回 0，使未编译字段的调用点仍有确定的中性结果。 */
 # define   schedstat_val(var)		0
 # define   schedstat_val_or_zero(var)	0
 
@@ -348,6 +349,10 @@ static void sched_info_arrive(struct rq *rq, struct task_struct *t)
 	t->sched_info.run_delay += delta;
 	t->sched_info.last_arrival = now;
 	t->sched_info.pcount++;
+	/*
+	 * 至此本段等待已提交到总量并开启执行时间片；下面只维护极值及其墙钟时间，
+	 * 最后再把同一个 delta 汇入 rq，保证 task 与 rq 看到的是同一次到达事件。
+	 */
 	if (delta > t->sched_info.max_run_delay) {
 		t->sched_info.max_run_delay = delta;
 		ktime_get_real_ts64(&t->sched_info.max_run_delay_ts);

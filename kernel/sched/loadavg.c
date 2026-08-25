@@ -102,6 +102,7 @@ long calc_load_fold_active(struct rq *this_rq, long adjust)
 	nr_active = this_rq->nr_running - adjust;
 	nr_active += (long)this_rq->nr_uninterruptible;
 
+	/* 只提交相对上次基线的变化，避免每次采样重复累计 rq 的完整 active 值。 */
 	if (nr_active != this_rq->calc_load_active) {
 		delta = nr_active - this_rq->calc_load_active;
 		this_rq->calc_load_active = nr_active;
@@ -136,6 +137,7 @@ fixed_power_int(unsigned long x, unsigned int frac_bits, unsigned int n)
 
 	if (n) {
 		for (;;) {
+			/* 当前二进制位为 1 时，把对应的 x^(2^i) 乘入结果。 */
 			if (n & 1) {
 				result *= x;
 				result += 1UL << (frac_bits - 1);
@@ -144,6 +146,7 @@ fixed_power_int(unsigned long x, unsigned int frac_bits, unsigned int n)
 			n >>= 1;
 			if (!n)
 				break;
+			/* 每右移一位便将底数平方，为下一位准备 x^(2^(i+1))。 */
 			x *= x;
 			x += 1UL << (frac_bits - 1);
 			x >>= frac_bits;

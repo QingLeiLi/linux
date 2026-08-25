@@ -80,6 +80,10 @@ cpuacct_css_alloc(struct cgroup_subsys_state *parent_css)
 	if (!parent_css)
 		return &root_cpuacct.css;
 
+	/*
+	 * root 使用静态存储，只有普通子组进入动态 ownership 阶段：先分配容器，
+	 * 再依次取得两份 per-CPU 区域；每个失败标签只撤销此前已经成功的资源。
+	 */
 	ca = kzalloc_obj(*ca);
 	if (!ca)
 		goto out;
@@ -88,6 +92,7 @@ cpuacct_css_alloc(struct cgroup_subsys_state *parent_css)
 	if (!ca->cpuusage)
 		goto out_free_ca;
 
+	/* 总量槽已归 ca 所有；再分配分类槽，失败时必须先经过 out_free_cpuusage。 */
 	ca->cpustat = alloc_percpu(struct kernel_cpustat);
 	if (!ca->cpustat)
 		goto out_free_cpuusage;
@@ -150,6 +155,10 @@ static u64 cpuacct_cpuusage_read(struct cpuacct *ca, int cpu,
 		data = cpustat[CPUTIME_SYSTEM] + cpustat[CPUTIME_IRQ] +
 			cpustat[CPUTIME_SOFTIRQ];
 		break;
+	/*
+	 * USER/SYSTEM 来自分类数组；NSTATS 则切换到独立的总执行时间槽，
+	 * 不能把枚举哨兵当作 cpustat 数组下标，否则会越界读取。
+	 */
 	case CPUACCT_STAT_NSTATS:
 		data = *cpuusage;
 		break;
@@ -259,6 +268,7 @@ static int __cpuacct_percpu_seq_show(struct seq_file *m,
 	u64 percpu;
 	int i;
 
+	/* 每次读取单个 CPU 的锁保护快照并立即输出；跨 CPU 行整体不是原子快照。 */
 	for_each_possible_cpu(i) {
 		percpu = cpuacct_cpuusage_read(ca, i, index);
 		seq_printf(m, "%llu ", (unsigned long long) percpu);
@@ -297,6 +307,7 @@ static int cpuacct_all_seq_show(struct seq_file *m, void *V)
 		seq_printf(m, " %s", cpuacct_stat_desc[index]);
 	seq_puts(m, "\n");
 
+	/* 表头固定列语义后，再逐 CPU 读取 user/system；单个 CPU 的两列也可能跨更新时刻。 */
 	for_each_possible_cpu(cpu) {
 		seq_printf(m, "%d", cpu);
 		for (index = 0; index < CPUACCT_STAT_NSTATS; index++)
@@ -321,6 +332,7 @@ static int cpuacct_stats_show(struct seq_file *sf, void *v)
 	int stat;
 
 	memset(&cputime, 0, sizeof(cputime));
+	/* 第一阶段跨 possible CPU 汇总原始用户、系统分类和调度器总执行时间。 */
 	for_each_possible_cpu(cpu) {
 		u64 *cpustat = per_cpu_ptr(ca->cpustat, cpu)->cpustat;
 
@@ -333,6 +345,10 @@ static int cpuacct_stats_show(struct seq_file *sf, void *v)
 		cputime.sum_exec_runtime += *per_cpu_ptr(ca->cpuusage, cpu);
 	}
 
+	/*
+	 * 第二阶段用持久 prev_cputime 约束 user/system 单调且不超过总执行时间；
+	 * 得到的 val 才是 legacy stat 对外发布的两项规范化结果。
+	 */
 	cputime_adjust(&cputime, &seq_css(sf)->cgroup->prev_cputime,
 		&val[CPUACCT_STAT_USER], &val[CPUACCT_STAT_SYSTEM]);
 
@@ -351,6 +367,7 @@ static struct cftype files[] = {
 		.read_u64 = cpuusage_read,
 		.write_u64 = cpuusage_write,
 	},
+	/* usage 提供总量并允许写 0 重置；下面两项把同一组拆成用户态和系统态总量。 */
 	{
 		.name = "usage_user",
 		.read_u64 = cpuusage_user_read,
@@ -359,6 +376,7 @@ static struct cftype files[] = {
 		.name = "usage_sys",
 		.read_u64 = cpuusage_sys_read,
 	},
+	/* 接下来三个接口保持相同分类，但把每个 possible CPU 的值按一行导出。 */
 	{
 		.name = "usage_percpu",
 		.seq_show = cpuacct_percpu_seq_show,
@@ -367,6 +385,7 @@ static struct cftype files[] = {
 		.name = "usage_percpu_user",
 		.seq_show = cpuacct_percpu_user_seq_show,
 	},
+	/* system 逐 CPU 项之后，usage_all 改用带表头的二维视图，便于稳定解析列。 */
 	{
 		.name = "usage_percpu_sys",
 		.seq_show = cpuacct_percpu_sys_seq_show,
@@ -375,6 +394,7 @@ static struct cftype files[] = {
 		.name = "usage_all",
 		.seq_show = cpuacct_all_seq_show,
 	},
+	/* stat 是兼容接口：经过单调调整并换算为 USER_HZ，而不是直接复用纳秒输出。 */
 	{
 		.name = "stat",
 		.seq_show = cpuacct_stats_show,

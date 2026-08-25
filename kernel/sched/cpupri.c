@@ -70,6 +70,10 @@ static int convert_prio(int prio)
 		cpupri = MAX_RT_PRIO-1 - prio;	/* 1 ... 99 */
 		break;
 
+	/*
+	 * 普通 RT 范围采用反向编号：内部 prio 数值越小，映射后的桶号越大。
+	 * 下面两个端点单列，避免 NORMAL 与 HIGHER 混入这段一一反转区间。
+	 */
 	case MAX_RT_PRIO-1:
 		cpupri = CPUPRI_NORMAL;		/*  0 */
 		break;
@@ -388,6 +392,10 @@ int cpupri_init(struct cpupri *cp)
 			goto cleanup;
 	}
 
+	/*
+	 * 至此所有桶 mask 都由 cp 拥有；第二阶段再建立 CPU→桶的反向表。
+	 * 该分配失败会从 cleanup 释放全部 mask，成功后再用 INVALID 哨兵填满反向表。
+	 */
 	cp->cpu_to_pri = kzalloc_objs(int, nr_cpu_ids);
 	if (!cp->cpu_to_pri)
 		goto cleanup;

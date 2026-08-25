@@ -15,12 +15,22 @@
 4. 按源码顺序以 1～5 个函数为一批修改；每批修改前读取最新连续窗口，修改后复读窗口并检查局部
    diff，避免函数头错位或补丁覆盖原内容。
 5. 完整复读修改后的目标文件，按方法论第 17 章核对函数、实体、英文注释、控制路径、并发、生命周期
-   和关联读取清单，再执行追加式安全审计、格式检查及可用的构建检查。
+   和关联读取清单，再执行注释密度门禁、追加式安全审计、格式检查及可用的构建检查。密度命令固定为
+   `scripts/check-learning-comment-density.py --min-density 0.20 --max-code-gap 10 <目标文件>`；两项阈值
+   必须同时通过，不能以总新增行数代替。
 6. 只有单文件内容验收全部通过后才标为 `[x]` 并登记验收摘要；一个 `[~]` 文件未闭环前不开始
    下一个文件。
 7. 为核对契约而读取的关联源码只登记到当前文件记录；读取关联文件不等于授权修改。
 8. 本清单覆盖创建时 `kernel/sched` 下的全部 51 个文件：46 个进入计划，5 个按用户要求排除。
    后续若目录新增文件，先登记到“范围变化”再决定学习顺序，不能静默遗漏。
+9. 从 2026-08-25 当前 `[~]` 文件起，后续每个函数的专属中文函数头必须紧邻函数定义并显式包含四项：
+   **业务背景**（必须包含理解该函数所需的业务背景知识、上层问题、存在理由和调用链位置）、**入参**（逐参数的含义、单位、范围、可空性、
+   输入/输出属性和 ownership）、**出参/返回**（逐输出参数的前后状态与 ownership，以及全部直接返回
+   类别）、**注意事项**（作为函数的强制注释事项，覆盖锁/中断/RCU/睡眠、生命周期、失败副作用、配置差异和误用后果中的适用项）。
+   无参数、无输出参数或 `void` 返回也必须明确写“无”，不能靠上下文猜测；函数组说明和函数体走读
+   不能替代单个函数的四项契约。验收记录必须逐函数核对这四项，密度脚本通过不能替代该人工门禁。
+10. 本规则采用向前生效：规则写入前已经标为 `[x]` 的文件不因新增四项格式而重新打开；当前 `[~]`
+    和所有 `[ ]` 文件必须严格执行。若已完成文件以后因其他原因重新打开，则该次重新验收也适用新规则。
 
 状态：`[ ]` 未开始；`[~]` 正在处理或验收；`[x]` 已按第 17 章完成全文件闭环；`[-]` 明确排除。
 
@@ -29,7 +39,7 @@
 ### 构建入口、公共数据结构与调度特性
 
 - [x] `kernel/sched/Makefile`
-- [x] `kernel/sched/sched.h`
+- [ ] `kernel/sched/sched.h`
 - [x] `kernel/sched/smp.h`
 - [x] `kernel/sched/features.h`
 - [x] `kernel/sched/rq-offsets.c`
@@ -46,9 +56,9 @@
 
 ### 调度类与运行队列策略
 
-- [x] `kernel/sched/fair.c`
-- [x] `kernel/sched/rt.c`
-- [x] `kernel/sched/deadline.c`
+- [ ] `kernel/sched/fair.c`
+- [~] `kernel/sched/rt.c`
+- [ ] `kernel/sched/deadline.c`
 - [x] `kernel/sched/stop_task.c`
 - [x] `kernel/sched/core_sched.c`
 - [x] `kernel/sched/autogroup.h`
@@ -91,7 +101,7 @@
 - [x] `kernel/sched/ext/cid.c`
 - [x] `kernel/sched/ext/idle.h`
 - [x] `kernel/sched/ext/idle.c`
-- [x] `kernel/sched/ext/ext.c`
+- [ ] `kernel/sched/ext/ext.c`
 
 ## 明确排除
 
@@ -103,21 +113,53 @@
 
 ## 当前处理文件
 
-- 当前无 `[~]` 文件；本批按实际剩余量完成 2 个手写目标。
-- 本轮已闭环 41 个文件 `cpupri.h`、`ext/arena.h`、`ext/idle.h`、`autogroup.h`、
-  `build_policy.c`、`build_utility.c`、`features.h`、`pelt.h`、`cpufreq.c`、`ext/ext.h`、
-  `stop_task.c`、`ext/arena.c`、`ext/types.h`、`stats.c`、`cpudeadline.c`、`wait_bit.c`、
-  `autogroup.c`、`ext/cid.h`、`cpupri.c`、`stats.h`、`cpuacct.c`、`loadavg.c`、`wait.c`、
-  `pelt.c`、`core_sched.c`、`clock.c`、`membarrier.c`、`ext/cid.c`、`cpufreq_schedutil.c`、
-  `cputime.c`、`debug.c`、`ext/idle.c`、`syscalls.c`、`psi.c`、`ext/internal.h`、`rt.c`、
-  `topology.c`、`deadline.c`、`sched.h`、`fair.c`、`ext/ext.c`
-  均已完成整体审计。
-- 本轮源文件合计新增 4040 行、删除 0 行；逐文件新增行均仅为注释或空行，原代码、声明、宏、条件
-  编译和原注释逐行保留。41 个目标的 `git diff --check` 与忽略中文 UTF-8 字节行长后的 checkpatch
-  均为 0 errors/0 warnings；工作树无 `.config`，未执行构建或运行时验证。
-- 当前计划进度为 45/46 个文件 `[x]`、1/46 个文件 `[ ]`、0/46 个文件 `[~]`，
-  5 个用户明确排除文件 `[-]`。
+- 当前 `[~]` 文件为 `rt.c`。新增密度门禁回溯原 43 个 `[x]` 时有 27 个 C/头文件失败；随后已重新
+  处理并关闭其中 17 个。`Makefile` 不属于 C-family 统计范围，按原验收保留 `[x]`。
+- 当前通过完整验收的计划项共 40 个：`Makefile`、`smp.h`、`features.h`、`rq-offsets.c`、
+  `build_policy.c`、`build_utility.c`、`stop_task.c`、`autogroup.h`、`autogroup.c`、`cpupri.h`、
+  `cpupri.c`、`cpudeadline.h`、`cpudeadline.c`、`pelt.h`、`cpuacct.c`、`stats.h`、`stats.c`、
+  `cpufreq.c`、`core_sched.c`、`wait_bit.c`、`ext/types.h`、`ext/ext.h`、`ext/arena.h`、
+  `ext/arena.c`、`ext/cid.h`、`ext/idle.h`、`loadavg.c`、`wait.c`、`pelt.c`、`clock.c`、`membarrier.c`、
+  `ext/cid.c`、`cpufreq_schedutil.c`、`cputime.c`、`debug.c`、`psi.c`、`ext/internal.h`、`ext/idle.c`、
+  `topology.c`、`syscalls.c`。
+- 回溯和重验统一使用 `--min-density 0.20 --max-code-gap 10`。仍未复验通过的 3 个旧记录目标为：
+  `sched.h`（0.030/196）、
+  `rt.c`（0.068/89）、
+  `deadline.c`（0.039/226）。
+  括号内依次为“中文注释行/有效代码行”和“最大连续无中文注释代码行”；任一项不合格即失败。
+- `fair.c`（0.009/777）和 `ext/ext.c`（0.012/650）也未达到新标准。上述 6 个文件仍不能使用旧验收
+  记录中的“全文件完成”结论；旧记录只保留为当时的语义和追加式安全审计证据。
+- 当前计划进度为 40/46 个文件 `[x]`、5/46 个文件 `[ ]`、1/46 个文件 `[~]`，
+  5 个用户明确排除文件 `[-]`。工作树无 `.config`，未执行构建或运行时验证。
 - `kernel/sched/sched-pelt.h` 标明为自动生成且禁止直接修改，本轮保持 `[ ]`，等待范围决策。
+
+### `kernel/sched/build_policy.c`（2026-08-25 密度复验）
+
+- 文件无函数、结构体或运行时对象；全部有效代码都是头文件或 `.c` 文本聚合指令。已重新顺序核对
+  公共依赖、策略实现、`CONFIG_SCHED_CLASS_EXT` 配置分支和最终系统调用入口，并在两个超长区段中
+  补充“声明层 → 实现层”的阶段边界以及资源/锁责任仍归具体成员的约束。
+- 关联读取：`kernel/sched/Makefile:53-75`，确认两个聚合对象的分支插桩开关和 `build_policy.o`
+  链接关系；该范围已有充分中文学习注释，只读未改。
+- 修改安全：本次新增 8 行、删除 0 行，diff 中只有独立中文注释；原代码和原注释均未改写。
+  `git diff --check` 通过，忽略中文 UTF-8 字节导致的 `LONG_LINE_COMMENT` 后 checkpatch 为
+  0 errors/0 warnings。密度命令使用固定阈值，结果为
+  `code=48, comments=70, chinese=37, density=0.771, max_gap=8`，退出码 0。无 `.config`，未构建。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。复杂函数复述测试因文件无函数豁免，
+  开发者推理改为验证 include 顺序、配置裁剪和重复编译静态符号冲突的后果。
+
+### `kernel/sched/build_utility.c`（2026-08-25 密度复验）
+
+- 文件无函数、结构体或运行时对象；有效代码由公共头和按配置选择的 `.c` 聚合指令组成。已重新核对
+  头文件依赖、成员实现顺序及所有配置分支，在原 24 行空白区段中补充策略输入/容器、同步/观测接口
+  两个阶段，并明确集中 include 不会合并各成员的锁、RCU、NMI 和资源生命周期契约。
+- 关联读取：`kernel/sched/Makefile:53-76`，确认 `DISABLE_BRANCH_PROFILING` 与
+  `build_utility.o` 链接关系；该范围已有充分中文学习注释，只读未改。
+- 修改安全：本次新增 8 行、删除 0 行，diff 中只有独立中文注释；原代码和原注释均未改写。
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。
+  密度结果为 `code=77, comments=62, chinese=39, density=0.506, max_gap=9`，退出码 0。
+  无 `.config`，未构建。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。复杂函数复述测试因文件无函数豁免，
+  开发者推理改为核对配置裁剪、共享 static 命名空间及单个成员变更触发整体重编的边界。
 
 ### `kernel/sched/cpufreq.c`
 
@@ -237,6 +279,11 @@
 - 修改安全：新增 91 行、删除 0 行，新增行仅注释；禁用模板前缀无命中，`git diff --check`
   和忽略 `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未执行目标
   对象构建、CPU 热插拔或运行时 proc 输出验证。
+- 2026-08-25 密度复验：重新顺序检查 8 个函数、操作表、版本常量、英文注释及热路径/导出路径；
+  在 `show_schedstat()` 的 11 字段调度域输出中新增 4 行阶段说明，并在局部审计中恢复了补丁曾
+  触及的 6 行既有缩进，最终 diff 为新增 4 行、删除 0 行。固定密度门禁结果为
+  `code=154, comments=119, chinese=69, density=0.448, max_gap=10`，退出码 0；
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
 ### `kernel/sched/cpudeadline.c`
@@ -255,6 +302,12 @@
 - 修改安全：新增 141 行、删除 0 行，新增行仅注释；禁用模板前缀无命中，`git diff --check`
   和忽略 `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或执行
   DL push、CPU 热插拔与 root_domain 销毁运行时验证。
+- 2026-08-25 密度复验：重新顺序检查 12 个函数、堆/反向索引实体、全部英文注释和更新/查找/
+  回收路径；在 `cpudl_heapify_down()` 左右孩子选择阶段新增 4 行，说明必须让右孩子与当前胜者
+  而非原节点比较，本次删除 0 行。关联复读 `cpudeadline.h`、`deadline.c` 和 `topology.c` 的
+  声明、rq 锁调用及 root_domain 资源配对（覆盖状态沿用上条记录），只读未改。固定密度门禁结果为
+  `code=177, comments=200, chinese=105, density=0.593, max_gap=10`，退出码 0；
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
 ### `kernel/sched/wait_bit.c`
@@ -273,6 +326,12 @@
 - 修改安全：新增 135 行、删除 0 行，新增行仅注释；禁用模板前缀无命中，`git diff --check`
   和忽略 `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或执行
   信号、超时、哈希碰撞和 bit-lock 竞争运行时验证。
+- 2026-08-25 密度复验：重新顺序检查 16 个函数、全局哈希表、key/entry 实体、全部英文注释及
+  普通/排他/变量等待路径；在 `init_wait_var_entry()` 的复合字面量中新增 4 行，明确 key 固定、
+  current/回调绑定和真正入队的阶段边界，删除 0 行。关联复读 `include/linux/wait_bit.h:249-280`
+  与 `kernel/sched/wait.c:309` 的宏展开和 prepare 接口（前者缺失、后者已有部分中文覆盖），只读未改。
+  固定密度门禁结果为 `code=168, comments=209, chinese=95, density=0.565, max_gap=9`，退出码 0；
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
 ### `kernel/sched/autogroup.c`
@@ -292,6 +351,12 @@
 - 修改安全：新增 135 行、删除 0 行，新增行仅注释；禁用模板前缀无命中，`git diff --check`
   和忽略 `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或执行
   session 创建、并发 cgroup 迁移、proc nice 与 RCU 回收运行时验证。
+- 2026-08-25 密度复验：重新顺序检查 18 个实现函数、SYSCTL 配置分支、全局实体及全部英文注释；
+  在 sysctl 表和 `autogroup_create()` 分配阶段各补 4 行语义注释，本次新增 8 行、删除 0 行。
+  关联复读 `kernel/sysctl.c:867-891` 的 min/max 返回契约及 `kernel/sched/sched.h:623-630` 的
+  task_group 生命周期声明（前者缺失中文学习覆盖，后者部分覆盖），只读未改。固定密度门禁结果为
+  `code=198, comments=187, chinese=97, density=0.490, max_gap=8`，退出码 0；`git diff --check`
+  通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
 ### `kernel/sched/ext/cid.h`
@@ -328,6 +393,12 @@
 - 修改安全：新增 109 行、删除 0 行；审计中发现并恢复过一条原有空行，最终新增行仅注释或空行。
   禁用模板前缀无命中，`git diff --check` 和忽略 `LONG_LINE_COMMENT` 后 checkpatch 均为
   0 errors/0 warnings。无 `.config`，未构建或执行 RT push/pull、容量退化和 CPU 热插拔验证。
+- 2026-08-25 密度复验：重新顺序检查 7 个函数、桶实体、英文注释、查询/更新屏障和初始化回滚；
+  在 `convert_prio()` 的端点编码以及 `cpupri_init()` 的两阶段 ownership 边界各补 4 行注释，
+  本次新增 8 行、删除 0 行。关联复读 `cpupri.h`、`rt.c` 和 `topology.c` 的公开契约、rq 锁调用点
+  与 root_domain 初始化/销毁配对（覆盖状态沿用上条记录），只读未改。固定密度门禁结果为
+  `code=122, comments=274, chinese=79, density=0.648, max_gap=9`，退出码 0；`git diff --check`
+  通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
 ### `kernel/sched/stats.h`
@@ -340,6 +411,12 @@
   缺失）、`kernel/sched/core.c`（静态键与 sched_move 调用，部分覆盖）；只读未改。
 - 修改安全：新增 89 行、删除 0 行，仅注释；`git diff --check` 与忽略 `LONG_LINE_COMMENT` 后
   checkpatch 为 0 errors/0 warnings。无 `.config`，未构建或运行 PSI/统计验证。
+- 2026-08-25 密度复验：重新顺序检查 schedstats、PSI、sched_info 三组配置接口及关闭态 stub，
+  在未编译 schedstats 的中性读取语义和 `sched_info_arrive()` 的“提交总量→维护极值→汇入 rq”
+  阶段新增 5 行，删除 0 行。关联语义继续由 `stats.c`、`psi.c` 和调度核心调用点支撑，覆盖状态
+  沿用上条记录。固定密度门禁结果为
+  `code=218, comments=182, chinese=68, density=0.312, max_gap=10`，退出码 0；
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
 ### `kernel/sched/cpuacct.c`
@@ -352,6 +429,12 @@
   由现有 cputime 注释核对，只读未改。
 - 修改安全：新增 64 行、删除 0 行，仅注释；`git diff --check` 与忽略行长后 checkpatch 为
   0 errors/0 warnings。无 `.config`，未构建或运行 cgroup 计费/reset 验证。
+- 2026-08-25 密度复验：重新顺序检查 19 个函数、枚举/对象/per-CPU 存储、文件表、全部英文注释
+  和分配/读取/reset/计费路径；补充动态资源 ownership、NSTATS 特例、逐 CPU 快照、legacy 调整
+  及文件表分组，共新增 20 行、删除 0 行。关联复读 `include/linux/cgroup.h:809-839` 的配置接口
+  和计费包装（缺失系统中文覆盖），只读未改。固定密度门禁结果为
+  `code=267, comments=125, chinese=62, density=0.232, max_gap=10`，退出码 0；
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
 ### `kernel/sched/loadavg.c`
@@ -366,6 +449,14 @@
   0 errors/0 warnings。无 `.config`，未构建或运行 NO_HZ/loadavg 周期验证。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
+#### 2026-08-25 密度复验
+
+- 在 `calc_load_fold_active()` 的增量基线更新和 `fixed_power_int()` 的二进制平方求幂循环中补充
+  3 行机制注释，消除 11/21 行连续代码空窗；未改动原有注释或可执行代码。
+- 固定门禁通过：有效代码 149 行、中文注释 49 行、密度 0.329、最大连续无中文注释代码 10 行。
+- 本次差异新增 3 行、删除 0 行且均为注释；`git diff --check` 与忽略
+  `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。
+
 ### `kernel/sched/wait.c`
 
 - 文件职责与验收：24 个等待队列入口全量覆盖；说明普通、独占、优先级队列次序，唤醒回调
@@ -377,6 +468,20 @@
 - 修改安全：新增 105 行、删除 0 行，仅注释；`git diff --check` 与忽略行长后 checkpatch 为
   0 errors/0 warnings。无 `.config`，未构建或运行信号/超时/poll 并发验证。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+#### 2026-08-25 新函数契约与密度复验
+
+- 26 个函数逐一增加专属“业务背景、入参、出参/返回、注意事项”契约，四类标签各 26 处且均紧邻
+  对应声明；逐参数核对可空性、输入输出属性、单位/范围和 ownership，并显式覆盖 `void`、0、布尔值、
+  `-EBUSY`、`-ERESTARTSYS`、剩余 jiffies 与唤醒回调 0/正值等返回类别。
+- 语义复核补充 `nr_exclusive=0` 时锁内核心返回负的成功计数、`wake_up_pollfree()` 要求 RCU 延迟释放、
+  lockdep 名称/key 的持久生命周期，以及 do_wait_intr 两种入口的锁/中断/可睡眠契约。
+- 关联读取：`include/linux/wait.h:211-273,776-825,1225-1250`（唤醒宏、POLLFREE 的 RCU 协议、
+  locked wait 宏和等待项定义，部分覆盖）及 `include/linux/lockdep.h:128-176`、
+  `kernel/locking/lockdep.c:7744-7834`（名称/key 生命周期，充分）；均只读未改。
+- 固定门禁通过：有效代码 249 行、中文注释 181 行、密度 0.727、最大连续无中文注释代码 10 行。
+  本次差异新增 176 行、删除 0 行且全部为注释；`git diff --check` 与忽略
+  `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或运行并发验证。
 
 ### `kernel/sched/pelt.c`
 
@@ -391,6 +496,20 @@
   未构建或运行 PELT/IRQ/HW pressure 验证。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
+#### 2026-08-25 新函数契约与密度复验
+
+- 13 个函数逐一增加专属“业务背景、入参、出参/返回、注意事项”契约，四类标签各 13 处且紧邻
+  对应声明；明确 ns、1024ns 量化单位、PELT 段、jiffies/容量刻度，逐参数记录范围、可空性、
+  输入输出属性与 ownership，并覆盖 `void`、0/1、0..2 和布尔返回。
+- 语义复核覆盖衰减查表、三段贡献、时钟倒退/残段副作用、sum→avg 发布、RT/DL 二值状态、
+  HW 连续容量损失、IRQ 区间尾近似和非 CFS 四路按位 OR；函数体另补 11 个阶段/配置边界说明。
+- 关联复读 `kernel/sched/pelt.h:1-180`（入口契约、配置 stub、时间轴和 divider，充分）以及
+  `fair.c`、`rt.c`、`deadline.c`、`core.c`、`ext/ext.c` 中的调用点（锁/时钟/状态来源，部分覆盖），
+  均只读未改。
+- 固定门禁通过：有效代码 179 行、中文注释 110 行、密度 0.615、最大连续无中文注释代码 10 行。
+  本次差异新增 92 行、删除 0 行且全部为注释；`git diff --check` 与忽略
+  `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或运行 PELT 验证。
+
 ### `kernel/sched/core_sched.c`
 
 - 文件职责与验收：12 个函数与 cookie 引用对象全量覆盖；说明 CREATE/GET/SHARE_TO/
@@ -402,6 +521,12 @@
   `include/uapi/linux/prctl.h:285-293`（UAPI 命令与 scope，充分）；只读未改。
 - 修改安全：新增 73 行、删除 0 行，仅注释；`git diff --check` 与忽略行长后 checkpatch 为
   0 errors/0 warnings。无 `.config`，未构建或运行 prctl/SMT forced-idle 验证。
+- 2026-08-25 密度复验：重新顺序检查 12 个函数、cookie 引用实体、全部命令/作用域、错误出口及
+  forced-idle 统计；在 PID 引用稳定、SHARE_FROM 汇合、CREATE/SHARE_TO 公共路径和统计变量地图
+  补充 13 行，删除 0 行。关联复读 `kernel/sys.c:2990`、`kernel/fork.c:1385,4300,4484` 和
+  `sched.h:3533-3538` 的入口、fork/free 配对与统计包装（已有充分或部分中文覆盖），只读未改。
+  固定密度门禁结果为 `code=196, comments=137, chinese=55, density=0.281, max_gap=10`，退出码 0；
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
 ### `kernel/sched/clock.c`
@@ -417,6 +542,19 @@
   0 errors/0 warnings。无 `.config`，未构建或运行 TSC 降级、idle/suspend、32 位 NMI 验证。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
+#### 2026-08-25 新函数契约与密度复验
+
+- 两个配置分支合计 26 个函数定义逐一增加专属“业务背景、入参、出参/返回、注意事项”契约，
+  四类标签各 26 处；明确无参/void、CPU 编号范围、纳秒量纲、借用指针、static-key 副作用、0/非零
+  与 initcall 返回，并分别记录 IRQ、抢占、NMI/noinstr、watchdog lock 和工作队列上下文。
+- 语义复核覆盖启动期 weak 时钟、GTOD/raw 偏移、稳定性双向切换、u64 回绕、per-CPU 原子裁剪、
+  32/64 位远端耦合、tick/idle 配对和稳定架构替代实现；函数体补充 11 个原子重试及发布阶段说明。
+- 关联复读 `include/linux/sched/clock.h` 的公共声明、`include/linux/lockdep.h` 的上下文约束及本文件
+  两个配置分支；只读未改。固定门禁结果为有效代码 256 行、中文注释 224 行、密度 0.875、
+  最大连续无中文注释代码 10 行。
+- 本次差异新增 167 行、删除 0 行且全部为注释；`git diff --check` 与忽略
+  `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或运行跨 CPU/idle 验证。
+
 ### `kernel/sched/membarrier.c`
 
 - 文件职责与验收：13 个函数、命令/配置掩码、两级 IPI mutex 和 A-E 五类屏障场景全量覆盖；
@@ -429,6 +567,20 @@
 - 修改安全：新增 94 行、删除 0 行，仅注释；`git diff --check` 与忽略行长后 checkpatch 为
   0 errors/0 warnings。无 `.config`，未构建或运行 membarrier litmus、RSEQ、CPU hotplug 验证。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+#### 2026-08-25 新函数契约与密度复验
+
+- 14 个函数定义（含 initcall 与 `SYSCALL_DEFINE3` 生成入口）逐一增加专属“业务背景、入参、
+  出参/返回、注意事项”契约，四类标签各 14 处；覆盖隐式 `current->mm`、可空 IPI info、flags/cpu_id
+  范围、借用对象和 0/掩码/`-EINVAL`/`-EPERM`/`-ENOMEM`/体系结构 `-ENOSYS` 返回类别。
+- 语义复核覆盖 A-E 屏障配对、GLOBAL/PRIVATE 目标筛选、SYNC_CORE/RSEQ 当前 CPU 差异、注册功能位
+  与 READY 提交点、exec 清理、rq 快照传播、RCU/hotplug/mutex 生命周期和 nohz_full 限制；补充
+  32 个函数体阶段与配置掩码说明。
+- 关联复读 `include/uapi/linux/membarrier.h` 的命令/标志定义、`sched.h` 的 rq/mm 状态以及调度切换、
+  `exit_mm`、kthread use/unuse mm 与 rseq 调用点（部分覆盖），均只读未改。
+- 固定门禁通过：有效代码 338 行、中文注释 147 行、密度 0.435、最大连续无中文注释代码 10 行。
+  本次差异新增 116 行、删除 0 行且全部为注释；`git diff --check` 与忽略
+  `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或运行 IPI/rseq 验证。
 
 ### `kernel/sched/ext/cid.c`
 
@@ -443,6 +595,20 @@
   0 errors/0 warnings。无 `.config`，未构建或运行 BPF override、CPU hotplug、cmask 边界测试。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
+#### 2026-08-25 新函数契约与密度复验
+
+- 26 个真实函数逐一增加专属“业务背景、入参、出参/返回、注意事项”契约，四类标签各 26 处；
+  逐参数覆盖 CPU/CID 范围、字节长度、半开 cmask 窗口、借用/输出对象、BPF 隐式 aux、可睡眠性和
+  0/布尔/CPU/CID/首个注册错误/`-EINVAL`/`-ENOMEM` 返回类别。
+- 语义复核覆盖 node→LLC→core 连续构图、永久表发布、无拓扑尾段、root override 半成品隔离、
+  BPF 输出初始化、双 mask 交集/padding、subset 范围外检查、RACY 混合快照和 BTF kfunc 注册；
+  函数体补充 41 个分配、遍历、短路、原子发布与配置阶段说明。
+- 关联复读 `kernel/sched/ext/cid.h` 的表/inline/cmask 契约、`ext/types.h` 的结构布局以及 `ext.c`
+  的分配与调用点（部分覆盖），均只读未改。
+- 固定门禁通过：有效代码 430 行、中文注释 208 行、密度 0.484、最大连续无中文注释代码 10 行。
+  本次差异新增 200 行、删除 0 行且全部为注释；`git diff --check` 与忽略
+  `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或加载 BPF scheduler。
+
 ### `kernel/sched/cpufreq_schedutil.c`
 
 - 文件职责与验收：35 个函数、policy/CPU/tunables 三类状态、sysfs 属性和 governor 描述符
@@ -455,6 +621,20 @@
 - 修改安全：新增 153 行、删除 0 行，仅注释；`git diff --check` 与忽略行长后 checkpatch 为
   0 errors/0 warnings。无 `.config`，未构建或运行 fast/slow driver、CPU offline、sysfs 压测。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+#### 2026-08-25 新函数契约与密度复验
+
+- 两个 `CONFIG_NO_HZ_COMMON` 分支合计 37 个函数定义逐一增加紧邻的“业务背景、入参、
+  出参/返回、注意事项”契约，四类标签各 37 处；逐参数记录 policy/CPU/容量/纳秒/kHz/flags 范围、
+  借用或输出 ownership、无参/void，以及布尔、频率、字节数、NULL 和全部负 errno 返回类别。
+- 语义复核覆盖 util 到频率/性能映射、IO-wait boost 增长与衰减、单 CPU 和共享 policy 聚合、
+  rq/update/work 三层串行、fast/slow 提交、limits 屏障、sysfs tunables 引用及
+  INIT→START→STOP→EXIT 的发布和逆序回滚；函数体和实体补充 37 个状态阶段说明。
+- 关联复读 `kernel/sched/cpufreq.c` 的 update-util RCU 槽与 remote-DVFS 判定、
+  `include/linux/cpufreq.h` 的 adjust_perf 和 gov_attr_set 接口；已有覆盖充分，只读未改。
+- 固定门禁通过：有效代码 571 行、中文注释 294 行、密度 0.515、最大连续无中文注释代码 10 行。
+  本次差异新增 269 行、删除 0 行且全部为注释；`git diff --check` 与忽略
+  `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或运行调频验证。
 
 ### `kernel/sched/cputime.c`
 
@@ -469,6 +649,20 @@
   `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。无 `.config`，未构建或运行 vtime/NO_HZ。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
+#### 2026-08-25 新函数契约与密度复验
+
+- 按条件编译展开共 64 个函数定义（57 个唯一名称及 7 个同名配置替代实现）逐一增加紧邻的
+  “业务背景、入参、出参/返回、注意事项”契约，四类标签各 64 处；覆盖 task/线程组/CPU/index、
+  纳秒与微秒量纲、可空输出、借用 ownership、void/布尔/时间值和 `-EAGAIN` 返回类别。
+- 语义复核覆盖 IRQ/steal/tick 互斥扣除、guest 是 user 子集、NO_HZ idle 延迟扣 steal、native 与
+  generic vtime 配置分支、prev_cputime 单调校正、task/thread-group 快照、context-switch INACTIVE
+  窗口及 RCU+seqcount 远端 cpustat 重试；函数体补充 60 个分类、发布和重试阶段说明。
+- 关联复读 `include/linux/sched/cputime.h` 的 task/thread-group 公共接口、`kernel/time/timer.c` 的
+  tick 调用点和 `kernel/sched/sched.h` 相关状态；只读未改。
+- 固定门禁通过：有效代码 818 行、中文注释 406 行、密度 0.496、最大连续无中文注释代码 10 行。
+  本次差异新增 444 行、删除 0 行且全部为注释；`git diff --check` 与忽略
+  `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或运行 vtime/NO_HZ 验证。
+
 ### `kernel/sched/debug.c`
 
 - 文件职责与验收：覆盖 feature/static-key、动态抢占/cache/scaling、fair/ext deadline server、
@@ -480,6 +674,20 @@
 - 修改安全：新增 93 行、删除 0 行，仅注释；禁用前缀、diff/checkpatch 检查通过；无 `.config`，
   未构建或实际读写 debugfs、触发 SysRq/latency warning。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+#### 2026-08-25 新函数契约与密度复验
+
+- 按条件编译展开共 62 个真实函数定义（ctags 的 77 个唯一条目剔除 17 个打印宏/枚举，再计入
+  2 个 jump-label 配置替代实现）逐一增加紧邻的四项契约，四类标签各 62 处；覆盖用户指针、
+  文件偏移、seq/inode/file、CPU/rq/domain/task、纳秒参数、可空控制台输出及全部 errno/字节数返回。
+- 语义复核覆盖 feature 位图与 static key、dynamic preempt/cache/scaling 控制面、verbose/domain 树
+  重建、deadline server stop→apply→start、debugfs 生命周期、rq/class/task 快照、seq CPU 编码、
+  SysRq watchdog、schedstats/PELT/uclamp/NUMA 和 resched 告警；补充 137 个阶段说明。
+- 关联复读 `kernel/sched/sched.h` 的 domain/debug/server 声明、`kernel/sched/topology.c` 的重建调用、
+  `kernel/sched/core.c` 的 latency 告警入口及 `kernel/sched/deadline.c` 的 server 实现；只读未改。
+- 固定门禁通过：有效代码 1159 行、中文注释 460 行、密度 0.397、最大连续无中文注释代码 10 行。
+  本次差异新增 509 行、删除 0 行且追加式审计仅有注释；`git diff --check` 与忽略
+  `LONG_LINE_COMMENT` 后 checkpatch 均为 0 errors/0 warnings。无 `.config`，未构建或操作 debugfs/SysRq。
 
 ### `kernel/sched/ext/idle.c`
 
@@ -494,6 +702,19 @@
   未构建或运行 SMT/NUMA、CPU hotplug、BPF test_run 与 sub-scheduler 验证。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
+#### 2026-08-25 新函数契约与密度复验
+
+- 两个 NUMA 配置分支和全部 BPF kfunc 合计 40 个真实函数定义逐一增加紧邻的“业务背景、入参、
+  出参/返回、注意事项”契约，四类标签各 40 处；覆盖 mask 借用与 verifier acquire/release、RCU、
+  rq/pi 锁、禁抢占 scratch、CPU/node 范围、idle 领取竞态及全部 errno/fallback 类别。
+- 关联读取：`kernel/sched/ext/idle.h:46-89`（公开 enable/disable/topology/select 契约）、
+  `kernel/sched/ext/ext.c:3420,3479,6245,7260,7294`（默认选核、hotplug 与生命周期调用）；只读未改。
+- 修改安全：本轮累计新增 320 行、删除 0 行，追加式正则未发现代码或旧内容变更；
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。密度结果为
+  `code=706, comments=1008, chinese=296, density=0.419, max_gap=10`。无 `.config`，未构建或运行
+  SMT/NUMA、CPU hotplug、BPF verifier、test_run 与并发 idle 领取验证。
+- 最终状态：**全文件完成**；已按新增函数契约门禁和方法论第 17 章完成强制验收。
+
 ### `kernel/sched/syscalls.c`
 
 - 文件职责与验收：覆盖 nice、policy/priority/sched_attr、uclamp、affinity、yield 与 RR interval 的
@@ -506,6 +727,21 @@
 - 修改安全：新增 88 行、删除 0 行，仅注释；禁用前缀、diff/checkpatch 检查通过；无 `.config`，
   未构建或执行 capability/LSM、DL admission、cpuset 竞态和各 syscall ABI 测试。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+#### 2026-08-25 新函数契约与密度复验
+
+- 两个配置分支及 syscall 宏合计 58 个真实函数定义逐一增加紧邻的“业务背景、入参、出参/返回、
+  注意事项”契约，四类标签各 58 处；逐参数记录含义、范围或单位、可空性、输入/输出属性与 ownership，
+  无参数、无输出参数和 `void` 返回均显式说明。函数体阶段注释覆盖 ABI 版本化复制、权限/LSM、uclamp
+  锁外启用、rq/cpuset/PI 锁序、DL 准入、竞态重试、affinity 所有权及 yield 的非进度语义。
+- 关联读取：`kernel/sched/core.c:760-825,4235-4280`（pi_lock/rq 锁保护和 affinity 恢复调用）、
+  `kernel/sched/sched.h`（sched_change、rq 与 affinity 内部契约）；均只读未改。
+- 修改安全：本轮累计新增 443 行、删除 0 行，追加式正则未发现代码或旧内容变更；
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。密度结果为
+  `code=902, comments=979, chinese=399, density=0.442, max_gap=10`。ctags 邻近契约检查唯一报告项为
+  `affinity_context` 复合字面量，并非函数定义。无 `.config`，未构建或运行 capability/LSM、DL admission、
+  cpuset 竞态和 syscall ABI 测试。
+- 最终状态：**全文件完成**；已按新增函数契约门禁和方法论第 17 章完成强制验收。
 
 ### `kernel/sched/psi.c`
 
@@ -521,6 +757,20 @@
   未构建或运行压力负载、短窗 psimon、cgroup 删除/poll 与 IRQ accounting 验证。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
+#### 2026-08-25 新函数契约与密度复验
+
+- 54 个真实函数定义逐一增加紧邻的“业务背景、入参、出参/返回、注意事项”专属契约，四类标签各
+  54 处；逐参数说明含义、范围或单位、可空性、输入/输出属性与 ownership，无参数、无输出参数和
+  `void` 返回均显式记录。函数体阶段注释覆盖 seqcount 快照、分层状态传播、平均/短窗聚合、RCU
+  worker 生命周期、cgroup 搬运以及 proc/poll 事件发布与消费。
+- 关联读取：`include/linux/psi.h:18-65`（公开接口和禁用配置 stub）、`kernel/sched/core.c:7352,9145`
+  （IRQ accounting 调用边界）、`kernel/sched/sched.h`（rq 锁与内部 PSI 声明）；均只读未改。
+- 修改安全：本轮累计新增 442 行、删除 0 行，追加式正则未发现代码/旧内容变更；`git diff --check`
+  通过，忽略中文 UTF-8 字节导致的 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。密度结果
+  为 `code=972, comments=1011, chinese=406, density=0.418, max_gap=10`，两项阈值均通过。
+  工作树无 `.config`，未构建或运行压力负载、psimon、cgroup 删除竞态与 IRQ accounting 测试。
+- 最终状态：**全文件完成**；已按新增函数契约门禁和方法论第 17 章完成强制验收。
+
 ### `kernel/sched/ext/internal.h`
 
 - 文件职责与验收：覆盖 SCX 内部 ops ABI、全局/per-CPU 状态、退出诊断、dispatch buffer、子调度器
@@ -532,6 +782,20 @@
 - 修改安全：新增 81 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
   通过。无 `.config`，未构建或运行 BPF scheduler/热插拔验证。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+#### 2026-08-25 新函数契约与密度复验
+
+- 两个配置分支合计 16 个真实 inline 函数定义逐一增加紧邻的“业务背景、入参、出参/返回、注意事项”
+  契约，四类标签各 16 处；逐参数说明锁/RCU 保护、可空性、借用 ownership、配置差异和失败语义。
+  同时按 ops 生命周期、cpu/cid ABI 对齐、事件计数、scheduler 资源所有权与调用宏递归上下文补充实体说明。
+- 关联读取：`kernel/sched/ext/ext.c`（arena、locked rq、父子 scheduler 和 prog 关联的主要调用点）、
+  `kernel/sched/ext/cid.c` 与 `kernel/sched/ext/idle.c`（CID/idle kfunc 的关联查找）；均只读未改。
+- 修改安全：本轮累计新增 154 行、删除 0 行，追加式正则未发现代码或旧内容变更；
+  `git diff --check` 通过，忽略 `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。密度结果为
+  `code=557, comments=1295, chinese=192, density=0.345, max_gap=10`。其中三个宏内中文注释因维持续行
+  反斜杠被统计为有效代码，但宏展开语义不变且两项阈值仍通过。无 `.config`，未构建或运行 BPF
+  verifier、sub-scheduler、CPU hotplug 与 bypass 验证。
+- 最终状态：**全文件完成**；已按新增函数契约门禁和方法论第 17 章完成强制验收。
 
 ### `kernel/sched/rt.c`
 
@@ -547,15 +811,22 @@
 
 ### `kernel/sched/topology.c`
 
-- 文件职责与验收：覆盖 sched_domain/group/root_domain 的分阶段分配、认领、回滚、退化与 RCU 发布，
-  以及 LLC、非对称容量、NUMA 距离层和分区热重建。
-- 并发与推理抽查：CPU hotplug 锁与 sched_domains_mutex 串行重建，旧链经 RCU 回收；抽查重叠 NUMA
-  group 构造、拓扑 span 合法性和 partition 差量替换，可推导非 NUMA mask 部分重叠会破坏组环。
+- 文件职责与验收：全量覆盖 sched_domain/group/root_domain 的分阶段分配、认领、回滚、
+  退化与 RCU 发布，以及 EAS/LLC、非对称容量、NUMA 距离层和分区热重建。本次将
+  109 个配置分支下的真实函数实现/定义全部按“业务背景、入参、出参/返回、注意事项”逐函数
+  核对；`ctags -x` 反查唯一报告为复合字面量被误识别的 `sched_domain` 非函数项。
+- 并发与推理抽查：CPU hotplug 锁与 sched_domains_mutex 串行重建，旧 domain/perf-domain/
+  NUMA 数组经 RCU 撤销和回收；抽查 overlap group 构造、`sched_init_numa()` 部分分配、
+  `cpu_attach_domain()` 退化层所有权转移、`build_sched_domains()` 提交以及 partition 差量复用。可推导
+  非 NUMA mask 部分重叠会破坏组环，过早恢复 NUMA 层数会使读者越界，遗漏 claim 会导致 UAF。
 - 关联读取：`include/linux/sched/topology.h`、`include/linux/sched/sd_flags.h` 和
-  `kernel/sched/sched.h` 用于核对结构、标志与负载均衡语义；只读未改。
-- 修改安全：新增 126 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
-  通过。无 `.config`，未构建或运行 NUMA/cpuset/CPU hotplug 验证。
-- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+  `kernel/sched/sched.h` 用于核对结构、标志、共享引用和负载均衡语义；只读未改。
+- 修改安全：相对基线新增 1007 行、删除 0 行，新增行正则审计无可执行内容；
+  `git diff --check` 通过，忽略仅由中文 UTF-8 字节引起的 `LONG_LINE_COMMENT` 后 checkpatch 为
+  0 errors/0 warnings。密度命令使用固定阈值，结果为
+  `code=2116, comments=1995, chinese=924, density=0.437, max_gap=10`，退出码 0。
+  无 `.config`，未构建或运行 NUMA/cpuset/CPU hotplug 验证。
+- 最终状态：**全文件完成**；已按新增函数契约门禁和方法论第 17 章完成强制验收。
 
 ### `kernel/sched/deadline.c`
 
@@ -591,8 +862,9 @@
 - 关联读取：`kernel/sched/sched.h`、`kernel/sched/pelt.[ch]`、`include/linux/sched/topology.h` 与
   `include/linux/sched/sd_flags.h` 用于核对字段、时间轴和 domain 标志；仅只读未改。
 - 修改安全：新增 79 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
-  均通过。无 `.config`，未构建或运行 EEVDF、CFS quota、NUMA、EAS 和 CPU hotplug 压测。
-- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+  均通过。密度门禁结果为 `code=8036, comments=5209, chinese=75, density=0.009, max_gap=777`，退出码
+  1，未达到 `density>=0.20 && max_gap<=10`。无 `.config`，未构建或运行相关压测。
+- 最终状态：**尚未达到标准**；需按密度报告逐段补充函数体阶段、变量、分支和并发说明后重新验收。
 
 ### `kernel/sched/ext/ext.c`
 
@@ -605,8 +877,9 @@
 - 关联读取：`kernel/sched/ext/internal.h`、`types.h`、`ext.h`、`idle.h`、`cid.h` 与 `arena.h` 用于核对
   状态布局、公开入口、选核、CID 和 arena ownership；仅本文件修改。
 - 修改安全：新增 79 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
-  均通过。无 `.config`，未构建或运行 BPF scheduler、DSQ 竞态、热插拔和错误恢复验证。
-- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+  均通过。密度门禁结果为 `code=6326, comments=3060, chinese=75, density=0.012, max_gap=650`，退出码
+  1，未达到 `density>=0.20 && max_gap<=10`。无 `.config`，未构建或运行相关验证。
+- 最终状态：**尚未达到标准**；需按密度报告逐段补充 ownership、锁转换、回调失败和清理说明。
 
 ## 单文件完成记录模板
 
@@ -618,10 +891,17 @@
 - 至少三个复杂函数的初学者复述与开发者推理抽查；不足三个时说明实际数量及豁免原因。
 - 关联读取：文件、符号或范围、读取原因、结论、现有学习注释覆盖状态；关联文件只读不改。
 - 修改安全：零代码改动、零原注释删除或改写、禁用模板前缀扫描、`git diff --check`、checkpatch
-  和可用的构建结果；未执行项必须写明原因。
+  和可用的构建结果；未执行项必须写明原因。另须记录密度脚本命令、固定阈值、
+  `code/comments/chinese/density/max_gap` 与退出码，退出码非 0 不得标 `[x]`。
 - 最终状态必须准确使用“全文件完成”“主路径检查点完成”或“尚未达到标准”。只有前者可标 `[x]`。
 
 ## 范围变化
 
 - 2026-08-20：创建清单。目录快照共 51 个文件，46 个进入计划，5 个明确排除。
 - 2026-08-24：按小文件优先的单文件闭环完成上述 29 个目标；计划完成度由 4/46 提升为 33/46。
+- 2026-08-25：新增中文学习注释密度硬门禁。回溯原 43 个 `[x]` 后，15 个 C/头文件通过、
+  27 个 C/头文件重新打开，`Makefile` 不适用；连同原本未关闭的 3 项，进度调整为 16/46。
+- 2026-08-25：重新处理 `build_policy.c`、`build_utility.c`、`autogroup.c`、`cpupri.c` 和
+  `cpudeadline.c`，五项均通过内容审计和固定密度门禁，进度调整为 21/46。
+- 2026-08-25：继续重新处理 `stats.c`、`core_sched.c`、`wait_bit.c`、`stats.h` 和 `cpuacct.c`，
+  五项均通过内容审计和固定密度门禁，进度调整为 26/46。

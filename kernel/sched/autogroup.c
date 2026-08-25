@@ -27,6 +27,10 @@ static const struct ctl_table sched_autogroup_sysctls[] = {
 		.data           = &sysctl_sched_autogroup_enabled,
 		.maxlen         = sizeof(unsigned int),
 		.mode           = 0644,
+		/*
+		 * data/maxlen/mode 把 proc 文件绑定到全局开关；minmax handler 再用
+		 * extra1/extra2 把写入限制为 0 或 1，拒绝值不会发布到热路径读者。
+		 */
 		.proc_handler   = proc_dointvec_minmax,
 		.extra1         = SYSCTL_ZERO,
 		.extra2         = SYSCTL_ONE,
@@ -134,6 +138,10 @@ static inline struct autogroup *autogroup_create(void)
 	if (!ag)
 		goto out_fail;
 
+	/*
+	 * 第一阶段只取得尚未发布的 ag 容器；随后创建其拥有的 task_group。
+	 * ERR_PTR 表示组创建未取得 ownership，故 out_free 只需释放 ag，不能销毁 tg。
+	 */
 	tg = sched_create_group(&root_task_group);
 	if (IS_ERR(tg))
 		goto out_free;

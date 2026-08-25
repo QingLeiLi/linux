@@ -293,6 +293,10 @@ void init_wait_var_entry(struct wait_bit_queue_entry *wbq_entry, void *var, int 
 			.flags	= (var),
 			.bit_nr = -1,
 		},
+		/*
+		 * key 先固定完整变量身份；内嵌 wq_entry 再绑定 current、过滤回调和
+		 * 自指链表头。初始化结束后仍未入队，后续 prepare_to_wait 才转移队列成员状态。
+		 */
 		.wq_entry = {
 			.flags	 = flags,
 			.private = current,

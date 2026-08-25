@@ -30,12 +30,14 @@ enum scx_exit_kind {
 	SCX_EXIT_NONE,
 	SCX_EXIT_DONE,
 
+	/* 64 起的注销类是可控停用来源，区别于 1024 起的运行时错误。 */
 	SCX_EXIT_UNREG = 64,	/* user-space initiated unregistration */
 	SCX_EXIT_UNREG_BPF,	/* BPF-initiated unregistration */
 	SCX_EXIT_UNREG_KERN,	/* kernel-initiated unregistration */
 	SCX_EXIT_SYSRQ,		/* requested by 'S' sysrq */
 	SCX_EXIT_PARENT,	/* parent exiting */
 
+	/* 错误子类保留触发来源，供 exit 回调和用户态决定诊断或重启策略。 */
 	SCX_EXIT_ERROR = 1024,	/* runtime error, error msg contains details */
 	SCX_EXIT_ERROR_BPF,	/* ERROR but triggered through scx_bpf_error() */
 	SCX_EXIT_ERROR_STALL,	/* watchdog detected stalled runnable tasks */
@@ -95,6 +97,7 @@ struct scx_exit_info {
 	 */
 	s32			exit_cpu;
 
+	/* code/flags 是机器可判定字段，reason/bt/msg/dump 是只读诊断载荷。 */
 	/* exit code if gracefully exiting */
 	s64			exit_code;
 
@@ -108,6 +111,7 @@ struct scx_exit_info {
 	unsigned long		*bt;
 	u32			bt_len;
 
+	/* msg 是简短原因，dump 可承载 scheduler 自定义状态，二者均由 core 管理。 */
 	/* informational message */
 	char			*msg;
 
@@ -131,6 +135,7 @@ enum scx_ops_flags {
 	 */
 	SCX_OPS_ENQ_LAST		= 1LLU << 1,
 
+	/* EXITING 和 PARTIAL 分别控制不可按 pid 查找任务的交付，以及接管的策略范围。 */
 	/*
 	 * An exiting task may schedule after PF_EXITING is set. In such cases,
 	 * bpf_task_from_pid() may not be able to find the task and if the BPF
@@ -151,6 +156,7 @@ enum scx_ops_flags {
 	 */
 	SCX_OPS_SWITCH_PARTIAL		= 1LLU << 3,
 
+	/* migration-disabled 任务默认走本地兜底；声明此位才把责任交给 BPF enqueue。 */
 	/*
 	 * A migration disabled task can only execute on its current CPU. By
 	 * default, such tasks are automatically put on the CPU's local DSQ with
@@ -180,6 +186,7 @@ enum scx_ops_flags {
 	 */
 	SCX_OPS_ALLOW_QUEUED_WAKEUP	= 1LLU << 5,
 
+	/* idle 拓扑和 local DSQ 立即执行语义可按 scheduler 能力独立选择。 */
 	/*
 	 * If set, enable per-node idle cpumasks. If clear, use a single global
 	 * flat idle cpumask.
@@ -192,6 +199,7 @@ enum scx_ops_flags {
 	 */
 	SCX_OPS_ALWAYS_ENQ_IMMED	= 1LLU << 7,
 
+	/* TID 映射是 root 提供的层级能力，依赖它的 sub-scheduler 会在 attach 时校验。 */
 	/*
 	 * Maintain a mapping from p->scx.tid to task_struct so the BPF
 	 * scheduler can recover task pointers from stored tids via
@@ -203,10 +211,12 @@ enum scx_ops_flags {
 	 */
 	SCX_OPS_TID_TO_TASK		= 1LLU << 8,
 
+	/* ALL_FLAGS 只汇总 BPF 可请求位，内核派生能力必须留在高八位域。 */
 	SCX_OPS_ALL_FLAGS		= SCX_OPS_KEEP_BUILTIN_IDLE |
 					  SCX_OPS_ENQ_LAST |
 					  SCX_OPS_ENQ_EXITING |
 					  SCX_OPS_ENQ_MIGRATION_DISABLED |
+					  /* 这里仍只组合用户可声明的低位能力。 */
 					  SCX_OPS_ALLOW_QUEUED_WAKEUP |
 					  SCX_OPS_SWITCH_PARTIAL |
 					  SCX_OPS_BUILTIN_IDLE_PER_NODE |
@@ -320,6 +330,7 @@ struct scx_sub_detach_args {
  * 为准，select_cpu 的结果只是候选，真正 CPU 在 dispatch 时仍可改变。
  */
 struct sched_ext_ops {
+	/* 选核与 enqueue/dispatch 构成任务从唤醒到进入 DSQ、再被 CPU 消费的主控制链。 */
 	/**
 	 * @select_cpu: Pick the target CPU for a task which is being woken up
 	 * @p: task being woken up
@@ -401,6 +412,7 @@ struct sched_ext_ops {
 	 */
 	void (*dispatch)(s32 cpu, struct task_struct *prev);
 
+	/* tick 只提供运行中周期反馈，不能代替 dispatch 对 runnable task 的所有权归还。 */
 	/**
 	 * @tick: Periodic tick
 	 * @p: task running currently
@@ -438,6 +450,7 @@ struct sched_ext_ops {
 	 */
 	void (*runnable)(struct task_struct *p, u64 enq_flags);
 
+	/* running/stopping/quiescent 按可运行生命周期成对报告，CPU 应从 task 记录而非 current 推断。 */
 	/**
 	 * @running: A task is starting to run on its associated CPU
 	 * @p: task starting to run
@@ -495,6 +508,7 @@ struct sched_ext_ops {
 	 */
 	void (*quiescent)(struct task_struct *p, u64 deq_flags);
 
+	/* yield 返回是否接管定向让出；false 时 core 保留默认处理。 */
 	/**
 	 * @yield: Yield CPU
 	 * @from: yielding task
@@ -528,6 +542,7 @@ struct sched_ext_ops {
 	 */
 	bool (*core_sched_before)(struct task_struct *a, struct task_struct *b);
 
+	/* 属性变更回调只同步 BPF 侧策略视图，task 字段的 ownership 仍归调度核心。 */
 	/**
 	 * @set_weight: Set task weight
 	 * @p: task to set weight for
@@ -569,6 +584,7 @@ struct sched_ext_ops {
 	 */
 	void (*update_idle)(s32 cpu, bool idle);
 
+	/* init_task 成功建立每 task BPF 状态，exit_task 在取消或正常退出时对称清理。 */
 	/**
 	 * @init_task: Initialize a task to run in a BPF scheduler
 	 * @p: task to initialize for BPF scheduling
@@ -594,6 +610,7 @@ struct sched_ext_ops {
 	 */
 	void (*exit_task)(struct task_struct *p, struct scx_exit_task_args *args);
 
+	/* enable/disable 标记 task 实际进入和离开 SCX，加载失败路径也必须容忍配对差异。 */
 	/**
 	 * @enable: Enable BPF scheduling for a task
 	 * @p: task to enable BPF scheduling for
@@ -644,6 +661,7 @@ struct sched_ext_ops {
 	void (*dump_task)(struct scx_dump_ctx *ctx, struct task_struct *p);
 
 #ifdef CONFIG_EXT_GROUP_SCHED
+	/* cgroup init/exit 管对象生命周期，prep/move/cancel 形成可回滚的 task 迁移事务。 */
 	/**
 	 * @cgroup_init: Initialize a cgroup
 	 * @cgrp: cgroup being initialized
@@ -706,6 +724,7 @@ struct sched_ext_ops {
 	void (*cgroup_cancel_move)(struct task_struct *p,
 				   struct cgroup *from, struct cgroup *to);
 
+	/* weight/bandwidth/idle 回调把控制器变化投影到 BPF，不授权修改 cgroup 核心对象。 */
 	/**
 	 * @cgroup_set_weight: A cgroup's weight is being changed
 	 * @cgrp: cgroup whose weight is being updated
@@ -749,6 +768,7 @@ struct sched_ext_ops {
 
 #endif	/* CONFIG_EXT_GROUP_SCHED */
 
+	/* sub_attach/detach 建立层级；CPU online/offline 则限定对应 CPU dispatch 的可调用窗口。 */
 	/**
 	 * @sub_attach: Attach a sub-scheduler
 	 * @args: argument container, see the struct definition
@@ -785,6 +805,7 @@ struct sched_ext_ops {
 	 */
 	void (*cpu_offline)(s32 cpu);
 
+	/* init 是加载提交点；exit 即使 init 失败也可能收到部分初始化的诊断上下文。 */
 	/*
 	 * All CPU hotplug ops must come before ops.init().
 	 */
@@ -804,6 +825,7 @@ struct sched_ext_ops {
 	 */
 	void (*exit)(struct scx_exit_info *info);
 
+	/* 以下字段是注册时输入参数，core 校验后复制进 scheduler 运行态。 */
 	/*
 	 * Data fields must comes after all ops fields.
 	 */
@@ -848,6 +870,7 @@ struct sched_ext_ops {
 	 */
 	u64 sub_cgroup_id;
 
+	/* name 是用户可见稳定标识，priv 由 core 以 RCU 发布关联的运行时 scheduler。 */
 	/**
 	 * @name: BPF scheduler's name
 	 *
@@ -920,6 +943,7 @@ struct sched_ext_ops {
  * See sched_ext_ops for callback documentation.
  */
 struct sched_ext_ops_cid {
+	/* cid-form 保持 cpu-form 的回调顺序和字段偏移，只把 CPU 标识域替换为 CID/cmask。 */
 	s32 (*select_cid)(struct task_struct *p, s32 prev_cid, u64 wake_flags);
 	void (*enqueue)(struct task_struct *p, u64 enq_flags);
 	void (*dequeue)(struct task_struct *p, u64 deq_flags);
@@ -930,8 +954,10 @@ struct sched_ext_ops_cid {
 	void (*stopping)(struct task_struct *p, bool runnable);
 	void (*quiescent)(struct task_struct *p, u64 deq_flags);
 	bool (*yield)(struct task_struct *from, struct task_struct *to);
+	/* core-sched 比较结束后进入属性同步与 task 生命周期回调组。 */
 	bool (*core_sched_before)(struct task_struct *a,
 				   struct task_struct *b);
+	/* task 属性、idle 与生命周期回调语义不因 CID 形式改变。 */
 	void (*set_weight)(struct task_struct *p, u32 weight);
 	void (*set_cmask)(struct task_struct *p,
 			   const struct scx_cmask *cmask);
@@ -940,12 +966,14 @@ struct sched_ext_ops_cid {
 			  struct scx_init_task_args *args);
 	void (*exit_task)(struct task_struct *p,
 			   struct scx_exit_task_args *args);
+	/* enable/disable 和 dump 回调对应 scheduler 接管状态及错误诊断阶段。 */
 	void (*enable)(struct task_struct *p);
 	void (*disable)(struct task_struct *p);
 	void (*dump)(struct scx_dump_ctx *ctx);
 	void (*dump_cid)(struct scx_dump_ctx *ctx, s32 cid, bool idle);
 	void (*dump_task)(struct scx_dump_ctx *ctx, struct task_struct *p);
 #ifdef CONFIG_EXT_GROUP_SCHED
+	/* 组调度字段必须与 cpu-form 同序，以便共用验证和复制逻辑。 */
 	s32 (*cgroup_init)(struct cgroup *cgrp,
 			    struct scx_cgroup_init_args *args);
 	void (*cgroup_exit)(struct cgroup *cgrp);
@@ -953,6 +981,7 @@ struct sched_ext_ops_cid {
 				 struct cgroup *from, struct cgroup *to);
 	void (*cgroup_move)(struct task_struct *p,
 			     struct cgroup *from, struct cgroup *to);
+	/* cancel_move 只回滚 prep 阶段，set_* 系列则同步已提交的控制器属性。 */
 	void (*cgroup_cancel_move)(struct task_struct *p,
 				    struct cgroup *from, struct cgroup *to);
 	void (*cgroup_set_weight)(struct cgroup *cgrp, u32 weight);
@@ -960,11 +989,13 @@ struct sched_ext_ops_cid {
 				      u64 period_us, u64 quota_us, u64 burst_us);
 	void (*cgroup_set_idle)(struct cgroup *cgrp, bool idle);
 #endif	/* CONFIG_EXT_GROUP_SCHED */
+	/* 层级、上线和全局生命周期字段继续维持与 sched_ext_ops 的布局对应。 */
 	s32 (*sub_attach)(struct scx_sub_attach_args *args);
 	void (*sub_detach)(struct scx_sub_detach_args *args);
 	void (*cid_online)(s32 cid);
 	void (*cid_offline)(s32 cid);
 	s32 (*init)(void);
+	/* exit 接收 core 拥有的退出快照；其后的数据字段不得当作回调指针索引。 */
 	void (*exit)(struct scx_exit_info *info);
 
 	/* Data fields - must match sched_ext_ops layout exactly */
@@ -974,6 +1005,7 @@ struct sched_ext_ops_cid {
 	u32 exit_dump_len;
 	u64 hotplug_seq;
 	u64 sub_cgroup_id;
+	/* 尾部配置与私有 RCU 指针同样保持 ABI 对齐，__end 标记可比较的末端。 */
 	char name[SCX_OPS_NAME_LEN];
 
 	/* internal use only, must be NULL */
@@ -1016,6 +1048,7 @@ struct scx_event_stats {
 	 */
 	s64		SCX_EV_DISPATCH_KEEP_LAST;
 
+	/* 这组计数记录 core 因 task 生命周期或迁移约束绕过 BPF enqueue 的次数。 */
 	/*
 	 * If SCX_OPS_ENQ_EXITING is not set, the number of times that a task
 	 * is dispatched to a local DSQ when exiting.
@@ -1036,6 +1069,7 @@ struct scx_event_stats {
 	 */
 	s64		SCX_EV_REENQ_IMMED;
 
+	/* 重复 local reenq 持续增长通常意味着 scheduler 没有正确处理 REENQ 反馈。 */
 	/*
 	 * The number of times a reenq of local DSQ caused another reenq of
 	 * local DSQ. This can happen when %SCX_ENQ_IMMED races against a higher
@@ -1053,6 +1087,7 @@ struct scx_event_stats {
 	 */
 	s64		SCX_EV_REFILL_SLICE_DFL;
 
+	/* bypass duration 使用纳秒，其余 bypass 字段是次数，导出端不能混同单位。 */
 	/*
 	 * The total duration of bypass modes in nanoseconds.
 	 */
@@ -1068,6 +1103,7 @@ struct scx_event_stats {
 	 */
 	s64		SCX_EV_BYPASS_ACTIVATE;
 
+	/* 不拥有 task 的 insert 会被忽略；计数用于区分偶发 attach 竞态与持续 scheduler 错误。 */
 	/*
 	 * The number of times the scheduler attempted to insert a task that it
 	 * doesn't own into a DSQ. Such attempts are ignored.
@@ -1131,6 +1167,7 @@ struct scx_sched_pcpu {
 	 */
 	struct scx_event_stats	event_stats;
 
+	/* deferred 链解决锁序约束，bypass_dsq 则在 BPF 不可用时保证本 CPU 仍能取任务。 */
 	struct scx_deferred_reenq_local deferred_reenq_local;
 	struct scx_dispatch_q	bypass_dsq;
 #ifdef CONFIG_EXT_SUB_SCHED
@@ -1165,6 +1202,7 @@ struct scx_sched {
 	};
 	bool			is_cid_type;	/* true if registered via bpf_sched_ext_ops_cid */
 
+	/* ops union 是只读回调 ABI，arena 三字段则只在 cid-form 中拥有映射和子分配器。 */
 	/*
 	 * Arena map auto-discovered from member progs at struct_ops attach.
 	 * cid-form schedulers must use exactly one arena across all member
@@ -1186,6 +1224,7 @@ struct scx_sched {
 	 */
 	struct scx_cmask * __percpu *set_cmask_scratch;
 
+	/* has_op 在加载时固化，热路径据此跳过 NULL 回调而不反复访问 BPF struct_ops。 */
 	DECLARE_BITMAP(has_op, SCX_OPI_END);
 
 	/*
@@ -1200,6 +1239,7 @@ struct scx_sched {
 	struct scx_sched_pnode	**pnode;
 	struct scx_sched_pcpu __percpu *pcpu;
 
+	/* 默认 slice 属于运行策略；bypass 时间戳/深度共同描述可嵌套的兜底区间。 */
 	u64			slice_dfl;
 	u64			bypass_timestamp;
 	s32			bypass_depth;
@@ -1208,6 +1248,7 @@ struct scx_sched {
 	unsigned long		bypass_dsp_claim;
 	atomic_t		bypass_dsp_enable_depth;
 
+	/* abort/dump/batch/level 是控制面状态，分别受退出协议、dump 锁或初始化后只读约束。 */
 	bool			aborting;
 	bool			dump_disabled;	/* protected by scx_dump_lock */
 	u32			dsp_max_batch;
@@ -1221,6 +1262,7 @@ struct scx_sched {
 	bool			warned_deprecated_rq:1;
 	bool			warned_unassoc_progs:1;
 
+	/* all 挂入全局 scheduler 集合；分层字段只在 EXT_SUB_SCHED 下形成父子与 cgroup 归属。 */
 	struct list_head	all;
 
 #ifdef CONFIG_EXT_SUB_SCHED
@@ -1230,6 +1272,7 @@ struct scx_sched {
 	struct list_head	sibling;
 	struct cgroup		*cgrp;
 	char			*cgrp_path;
+	/* sub_kset 发布 sysfs 子层级，sub_attached 表示 attach 事务已越过提交点。 */
 	struct kset		*sub_kset;
 
 	bool			sub_attached;
@@ -1242,11 +1285,13 @@ struct scx_sched {
 	 */
 	unsigned long		watchdog_timeout;
 
+	/* exit_kind 原子发布一次退出请求，exit_info 保存随后由 helper/work 消费的诊断对象。 */
 	atomic_t		exit_kind;
 	struct scx_exit_info	*exit_info;
 
 	struct kobject		kobj;
 
+	/* helper/work/timer/cpumask/RCU work 承担异步禁用与 bypass 负载均衡，销毁必须逐项同步。 */
 	struct kthread_worker	*helper;
 	struct irq_work		disable_irq_work;
 	struct kthread_work	disable_work;
@@ -1270,6 +1315,12 @@ struct scx_sched {
  * larger than GUARD_SZ / 2 must be explicitly bounds-checked.
  */
 /* 将 BPF arena 低 32 位偏移映射到 @sch 内核窗口；大于 guard 半页访问仍需边界检查。 */
+/*
+ * 业务背景：SCX kfunc 需要把 BPF arena 中的 32 位相对地址转换成内核可解引用窗口地址。
+ * 入参：sch 是不可空、借用且 arena 已映射的 scheduler；bpf_ptr 是只取低 32 位的 arena 输入地址，可为零。
+ * 出参/返回：返回借用的内核虚拟地址，不转移 ownership；无输出参数，返回值不表示目标对象有效。
+ * 注意事项：不做对象边界检查；仅 guard 半页范围由映射容错，较大访问必须由调用者显式校验。
+ */
 static inline void *scx_arena_to_kaddr(struct scx_sched *sch, const void *bpf_ptr)
 {
 	return (void *)(sch->arena_kern_base + (u32)(uintptr_t)bpf_ptr);
@@ -1281,6 +1332,12 @@ static inline void *scx_arena_to_kaddr(struct scx_sched *sch, const void *bpf_pt
  * @kaddr: kernel-side arena address, supplied by trusted kernel code
  */
 /* 把可信内核 arena 地址转换成 BPF 偏移形式，不验证输入范围。 */
+/*
+ * 业务背景：内核向 BPF 回调传递 arena 对象时需把内核窗口地址还原为 BPF 可见偏移。
+ * 入参：sch 是不可空、借用且 arena 基址稳定的 scheduler；kaddr 是可信、属于该 arena 的只读输入地址。
+ * 出参/返回：返回不拥有存储的 BPF arena 地址形式；无输出参数，不增加对象引用。
+ * 注意事项：不验证 kaddr 范围，错误 scheduler 或越界地址会生成不可安全解引用的偏移。
+ */
 static inline void *scx_kaddr_to_arena(struct scx_sched *sch, const void *kaddr)
 {
 	return (void *)((uintptr_t)kaddr - sch->arena_kern_base);
@@ -1302,6 +1359,7 @@ enum scx_enq_flags {
 	SCX_ENQ_CPU_SELECTED	= ENQUEUE_RQ_SELECTED,
 
 	/* high 32bits are SCX specific */
+	/* PREEMPT 清当前 slice 并隐含 HEAD，仅用于 local DSQ 的即时抢占请求。 */
 
 	/*
 	 * Set the following to trigger preemption when calling
@@ -1329,6 +1387,7 @@ enum scx_enq_flags {
 	 */
 	SCX_ENQ_IMMED		= 1LLU << 33,
 
+	/* REENQ 告知 BPF 这是 core 退回的旧 DSQ task，需结合 task reenq 原因处理。 */
 	/*
 	 * The task being enqueued was previously enqueued on a DSQ, but was
 	 * removed and is being re-enqueued. See SCX_TASK_REENQ_* flags to find
@@ -1347,6 +1406,7 @@ enum scx_enq_flags {
 	 */
 	SCX_ENQ_LAST		= 1LLU << 41,
 
+	/* 高八位是 core 内部协议，分别清 ownership、选择优先队列、标记嵌套与全局兜底。 */
 	/* high 8 bits are internal */
 	__SCX_ENQ_INTERNAL_MASK	= 0xffLLU << 56,
 
@@ -1440,6 +1500,7 @@ enum scx_enable_state {
 	SCX_DISABLED,
 };
 
+/* 字符串数组按 enum 值直接索引，只用于状态展示，不能接受越界状态。 */
 static const char *scx_enable_state_str[] = {
 	[SCX_ENABLING]		= "enabling",
 	[SCX_ENABLED]		= "enabled",
@@ -1578,6 +1639,7 @@ enum scx_ops_state {
 #define SCX_OPSS_STATE_MASK	((1LU << SCX_OPSS_QSEQ_SHIFT) - 1)
 #define SCX_OPSS_QSEQ_MASK	(~SCX_OPSS_STATE_MASK)
 
+/* root 由 RCU 发布；locked_rq_state 仅在禁止迁移的当前 CPU 回调范围内有效。 */
 extern struct scx_sched __rcu *scx_root;
 DECLARE_PER_CPU(struct rq *, scx_locked_rq_state);
 
@@ -1588,10 +1650,12 @@ DECLARE_PER_CPU(struct rq *, scx_locked_rq_state);
  */
 DECLARE_STATIC_KEY_FALSE(__scx_is_cid_type);
 
+/* 声明层分别校验 kfunc 上下文、CPU 域并把首次退出原因格式化发布给异步停用路径。 */
 int scx_kfunc_context_filter(const struct bpf_prog *prog, u32 kfunc_id);
 
 bool scx_cpu_valid(struct scx_sched *sch, s32 cpu, const char *where);
 
+/* 两种 exit 声明分别接收现成 va_list 或可变参数，返回是否赢得首次退出发布。 */
 __printf(5, 0) bool scx_vexit(struct scx_sched *sch, enum scx_exit_kind kind,
 			      s64 exit_code, s32 exit_cpu, const char *fmt,
 			      va_list args);
@@ -1600,6 +1664,7 @@ __printf(5, 6) bool __scx_exit(struct scx_sched *sch, enum scx_exit_kind kind,
 
 #define scx_exit(sch, kind, exit_code, fmt, args...)				\
 	__scx_exit(sch, kind, exit_code, raw_smp_processor_id(), fmt, ##args)
+/* error 包装统一填运行错误类别、当前 CPU 和默认退出码。 */
 #define scx_error(sch, fmt, args...)						\
 	scx_exit((sch), SCX_EXIT_ERROR, 0, fmt, ##args)
 #define scx_verror(sch, fmt, args)						\
@@ -1610,12 +1675,24 @@ __printf(5, 6) bool __scx_exit(struct scx_sched *sch, enum scx_exit_kind kind,
  * locked.
  */
 /* 返回当前 CPU SCX 回调记录的已锁 rq；无 rq 锁回调返回 NULL，不取得新锁。 */
+/*
+ * 业务背景：SCX kfunc 需判断当前回调是否已经由调用框架持有某个 rq 锁，避免重复或错误加锁。
+ * 入参：无。
+ * 出参/返回：返回当前 CPU 借用的已锁 rq，未记录时返回 NULL；无输出参数和 ownership 变化。
+ * 注意事项：只能在禁止迁移的 SCX 回调窗口使用；返回值不会取得锁，离开窗口后不得保存。
+ */
 static inline struct rq *scx_locked_rq(void)
 {
 	return __this_cpu_read(scx_locked_rq_state);
 }
 
 /* 校验非空 @rq 确实已锁后更新 per-CPU 回调上下文；仅允许禁止迁移期间使用。 */
+/*
+ * 业务背景：进入或退出可递归 SCX op 时要发布当前已锁 rq，供其内部 kfunc 验证调用上下文。
+ * 入参：rq 是可空输入借用指针；非空时必须已由当前上下文持锁，NULL 表示清除记录。
+ * 出参/返回：无直接返回值、无输出参数；覆盖当前 CPU 的 scx_locked_rq_state，不转移 ownership。
+ * 注意事项：依赖禁止迁移保证 this_cpu 写入正确 CPU；函数只做 lockdep 断言，不负责加锁或解锁。
+ */
 static inline void update_locked_rq(struct rq *rq)
 {
 	/*
@@ -1644,6 +1721,7 @@ do {										\
 		__prev_locked_rq = scx_locked_rq();				\
 		update_locked_rq(locked_rq);					\
 	}									\
+	/* 回调执行完必须恢复递归外层记录，不能泄漏内层 rq。 */		\
 	(sch)->ops.op(args);							\
 	if (locked_rq)								\
 		update_locked_rq(__prev_locked_rq);				\
@@ -1659,6 +1737,7 @@ do {										\
 		__prev_locked_rq = scx_locked_rq();				\
 		update_locked_rq(locked_rq);					\
 	}									\
+	/* 保存结果，恢复 rq 上下文后返回。 */				\
 	__ret = (sch)->ops.op(args);						\
 	if (locked_rq)								\
 		update_locked_rq(__prev_locked_rq);				\
@@ -1708,6 +1787,7 @@ do {										\
 	WARN_ON_ONCE(current->scx.kf_tasks[0]);					\
 	current->scx.kf_tasks[0] = task0;					\
 	current->scx.kf_tasks[1] = task1;					\
+	/* 两个授权覆盖回调，返回前撤销。 */				\
 	__ret = SCX_CALL_OP_RET((sch), op, locked_rq, task0, task1, ##args);	\
 	current->scx.kf_tasks[0] = NULL;					\
 	current->scx.kf_tasks[1] = NULL;					\
@@ -1716,6 +1796,12 @@ do {										\
 
 /* see SCX_CALL_OP_TASK() */
 /* kfunc 参数必须等于当前 op 临时发布的两个 task 之一；否则报错并返回 false。 */
+/*
+ * 业务背景：task 型 SCX op 内调用 kfunc 时，核心必须拒绝操作不受当前 rq/pi 锁稳定的第三方 task。
+ * 入参：sch 是不可空、借用的报错目标 scheduler；p 是不可空、待核对且不转移 ownership 的 task。
+ * 出参/返回：p 等于当前临时授权的任一 task 返回 true；否则记录 scheduler 错误并返回 false；无输出参数。
+ * 注意事项：只能在 SCX_CALL_OP_TASK* 回调动态范围内调用；失败可能触发 scheduler 退出流程。
+ */
 static __always_inline bool scx_kf_arg_task_ok(struct scx_sched *sch,
 					       struct task_struct *p)
 {
@@ -1729,6 +1815,12 @@ static __always_inline bool scx_kf_arg_task_ok(struct scx_sched *sch,
 }
 
 /* 读取 @sch 在 @cpu 是否进入 bypass；per-CPU flag 仅是瞬时状态。 */
+/*
+ * 业务背景：禁用/错误恢复期间各 CPU 可进入 bypass，热路径需快速选择核心兜底 dispatch。
+ * 入参：sch 是不可空、借用且 pcpu 已分配的 scheduler；cpu 是有效 possible CPU 编号。
+ * 出参/返回：该 CPU 设置 SCX_SCHED_PCPU_BYPASSING 时返回 true，否则 false；无输出参数。
+ * 注意事项：无锁瞬时读取仅用于路径选择，不提供状态持续性；调用者须稳定 sch 生命周期和 cpu 范围。
+ */
 static inline bool scx_bypassing(struct scx_sched *sch, s32 cpu)
 {
 	return unlikely(per_cpu_ptr(sch->pcpu, cpu)->flags &
@@ -1744,6 +1836,12 @@ static inline bool scx_bypassing(struct scx_sched *sch, s32 cpu)
  * held.
  */
 /* 在 @p pi_lock 或 rq 锁下取得其受保护 scheduler 指针，不增加引用。 */
+/*
+ * 业务背景：启用 sub-scheduler 时每个 task 可关联不同 scheduler，调度热路径需在现有 task 锁下查找。
+ * 入参：p 是不可空、借用的 task，调用者必须持其 pi_lock 或当前 rq 锁。
+ * 出参/返回：返回 p 当前关联的可空借用 scheduler；无输出参数且不增加引用。
+ * 注意事项：仅 EXT_SUB_SCHED；保护锁释放后返回指针可能失效，不得跨生命周期保存。
+ */
 static inline struct scx_sched *scx_task_sched(const struct task_struct *p)
 {
 	return rcu_dereference_protected(p->scx.sched,
@@ -1758,6 +1856,12 @@ static inline struct scx_sched *scx_task_sched(const struct task_struct *p)
  * Return @p's scheduler instance. The returned scx_sched is RCU protected.
  */
 /* RCU 读侧取得 @p scheduler；裸指针不得带出 grace-period 保护窗口。 */
+/*
+ * 业务背景：无需获取 task 锁的读路径要在 RCU 保护下查询 p 当前 sub-scheduler。
+ * 入参：p 是不可空、借用且生命周期稳定的 task。
+ * 出参/返回：返回 RCU 保护的可空借用 scheduler；无输出参数和引用转移。
+ * 注意事项：仅 EXT_SUB_SCHED；调用者须处于适用 RCU 读侧窗口，不能把结果带出保护期。
+ */
 static inline struct scx_sched *scx_task_sched_rcu(const struct task_struct *p)
 {
 	return rcu_dereference_all(p->scx.sched);
@@ -1771,6 +1875,12 @@ static inline struct scx_sched *scx_task_sched_rcu(const struct task_struct *p)
  * Returns %true if @p is on @sch, %false otherwise.
  */
 /* 无需解引用 scheduler 内容地比较 @p 当前关联是否为 @sch。 */
+/*
+ * 业务背景：控制面需快速判断 task 是否仍归指定 scheduler，而无需取得 scheduler 对象引用。
+ * 入参：sch 是可空、仅作地址比较的 scheduler；p 是不可空、借用且关联指针可读的 task。
+ * 出参/返回：p 当前 RCU 指针等于 sch 返回 true，否则 false；无输出参数和 ownership 变化。
+ * 注意事项：仅 EXT_SUB_SCHED；比较结果是瞬时快照，函数不保证对象可解引用或关联随后不变。
+ */
 static inline bool scx_task_on_sched(struct scx_sched *sch,
 				     const struct task_struct *p)
 {
@@ -1789,12 +1899,19 @@ static inline bool scx_task_on_sched(struct scx_sched *sch,
  * 从 BPF prog 的 struct_ops 关联取得 scheduler；旧版无关联 prog 仅在 root
  * 没有 sub_attach 时兼容回退，否则一次性告警并返回 NULL。
  */
+/*
+ * 业务背景：SCX kfunc 要从隐式 BPF program 元数据定位发起调用的 scheduler，并兼容旧版未关联程序。
+ * 入参：aux 是不可空、BPF 核心在 kfunc 调用期借出的只读 program aux。
+ * 出参/返回：返回 RCU 保护的关联/root scheduler；无法安全归属时返回 NULL；无输出参数。
+ * 注意事项：仅 EXT_SUB_SCHED且须在 RCU 保护期使用；兼容回退受 root.sub_attach 限制并可能延迟打印告警。
+ */
 static inline struct scx_sched *scx_prog_sched(const struct bpf_prog_aux *aux)
 {
 	struct sched_ext_ops *ops;
 	struct scx_sched *root;
 
 	ops = bpf_prog_get_assoc_struct_ops(aux);
+	/* 新程序由 struct_ops.priv 直接定位 scheduler，这是无歧义的首选路径。 */
 	if (likely(ops))
 		return rcu_dereference_all(ops->priv);
 
@@ -1807,6 +1924,7 @@ static inline struct scx_sched *scx_prog_sched(const struct bpf_prog_aux *aux)
 		if (!root->ops.sub_attach)
 			return root;
 
+		/* 一旦 root 支持分层，未关联 program 无法确定归属，只告警一次后拒绝。 */
 		if (!root->warned_unassoc_progs) {
 			printk_deferred(KERN_WARNING "sched_ext: Unassociated program %s (id %d)\n",
 					aux->name, aux->id);
@@ -1824,6 +1942,12 @@ static inline struct scx_sched *scx_prog_sched(const struct bpf_prog_aux *aux)
  * Returns the parent scheduler or %NULL if @sch is root.
  */
 /* 从稳定 ancestors 柔性数组返回父 scheduler；root 返回 NULL。 */
+/*
+ * 业务背景：sub-scheduler 的状态传播和退出处理需要沿预建 ancestors 数组向父层遍历。
+ * 入参：sch 是不可空、借用且层级已完成初始化的 scheduler。
+ * 出参/返回：非 root 返回借用父 scheduler，root 返回 NULL；无输出参数和引用变化。
+ * 注意事项：仅 EXT_SUB_SCHED；调用者必须稳定整个层级生命周期，level/ancestors 不一致会越界。
+ */
 static inline struct scx_sched *scx_parent(struct scx_sched *sch)
 {
 	if (sch->level)
@@ -1833,6 +1957,12 @@ static inline struct scx_sched *scx_parent(struct scx_sched *sch)
 }
 #else	/* CONFIG_EXT_SUB_SCHED */
 /* 无 sub-scheduler 配置时所有 task 都借用受锁保护的 scx_root。 */
+/*
+ * 业务背景：未编译 sub-scheduler 时保留统一调用接口，使 task 查找折叠为全局 root。
+ * 入参：p 是不可空、借用的 task；值本身不参与选择，但调用者仍应遵守原 task 锁契约。
+ * 出参/返回：返回受相应锁保护的可空 scx_root；无输出参数且不增加引用。
+ * 注意事项：仅非 EXT_SUB_SCHED；结果生命周期仍受 root 发布/退出协议约束。
+ */
 static inline struct scx_sched *scx_task_sched(const struct task_struct *p)
 {
 	return rcu_dereference_protected(scx_root,
@@ -1841,12 +1971,24 @@ static inline struct scx_sched *scx_task_sched(const struct task_struct *p)
 }
 
 /* 无 sub-scheduler 配置的 RCU 读取恒返回 root。 */
+/*
+ * 业务背景：无 sub-scheduler 构建仍需为 RCU 读路径提供与分层构建相同的 task 查询接口。
+ * 入参：p 是不可空但实现未使用的借用 task。
+ * 出参/返回：返回 RCU 保护的可空 scx_root；无输出参数和 ownership 变化。
+ * 注意事项：仅非 EXT_SUB_SCHED；调用者须处于适用 RCU 保护期，不能长期保存裸指针。
+ */
 static inline struct scx_sched *scx_task_sched_rcu(const struct task_struct *p)
 {
 	return rcu_dereference_all(scx_root);
 }
 
 /* 单 scheduler 构建中任何 SCX task 都在传入 scheduler 上，恒返回 true。 */
+/*
+ * 业务背景：无层级构建不存在 task 跨 scheduler 归属，调用方可消除关联比较分支。
+ * 入参：sch 是实现未使用的可空借用 scheduler；p 是实现未使用的可空借用 task。
+ * 出参/返回：恒返回 true；无输出参数和 ownership 变化。
+ * 注意事项：仅非 EXT_SUB_SCHED；该结果假定调用对象本来属于启用的唯一 SCX scheduler。
+ */
 static inline bool scx_task_on_sched(struct scx_sched *sch,
 				     const struct task_struct *p)
 {
@@ -1854,12 +1996,24 @@ static inline bool scx_task_on_sched(struct scx_sched *sch,
 }
 
 /* 单 scheduler 构建中所有 kfunc prog 关联到 RCU scx_root。 */
+/*
+ * 业务背景：无 sub-scheduler 时 BPF program 无需独立关联，所有 kfunc 都映射到 root。
+ * 入参：aux 是实现未使用的可空借用 program aux。
+ * 出参/返回：返回 RCU 保护的可空 scx_root；无输出参数且不增加引用。
+ * 注意事项：仅非 EXT_SUB_SCHED；调用者必须遵守 root 的 RCU 生命周期，不能因忽略 aux 而跨期使用。
+ */
 static inline struct scx_sched *scx_prog_sched(const struct bpf_prog_aux *aux)
 {
 	return rcu_dereference_all(scx_root);
 }
 
 /* 单 scheduler 构建没有父层，恒返回 NULL。 */
+/*
+ * 业务背景：无层级构建用同名 helper 终止通用祖先遍历，而无需调用点增加配置分支。
+ * 入参：sch 是实现未使用的可空借用 scheduler。
+ * 出参/返回：恒返回 NULL；无输出参数和 ownership 变化。
+ * 注意事项：仅非 EXT_SUB_SCHED；NULL 表示没有父层，不表示输入 scheduler 无效。
+ */
 static inline struct scx_sched *scx_parent(struct scx_sched *sch) { return NULL; }
 #endif	/* CONFIG_EXT_SUB_SCHED */
 
