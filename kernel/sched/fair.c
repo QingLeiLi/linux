@@ -59,6 +59,20 @@
 #include "autogroup.h"
 
 /*
+ * CFS/EEVDF 用 vruntime 表示按权重归一化后的已获服务，并从所有实体的加权
+ * vruntime 近似虚拟时间 V；只有 lag>=0 的实体有资格运行，再从中选择最早虚拟
+ * deadline。tasks_timeline 是带 min_vruntime/min_slice 增广信息的红黑树，rq 锁
+ * 保护排队、选择、PELT 与层级传播。组调度把每个 task_group 在每个 CPU 上表现为
+ * 一层 cfs_rq 和父 sched_entity，enqueue/dequeue 必须沿祖先链维护 runnable 与负载。
+ *
+ * SMP 选核与负载均衡分两阶段：拓扑统计和无锁容量值只生成候选，真正 detach/attach
+ * 时锁住源/目标 rq 并复验亲和性、热度和可运行状态。CFS bandwidth 从 task_group
+ * 全局配额向 per-cfs_rq runtime 池切片，耗尽即 throttle 整个层级，period/slack timer
+ * 补充后再逐层 unthrottle。NUMA balancing 以采样 hint fault 推断 task/mm 的内存局部性，
+ * 其迁移选择同样不能越过 cpuset、容量和锁后状态复验。
+ */
+
+/*
  * The initial- and re-scaling of tunables is configurable
  *
  * Options are:
@@ -154,6 +168,7 @@ static const struct ctl_table sched_fair_sysctls[] = {
 #endif /* CONFIG_NUMA_BALANCING */
 };
 
+/* 注册 fair/NUMA 调节项；参数边界由 ctl_table 在写入时统一校验。 */
 static int __init sched_fair_sysctl_init(void)
 {
 	register_sysctl_init("kernel", sched_fair_sysctls);
@@ -162,6 +177,7 @@ static int __init sched_fair_sysctl_init(void)
 late_initcall(sched_fair_sysctl_init);
 #endif /* CONFIG_SYSCTL */
 
+/* 权重变化后清除倒数缓存，下一次比例计算再按新总权重生成。 */
 static inline void update_load_add(struct load_weight *lw, unsigned long inc)
 {
 	lw->weight += inc;
@@ -189,6 +205,7 @@ static inline void update_load_set(struct load_weight *lw, unsigned long w)
  *
  * This idea comes from the SD scheduler of Con Kolivas:
  */
+/* 在线 CPU 数最多按 8 计入缩放，避免大机器把交互粒度无限放大。 */
 static unsigned int get_update_sysctl_factor(void)
 {
 	unsigned int cpus = min_t(unsigned int, num_online_cpus(), 8);
@@ -258,6 +275,7 @@ static void __update_inv_weight(struct load_weight *lw)
  * Or, weight =< lw.weight (because lw.weight is the runqueue weight), thus
  * weight/lw.weight <= 1, and therefore our shift will also be positive.
  */
+/* 用缓存倒数计算 delta_exec*weight/lw，分段移位避免中间乘法溢出。 */
 static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight *lw)
 {
 	u64 fact = scale_load_down(weight);
@@ -314,6 +332,7 @@ const struct sched_class fair_sched_class;
 #define for_each_sched_entity(se) \
 		for (; se; se = se->parent)
 
+/* 将有任务的叶 cfs_rq 按层级顺序接入 CPU 列表，返回是否仍需向父层传播。 */
 static inline bool list_add_leaf_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	struct rq *rq = rq_of(cfs_rq);
@@ -611,6 +630,7 @@ static inline bool entity_before(const struct sched_entity *a,
  * weight of 2, which nicely cancels vs the fuzz in zero_vruntime not actually
  * being the zero-lag point).
  */
+/* 以 zero_vruntime 为近邻原点计算有符号 key，降低 u64 回绕和溢出风险。 */
 static inline s64 entity_key(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	return vruntime_op(se->vruntime, "-", cfs_rq->zero_vruntime);
@@ -777,6 +797,7 @@ void update_zero_vruntime(struct cfs_rq *cfs_rq, s64 delta)
  * This means it is one entry 'behind' but that puts it close enough to where
  * the bound on entity_key() is at most two lag bounds.
  */
+/* 返回所有排队实体加当前实体的加权平均 vruntime，左偏取整维持 eligibility。 */
 u64 avg_vruntime(struct cfs_rq *cfs_rq)
 {
 	struct sched_entity *curr = cfs_rq->curr;
@@ -829,6 +850,7 @@ static inline u64 cfs_rq_max_slice(struct cfs_rq *cfs_rq);
  *
  *   -r_max < lag < max(r_max, q)
  */
+/* 计算应获与实获服务差，并按队列可在有限时间内偿还的范围钳位。 */
 static s64 entity_lag(struct cfs_rq *cfs_rq, struct sched_entity *se, u64 avruntime)
 {
 	u64 max_slice = cfs_rq_max_slice(cfs_rq) + TICK_NSEC;
@@ -936,6 +958,7 @@ static int vruntime_eligible(struct cfs_rq *cfs_rq, u64 vruntime)
 #endif
 }
 
+/* lag 非负才有资格参与 EEVDF；判断使用同一 rq 锁下的 V 与实体 vruntime。 */
 int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	return vruntime_eligible(cfs_rq, se->vruntime);
@@ -1037,6 +1060,7 @@ RB_DECLARE_CALLBACKS(static, min_vruntime_cb, struct sched_entity,
 /*
  * Enqueue an entity into the rb-tree:
  */
+/* 链接 deadline 有序红黑树；增广回调同步维护子树 eligibility 和 slice 边界。 */
 static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	sum_w_vruntime_add(cfs_rq, se);
@@ -1133,6 +1157,7 @@ static inline void cancel_protect_slice(struct sched_entity *se)
  *
  * Which allows tree pruning through eligibility.
  */
+/* 借助增广最小 vruntime 剪枝，在 eligible 实体中以 O(log n) 找最早 deadline。 */
 static struct sched_entity *pick_eevdf(struct cfs_rq *cfs_rq, bool protect)
 {
 	struct rb_node *node = cfs_rq->tasks_timeline.rb_root.rb_node;
@@ -1235,6 +1260,7 @@ static void clear_buddies(struct cfs_rq *cfs_rq, struct sched_entity *se);
  * XXX: strictly: vd_i += N*r_i/w_i such that: vd_i > ve_i
  * this is probably good enough.
  */
+/* slice 用尽后按权重推进虚拟 deadline；未到期时保留连续执行资格。 */
 static bool update_deadline(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	if (vruntime_cmp(se->vruntime, "<", se->deadline))
@@ -1352,6 +1378,7 @@ void post_init_entity_util_avg(struct task_struct *p)
 
 static inline void account_mm_sched(struct rq *rq, struct task_struct *p, s64 delta_exec);
 
+/* 结算本次执行并推进 vruntime、deadline、统计与 cache 记账，返回实际执行量。 */
 static s64 update_se(struct rq *rq, struct sched_entity *se)
 {
 	u64 now = rq_clock_task(rq);
@@ -1982,6 +2009,7 @@ s64 update_curr_common(struct rq *rq)
 /*
  * Update the current task's runtime statistics.
  */
+/* rq 锁下更新当前实体及祖先组实体，随后扣除本地 CFS bandwidth runtime。 */
 static void update_curr(struct cfs_rq *cfs_rq)
 {
 	/*
@@ -2217,6 +2245,7 @@ unsigned int sysctl_numa_balancing_scan_delay = 1000;
 /* The page with hint page fault latency < threshold in ms is considered hot */
 unsigned int sysctl_numa_balancing_hot_threshold = MSEC_PER_SEC;
 
+/* 多任务共享地址空间/工作集的 NUMA 统计对象，以 refcount+RCU 管生命周期。 */
 struct numa_group {
 	refcount_t refcount;
 
@@ -2813,6 +2842,7 @@ struct numa_stats {
 	int idle_cpu;
 };
 
+/* 一次 NUMA 放置搜索的输入、最佳候选和源/目标负载快照，不跨调用保存。 */
 struct task_numa_env {
 	struct task_struct *p;
 
@@ -3246,6 +3276,7 @@ static void task_numa_find_cpu(struct task_numa_env *env,
 	}
 }
 
+/* 汇总节点/CPU 候选收益后执行一次锁后复验迁移；无改善或竞态失败保持原 CPU。 */
 static int task_numa_migrate(struct task_struct *p)
 {
 	struct task_numa_env env = {
@@ -3636,6 +3667,7 @@ static int preferred_group_nid(struct task_struct *p, int nid)
 	return nid;
 }
 
+/* 将本轮 hint faults 折入 task/group 统计并更新 preferred_nid，不直接承诺迁移。 */
 static void task_numa_placement(struct task_struct *p)
 	__context_unsafe(/* conditional locking */)
 {
@@ -3935,6 +3967,7 @@ void task_numa_free(struct task_struct *p, bool final)
 /*
  * Got a PROT_NONE fault for a page on @node.
  */
+/* hint fault 记录访问者与内存节点关系；分配失败只丢失优化信息，不影响页访问正确性。 */
 void task_numa_fault(int last_cpupid, int mem_node, int pages, int flags)
 {
 	struct task_struct *p = current;
@@ -4073,6 +4106,7 @@ static bool vma_is_accessed(struct mm_struct *mm, struct vm_area_struct *vma)
  * The expensive part of numa migration is done from task_work context.
  * Triggered from task_tick_numa().
  */
+/* task_work 分批扫描 VMA 并设置 PROT_NONE 提示页，按自适应周期重新安排下一轮。 */
 static void task_numa_work(struct callback_head *work)
 {
 	unsigned long migrate, next_scan, now = jiffies;
@@ -4663,6 +4697,7 @@ rescale_entity(struct sched_entity *se, unsigned long weight, bool rel_vprot)
 		se->vprot = div64_long(se->vprot * old_weight, weight);
 }
 
+/* rq 锁下先撤旧权重贡献、保留 lag，再以新权重重算 slice/deadline 并加回。 */
 static void reweight_entity(struct cfs_rq *cfs_rq, struct sched_entity *se,
 			    unsigned long weight)
 {
@@ -5489,6 +5524,7 @@ update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
  * Must call update_cfs_rq_load_avg() before this, since we rely on
  * cfs_rq->avg.last_update_time being current.
  */
+/* 迁入实体先与目标 PELT 时间轴对齐，再把 load/util/runnable 加入聚合。 */
 static void attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	/*
@@ -5544,6 +5580,7 @@ static void attach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *s
  * Must call update_cfs_rq_load_avg() before this, since we rely on
  * cfs_rq->avg.last_update_time being current.
  */
+/* 从目标聚合扣除实体贡献并记入 removed 同步，避免无锁更新出现负值。 */
 static void detach_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se)
 {
 	dequeue_load_avg(cfs_rq, se);
@@ -5745,6 +5782,7 @@ static inline unsigned long _task_util_est(struct task_struct *p)
 	return READ_ONCE(p->se.avg.util_est) & ~UTIL_AVG_UNCHANGED;
 }
 
+/* util_est 取 PELT 与突发估值较大者，为尚未收敛的新负载提供保守容量需求。 */
 static inline unsigned long task_util_est(struct task_struct *p)
 {
 	return max(task_util(p), _task_util_est(p));
@@ -5791,6 +5829,7 @@ static inline unsigned long get_actual_cpu_capacity(int cpu)
 	return capacity;
 }
 
+/* 同时检查 capacity 与 uclamp min/max；返回值区分完全适配和仅 capacity 适配。 */
 static inline int util_fits_cpu(unsigned long util,
 				unsigned long uclamp_min,
 				unsigned long uclamp_max,
@@ -5964,6 +6003,7 @@ void __setparam_fair(struct task_struct *p, const struct sched_attr *attr)
 	}
 }
 
+/* 唤醒/初生实体按保存 lag 映射到当前 V，并计算新虚拟 deadline。 */
 static void
 place_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
@@ -6106,6 +6146,7 @@ static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq);
 static void
 requeue_delayed_entity(struct sched_entity *se);
 
+/* 依次更新时间、负载、lag/deadline 和树链接；throttle 祖先不向 CPU 发布 runnable。 */
 static void
 enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
@@ -6230,6 +6271,7 @@ static void clear_delayed(struct sched_entity *se)
 	}
 }
 
+/* 睡眠可延迟 dequeue 以偿还负 lag；真正摘除时保存 lag 并沿层级撤销负载。 */
 static bool
 dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 {
@@ -6321,6 +6363,7 @@ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	return true;
 }
 
+/* 选中实体从树取出成为 curr，但仍保留在 cfs_rq 的负载与 runnable 统计中。 */
 static void
 set_next_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, bool first)
 {
@@ -6372,6 +6415,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags);
  * 3) pick the "last" process, for cache locality
  * 4) do not run the "skip" process, if something else is available
  */
+/* EEVDF 结果若是 delayed 实体则完成最终阻塞并重选，之后不可再引用该实体。 */
 static struct sched_entity *
 pick_next_entity(struct rq *rq, struct cfs_rq *cfs_rq, bool protect)
 {
@@ -6504,6 +6548,7 @@ static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
 }
 
 /* returns 0 on failure to allocate runtime */
+/* 在 bandwidth 锁下从组全局池切片给本地 rq；只发放实际剩余量。 */
 static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
 				   struct cfs_rq *cfs_rq, u64 target_runtime)
 {
@@ -6842,6 +6887,7 @@ static int tg_throttle_down(struct task_group *tg, void *data)
 	return 0;
 }
 
+/* runtime 耗尽时冻结本层 PELT 时钟、从祖先 runnable 撤除并链接 throttled 列表。 */
 static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
@@ -6907,6 +6953,7 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
 	return true;
 }
 
+/* 获得 runtime 后恢复 PELT/祖先计数；重新可运行时触发 rq 重调度。 */
 void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	struct rq *rq = rq_of(cfs_rq);
@@ -7120,6 +7167,7 @@ static bool distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
  * period the timer is deactivated until scheduling resumes; cfs_b->idle is
  * used to track this state.
  */
+/* 周期补充 quota 并分发给 throttled rq；持续空闲后停止 timer 以减少开销。 */
 static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, unsigned long flags)
 	__must_hold(&cfs_b->lock)
 {
@@ -7400,6 +7448,7 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
 	return HRTIMER_RESTART;
 }
 
+/* 初始化组配额锁、period/slack timer 和 throttled 列表；parent 约束层级 quota。 */
 void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b, struct cfs_bandwidth *parent)
 {
 	raw_spin_lock_init(&cfs_b->lock);
@@ -7441,6 +7490,7 @@ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
 	hrtimer_start_expires(&cfs_b->period_timer, HRTIMER_MODE_ABS_PINNED);
 }
 
+/* task_group 销毁前取消两类 timer；调用链已保证没有 cfs_rq 再引用该配额池。 */
 static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
 {
 	int __maybe_unused i;
@@ -7798,6 +7848,7 @@ requeue_delayed_entity(struct sched_entity *se)
  * increased. Here we update the fair scheduling stats and
  * then put the task into the rbtree:
  */
+/* 沿 task 到根组逐层入队；遇到已可运行祖先即可停止重复传播。 */
 static void
 enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
@@ -8033,6 +8084,7 @@ static int dequeue_entities(struct rq *rq, struct sched_entity *se, int flags)
  * decreased. We remove the task from the rbtree and
  * update the fair scheduling stats:
  */
+/* 沿层级撤销任务；delayed dequeue 返回 false 时实体仍在树中等待 lag 归零。 */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
 	if (task_is_throttled(p)) {
@@ -8797,6 +8849,7 @@ static inline bool asym_fits_cpu(unsigned long util,
 /*
  * Try and locate an idle core/thread in the LLC cache domain.
  */
+/* 按 target、共享缓存、idle core/CPU/SMT 次序搜索；结果仍需唤醒路径复验。 */
 static int select_idle_sibling(struct task_struct *p, int prev, int target)
 {
 	bool has_idle_core = false;
@@ -9177,6 +9230,7 @@ unsigned long sched_cpu_util(int cpu)
  * @cpu_cap:        Maximum CPU capacity for the perf domain.
  * @pd_cap:         Entire perf domain capacity. (pd->nr_cpus * cpu_cap).
  */
+/* EAS 对单个 perf_domain 的 busy time、容量和 task 增量计算工作区。 */
 struct energy_env {
 	unsigned long task_busy_time;
 	unsigned long pd_busy_time;
@@ -9352,6 +9406,7 @@ compute_energy(struct energy_env *eenv, struct perf_domain *pd,
  * other use-cases too. So, until someone finds a better way to solve this,
  * let's keep things simple by re-using the existing slow path.
  */
+/* 在 perf_domain 中比较放置前后能耗，容量/uclamp 不适配的 CPU 不参与候选。 */
 static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
 {
 	struct cpumask *cpus = this_cpu_cpumask_var_ptr(select_rq_mask);
@@ -9540,6 +9595,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
  *
  * Returns the target CPU number.
  */
+/* 唤醒选核组合 wake-affine、EAS、idle 搜索和 domain idlest；失败保留 prev_cpu。 */
 static int
 select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
 {
@@ -9613,6 +9669,7 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
  * cfs_rq_of(p) references at time of call are still valid and identify the
  * previous CPU. The caller guarantees p->pi_lock or task_rq(p)->lock is held.
  */
+/* TASK_WAKING 迁移时把实体 PELT lag 映射到目标时钟，避免携带旧 rq 的时间基准。 */
 static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 {
 	struct sched_entity *se = &p->se;
@@ -9767,6 +9824,7 @@ preempt_sync(struct rq *rq, int wake_flags,
 /*
  * Preempt the current task with a newly woken task if needed:
  */
+/* 只在唤醒实体更 eligible/更早 deadline 时请求重调度，并维护 next buddy 提示。 */
 static void wakeup_preempt_fair(struct rq *rq, struct task_struct *p, int wake_flags)
 {
 	enum preempt_wakeup_action preempt_action = PREEMPT_WAKEUP_PICK;
@@ -9909,6 +9967,7 @@ preempt:
 	resched_curr_lazy(rq);
 }
 
+/* 从根 cfs_rq 逐层下降到 task；途中 delayed 实体阻塞后从根重新选择。 */
 struct task_struct *pick_task_fair(struct rq *rq, struct rq_flags *rf)
 	__must_hold(__rq_lockp(rq))
 {
@@ -9972,6 +10031,7 @@ void fair_server_init(struct rq *rq)
 /*
  * Account for a descheduled task:
  */
+/* 从 task 向根逐层结算并把仍 runnable 的 curr 放回 EEVDF 树。 */
 static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct task_struct *next)
 {
 	struct sched_entity *se = &prev->se;
@@ -10009,6 +10069,7 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 /*
  * sched_yield() is very simple
  */
+/* yield 放弃 slice 保护并推进 deadline，再重排当前实体；不保证其他任务立即运行。 */
 static void yield_task_fair(struct rq *rq)
 {
 	struct task_struct *curr = rq->donor;
@@ -10255,6 +10316,7 @@ enum migration_type {
 #define LBF_ACTIVE_LB	0x10
 #define LBF_LLC_PINNED	0x20
 
+/* 一轮 domain balance 的锁外统计与锁内迁移上下文；src_rq 可在循环中变化。 */
 struct lb_env {
 	struct sched_domain	*sd;
 
@@ -10707,6 +10769,7 @@ migrate_degrades_llc(struct task_struct *p, struct lb_env *env)
  * can_migrate_task - may task p from runqueue rq be migrated to this_cpu?
  */
 static
+/* 锁住源 rq 后检查亲和性、running、热度、throttle 与 dst capacity，失败记录原因。 */
 int can_migrate_task(struct task_struct *p, struct lb_env *env)
 {
 	long degrades, hot;
@@ -10890,6 +10953,7 @@ static struct task_struct *detach_one_task(struct lb_env *env)
  *
  * Returns number of detached tasks if successful and 0 otherwise.
  */
+/* 源 rq 锁下按 imbalance 批量摘任务；每项经 can_migrate_task() 重新验证。 */
 static int detach_tasks(struct lb_env *env)
 {
 	struct list_head *tasks = &env->src_rq->cfs_tasks;
@@ -11033,6 +11097,7 @@ next:
  * attach_tasks() -- attaches all tasks detached by detach_tasks() to their
  * new rq.
  */
+/* 目标 rq 锁下逐项 set_task_cpu+activate，完成后清空临时迁移链。 */
 static void attach_tasks(struct lb_env *env)
 {
 	struct list_head *tasks = &env->tasks;
@@ -11250,6 +11315,7 @@ static void sched_balance_update_blocked_averages(int cpu)
 /*
  * sg_lb_stats - stats of a sched_group required for load-balancing:
  */
+/* 单 sched_group 的瞬时负载、容量、idle 和 misfit 汇总。 */
 struct sg_lb_stats {
 	unsigned long avg_load;			/* Avg load            over the CPUs of the group */
 	unsigned long group_load;		/* Total load          over the CPUs of the group */
@@ -11278,6 +11344,7 @@ struct sg_lb_stats {
 /*
  * sd_lb_stats - stats of a sched_domain required for load-balancing:
  */
+/* domain 级本地组与 busiest 组比较结果，供 imbalance 类型和迁移量决策。 */
 struct sd_lb_stats {
 	struct sched_group *busiest;		/* Busiest group in this sd */
 	struct sched_group *local;		/* Local group in this sd */
@@ -12783,6 +12850,7 @@ static inline void calculate_imbalance(struct lb_env *env, struct sd_lb_stats *s
  *
  * Return:	- The busiest group if imbalance exists.
  */
+/* 根据组类型与 imbalance 指标选择源组；统计快照只是本轮均衡输入。 */
 static struct sched_group *sched_balance_find_src_group(struct lb_env *env)
 {
 	struct sg_lb_stats *local, *busiest;
@@ -12922,6 +12990,7 @@ out_balanced:
 /*
  * sched_balance_find_src_rq - find the busiest runqueue among the CPUs in the group.
  */
+/* 在选定组内找最合适源 rq，并过滤 capacity/亲和性上不可能迁移的队列。 */
 static struct rq *sched_balance_find_src_rq(struct lb_env *env,
 				     struct sched_group *group)
 {
@@ -13157,6 +13226,7 @@ static int need_active_balance(struct lb_env *env)
 
 static int active_load_balance_cpu_stop(void *data);
 
+/* 只有 group balance CPU 或合适 idle 替代者执行本层均衡，避免重复扫描。 */
 static int should_we_balance(struct lb_env *env)
 {
 	struct cpumask *swb_cpus = this_cpu_cpumask_var_ptr(should_we_balance_tmpmask);
@@ -13266,6 +13336,7 @@ static atomic_t sched_balance_running = ATOMIC_INIT(0);
  * Check this_cpu to ensure it is balanced within domain. Attempt to move
  * tasks if there is an imbalance.
  */
+/* 逐组定位 busiest rq 并成批 detach/attach；每次迁移前在双 rq 锁下复验。 */
 static int sched_balance_rq(int this_cpu, struct rq *this_rq,
 			struct sched_domain *sd, enum cpu_idle_type idle,
 			int *continue_balancing)
@@ -13603,6 +13674,7 @@ update_next_balance(struct sched_domain *sd, unsigned long *next_balance)
  * least 1 task to be running on each physical CPU where possible, and
  * avoids physical / logical imbalances.
  */
+/* stopper 在源 CPU 上锁后强制迁走一项；条件失效则放弃并清 active_balance。 */
 static int active_load_balance_cpu_stop(void *data)
 {
 	struct rq *busiest_rq = data;
@@ -13762,6 +13834,7 @@ update_newidle_cost(struct sched_domain *sd, u64 cost, unsigned int success)
  *
  * Balancing parameters are set up in init_sched_domains.
  */
+/* 按当前 CPU 的 domain 链执行周期均衡，并推进每层及 rq 的 next_balance。 */
 static void sched_balance_domains(struct rq *rq, enum cpu_idle_type idle)
 {
 	int continue_balancing = 1;
@@ -13915,6 +13988,7 @@ static void kick_ilb(unsigned int flags)
  * Current decision point for kicking the idle load balancer in the presence
  * of idle CPUs in the system.
  */
+/* 忙 CPU 根据过载/不对称/blocked load 提示挑选 idle balancer 并发送一次 kick。 */
 static void nohz_balancer_kick(struct rq *rq)
 {
 	unsigned long now = jiffies;
@@ -14153,6 +14227,7 @@ static bool update_nohz_stats(struct rq *rq)
  * can be a simple update of blocked load or a complete load balance with
  * tasks movement depending of flags.
  */
+/* 一个 idle CPU 代替停 tick CPU 更新 blocked PELT，必要时执行完整 domain balance。 */
 static void _nohz_idle_balance(struct rq *this_rq, unsigned int flags)
 {
 	/* Earliest time when we have to do rebalance again */
@@ -14342,6 +14417,7 @@ static inline void nohz_newidle_balance(struct rq *this_rq) { }
  *     0 - failed, no new tasks
  *   > 0 - success, new (fair) tasks present
  */
+/* CPU 即将 idle 时按成本预算逐层 pull；放锁期间高优先级类变化则返回负值重选。 */
 static int sched_balance_newidle(struct rq *this_rq, struct rq_flags *rf)
 	__must_hold(__rq_lockp(this_rq))
 {
@@ -14848,6 +14924,7 @@ static inline void task_tick_core(struct rq *rq, struct task_struct *curr) {}
  * and everything must be accessed through the @rq and @curr passed in
  * parameters.
  */
+/* tick 沿实体祖先链结算 EEVDF/PELT，并触发 NUMA、cache、misfit 与 core 维护。 */
 static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 {
 	struct sched_entity *se = &curr->se;
@@ -15030,6 +15107,7 @@ static void switched_to_fair(struct rq *rq, struct task_struct *p)
  * This routine is mostly called to set cfs_rq->curr field when a task
  * migrates between groups/classes.
  */
+/* 沿组层级设置 curr 并确保各层配额；首次切入再启动 hrtick 与 misfit 检查。 */
 static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
 {
 	struct sched_entity *se = &p->se;
@@ -15071,6 +15149,7 @@ static void set_next_task_fair(struct rq *rq, struct task_struct *p, bool first)
 	sched_fair_update_stop_tick(rq, p);
 }
 
+/* 建立空 EEVDF 树、回绕安全的初始虚拟时间和 removed PELT 锁。 */
 void init_cfs_rq(struct cfs_rq *cfs_rq)
 {
 	cfs_rq->tasks_timeline = RB_ROOT_CACHED;

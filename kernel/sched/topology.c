@@ -2,6 +2,17 @@
 /*
  * Scheduler topology setup/handling methods
  */
+/*
+ * 本文件把体系结构提供的 SMT/cluster/LLC/package/NUMA mask 构造成每 CPU 的
+ * sched_domain 父链、环形 sched_group 及共享 capacity，并把同一负载均衡分区
+ * 的 CPU 连接到 root_domain。构建在 hotplug lock+sched_domains_mutex 下完成，
+ * 新指针用 RCU 挂接；旧 domain/root/perf-domain 摘除后延迟到 grace period 释放。
+ *
+ * 构建分阶段分配所有 per-CPU 对象，任一步失败按 s_alloc 状态逆序回滚；group
+ * span 必须不重叠并完整覆盖 domain span（NUMA overlap 例外），child span 必须是
+ * parent 子集。capacity、asym/LLC/NUMA per-CPU cache 都是派生索引，只有在完整组装
+ * 后才能发布，CPU hotplug/partition 重建时必须同步撤销，避免 reader 看到半成品。
+ */
 
 #include <linux/sched/isolation.h>
 #include <linux/sched/clock.h>
@@ -9,10 +20,12 @@
 #include "sched.h"
 
 DEFINE_MUTEX(sched_domains_mutex);
+/* 获取可睡眠的全局 topology 重建互斥锁。 */
 void sched_domains_mutex_lock(void)
 {
 	mutex_lock(&sched_domains_mutex);
 }
+/* 释放 topology 重建互斥锁；此前发布的 RCU 指针仍由 grace period 保护。 */
 void sched_domains_mutex_unlock(void)
 {
 	mutex_unlock(&sched_domains_mutex);
@@ -24,6 +37,7 @@ static cpumask_var_t sched_domains_tmpmask;
 static cpumask_var_t sched_domains_tmpmask2;
 int max_lid;
 
+/* early 参数 sched_verbose 开启 domain 结构校验输出，成功消费参数。 */
 static int __init sched_debug_setup(char *str)
 {
 	sched_debug_verbose = true;
@@ -32,6 +46,7 @@ static int __init sched_debug_setup(char *str)
 }
 early_param("sched_verbose", sched_debug_setup);
 
+/* 返回只读 verbose 开关。 */
 static inline bool sched_debug(void)
 {
 	return sched_debug_verbose;
@@ -43,6 +58,7 @@ const struct sd_flag_debug sd_flag_debug[] = {
 };
 #undef SD_FLAG
 
+/* 校验并打印单层 domain 的 span、flags、环形 groups 与 parent/child 包含关系。 */
 static int sched_domain_debug_one(struct sched_domain *sd, int cpu, int level,
 				  struct cpumask *groupmask)
 {
@@ -139,6 +155,7 @@ static int sched_domain_debug_one(struct sched_domain *sd, int cpu, int level,
 	return 0;
 }
 
+/* verbose 模式沿 @cpu domain 父链逐层执行结构校验；NULL 表示解绑。 */
 static void sched_domain_debug(struct sched_domain *sd, int cpu)
 {
 	int level = 0;
@@ -170,6 +187,7 @@ static const unsigned int SD_DEGENERATE_GROUPS_MASK =
 0;
 #undef SD_FLAG
 
+/* 单 CPU 或没有任何有效多组功能的 domain 可退化删除。 */
 static int sd_degenerate(struct sched_domain *sd)
 {
 	if (cpumask_weight(sched_domain_span(sd)) == 1)
@@ -187,6 +205,7 @@ static int sd_degenerate(struct sched_domain *sd)
 	return 1;
 }
 
+/* parent span/flags 不增加有效能力时可与 child 合并，返回 true。 */
 static int
 sd_parent_degenerate(struct sched_domain *sd, struct sched_domain *parent)
 {
@@ -214,6 +233,7 @@ static unsigned int sysctl_sched_energy_aware = 1;
 static DEFINE_MUTEX(sched_energy_mutex);
 static bool sched_energy_update;
 
+/* 校验非对称容量、无 SMT、频率不变性、cpufreq/EM 准备情况，判断 EAS 可用性。 */
 static bool sched_is_eas_possible(const struct cpumask *cpu_mask)
 {
 	bool any_asym_capacity = false;
@@ -262,6 +282,7 @@ static bool sched_is_eas_possible(const struct cpumask *cpu_mask)
 	return true;
 }
 
+/* 在 energy mutex 下强制重建 perf domains，避免并发 sysctl/hotplug 交叉发布。 */
 void rebuild_sched_domains_energy(void)
 {
 	mutex_lock(&sched_energy_mutex);
@@ -272,6 +293,7 @@ void rebuild_sched_domains_energy(void)
 }
 
 #ifdef CONFIG_PROC_SYSCTL
+/* CAP_SYS_ADMIN 控制 EAS sysctl；写后重建 domains，当前拓扑不支持则拒绝。 */
 static int sched_energy_aware_handler(const struct ctl_table *table, int write,
 		void *buffer, size_t *lenp, loff_t *ppos)
 {
@@ -310,6 +332,7 @@ static const struct ctl_table sched_energy_aware_sysctls[] = {
 	},
 };
 
+/* 启动期注册 EAS sysctl。 */
 static int __init sched_energy_aware_sysctl_init(void)
 {
 	register_sysctl_init("kernel", sched_energy_aware_sysctls);
@@ -319,6 +342,7 @@ static int __init sched_energy_aware_sysctl_init(void)
 late_initcall(sched_energy_aware_sysctl_init);
 #endif /* CONFIG_PROC_SYSCTL */
 
+/* 释放一条尚未 RCU 发布或 grace period 已结束的 perf_domain 链。 */
 static void free_pd(struct perf_domain *pd)
 {
 	struct perf_domain *tmp;
@@ -330,6 +354,7 @@ static void free_pd(struct perf_domain *pd)
 	}
 }
 
+/* 在 perf_domain 链中查覆盖 @cpu 的节点；返回借用指针或 NULL。 */
 static struct perf_domain *find_pd(struct perf_domain *pd, int cpu)
 {
 	while (pd) {
@@ -341,6 +366,7 @@ static struct perf_domain *find_pd(struct perf_domain *pd, int cpu)
 	return NULL;
 }
 
+/* 从 energy model 为 @cpu perf domain 分配 span 节点并取得 em_pd 引用。 */
 static struct perf_domain *pd_init(int cpu)
 {
 	struct em_perf_domain *obj = em_cpu_get(cpu);
@@ -360,6 +386,7 @@ static struct perf_domain *pd_init(int cpu)
 	return pd;
 }
 
+/* verbose 输出新 perf-domain 链及其 CPU span。 */
 static void perf_domain_debug(const struct cpumask *cpu_map,
 						struct perf_domain *pd)
 {
@@ -379,6 +406,7 @@ static void perf_domain_debug(const struct cpumask *cpu_map,
 	printk(KERN_CONT "\n");
 }
 
+/* RCU 回调释放旧 root_domain 的 perf-domain 链并归还 energy-model 引用。 */
 static void destroy_perf_domain_rcu(struct rcu_head *rp)
 {
 	struct perf_domain *pd;
@@ -408,6 +436,7 @@ static void sched_energy_set(bool has_eas)
  *    4. schedutil is driving the frequency of all CPUs of the rd;
  *    5. frequency invariance support is present;
  */
+/* 为分区构建去重 perf-domain 链并 RCU 替换 rd->pd；失败不发布半链。 */
 static bool build_perf_domains(const struct cpumask *cpu_map)
 {
 	int i;
@@ -457,6 +486,7 @@ free:
 static void free_pd(struct perf_domain *pd) { }
 #endif /* !(CONFIG_ENERGY_MODEL && CONFIG_CPU_FREQ_GOV_SCHEDUTIL) */
 
+/* root_domain 最后引用归零后的 RCU 回调，释放 cpumask/cpupri/DL/perf-domain。 */
 static void free_rootdomain(struct rcu_head *rcu)
 {
 	struct root_domain *rd = container_of(rcu, struct root_domain, rcu);
@@ -471,6 +501,10 @@ static void free_rootdomain(struct rcu_head *rcu)
 	kfree(rd);
 }
 
+/*
+ * rq 锁下从旧 root_domain 摘 @rq 并加入 @rd；更新 online/active span、RT/DL
+ * 索引与引用，旧 rd 最后引用通过 RCU 延迟释放。
+ */
 void rq_attach_root(struct rq *rq, struct root_domain *rd)
 {
 	struct root_domain *old_rd = NULL;
@@ -521,11 +555,13 @@ void rq_attach_root(struct rq *rq, struct root_domain *rd)
 		call_rcu(&old_rd->rcu, free_rootdomain);
 }
 
+/* 增加 root_domain 引用，允许异步 push/work 跨越 rq 挂接变化。 */
 void sched_get_rd(struct root_domain *rd)
 {
 	atomic_inc(&rd->refcount);
 }
 
+/* 释放 root_domain 引用；最后一个引用用 call_rcu 延迟销毁。 */
 void sched_put_rd(struct root_domain *rd)
 {
 	if (!atomic_dec_and_test(&rd->refcount))
@@ -534,6 +570,7 @@ void sched_put_rd(struct root_domain *rd)
 	call_rcu(&rd->rcu, free_rootdomain);
 }
 
+/* 分配并初始化 rd span/online/dloverload/cpupri/cpudl 等共享索引；失败逆序回滚。 */
 static int init_rootdomain(struct root_domain *rd)
 {
 	if (!zalloc_cpumask_var(&rd->span, GFP_KERNEL))
@@ -580,6 +617,7 @@ out:
  */
 struct root_domain def_root_domain;
 
+/* 启动期初始化永久 fallback root_domain；失败属于不可恢复启动错误。 */
 void __init init_defrootdomain(void)
 {
 	init_rootdomain(&def_root_domain);
@@ -587,6 +625,7 @@ void __init init_defrootdomain(void)
 	atomic_set(&def_root_domain.refcount, 1);
 }
 
+/* 分配并初始化动态 root_domain，失败返回 NULL。 */
 static struct root_domain *alloc_rootdomain(void)
 {
 	struct root_domain *rd;
@@ -603,6 +642,7 @@ static struct root_domain *alloc_rootdomain(void)
 	return rd;
 }
 
+/* 按环形链引用计数释放 sched_group，按 @free_sgc 决定是否同时释放 capacity。 */
 static void free_sched_groups(struct sched_group *sg, int free_sgc)
 {
 	struct sched_group *tmp, *first;
@@ -623,12 +663,14 @@ static void free_sched_groups(struct sched_group *sg, int free_sgc)
 	} while (sg != first);
 }
 
+/* shared 引用归零时释放对象，否则仅减引用。 */
 static void free_sched_domain_shared(struct sched_domain_shared *sds)
 {
 	if (sds && atomic_dec_and_test(&sds->ref))
 		kfree(sds);
 }
 
+/* 释放单层 domain 的 groups/shared 与自身；调用前已从 RCU reader 摘除。 */
 static void destroy_sched_domain(struct sched_domain *sd)
 {
 	/*
@@ -646,6 +688,7 @@ static void destroy_sched_domain(struct sched_domain *sd)
 	kfree(sd);
 }
 
+/* grace period 后沿 parent 链销毁旧 domain。 */
 static void destroy_sched_domains_rcu(struct rcu_head *rcu)
 {
 	struct sched_domain *sd = container_of(rcu, struct sched_domain, rcu);
@@ -657,6 +700,7 @@ static void destroy_sched_domains_rcu(struct rcu_head *rcu)
 	}
 }
 
+/* 将旧 domain 链挂到 RCU callback，立即返回给重建路径。 */
 static void destroy_sched_domains(struct sched_domain *sd)
 {
 	if (sd)
@@ -685,6 +729,7 @@ DEFINE_PER_CPU(struct sched_domain __rcu *, sd_asym_cpucapacity);
 DEFINE_STATIC_KEY_FALSE(sched_asym_cpucapacity);
 DEFINE_STATIC_KEY_FALSE(sched_cluster_active);
 
+/* 从新 domain 链派生并 RCU 发布 LLC/NUMA/asym per-CPU 快捷指针和 id。 */
 static void update_top_cache_domain(int cpu)
 {
 	struct sched_domain_shared *sds = NULL;
@@ -741,6 +786,10 @@ static void update_top_cache_domain(int cpu)
 /*
  * Attach the domain 'sd' to 'cpu' as its base domain. Callers must
  * hold the hotplug lock.
+ */
+/*
+ * 删除退化层、修正 parent/child 后先挂 root_domain，再 RCU 发布 @cpu 的 sd；
+ * 旧链延迟释放，最后刷新 per-CPU topology cache。
  */
 static void
 cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
@@ -831,12 +880,17 @@ cpu_attach_domain(struct sched_domain *sd, struct root_domain *rd, int cpu)
 	update_top_cache_domain(cpu);
 }
 
+/*
+ * 一次拓扑重建的临时所有权集合：对象先按 CPU 分配，成功接入的条目由
+ * claim_allocations() 摘走，失败路径再按 s_alloc 所示阶段逆序释放。
+ */
 struct s_data {
 	struct sched_domain_shared * __percpu *sds;
 	struct sched_domain * __percpu *sd;
 	struct root_domain	*rd;
 };
 
+/* 分配进度同时也是回滚边界，避免半成品 root_domain/sd/group 泄漏。 */
 enum s_alloc {
 	sa_rootdomain,
 	sa_sd,
@@ -871,6 +925,7 @@ int sysctl_sched_cache_user = 1;
  * to fill in the bottom domain's llc_bytes once the cache attributes
  * are available.
  */
+/* 按分区实际覆盖的兄弟比例折算可用 LLC；cacheinfo 未就绪时返回 0。 */
 static unsigned long get_effective_llc_bytes(int cpu,
 					     struct sched_domain *sd)
 {
@@ -888,6 +943,7 @@ static unsigned long get_effective_llc_bytes(int cpu,
 	return div_u64((u64)ci->size * sd->span_weight, hw_weight);
 }
 
+/* 为每个底层 domain 建立 LLC 计数存储；任一失败即清空本轮全部结果。 */
 static bool alloc_sd_llc(const struct cpumask *cpu_map,
 			 struct s_data *d)
 {
@@ -944,6 +1000,7 @@ err:
  * Enable/disable cache aware scheduling according to
  * user input and the presence of hardware support.
  */
+/* 调用者同时持 CPU 热插拔锁和 domains_mutex，静态键才不会与重建竞态。 */
 static void _sched_cache_active_set(void)
 {
 	lockdep_assert_cpus_held();
@@ -975,6 +1032,7 @@ static void _sched_cache_active_set(void)
 }
 
 /* used by debugfs */
+/* debugfs 入口自行取得两层锁，再统一更新 cache-aware 静态键。 */
 void sched_cache_active_set(void)
 {
 	cpus_read_lock();
@@ -996,6 +1054,7 @@ void sched_cache_active_set(void)
  * and does not populates the per-CPU struct cpu_cacheinfo array
  * that get_cpu_cacheinfo_llc() reads.
  */
+/* cacheinfo 变化后重算整个 LLC 兄弟集合，修正 CPU 逐个上线时的临时高估。 */
 void sched_update_llc_bytes(unsigned int cpu)
 {
 	struct sched_domain *sd, *sdp;
@@ -1025,6 +1084,7 @@ unlock:
 	sched_domains_mutex_unlock();
 }
 
+/* 将重建结果发布为“硬件存在”静态键，并与用户开关合成最终启用状态。 */
 static void sched_cache_set(bool has_multi_llcs)
 {
 	/*
@@ -1064,6 +1124,7 @@ static inline void sched_cache_set(bool has_multi_llcs) { }
  * cache-aware scheduling. Conversely, if there is only one
  * LLC per partition, cache-aware scheduling should be disabled.
  */
+/* 跳过同 span 的退化父层，判断分区中是否确实包含多个 LLC。 */
 static bool sd_in_multi_llcs(struct sched_domain *sd)
 {
 	struct sched_domain *sdp = sd->parent;
@@ -1087,6 +1148,7 @@ static bool sd_in_multi_llcs(struct sched_domain *sd)
  *
  * Also see should_we_balance().
  */
+/* balance_mask 的首个 CPU 是该组唯一向上继续做负载均衡的代表。 */
 int group_balance_cpu(struct sched_group *sg)
 {
 	return cpumask_first(group_balance_mask(sg));
@@ -1198,6 +1260,7 @@ int group_balance_cpu(struct sched_group *sg)
  * can fully construct this using the sched_domain bits (which are already
  * complete).
  */
+/* 只保留能够从子 domain 到达本组的 CPU；空 mask 表示拓扑构造已损坏。 */
 static void
 build_balance_mask(struct sched_domain *sd, struct sched_group *sg, struct cpumask *mask)
 {
@@ -1235,6 +1298,7 @@ build_balance_mask(struct sched_domain *sd, struct sched_group *sg, struct cpuma
  * immediately access remote memory to construct this group's load-balance
  * statistics having the groups node local is of dubious benefit.
  */
+/* 用子 domain 的 span 构造重叠组；分配失败由上层拆除已串起的环。 */
 static struct sched_group *
 build_group_from_child_sched_domain(struct sched_domain *sd, int cpu)
 {
@@ -1259,6 +1323,7 @@ build_group_from_child_sched_domain(struct sched_domain *sd, int cpu)
 	return sg;
 }
 
+/* 共享 sgc 以引用计数归并，首次访问者负责写入 balance_mask 和初始容量。 */
 static void init_overlap_sched_group(struct sched_domain *sd,
 				     struct sched_group *sg)
 {
@@ -1287,6 +1352,7 @@ static void init_overlap_sched_group(struct sched_domain *sd,
 	sg->sgc->max_capacity = SCHED_CAPACITY_SCALE;
 }
 
+/* 向下寻找 span 不越出当前 domain 且不会随后退化掉的有效兄弟层。 */
 static struct sched_domain *
 find_descended_sibling(struct sched_domain *sd, struct sched_domain *sibling)
 {
@@ -1312,6 +1378,7 @@ find_descended_sibling(struct sched_domain *sd, struct sched_domain *sibling)
 	return sibling;
 }
 
+/* 为非树形 NUMA span 建立可重叠的组环；ENOMEM 时释放此前完成的组。 */
 static int
 build_overlap_sched_groups(struct sched_domain *sd, int cpu)
 {
@@ -1478,6 +1545,7 @@ fail:
  * [*] in other words, the first group of each domain is its child domain.
  */
 
+/* 以规范 CPU 索引取得共享 group/sgc；只有第一次引用执行初始化。 */
 static struct sched_group *get_group(int cpu, struct sd_data *sdd)
 {
 	struct sched_domain *sd = *per_cpu_ptr(sdd->sd, cpu);
@@ -1523,6 +1591,7 @@ static struct sched_group *get_group(int cpu, struct sd_data *sdd)
  *
  * Assumes the sched_domain tree is fully constructed
  */
+/* 对非重叠拓扑按子 domain 划分 span，最终形成覆盖当前 domain 的闭环。 */
 static int
 build_sched_groups(struct sched_domain *sd, int cpu)
 {
@@ -1569,6 +1638,7 @@ build_sched_groups(struct sched_domain *sd, int cpu)
  * group having more cpu_capacity will pickup more load compared to the
  * group having less cpu_capacity.
  */
+/* 汇总组权重、核心数和非对称首选 CPU，仅 balance CPU 刷新共享容量。 */
 static void init_sched_groups_capacity(int cpu, struct sched_domain *sd)
 {
 	struct sched_group *sg = sd->groups;
@@ -1610,6 +1680,7 @@ next:
 }
 
 /* Update the "asym_prefer_cpu" when arch_asym_cpu_priority() changes. */
+/* 架构优先级变化时更新所有受影响组；RCU 保护正在发布的 domain 链。 */
 void sched_update_asym_prefer_cpu(int cpu, int old_prio, int new_prio)
 {
 	int asym_prefer_cpu = cpu;
@@ -1675,6 +1746,7 @@ LIST_HEAD(asym_cap_list);
  * Verify whether there is any CPU capacity asymmetry in a given sched domain.
  * Provides sd_flags reflecting the asymmetry scope.
  */
+/* 统计 span 中容量类别；缺失系统中仍存在的类别时只能标记局部非对称。 */
 static inline int
 asym_cpu_capacity_classify(const struct cpumask *sd_span,
 			   const struct cpumask *cpu_map)
@@ -1709,12 +1781,14 @@ asym_cpu_capacity_classify(const struct cpumask *sd_span,
 
 }
 
+/* 容量类别可能仍被 RCU 读者遍历，宽限期结束后才释放。 */
 static void free_asym_cap_entry(struct rcu_head *head)
 {
 	struct asym_cap_data *entry = container_of(head, struct asym_cap_data, rcu);
 	kfree(entry);
 }
 
+/* 将 CPU 放入按容量降序排列的类别；内存不足时保留可运行但较保守的分类。 */
 static inline void asym_cpu_capacity_update_data(int cpu)
 {
 	unsigned long capacity = arch_scale_cpu_capacity(cpu);
@@ -1751,6 +1825,7 @@ done:
  * An update requires explicit request to rebuild sched domains
  * with state indicating CPU topology changes.
  */
+/* 重建容量类别并用 call_rcu() 回收消失项；单一类别无需保留。 */
 static void asym_cpu_capacity_scan(void)
 {
 	struct asym_cap_data *entry, *next;
@@ -1788,6 +1863,7 @@ static void asym_cpu_capacity_scan(void)
 static int default_relax_domain_level = -1;
 int sched_domain_level_max;
 
+/* 解析启动参数；非法值只告警并保留默认配置。 */
 static int __init setup_relax_domain_level(char *str)
 {
 	if (kstrtoint(str, 0, &default_relax_domain_level))
@@ -1797,6 +1873,7 @@ static int __init setup_relax_domain_level(char *str)
 }
 __setup("relax_domain_level=", setup_relax_domain_level);
 
+/* 达到 relax 层级后关闭唤醒/新空闲均衡，限制主动跨域搬迁。 */
 static void set_domain_attribute(struct sched_domain *sd,
 				 struct sched_domain_attr *attr)
 {
@@ -1821,6 +1898,7 @@ static int __sdt_alloc(const struct cpumask *cpu_map);
 static void __sds_free(struct s_data *d, const struct cpumask *cpu_map);
 static int __sds_alloc(struct s_data *d, const struct cpumask *cpu_map);
 
+/* 按最后成功阶段逆序释放，已被 claim 的 NULL 条目不会被重复释放。 */
 static void __free_domain_allocs(struct s_data *d, enum s_alloc what,
 				 const struct cpumask *cpu_map)
 {
@@ -1843,6 +1921,7 @@ static void __free_domain_allocs(struct s_data *d, enum s_alloc what,
 	}
 }
 
+/* 逐层建立临时存储并返回精确回滚点，不把半初始化对象发布给 rq。 */
 static enum s_alloc
 __visit_domain_allocation_hell(struct s_data *d, const struct cpumask *cpu_map)
 {
@@ -1867,6 +1946,7 @@ __visit_domain_allocation_hell(struct s_data *d, const struct cpumask *cpu_map)
  * sched_group structure so that the subsequent __free_domain_allocs()
  * will not free the data we're using.
  */
+/* 把已接入拓扑的共享对象从临时数组摘除，将其所有权移交给 domain 链。 */
 static void claim_allocations(int cpu, struct s_data *d)
 {
 	struct sched_domain *sd;
@@ -1929,6 +2009,7 @@ static struct cpumask		***sched_domains_numa_masks;
 	 SD_NUMA		|	\
 	 SD_ASYM_PACKING)
 
+/* 把 topology level 的描述转换成一个 per-CPU domain，并连接 child。 */
 static struct sched_domain *
 sd_init(struct sched_domain_topology_level *tl,
 	const struct cpumask *cpu_map,
@@ -2029,11 +2110,13 @@ sd_init(struct sched_domain_topology_level *tl,
 }
 
 #ifdef CONFIG_SCHED_SMT
+/* SMT 层共享算力和 LLC，这些描述标志随后由 sd_init() 映射为均衡策略。 */
 int cpu_smt_flags(void)
 {
 	return SD_SHARE_CPUCAPACITY | SD_SHARE_LLC;
 }
 
+/* 返回架构维护的 SMT 兄弟掩码，生命周期由拓扑代码而非调用者管理。 */
 const struct cpumask *tl_smt_mask(struct sched_domain_topology_level *tl, int cpu)
 {
 	return cpu_smt_mask(cpu);
@@ -2041,11 +2124,13 @@ const struct cpumask *tl_smt_mask(struct sched_domain_topology_level *tl, int cp
 #endif
 
 #ifdef CONFIG_SCHED_CLUSTER
+/* cluster 是共享 LLC 的中间拓扑层。 */
 int cpu_cluster_flags(void)
 {
 	return SD_CLUSTER | SD_SHARE_LLC;
 }
 
+/* 返回 CPU 所属 cluster 的只读掩码。 */
 const struct cpumask *tl_cls_mask(struct sched_domain_topology_level *tl, int cpu)
 {
 	return cpu_clustergroup_mask(cpu);
@@ -2053,11 +2138,13 @@ const struct cpumask *tl_cls_mask(struct sched_domain_topology_level *tl, int cp
 #endif
 
 #ifdef CONFIG_SCHED_MC
+/* MC 层通常对应共享末级缓存。 */
 int cpu_core_flags(void)
 {
 	return SD_SHARE_LLC;
 }
 
+/* 返回 CPU 所属 core group 的只读掩码。 */
 const struct cpumask *tl_mc_mask(struct sched_domain_topology_level *tl, int cpu)
 {
 	return cpu_coregroup_mask(cpu);
@@ -2078,6 +2165,7 @@ const struct cpumask *tl_mc_mask(struct sched_domain_topology_level *tl, int cpu
 
 #define llc_mask(cpu) arch_llc_mask(cpu)
 
+/* package 默认以 NUMA node 的 CPU 集合作为 span。 */
 const struct cpumask *tl_pkg_mask(struct sched_domain_topology_level *tl, int cpu)
 {
 	return cpu_node_mask(cpu);
@@ -2109,6 +2197,7 @@ static struct sched_domain_topology_level *sched_domain_topology_saved;
 #define for_each_sd_topology(tl)			\
 	for (tl = sched_domain_topology; tl->mask; tl++)
 
+/* 架构只能在调度器 SMP 初始化前替换层级表，之后调用仅告警不生效。 */
 void __init set_sched_topology(struct sched_domain_topology_level *tl)
 {
 	if (WARN_ON_ONCE(sched_smp_initialized))
@@ -2119,16 +2208,19 @@ void __init set_sched_topology(struct sched_domain_topology_level *tl)
 }
 
 #ifdef CONFIG_NUMA
+/* NUMA 层允许重叠，并触发远距离均衡语义。 */
 static int cpu_numa_flags(void)
 {
 	return SD_NUMA;
 }
 
+/* 从 RCU 发布的距离层表取得该 CPU 所在 node 的覆盖掩码。 */
 static const struct cpumask *sd_numa_mask(struct sched_domain_topology_level *tl, int cpu)
 {
 	return sched_domains_numa_masks[tl->numa_level][cpu_to_node(cpu)];
 }
 
+/* 拓扑异常只完整打印一次，避免每次重建重复淹没日志。 */
 static void sched_numa_warn(const char *str)
 {
 	static int done = false;
@@ -2154,6 +2246,7 @@ static void sched_numa_warn(const char *str)
 	printk(KERN_WARNING "\n");
 }
 
+/* 在 RCU 读侧检查原始 node 距离集合；本地距离始终存在。 */
 bool find_numa_distance(int distance)
 {
 	bool found = false;
@@ -2203,6 +2296,7 @@ unlock:
  *   there is an intermediary node C, which is < N hops away from both
  *   nodes A and B, the system is a glueless mesh.
  */
+/* 根据最远节点间是否存在中继节点区分直连、无胶合网格和背板。 */
 static void init_numa_topology_type(int offline_node)
 {
 	int a, b, c, n;
@@ -2250,11 +2344,13 @@ static void init_numa_topology_type(int offline_node)
  * A NUMA level is created for each unique
  * arch_sched_node_distance.
  */
+/* 默认距离来源是固件 node_distance()，架构可覆盖弱别名改变分组。 */
 static int numa_node_dist(int i, int j)
 {
 	return node_distance(i, j);
 }
 
+/* 架构可覆盖该弱符号；返回值决定创建哪些 NUMA domain 层。 */
 int arch_sched_node_distance(int from, int to)
 			     __weak __alias(numa_node_dist);
 
@@ -2263,6 +2359,7 @@ static bool modified_sched_node_distance(void)
 	return numa_node_dist != arch_sched_node_distance;
 }
 
+/* 去重并排序距离矩阵；非法距离或分配失败时不发布半成品数组。 */
 static int sched_record_numa_dist(int offline_node, int (*n_dist)(int, int),
 				  int **dist, int *levels)
 {
@@ -2312,6 +2409,7 @@ static int sched_record_numa_dist(int offline_node, int (*n_dist)(int, int),
 	return 0;
 }
 
+/* 构造逐距离、逐 node 的 CPU mask，再一次性发布并扩展 topology 表。 */
 void sched_init_numa(int offline_node)
 {
 	struct sched_domain_topology_level *tl;
@@ -2434,6 +2532,7 @@ void sched_init_numa(int offline_node)
 }
 
 
+/* 先撤销 RCU 指针，等待旧读者退出后释放距离表、mask 和动态层级。 */
 static void sched_reset_numa(void)
 {
 	int nr_levels, *distances, *dom_distances = NULL;
@@ -2476,6 +2575,7 @@ static void sched_reset_numa(void)
 /*
  * Call with hotplug lock held
  */
+/* 仅 node 首个 CPU 上线或最后一个下线时重建 NUMA 拓扑。 */
 void sched_update_numa(int cpu, bool online)
 {
 	int node;
@@ -2492,6 +2592,7 @@ void sched_update_numa(int cpu, bool online)
 	sched_init_numa(online ? NUMA_NO_NODE : node);
 }
 
+/* CPU 上线后把它加入所有能覆盖其 node 的远端距离掩码。 */
 void sched_domains_numa_masks_set(unsigned int cpu)
 {
 	int node = cpu_to_node(cpu);
@@ -2510,6 +2611,7 @@ void sched_domains_numa_masks_set(unsigned int cpu)
 	}
 }
 
+/* CPU 下线前从全部 NUMA 距离掩码移除，避免后续选择到失效 CPU。 */
 void sched_domains_numa_masks_clear(unsigned int cpu)
 {
 	int i, j;
@@ -2582,6 +2684,7 @@ unlock:
 	return found;
 }
 
+/* bsearch 的状态：寻找累计候选数首次超过第 cpu 个候选的距离层。 */
 struct __cmp_key {
 	const struct cpumask *cpus;
 	struct cpumask ***masks;
@@ -2590,6 +2693,7 @@ struct __cmp_key {
 	int w;
 };
 
+/* 比较同时记录上一层累计权重，供最终换算成当前 hop 内的序号。 */
 static int hop_cmp(const void *a, const void *b)
 {
 	struct cpumask **prev_hop, **cur_hop = *(struct cpumask ***)b;
@@ -2621,6 +2725,7 @@ static int hop_cmp(const void *a, const void *b)
  *
  * Return: cpu, or nr_cpu_ids when nothing found.
  */
+/* 在 RCU 保护下按距离层选第 N 个在线候选；不存在时返回 nr_cpu_ids。 */
 int sched_numa_find_nth_cpu(const struct cpumask *cpus, int cpu, int node)
 {
 	struct __cmp_key k = { .cpus = cpus, .cpu = cpu };
@@ -2671,6 +2776,7 @@ EXPORT_SYMBOL_GPL(sched_numa_find_nth_cpu);
  * Also note that this is a reflection of sched_domains_numa_masks, which may change
  * during the lifetime of the system (offline nodes are taken out of the masks).
  */
+/* 返回值借用自 RCU 表，仅在调用者持有的读侧临界区内有效。 */
 const struct cpumask *sched_numa_hop_mask(unsigned int node, unsigned int hops)
 {
 	struct cpumask ***masks;
@@ -2688,6 +2794,7 @@ EXPORT_SYMBOL_GPL(sched_numa_hop_mask);
 
 #endif /* CONFIG_NUMA */
 
+/* 为每层、每 CPU 预分配 sd/group/sgc；失败交给阶段回滚统一收尾。 */
 static int __sdt_alloc(const struct cpumask *cpu_map)
 {
 	struct sched_domain_topology_level *tl;
@@ -2743,6 +2850,7 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
 	return 0;
 }
 
+/* 释放尚未被 claim 的拓扑对象，并清空 per-CPU 容器指针。 */
 static void __sdt_free(const struct cpumask *cpu_map)
 {
 	struct sched_domain_topology_level *tl;
@@ -2775,6 +2883,7 @@ static void __sdt_free(const struct cpumask *cpu_map)
 	}
 }
 
+/* 分配可被同 span domain 共享的状态，引用计数在认领时建立。 */
 static int __sds_alloc(struct s_data *d, const struct cpumask *cpu_map)
 {
 	int j;
@@ -2797,6 +2906,7 @@ static int __sds_alloc(struct s_data *d, const struct cpumask *cpu_map)
 	return 0;
 }
 
+/* 仅回收临时数组中仍有所有权的 shared 对象。 */
 static void __sds_free(struct s_data *d, const struct cpumask *cpu_map)
 {
 	int j;
@@ -2811,6 +2921,7 @@ static void __sds_free(struct s_data *d, const struct cpumask *cpu_map)
 	d->sds = NULL;
 }
 
+/* 初始化单层并连接父子；架构 mask 越界时扩大父 span 以维持包含不变量。 */
 static struct sched_domain *build_sched_domain(struct sched_domain_topology_level *tl,
 		const struct cpumask *cpu_map, struct sched_domain_attr *attr,
 		struct sched_domain *child, int cpu)
@@ -2843,6 +2954,7 @@ static struct sched_domain *build_sched_domain(struct sched_domain_topology_leve
  * Ensure topology masks are sane, i.e. there are no conflicts (overlaps) for
  * any two given CPUs on non-NUMA topology levels.
  */
+/* 非 NUMA mask 必须相等或不相交，否则共享 group 的环形链接会互相覆盖。 */
 static bool topology_span_sane(const struct cpumask *cpu_map)
 {
 	struct sched_domain_topology_level *tl;
@@ -2900,6 +3012,7 @@ static bool topology_span_sane(const struct cpumask *cpu_map)
  * Calculate an allowed NUMA imbalance such that LLCs do not get
  * imbalanced.
  */
+/* 由每节点 LLC 数推导可容忍任务差，并按更高 NUMA span 比例放大。 */
 static void adjust_numa_imbalance(struct sched_domain *sd_llc)
 {
 	struct sched_domain *parent;
@@ -2964,6 +3077,7 @@ static void adjust_numa_imbalance(struct sched_domain *sd_llc)
 	}
 }
 
+/* 为相同语义的 domain 复用 shared 状态；ref 决定最终销毁时机。 */
 static void
 init_sched_domain_shared(struct s_data *d, struct sched_domain *sd, int flags)
 {
@@ -3046,6 +3160,7 @@ static bool claim_asym_sched_domain_shared(struct s_data *d, int cpu)
 	return true;
 }
 
+/* 在 mutex 下分配最小空闲 LLC id，并维护计数数组所需的最大上界。 */
 static int __sched_domains_alloc_llc_id(void)
 {
 	int lid, max;
@@ -3068,6 +3183,7 @@ static int __sched_domains_alloc_llc_id(void)
 	return lid;
 }
 
+/* 仅最后一个在线 LLC 兄弟离开时归还 id，随后收缩 max_lid。 */
 static void __sched_domains_free_llc_id(int cpu)
 {
 	int i, lid, max;
@@ -3094,6 +3210,7 @@ static void __sched_domains_free_llc_id(int cpu)
 		max_lid = max;
 }
 
+/* 对外入口串行化 LLC id 回收。 */
 void sched_domains_free_llc_id(int cpu)
 {
 	sched_domains_mutex_lock();
@@ -3105,6 +3222,7 @@ void sched_domains_free_llc_id(int cpu)
  * Build sched domains for a given set of CPUs and attach the sched domains
  * to the individual CPUs
  */
+/* 分阶段构造 domain/group/capacity，完成后在 RCU 下接入各 rq；失败统一回滚。 */
 static int
 build_sched_domains(const struct cpumask *cpu_map, struct sched_domain_attr *attr,
 		    bool *multi_llcs)
@@ -3277,11 +3395,13 @@ static cpumask_var_t			fallback_doms;
  * CPU core maps. It is supposed to return 1 if the topology changed
  * or 0 if it stayed the same.
  */
+/* 默认架构无需刷新拓扑；返回非零会强制现有分区全部重建。 */
 int __weak arch_update_cpu_topology(void)
 {
 	return 0;
 }
 
+/* 分配分区 mask 数组；中途失败释放此前条目并返回 NULL。 */
 cpumask_var_t *alloc_sched_domains(unsigned int ndoms)
 {
 	int i;
@@ -3299,6 +3419,7 @@ cpumask_var_t *alloc_sched_domains(unsigned int ndoms)
 	return doms;
 }
 
+/* 释放由 alloc_sched_domains() 创建的整个分区数组。 */
 void free_sched_domains(cpumask_var_t doms[], unsigned int ndoms)
 {
 	unsigned int i;
@@ -3311,6 +3432,7 @@ void free_sched_domains(cpumask_var_t doms[], unsigned int ndoms)
  * Set up scheduler domains and groups.  For now this just excludes isolated
  * CPUs, but could be used to exclude other special cases in the future.
  */
+/* 初始化全局临时 mask 和首个 housekeeping 分区，再发布缓存感知状态。 */
 int __init sched_init_domains(const struct cpumask *cpu_map)
 {
 	bool multi_llcs;
@@ -3339,6 +3461,7 @@ int __init sched_init_domains(const struct cpumask *cpu_map)
  * Detach sched domains from a group of CPUs specified in cpu_map
  * These CPUs will now be attached to the NULL domain
  */
+/* 先修正静态键计数，再把 CPU 接回默认 root_domain；旧链由 RCU 延迟销毁。 */
 static void detach_destroy_domains(const struct cpumask *cpu_map)
 {
 	unsigned int cpu = cpumask_any(cpu_map);
@@ -3357,6 +3480,7 @@ static void detach_destroy_domains(const struct cpumask *cpu_map)
 }
 
 /* handle null as "default" */
+/* NULL 属性等价于 SD_ATTR_INIT，用于判断现有分区是否可以复用。 */
 static int dattrs_equal(struct sched_domain_attr *cur, int idx_cur,
 			struct sched_domain_attr *new, int idx_new)
 {
@@ -3399,6 +3523,7 @@ static int dattrs_equal(struct sched_domain_attr *cur, int idx_cur,
  *
  * Call with hotplug lock and sched_domains_mutex held
  */
+/* 热插拔锁和 domains_mutex 下做差量替换；函数接管 doms_new 的所有权。 */
 static void partition_sched_domains_locked(int ndoms_new, cpumask_var_t doms_new[],
 				    struct sched_domain_attr *dattr_new)
 {
@@ -3523,6 +3648,7 @@ match3:
 /*
  * Call with hotplug lock held
  */
+/* 公共入口负责 domains_mutex，调用者仍须按约定持有 CPU 热插拔读锁。 */
 void partition_sched_domains(int ndoms_new, cpumask_var_t doms_new[],
 			     struct sched_domain_attr *dattr_new)
 {

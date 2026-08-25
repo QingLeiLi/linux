@@ -136,6 +136,17 @@
  * cost-wise, yet way more sensitive and accurate than periodic
  * sampling of the aggregate task states would be.
  */
+/*
+ * PSI 把每个 task 的 RUNNING/ONCPU/IOWAIT/MEMSTALL 状态先在本 CPU、各 cgroup
+ * 祖先中记账，再低频归一化为 SOME/FULL 压力。写端随 rq 状态转换执行并用
+ * per-CPU seqcount 发布；聚合读者可跨 CPU 得到近似但各 CPU 内一致的快照。
+ *
+ * 普通平均触发器复用 delayed_work；特权短窗口触发器使用 psimon kthread、
+ * timer 与 rtpoll mutex。trigger 从链表摘除后先清 RCU 发布指针并等待 grace
+ * period，才停止线程和释放内存；poll 以 release/acquire 发布 trigger，以
+ * cmpxchg 独占一次 event。cgroup 移动持 task rq 锁，并按旧 flags 从旧树扣除、
+ * 发布新 css_set、再向新树加入，避免压力状态同时留在两棵层级中。
+ */
 #include <linux/sched/clock.h>
 #include <linux/workqueue.h>
 #include <linux/psi.h>
@@ -151,6 +162,7 @@ static bool psi_enable;
 #else
 static bool psi_enable = true;
 #endif
+/* 解析启动参数 psi=bool；成功返回 1 表示参数已消费，失败返回 0。 */
 static int __init setup_psi(char *str)
 {
 	return kstrtobool(str, &psi_enable) == 0;
@@ -178,21 +190,25 @@ struct psi_group psi_system = {
 
 static DEFINE_PER_CPU(seqcount_t, psi_seq) = SEQCNT_ZERO(psi_seq);
 
+/* 开始 @cpu PSI 状态写序列；调用者已由 rq/本 CPU 上下文串行。 */
 static inline void psi_write_begin(int cpu)
 {
 	write_seqcount_begin(per_cpu_ptr(&psi_seq, cpu));
 }
 
+/* 结束 @cpu PSI 写序列，使读者能检测并发修改。 */
 static inline void psi_write_end(int cpu)
 {
 	write_seqcount_end(per_cpu_ptr(&psi_seq, cpu));
 }
 
+/* 读取 @cpu seqcount 起始序号，供一致快照循环使用。 */
 static inline u32 psi_read_begin(int cpu)
 {
 	return read_seqcount_begin(per_cpu_ptr(&psi_seq, cpu));
 }
 
+/* 若 @cpu 在快照期间发生写入则返回 true，要求调用者重读全部字段。 */
 static inline bool psi_read_retry(int cpu, u32 seq)
 {
 	return read_seqcount_retry(per_cpu_ptr(&psi_seq, cpu), seq);
@@ -202,6 +218,7 @@ static void psi_avgs_work(struct work_struct *work);
 
 static void poll_timer_fn(struct timer_list *t);
 
+/* 初始化 group 时钟、平均/rtpoll trigger 链表、锁、work、timer 与 RCU task 指针。 */
 static void group_init(struct psi_group *group)
 {
 	group->enabled = true;
@@ -225,6 +242,7 @@ static void group_init(struct psi_group *group)
 	rcu_assign_pointer(group->rtpoll_task, NULL);
 }
 
+/* 启动期配置 static key、采样周期并初始化 system group；禁用时不分配后台工作。 */
 void __init psi_init(void)
 {
 	if (!psi_enable) {
@@ -240,6 +258,7 @@ void __init psi_init(void)
 	group_init(&psi_system);
 }
 
+/* 从 task 计数与 ONCPU 位派生 IO/MEM/CPU SOME/FULL 和 NONIDLE 状态位图。 */
 static u32 test_states(unsigned int *tasks, u32 state_mask)
 {
 	const bool oncpu = state_mask & PSI_ONCPU;
@@ -268,6 +287,10 @@ static u32 test_states(unsigned int *tasks, u32 state_mask)
 	return state_mask;
 }
 
+/*
+ * seqcount 下取得 @cpu 当前累计时间并换算为相对上次 @aggregator 的 u32 增量；
+ * 输出 changed 位，平均 worker 自身睡眠时避免无穷自唤醒。
+ */
 static void get_recent_times(struct psi_group *group, int cpu,
 			     enum psi_aggregators aggregator, u32 *times,
 			     u32 *pchanged_states)
@@ -339,6 +362,7 @@ static void get_recent_times(struct psi_group *group, int cpu,
 	}
 }
 
+/* 将一个 active 样本及漏掉的零样本推进 10/60/300 秒定点衰减平均。 */
 static void calc_avgs(unsigned long avg[3], int missed_periods,
 		      u64 time, u64 period)
 {
@@ -359,6 +383,7 @@ static void calc_avgs(unsigned long avg[3], int missed_periods,
 	avg[2] = calc_load(avg[2], EXP_300s, pct);
 }
 
+/* 汇总 possible CPU 增量，以 nonidle 时间加权并累计到 group total。 */
 static void collect_percpu_times(struct psi_group *group,
 				 enum psi_aggregators aggregator,
 				 u32 *pchanged_states)
@@ -415,6 +440,7 @@ static void collect_percpu_times(struct psi_group *group,
 }
 
 /* Trigger tracking window manipulations */
+/* 以当前累计值重置近似滑窗，并保存上一完整窗口增长供下一窗口插值。 */
 static void window_reset(struct psi_window *win, u64 now, u64 value,
 			 u64 prev_growth)
 {
@@ -434,6 +460,7 @@ static void window_reset(struct psi_window *win, u64 now, u64 value,
  * positive direction and over relatively small window sizes the growth
  * is close to linear.
  */
+/* 返回当前窗口增长；未满窗口时线性叠加上一窗口的剩余比例。 */
 static u64 window_update(struct psi_window *win, u64 now, u64 value)
 {
 	u64 elapsed;
@@ -460,6 +487,7 @@ static u64 window_update(struct psi_window *win, u64 now, u64 value)
 	return growth;
 }
 
+/* 在对应 trigger mutex 下检查阈值并每窗口至多发布一个 event。 */
 static void update_triggers(struct psi_group *group, u64 now,
 						   enum psi_aggregators aggregator)
 {
@@ -522,6 +550,7 @@ static void update_triggers(struct psi_group *group, u64 now,
 	}
 }
 
+/* 推进 group 的 avg/total 游标，限制跨周期误差不超过 100%，返回下次固定期限。 */
 static u64 update_averages(struct psi_group *group, u64 now)
 {
 	unsigned long missed_periods = 0;
@@ -575,6 +604,7 @@ static u64 update_averages(struct psi_group *group, u64 now)
 	return avg_next_update;
 }
 
+/* delayed_work 聚合平均与普通触发器；全组无活动时停止自重排。 */
 static void psi_avgs_work(struct work_struct *work)
 {
 	struct delayed_work *dwork;
@@ -610,6 +640,7 @@ static void psi_avgs_work(struct work_struct *work)
 	mutex_unlock(&group->avgs_lock);
 }
 
+/* 进入实时轮询窗口时把所有 trigger 窗口和 group 游标对齐到 @now。 */
 static void init_rtpoll_triggers(struct psi_group *group, u64 now)
 {
 	struct psi_trigger *t;
@@ -623,6 +654,10 @@ static void init_rtpoll_triggers(struct psi_group *group, u64 now)
 }
 
 /* Schedule rtpolling if it's not already scheduled or forced. */
+/*
+ * 以 atomic_xchg 合并调度并提供与状态写的全屏障；RCU 下若 worker 仍发布，
+ * 修改 timer，否则清 scheduled 允许未来 trigger 重建后再次调度。
+ */
 static void psi_schedule_rtpoll_work(struct psi_group *group, unsigned long delay,
 				   bool force)
 {
@@ -650,6 +685,7 @@ static void psi_schedule_rtpoll_work(struct psi_group *group, unsigned long dela
 	rcu_read_unlock();
 }
 
+/* 在 trigger mutex 下聚合短窗口、发事件并决定停止或按最小周期重排。 */
 static void psi_rtpoll_work(struct psi_group *group)
 {
 	bool force_reschedule = false;
@@ -735,6 +771,7 @@ out:
 	mutex_unlock(&group->rtpoll_trigger_lock);
 }
 
+/* 低优先级 FIFO psimon 等待 timer 唤醒，直至 kthread_stop；返回 0。 */
 static int psi_rtpoll_worker(void *data)
 {
 	struct psi_group *group = (struct psi_group *)data;
@@ -753,6 +790,7 @@ static int psi_rtpoll_worker(void *data)
 	return 0;
 }
 
+/* timer 回调只置 wakeup 位并唤醒 psimon，不在 timer 上下文执行聚合。 */
 static void poll_timer_fn(struct timer_list *t)
 {
 	struct psi_group *group = timer_container_of(group, t, rtpoll_timer);
@@ -761,6 +799,7 @@ static void poll_timer_fn(struct timer_list *t)
 	wake_up_interruptible(&group->rtpoll_wait);
 }
 
+/* 把 state_start 至 @now 的区间按旧 state_mask 累入互斥 SOME/FULL/NONIDLE 桶。 */
 static void record_times(struct psi_group_cpu *groupc, u64 now)
 {
 	u32 delta;
@@ -793,6 +832,10 @@ static void record_times(struct psi_group_cpu *groupc, u64 now)
 #define for_each_group(iter, group) \
 	for (typeof(group) iter = group; iter; iter = iter->parent)
 
+/*
+ * 已持 @cpu rq 锁和 PSI 写序列时，先结算旧状态，再按 clear/set 更新 task
+ * 计数与派生 mask；活动重启平均 work，命中短窗状态则调度 rtpoll。
+ */
 static void psi_group_change(struct psi_group *group, int cpu,
 			     unsigned int clear, unsigned int set,
 			     u64 now, bool wake_clock)
@@ -882,6 +925,7 @@ static void psi_group_change(struct psi_group *group, int cpu,
 		schedule_delayed_work(&group->avgs_work, PSI_FREQ);
 }
 
+/* RCU/rq 保护下返回 @task 当前 cgroup PSI group；禁用 cgroup PSI 时返回 system。 */
 static inline struct psi_group *task_psi_group(struct task_struct *task)
 {
 #ifdef CONFIG_CGROUPS
@@ -891,6 +935,7 @@ static inline struct psi_group *task_psi_group(struct task_struct *task)
 	return &psi_system;
 }
 
+/* 仅更新 task 自身 psi_flags，并检查 clear/set 不重叠及状态转换合法性。 */
 static void psi_flags_change(struct task_struct *task, int clear, int set)
 {
 	if (((task->psi_flags & set) ||
@@ -906,6 +951,10 @@ static void psi_flags_change(struct task_struct *task, int clear, int set)
 	task->psi_flags |= set;
 }
 
+/*
+ * 对非 idle task 更新自身 flags，并在本 CPU seqcount 写段内沿 cgroup→root
+ * 传播计数和时钟；调用者持 task 所在 rq 锁，故 task_cpu 稳定。
+ */
 void psi_task_change(struct task_struct *task, int clear, int set)
 {
 	int cpu = task_cpu(task);
@@ -923,6 +972,10 @@ void psi_task_change(struct task_struct *task, int clear, int set)
 	psi_write_end(cpu);
 }
 
+/*
+ * context switch 合并 next ONCPU 与 prev 下 CPU/睡眠状态传播；遇共同祖先后
+ * 只继续传播非 ONCPU 差异，避免同一层级重复走树。
+ */
 void psi_task_switch(struct task_struct *prev, struct task_struct *next,
 		     bool sleep)
 {
@@ -1003,6 +1056,7 @@ void psi_task_switch(struct task_struct *prev, struct task_struct *next,
 }
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
+/* 在 rq 锁下把切换边界新增 IRQ 时间沿 curr cgroup 祖先计入 IRQ_FULL。 */
 void psi_account_irqtime(struct rq *rq, struct task_struct *curr, struct task_struct *prev)
 {
 	int cpu = task_cpu(curr);
@@ -1053,6 +1107,7 @@ void psi_account_irqtime(struct rq *rq, struct task_struct *curr, struct task_st
  * Marks the calling task as being stalled due to a lack of memory,
  * such as waiting for a refault or performing reclaim.
  */
+/* 支持嵌套地标记 current 进入内存停顿；rq 锁使标志更新与迁移/调度原子。 */
 void psi_memstall_enter(unsigned long *flags)
 {
 	struct rq_flags rf;
@@ -1084,6 +1139,7 @@ EXPORT_SYMBOL_GPL(psi_memstall_enter);
  *
  * Marks the calling task as no longer stalled due to lack of memory.
  */
+/* 仅最外层离开时在 rq 锁下清 MEMSTALL/MEMSTALL_RUNNING；嵌套层为空操作。 */
 void psi_memstall_leave(unsigned long *flags)
 {
 	struct rq_flags rf;
@@ -1109,6 +1165,7 @@ void psi_memstall_leave(unsigned long *flags)
 EXPORT_SYMBOL_GPL(psi_memstall_leave);
 
 #ifdef CONFIG_CGROUPS
+/* 为 cgroup 分配 group 与 percpu 状态并链接 parent；失败逆序释放并返回 -ENOMEM。 */
 int psi_cgroup_alloc(struct cgroup *cgroup)
 {
 	if (!static_branch_likely(&psi_cgroups_enabled))
@@ -1128,6 +1185,7 @@ int psi_cgroup_alloc(struct cgroup *cgroup)
 	return 0;
 }
 
+/* 取消平均 work、释放 percpu/group；调用前所有 trigger 必须已移除。 */
 void psi_cgroup_free(struct cgroup *cgroup)
 {
 	if (!static_branch_likely(&psi_cgroups_enabled))
@@ -1151,6 +1209,10 @@ void psi_cgroup_free(struct cgroup *cgroup)
  * This function acquires the task's rq lock to lock out concurrent
  * changes to the task's scheduling state and - in case the task is
  * running - concurrent changes to its stall state.
+ */
+/*
+ * 持 task rq 锁，以 task->psi_flags 从旧祖先链扣除，RCU 发布 @to，再向新链
+ * 加回；直接依赖 PSI flags 而非可能处于 schedule 中间窗口的 on_rq 状态。
  */
 void cgroup_move_task(struct task_struct *task, struct css_set *to)
 {
@@ -1207,6 +1269,7 @@ void cgroup_move_task(struct task_struct *task, struct css_set *to)
 	task_rq_unlock(rq, task, &rf);
 }
 
+/* 重新启用 group 后逐 CPU 持 rq 锁重建派生 mask/起始时钟；task 计数一直保留。 */
 void psi_cgroup_restart(struct psi_group *group)
 {
 	int cpu;
@@ -1242,6 +1305,10 @@ void psi_cgroup_restart(struct psi_group *group)
 }
 #endif /* CONFIG_CGROUPS */
 
+/*
+ * 在 avgs mutex 下先聚合最新时间，再输出 @res 的 some/full 10/60/300 平均
+ * 与累计微秒；system CPU FULL 未定义按零展示，禁用资源返回 -EOPNOTSUPP。
+ */
 int psi_show(struct seq_file *m, struct psi_group *group, enum psi_res res)
 {
 	bool only_full = false;
@@ -1292,6 +1359,10 @@ int psi_show(struct seq_file *m, struct psi_group *group, enum psi_res res)
 	return 0;
 }
 
+/*
+ * 解析 "some|full threshold window"，校验权限/窗口后分配 trigger；普通用户
+ * 挂 avgs 链，特权短窗按需创建并 RCU 发布 psimon，返回指针或 ERR_PTR。
+ */
 struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,
 				       enum psi_res res, struct file *file,
 				       struct kernfs_open_file *of)
@@ -1394,6 +1465,10 @@ struct psi_trigger *psi_trigger_create(struct psi_group *group, char *buf,
 	return t;
 }
 
+/*
+ * 唤醒 poller、从相应链表摘除并更新状态位；最后短窗 trigger 清 RCU task
+ * 与 timer。等待 grace period 后在 mutex 外 stop kthread，再释放 trigger。
+ */
 void psi_trigger_destroy(struct psi_trigger *t)
 {
 	struct psi_group *group;
@@ -1479,6 +1554,7 @@ void psi_trigger_destroy(struct psi_trigger *t)
 	kfree(t);
 }
 
+/* acquire 读取已发布 trigger、登记等待队列，并用 cmpxchg 领取一次 EPOLLPRI。 */
 __poll_t psi_trigger_poll(void **trigger_ptr,
 				struct file *file, poll_table *wait)
 {
@@ -1504,36 +1580,46 @@ __poll_t psi_trigger_poll(void **trigger_ptr,
 }
 
 #ifdef CONFIG_PROC_FS
+/* 输出 system IO PSI；@v 未使用。 */
 static int psi_io_show(struct seq_file *m, void *v)
 {
 	return psi_show(m, &psi_system, PSI_IO);
 }
 
+/* 输出 system memory PSI。 */
 static int psi_memory_show(struct seq_file *m, void *v)
 {
 	return psi_show(m, &psi_system, PSI_MEM);
 }
 
+/* 输出 system CPU PSI。 */
 static int psi_cpu_show(struct seq_file *m, void *v)
 {
 	return psi_show(m, &psi_system, PSI_CPU);
 }
 
+/* 为 /proc/pressure/io 建立 single_open 上下文。 */
 static int psi_io_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, psi_io_show, NULL);
 }
 
+/* 为 /proc/pressure/memory 建立 single_open 上下文。 */
 static int psi_memory_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, psi_memory_show, NULL);
 }
 
+/* 为 /proc/pressure/cpu 建立 single_open 上下文。 */
 static int psi_cpu_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, psi_cpu_show, NULL);
 }
 
+/*
+ * 为一个 fd 创建唯一 system trigger；seq lock 串行写者，成功以 release
+ * 发布到 seq->private 并返回原 nbytes，重复写返回 -EBUSY。
+ */
 static ssize_t psi_write(struct file *file, const char __user *user_buf,
 			 size_t nbytes, enum psi_res res)
 {
@@ -1577,24 +1663,28 @@ static ssize_t psi_write(struct file *file, const char __user *user_buf,
 	return nbytes;
 }
 
+/* 将 proc IO trigger 配置转交 psi_write。 */
 static ssize_t psi_io_write(struct file *file, const char __user *user_buf,
 			    size_t nbytes, loff_t *ppos)
 {
 	return psi_write(file, user_buf, nbytes, PSI_IO);
 }
 
+/* 将 proc memory trigger 配置转交 psi_write。 */
 static ssize_t psi_memory_write(struct file *file, const char __user *user_buf,
 				size_t nbytes, loff_t *ppos)
 {
 	return psi_write(file, user_buf, nbytes, PSI_MEM);
 }
 
+/* 将 proc CPU trigger 配置转交 psi_write。 */
 static ssize_t psi_cpu_write(struct file *file, const char __user *user_buf,
 			     size_t nbytes, loff_t *ppos)
 {
 	return psi_write(file, user_buf, nbytes, PSI_CPU);
 }
 
+/* 对 seq->private trigger 执行 acquire/poll/event 领取。 */
 static __poll_t psi_fop_poll(struct file *file, poll_table *wait)
 {
 	struct seq_file *seq = file->private_data;
@@ -1602,6 +1692,7 @@ static __poll_t psi_fop_poll(struct file *file, poll_table *wait)
 	return psi_trigger_poll(&seq->private, file, wait);
 }
 
+/* 销毁 fd 私有 trigger 后释放 single_open；确保 poller 不再访问已释放对象。 */
 static int psi_fop_release(struct inode *inode, struct file *file)
 {
 	struct seq_file *seq = file->private_data;
@@ -1638,16 +1729,19 @@ static const struct proc_ops psi_cpu_proc_ops = {
 };
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
+/* IRQ time accounting 可用时输出 system IRQ FULL PSI。 */
 static int psi_irq_show(struct seq_file *m, void *v)
 {
 	return psi_show(m, &psi_system, PSI_IRQ);
 }
 
+/* 为 /proc/pressure/irq 建立 single_open 上下文。 */
 static int psi_irq_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, psi_irq_show, NULL);
 }
 
+/* 将 proc IRQ trigger 配置转交 psi_write；只接受 full 状态。 */
 static ssize_t psi_irq_write(struct file *file, const char __user *user_buf,
 			     size_t nbytes, loff_t *ppos)
 {
@@ -1664,6 +1758,7 @@ static const struct proc_ops psi_irq_proc_ops = {
 };
 #endif /* CONFIG_IRQ_TIME_ACCOUNTING */
 
+/* PSI 启用时创建四类 /proc/pressure 节点；节点创建失败不阻止启动。 */
 static int __init psi_proc_init(void)
 {
 	if (psi_enable) {

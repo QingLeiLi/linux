@@ -20,6 +20,20 @@
 #include "arena.h"
 #include "idle.h"
 
+/*
+ * sched_ext 把调度策略交给 BPF，但内核仍拥有任务生命周期、rq 锁、迁移和安全兜底。
+ * runnable task 在“BPF custody、QUEUEING/QUEUED/DISPATCHING、某个 DSQ、本地 rq 执行”
+ * 之间转移；ops_state 的 release/acquire 与 qseq 防止异步 dispatch 使用旧一代排队权。
+ * local DSQ 受对应 rq 锁保护，global/user DSQ 使用自身 raw lock；跨 DSQ/跨 rq 移动
+ * 必须按既定舞步释放并重取锁，随后复验 task 状态、CPU 亲和性和 scheduler 归属。
+ *
+ * enable/disable 由 scx_enable_mutex 串行，静态键只在所有 task 初始化、带宽和 per-CPU
+ * 资源准备完成后发布。任何 BPF 错误、watchdog 超时或热插拔序列不匹配都会进入 bypass，
+ * 让内核 DSQ 保证系统继续调度，再由 workqueue 完成 dump、逐任务退出、RCU 摘除和资源回收。
+ * kfunc 的 verifier 上下文门禁是锁与 ownership 契约的一部分，返回的 task/cpumask/DSQ
+ * 指针只在各自声明的 RCU、引用或回调窗口内有效。
+ */
+
 static DEFINE_RAW_SPINLOCK(scx_sched_lock);
 
 /*
@@ -84,6 +98,7 @@ static DEFINE_STATIC_KEY_FALSE(__scx_tid_to_task_enabled);
  * take the address, and hints "likely enabled" for the common case where
  * the feature is in use.
  */
+/* 静态键只在 tid 哈希表完全可用后开启，读者因此不会观察半初始化表。 */
 static inline bool scx_tid_to_task_enabled(void)
 {
 	return static_branch_likely(&__scx_tid_to_task_enabled);
@@ -207,6 +222,7 @@ static struct kset *scx_kset;
 static unsigned int scx_slice_bypass_us = SCX_SLICE_BYPASS / NSEC_PER_USEC;
 static unsigned int scx_bypass_lb_intv_us = SCX_BYPASS_LB_DFL_INTV_US;
 
+/* 调试参数限定 100us..100s，非法文本或越界值原样返回参数解析错误。 */
 static int set_slice_us(const char *val, const struct kernel_param *kp)
 {
 	return param_set_uint_minmax(val, kp, 100, 100 * USEC_PER_MSEC);
@@ -309,12 +325,14 @@ static struct scx_sched *scx_next_descendant_pre(struct scx_sched *pos,
 	return NULL;
 }
 
+/* 在 RCU/写锁保护下按 cgroup id 查询 sub-scheduler；返回借用指针。 */
 static struct scx_sched *scx_find_sub_sched(u64 cgroup_id)
 {
 	return rhashtable_lookup(&scx_sched_hash, &cgroup_id,
 				 scx_sched_hash_params);
 }
 
+/* 以 RCU 指针发布 task 所属 scheduler；调用者先完成旧/新两侧状态交接。 */
 static void scx_set_task_sched(struct task_struct *p, struct scx_sched *sch)
 {
 	rcu_assign_pointer(p->scx.sched, sch);
@@ -356,6 +374,7 @@ static struct scx_dispatch_q *find_global_dsq(struct scx_sched *sch, s32 cpu)
 	return &sch->pnode[cpu_to_node(cpu)]->global_dsq;
 }
 
+/* rhashtable 查找只返回 scheduler 拥有的 user DSQ，生命周期由 RCU/控制路径稳定。 */
 static struct scx_dispatch_q *find_user_dsq(struct scx_sched *sch, u64 dsq_id)
 {
 	return rhashtable_lookup(&sch->dsq_hash, &dsq_id, dsq_hash_params);
@@ -425,6 +444,7 @@ static bool bypass_dsp_enabled(struct scx_sched *sch)
  * before going to idle and not inserting a task into @rq's local DSQ after a
  * %false return doesn't cause @rq to stall.
  */
+/* rq 只有在线且未被 CPU release 协议关闭时可接收普通 enqueue。 */
 static bool rq_is_open(struct rq *rq, u64 enq_flags)
 {
 	lockdep_assert_rq_held(rq);
@@ -479,6 +499,7 @@ static bool rq_is_open(struct rq *rq, u64 enq_flags)
  */
 DEFINE_PER_CPU(struct rq *, scx_locked_rq_state);
 
+/* kfunc 跨 rq 操作按统一顺序切锁，并同步 verifier 追踪的当前 locked rq。 */
 static void switch_rq_lock(struct rq *from, struct rq *to)
 {
 	bool tracked = scx_locked_rq() == from;
@@ -603,6 +624,7 @@ static struct task_struct *nldsq_next_task(struct scx_dispatch_q *dsq,
  * bounds the iteration and guarantees that vtime never jumps in the other
  * direction while iterating.
  */
+/* cursor 只遍历初始化前已入队任务；节点代际变化时停止而不追逐新任务。 */
 static struct task_struct *nldsq_cursor_next_task(struct scx_dsq_list_node *cursor,
 						  struct scx_dispatch_q *dsq)
 {
@@ -647,6 +669,7 @@ static struct task_struct *nldsq_cursor_next_task(struct scx_dsq_list_node *curs
  *
  * On %false return, the caller can assume full ownership of @p.
  */
+/* 通过 qseq 判断 cursor 是否失去任务；false 表示调用者取得该 task 的完整所有权。 */
 static bool nldsq_cursor_lost_task(struct scx_dsq_list_node *cursor,
 				   struct rq *rq, struct scx_dispatch_q *dsq,
 				   struct task_struct *p)
@@ -778,6 +801,7 @@ struct scx_task_iter {
  * All tasks which existed when the iteration started are guaranteed to be
  * visited as long as they are not dead.
  */
+/* 建立全 task 或 cgroup 子树快照迭代；必须最终 stop 以归还锁和引用。 */
 static void scx_task_iter_start(struct scx_task_iter *iter, struct cgroup *cgrp)
 {
 	memset(iter, 0, sizeof(*iter));
@@ -935,6 +959,7 @@ static struct task_struct *scx_task_iter_next(struct scx_task_iter *iter)
  * whether they would like to filter out dead tasks. See scx_task_iter_start()
  * for details.
  */
+/* 返回时持 task 当前 rq 锁；批量阈值会周期性放锁，故每轮都重新验证 task。 */
 static struct task_struct *scx_task_iter_next_locked(struct scx_task_iter *iter)
 {
 	struct task_struct *p;
@@ -1045,6 +1070,7 @@ static enum scx_enable_state scx_enable_state(void)
 	return atomic_read(&scx_enable_state_var);
 }
 
+/* 原子交换全局启用状态，返回旧值供严格状态机检查。 */
 static enum scx_enable_state scx_set_enable_state(enum scx_enable_state to)
 {
 	return atomic_xchg(&scx_enable_state_var, to);
@@ -1068,6 +1094,7 @@ static bool scx_tryset_enable_state(enum scx_enable_state to,
  * has load_acquire semantics to ensure that the caller can see the updates made
  * in the enqueueing and dispatching paths.
  */
+/* 等待 task 离开指定 ops_state；只能在允许忙等且 task 生命周期稳定的路径使用。 */
 static void wait_ops_state(struct task_struct *p, unsigned long opss)
 {
 	do {
@@ -1113,6 +1140,7 @@ bool scx_cpu_valid(struct scx_sched *sch, s32 cpu, const char *where)
  * value fails IS_ERR() test after being encoded with ERR_PTR() and then is
  * handled as a pointer.
  */
+/* BPF 只能返回合法负 errno；异常返回触发 scheduler error 并规范为安全错误。 */
 static int ops_sanitize_err(struct scx_sched *sch, const char *ops_name, s32 err)
 {
 	if (err < 0 && err >= -MAX_ERRNO)
@@ -1144,6 +1172,7 @@ static void deferred_irq_workfn(struct irq_work *irq_work)
  * with @rq locked but unpinned, and thus can unlock @rq to e.g. migrate tasks
  * to other rqs.
  */
+/* 无 rq 锁上下文以 irq_work 安排延迟动作，pending 位避免重复投递。 */
 static void schedule_deferred(struct rq *rq)
 {
 	/*
@@ -1168,6 +1197,7 @@ static void schedule_deferred(struct rq *rq)
  * Schedule execution of deferred actions on @rq. Equivalent to
  * schedule_deferred() but requires @rq to be locked and can be more efficient.
  */
+/* rq 锁内优先挂 balance_callback，在解锁边界执行以缩短热路径。 */
 static void schedule_deferred_locked(struct rq *rq)
 {
 	lockdep_assert_rq_held(rq);
@@ -1330,6 +1360,7 @@ static void touch_core_sched_dispatch(struct rq *rq, struct task_struct *p)
 #endif
 }
 
+/* 结算当前 SCX task 执行时间并扣 slice，同时把 runtime 传播给保护它的 DL server。 */
 static void update_curr_scx(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
@@ -1359,6 +1390,7 @@ static bool scx_dsq_priq_less(struct rb_node *node_a,
 	return time_before64(a->scx.dsq_vtime, b->scx.dsq_vtime);
 }
 
+/* DSQ 入队计数与 scheduler/rq 聚合在对应锁域内同步增加。 */
 static void dsq_inc_nr(struct scx_dispatch_q *dsq, struct task_struct *p, u64 enq_flags)
 {
 	/* scx_bpf_dsq_nr_queued() reads ->nr without locking, use WRITE_ONCE() */
@@ -1510,6 +1542,7 @@ static void local_dsq_post_enq(struct scx_sched *sch, struct scx_dispatch_q *dsq
 	}
 }
 
+/* 将已取得 custody 的 task 链入 FIFO 或 vtime priq，并发布 QUEUED/qseq 新一代。 */
 static void dispatch_enqueue(struct scx_sched *sch, struct rq *rq,
 			     struct scx_dispatch_q *dsq, struct task_struct *p,
 			     u64 enq_flags)
@@ -1660,6 +1693,7 @@ static void task_unlink_from_dsq(struct task_struct *p,
 	}
 }
 
+/* 从当前 DSQ 摘除 task 并清队列状态；本地和非本地 DSQ 分别使用 rq/dsq 锁。 */
 static void dispatch_dequeue(struct rq *rq, struct task_struct *p)
 {
 	struct scx_dispatch_q *dsq = p->scx.dsq;
@@ -1758,6 +1792,7 @@ static struct scx_dispatch_q *find_dsq_for_dispatch(struct scx_sched *sch,
 	return dsq;
 }
 
+/* enqueue 回调期间登记一次 direct dispatch；重复或错误 task 触发 scheduler error。 */
 static void mark_direct_dispatch(struct scx_sched *sch,
 				 struct task_struct *ddsp_task,
 				 struct task_struct *p, u64 dsq_id,
@@ -1810,6 +1845,7 @@ static inline void clear_direct_dispatch(struct task_struct *p)
 	p->scx.ddsp_enq_flags = 0;
 }
 
+/* 消费 direct-dispatch 标记并把当前 enqueue task 直接送入目标 DSQ。 */
 static void direct_dispatch(struct scx_sched *sch, struct task_struct *p,
 			    u64 enq_flags)
 {
@@ -1875,6 +1911,7 @@ static bool scx_rq_online(struct rq *rq)
 	return likely((rq->scx.flags & SCX_RQ_ONLINE) && cpu_active(cpu_of(rq)));
 }
 
+/* 建立 BPF custody 后调用 select/enqueue；bypass 或无回调时走内核安全 DSQ。 */
 static void do_enqueue_task(struct rq *rq, struct task_struct *p, u64 enq_flags,
 			    int sticky_cpu)
 {
@@ -2015,6 +2052,7 @@ static void clr_task_runnable(struct task_struct *p, bool reset_runnable_at)
 		p->scx.flags |= SCX_TASK_RESET_RUNNABLE_AT;
 }
 
+/* core 入队标志转换成 SCX 语义，维护 runnable 状态后交给 do_enqueue_task。 */
 static void enqueue_task_scx(struct rq *rq, struct task_struct *p, int core_enq_flags)
 {
 	struct scx_sched *sch = scx_task_sched(p);
@@ -2141,6 +2179,7 @@ retry:
 	call_task_dequeue(sch, rq, p, deq_flags);
 }
 
+/* 先结算当前执行，再撤销 BPF custody/DSQ/runnable；迁移保留必要的任务状态。 */
 static bool dequeue_task_scx(struct rq *rq, struct task_struct *p, int core_deq_flags)
 {
 	struct scx_sched *sch = scx_task_sched(p);
@@ -2273,6 +2312,7 @@ static void move_local_task_to_local_dsq(struct scx_sched *sch,
  *
  * Move @p which is currently on @src_rq to @dst_rq's local DSQ.
  */
+/* 双 rq 锁下把远端 task 迁入目标 local DSQ；锁后再次检查 CPU 可运行条件。 */
 static void move_remote_task_to_local_dsq(struct task_struct *p, u64 enq_flags,
 					  struct rq *src_rq, struct rq *dst_rq)
 {
@@ -2406,6 +2446,7 @@ static bool task_can_run_on_remote_rq(struct scx_sched *sch,
  * On return, @dsq is unlocked and @src_rq is locked. Returns %true if @p is
  * still valid. %false if lost to dequeue.
  */
+/* 为避免 dsq->rq 锁反序，先以 qseq claim task，再放 DSQ 锁并取得源 rq 锁。 */
 static bool unlink_dsq_and_lock_src_rq(struct task_struct *p,
 				       struct scx_dispatch_q *dsq,
 				       struct rq *src_rq)
@@ -2458,6 +2499,7 @@ static bool consume_remote_task(struct rq *this_rq,
  * On return, @src_dsq is unlocked and only @p's new task_rq, which is the
  * return value, is locked.
  */
+/* 在源 DSQ 与 task rq 所有权明确时完成移动；返回时仅新 task_rq 保持加锁。 */
 static struct rq *move_task_between_dsqs(struct scx_sched *sch,
 					 struct task_struct *p, u64 enq_flags,
 					 struct scx_dispatch_q *src_dsq,
@@ -2512,6 +2554,7 @@ static struct rq *move_task_between_dsqs(struct scx_sched *sch,
 	return dst_rq;
 }
 
+/* 从非本地 DSQ claim 首个可运行 task 并迁入当前 local DSQ；空/竞态返回 false。 */
 static bool consume_dispatch_q(struct scx_sched *sch, struct rq *rq,
 			       struct scx_dispatch_q *dsq, u64 enq_flags)
 {
@@ -2581,6 +2624,7 @@ static bool consume_global_dsq(struct scx_sched *sch, struct rq *rq)
  * The caller must have exclusive ownership of @p (e.g. through
  * %SCX_OPSS_DISPATCHING).
  */
+/* 处理同 CPU、远端和正在 QUEUEING 三类目标，必要时等待发布再重新 claim。 */
 static void dispatch_to_local_dsq(struct scx_sched *sch, struct rq *rq,
 				  struct scx_dispatch_q *dst_dsq,
 				  struct task_struct *p, u64 enq_flags)
@@ -2677,6 +2721,7 @@ static void dispatch_to_local_dsq(struct scx_sched *sch, struct rq *rq,
  * was valid in the first place. Make sure that the task is still owned by the
  * BPF scheduler and claim the ownership before dispatching.
  */
+/* qseq 匹配才把 DISPATCHING task 提交到目标；失配说明所有权已变化并放弃。 */
 static void finish_dispatch(struct scx_sched *sch, struct rq *rq,
 			    struct task_struct *p,
 			    unsigned long qseq_at_dispatch,
@@ -2745,6 +2790,7 @@ retry:
 		dispatch_enqueue(sch, rq, dsq, p, enq_flags | SCX_ENQ_CLEAR_OPSS);
 }
 
+/* 逐项完成 BPF buffered dispatch，并无条件清空本轮 buffer/context。 */
 static void flush_dispatch_buf(struct scx_sched *sch, struct rq *rq)
 {
 	struct scx_dsp_ctx *dspc = &this_cpu_ptr(sch->pcpu)->dsp_ctx;
@@ -2883,6 +2929,7 @@ scx_dispatch_sched(struct scx_sched *sch, struct rq *rq,
 	return false;
 }
 
+/* 尝试 local/global/BPF dispatch 直至获得任务或达到循环上限；错误时转 bypass。 */
 static int balance_one(struct rq *rq, struct task_struct *prev)
 {
 	struct scx_sched *sch = scx_root;
@@ -3255,6 +3302,7 @@ do_pick_task_scx(struct rq *rq, struct rq_flags *rf, bool force_scx)
 	return p;
 }
 
+/* 从 local DSQ 选择首项；为空时通过 DL server/balance 触发策略补充。 */
 static struct task_struct *pick_task_scx(struct rq *rq, struct rq_flags *rf)
 {
 	return do_pick_task_scx(rq, rf, false);
@@ -3411,6 +3459,7 @@ static void set_cpus_allowed_scx(struct task_struct *p,
 		scx_call_op_set_cpumask(sch, task_rq(p), p, (struct cpumask *)p->cpus_ptr);
 }
 
+/* rq 锁下同步内建状态与 BPF cpu_online/offline 回调；序列变化可使启用失败。 */
 static void handle_hotplug(struct rq *rq, bool online)
 {
 	struct scx_sched *sch = scx_root;
@@ -3460,6 +3509,7 @@ static void rq_offline_scx(struct rq *rq)
 	rq->scx.flags &= ~SCX_RQ_ONLINE;
 }
 
+/* 扫描 runnable task 的最后进展时间；超 watchdog 阈值即报告 stall。 */
 static bool check_rq_for_timeouts(struct rq *rq)
 {
 	struct scx_sched *sch;
@@ -3493,6 +3543,7 @@ out_unlock:
 	return timed_out;
 }
 
+/* 共享 watchdog 周期检查所有 rq/scheduler，并按最短 timeout 重新安排。 */
 static void scx_watchdog_workfn(struct work_struct *work)
 {
 	unsigned long intv;
@@ -3580,6 +3631,7 @@ static struct cgroup *tg_cgrp(struct task_group *tg)
 
 #endif	/* CONFIG_EXT_GROUP_SCHED */
 
+/* 调用 ops.init_task 建立 scheduler 私有状态；失败由调用者按阶段执行 cancel/exit。 */
 static int __scx_init_task(struct scx_sched *sch, struct task_struct *p, bool fork)
 {
 	int ret;
@@ -3631,6 +3683,7 @@ static int __scx_init_task(struct scx_sched *sch, struct task_struct *p, bool fo
 	return 0;
 }
 
+/* 将已 INIT task 切到 ENABLED 并调用 ops.enable；rq 锁保证不与排队转换交叉。 */
 static void __scx_enable_task(struct scx_sched *sch, struct task_struct *p)
 {
 	struct rq *rq = task_rq(p);
@@ -3697,6 +3750,7 @@ static void scx_disable_task(struct scx_sched *sch, struct task_struct *p)
 	WARN_ON_ONCE(p->scx.flags & SCX_TASK_IN_CUSTODY);
 }
 
+/* 按 ENABLED/READY/INIT 阶段逆序调用 disable/exit/cancel，最终撤销 scheduler 归属。 */
 static void __scx_disable_and_exit_task(struct scx_sched *sch,
 					struct task_struct *p)
 {
@@ -3779,6 +3833,7 @@ void init_scx_entity(struct sched_ext_entity *scx)
 }
 
 /* See scx_tid_alloc / scx_tid_cursor. */
+/* 每 CPU 从全局 cursor 批量领取 tid，0 保留；局部区间耗尽才做原子更新。 */
 static u64 scx_alloc_tid(void)
 {
 	struct scx_tid_alloc *ta;
@@ -3901,6 +3956,7 @@ void scx_cancel_fork(struct task_struct *p)
  * that needs to happen on the task. Use this test to short-circuit sched_class
  * operations which may be called on dead tasks.
  */
+/* 最终 context switch 完成且 SCX 引用释放后，dead task 才可从全局表摘除。 */
 static bool task_dead_and_done(struct task_struct *p)
 {
 	struct rq *rq = task_rq(p);
@@ -4171,6 +4227,7 @@ static u32 reenq_local(struct scx_sched *sch, struct rq *rq, u64 reenq_flags)
 	return nr_enqueued;
 }
 
+/* 在 rq 解锁边界处理 local DSQ reenq 请求，序列号限制重复循环和活锁。 */
 static void process_deferred_reenq_locals(struct rq *rq)
 {
 	u64 seq = ++rq->scx.deferred_reenq_locals_seq;
@@ -4300,6 +4357,7 @@ static void reenq_user(struct rq *rq, struct scx_dispatch_q *dsq, u64 reenq_flag
 	}
 }
 
+/* 逐个处理 user DSQ 延迟 reenq；DSQ 销毁或归属变化时安全跳过。 */
 static void process_deferred_reenq_users(struct rq *rq)
 {
 	lockdep_assert_rq_held(rq);
@@ -4334,6 +4392,7 @@ static void process_deferred_reenq_users(struct rq *rq)
 	}
 }
 
+/* 汇总执行 deferred dispatch、reenq 与 kick，pending 位在完成后清除。 */
 static void run_deferred(struct rq *rq)
 {
 	process_ddsp_deferred_locals(rq);
@@ -4709,6 +4768,7 @@ static void exit_dsq(struct scx_dispatch_q *dsq)
 	free_percpu(dsq->pcpu);
 }
 
+/* user DSQ 从哈希和调度路径摘除后，等待 RCU 读者退出再释放。 */
 static void free_dsq_rcufn(struct rcu_head *rcu)
 {
 	struct scx_dispatch_q *dsq = container_of(rcu, struct scx_dispatch_q, rcu);
@@ -4728,6 +4788,7 @@ static void free_dsq_irq_workfn(struct irq_work *irq_work)
 
 static DEFINE_IRQ_WORK(free_dsq_irq_work, free_dsq_irq_workfn);
 
+/* 从哈希摘除 DSQ 并迁走残留 task；实际内存回收延迟到 RCU/irq_work。 */
 static void destroy_dsq(struct scx_sched *sch, u64 dsq_id)
 {
 	struct scx_dispatch_q *dsq;
@@ -5253,6 +5314,7 @@ bool scx_hardlockup(int cpu)
 	return true;
 }
 
+/* bypass 下从 donor local DSQ 向空闲 donee 批量迁移，仍遵守 task 亲和性。 */
 static u32 bypass_lb_cpu(struct scx_sched *sch, s32 donor,
 			 struct cpumask *donee_mask, struct cpumask *resched_mask,
 			 u32 nr_donor_target, u32 nr_donee_target)
@@ -5434,6 +5496,7 @@ static void bypass_lb_node(struct scx_sched *sch, int node)
  * outcomes, a simple load balancing mechanism is implemented by the following
  * timer which runs periodically while bypass mode is in effect.
  */
+/* 周期性兜底均衡 bypass DSQ；只安排有限批次，避免 timer 长时间占用 CPU。 */
 static void scx_bypass_lb_timerfn(struct timer_list *timer)
 {
 	struct scx_sched *sch = container_of(timer, struct scx_sched, bypass_lb_timer);
@@ -5481,6 +5544,7 @@ static bool dec_bypass_depth(struct scx_sched *sch)
 	return true;
 }
 
+/* 首层 bypass 把 scheduler 标成内核接管，并重排已有 task 到安全 DSQ。 */
 static void enable_bypass_dsp(struct scx_sched *sch)
 {
 	struct scx_sched *host = scx_parent(sch) ?: sch;
@@ -5528,6 +5592,7 @@ static void enable_bypass_dsp(struct scx_sched *sch)
 }
 
 /* may be called without holding scx_bypass_lock */
+/* 最后一层退出 bypass 后重新把 task 交给 BPF；嵌套深度未归零时保持接管。 */
 static void disable_bypass_dsp(struct scx_sched *sch)
 {
 	s32 ret;
@@ -5576,6 +5641,7 @@ static void disable_bypass_dsp(struct scx_sched *sch)
  *
  * - scx_prio_less() reverts to the default core_sched_at order.
  */
+/* bypass_lock 串行嵌套深度与全 CPU 重排，保证错误恢复期间始终有可运行路径。 */
 static void scx_bypass(struct scx_sched *sch, bool bypass)
 {
 	struct scx_sched *pos;
@@ -5686,6 +5752,7 @@ static void free_exit_info(struct scx_exit_info *ei)
 	kfree(ei);
 }
 
+/* 一次分配退出元数据和可变 dump 缓冲；ENOMEM 由启用路径回滚。 */
 static struct scx_exit_info *alloc_exit_info(size_t exit_dump_len)
 {
 	struct scx_exit_info *ei;
@@ -6222,6 +6289,7 @@ done:
  * preempted and the BPF scheduler fails to schedule it back, the helper work
  * will never be kicked and the whole system can wedge.
  */
+/* cmpxchg 只允许首个退出原因获胜，后续故障不会覆盖诊断根因。 */
 static bool scx_claim_exit(struct scx_sched *sch, enum scx_exit_kind kind)
 {
 	int none = SCX_EXIT_NONE;
@@ -6266,6 +6334,7 @@ static bool scx_claim_exit(struct scx_sched *sch, enum scx_exit_kind kind)
 	return true;
 }
 
+/* 可睡眠控制路径进入 bypass、dump、退出全部 task、撤静态键并释放 scheduler。 */
 static void scx_disable_workfn(struct kthread_work *work)
 {
 	struct scx_sched *sch = container_of(work, struct scx_sched, disable_work);
@@ -6289,6 +6358,7 @@ static void scx_disable_workfn(struct kthread_work *work)
 		scx_root_disable(sch);
 }
 
+/* 首次调用者 claim exit reason 并安排 disable work，重复错误只保留首因。 */
 static void scx_disable(struct scx_sched *sch, enum scx_exit_kind kind)
 {
 	guard(preempt)();
@@ -6576,6 +6646,7 @@ next:
  * separately. For error dumps, @dump_all_tasks=true since only the failing
  * scheduler is dumped.
  */
+/* dump_lock 串行全局格式缓冲，依次输出 ops、CPU 和 task 快照后截断到容量。 */
 static void scx_dump_state(struct scx_sched *sch, struct scx_exit_info *ei,
 			   size_t dump_len, bool dump_all_tasks)
 {
@@ -6781,6 +6852,7 @@ struct scx_enable_cmd {
  * Allocate and initialize a new scx_sched. @cgrp's reference is always
  * consumed whether the function succeeds or fails.
  */
+/* 校验 ops 后分配 scheduler 及 per-CPU/DSQ 资源，成功才加入全局索引。 */
 static struct scx_sched *scx_alloc_and_add_sched(struct scx_enable_cmd *cmd,
 						 struct cgroup *cgrp,
 						 struct scx_sched *parent)
@@ -7812,6 +7884,7 @@ static s32 __init scx_cgroup_lifetime_notifier_init(void)
 core_initcall(scx_cgroup_lifetime_notifier_init);
 #endif	/* CONFIG_EXT_SUB_SCHED */
 
+/* 串行完成协商、资源分配、逐 task 初始化/启用和静态键发布；失败完整回滚。 */
 static s32 scx_enable(struct scx_enable_cmd *cmd, struct bpf_link *link)
 {
 	static struct kthread_worker *helper;
@@ -8680,6 +8753,7 @@ __bpf_kfunc_start_defs();
  * scheduler, %false return triggers scheduler abort and the caller doesn't need
  * to check the return value.
  */
+/* verifier 已限制上下文；p 必须仍由当前 enqueue/dispatch 回调拥有，否则报错。 */
 __bpf_kfunc bool scx_bpf_dsq_insert___v2(struct task_struct *p, u64 dsq_id,
 					 u64 slice, u64 enq_flags,
 					 const struct bpf_prog_aux *aux)
@@ -9105,6 +9179,7 @@ __bpf_kfunc void scx_bpf_dsq_move_set_vtime(struct bpf_iter_scx_dsq *it__iter,
  * consumed, dequeued, or, for sub-scheds, @dsq_id points to a disallowed local
  * DSQ.
  */
+/* 仅移动 iterator 当前且仍属源 DSQ 的 task；竞争失去所有权时返回 false。 */
 __bpf_kfunc bool scx_bpf_dsq_move(struct bpf_iter_scx_dsq *it__iter,
 				  struct task_struct *p, u64 dsq_id,
 				  u64 enq_flags)
@@ -9249,6 +9324,7 @@ __bpf_kfunc_start_defs();
  * Create a custom DSQ identified by @dsq_id. Can be called from any sleepable
  * scx callback, and any BPF_PROG_TYPE_SYSCALL prog.
  */
+/* 创建 user DSQ 并原子加入 scheduler 哈希；保留 id 或重复 id 返回负 errno。 */
 __bpf_kfunc s32 scx_bpf_create_dsq(u64 dsq_id, s32 node, const struct bpf_prog_aux *aux)
 {
 	struct scx_dispatch_q *dsq;
@@ -9425,6 +9501,7 @@ out:
  * scx_ops operation and the actual kicking is performed asynchronously through
  * an irq work.
  */
+/* 合并 per-CPU kick/preempt/wait 请求，实际 IPI 在延迟路径发送以避免锁反序。 */
 __bpf_kfunc void scx_bpf_kick_cpu(s32 cpu, u64 flags, const struct bpf_prog_aux *aux)
 {
 	struct scx_sched *sch;
@@ -10284,6 +10361,7 @@ __bpf_kfunc struct task_struct *scx_bpf_cid_curr(s32 cid, const struct bpf_prog_
  * (KF_RCU_PROTECTED). Requires SCX_OPS_TID_TO_TASK to be set on the root
  * scheduler; otherwise an error is raised and NULL returned.
  */
+/* RCU 哈希查询 tid；返回 trusted 引用的可用范围由 KF_ACQUIRE/释放协议约束。 */
 __bpf_kfunc struct task_struct *scx_bpf_tid_to_task(u64 tid)
 {
 	struct sched_ext_entity *scx;
@@ -10331,6 +10409,7 @@ __bpf_kfunc struct task_struct *scx_bpf_tid_to_task(u64 tid)
  *  clock values in two different scx_bpf_now() calls in the same CPU
  *  during the same period of when the rq clock is valid.
  */
+/* 优先返回当前 locked rq 的稳定时钟，否则使用全局调度时钟；不建立时间冻结保证。 */
 __bpf_kfunc u64 scx_bpf_now(void)
 {
 	struct rq *rq;

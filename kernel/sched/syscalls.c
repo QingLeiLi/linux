@@ -7,6 +7,14 @@
  *  Copyright (C) 1991-2002  Linus Torvalds
  *  Copyright (C) 1998-2024  Ingo Molnar, Red Hat
  */
+/*
+ * 本文件把用户可见的 policy、priority、nice、uclamp 与 affinity 请求转换为
+ * 调度器内部状态。共同主线是：复制并规范化用户参数→查找且持有 task→
+ * 权限/LSM/资源上限检查→在 rq/pi/cpuset 锁协议下 dequeue、修改、enqueue。
+ * 任何会睡眠的校验必须在 rq 锁外完成；task_rq_lock 后若 policy 或 cpuset
+ * 已变化则重新检查。affinity 的 user_mask 所有权由 context 明确转交，失败
+ * 路径释放临时 mask，读取接口只承诺与相应锁一致的瞬时快照。
+ */
 #include <linux/sched.h>
 #include <linux/cpuset.h>
 #include <linux/sched/debug.h>
@@ -16,6 +24,7 @@
 #include "sched.h"
 #include "autogroup.h"
 
+/* 把 policy、用户 RT priority 或 nice 映射为统一内部 prio；值越小优先级越高。 */
 static inline int __normal_prio(int policy, int rt_prio, int nice)
 {
 	int prio;
@@ -37,6 +46,7 @@ static inline int __normal_prio(int policy, int rt_prio, int nice)
  * setprio syscalls, and whenever the interactivity
  * estimator recalculates.
  */
+/* 根据 @p 当前策略计算不含 PI boost 的 normal_prio。 */
 static inline int normal_prio(struct task_struct *p)
 {
 	return __normal_prio(p->policy, p->rt_priority, PRIO_TO_NICE(p->static_prio));
@@ -49,6 +59,7 @@ static inline int normal_prio(struct task_struct *p)
  * interactivity modifiers. Will be RT if the task got
  * RT-boosted. If not then it returns p->normal_prio.
  */
+/* 更新 normal_prio；若 @p 正被 RT/DL PI boost 则保留当前有效 prio。 */
 static int effective_prio(struct task_struct *p)
 {
 	p->normal_prio = normal_prio(p);
@@ -62,6 +73,10 @@ static int effective_prio(struct task_struct *p)
 	return p->prio;
 }
 
+/*
+ * 在 task rq 锁及 sched_change scope 下更新 @p 的 nice/权重/有效优先级；
+ * 非法或相同 nice 快速返回，RT/DL 仅保存将来回到 fair 后使用的 static_prio。
+ */
 void set_user_nice(struct task_struct *p, long nice)
 {
 	int old_prio;
@@ -102,6 +117,7 @@ EXPORT_SYMBOL(set_user_nice);
  * @p: task
  * @nice: nice value
  */
+/* 只按 @p 的 RLIMIT_NICE 判断是否允许提高优先级，不执行 capability 检查。 */
 static bool is_nice_reduction(const struct task_struct *p, const int nice)
 {
 	/* Convert nice value [19,-20] to rlimit style value [1,40]: */
@@ -115,6 +131,7 @@ static bool is_nice_reduction(const struct task_struct *p, const int nice)
  * @p: task
  * @nice: nice value
  */
+/* RLIMIT_NICE 允许或调用者具 CAP_SYS_NICE 时返回 true。 */
 int can_nice(const struct task_struct *p, const int nice)
 {
 	return is_nice_reduction(p, nice) || capable(CAP_SYS_NICE);
@@ -129,6 +146,7 @@ int can_nice(const struct task_struct *p, const int nice)
  * sys_setpriority is a more generic, but much slower function that
  * does similar things.
  */
+/* 当前 task nice 增量 syscall：夹取范围、检查提权/LSM，成功返回 0。 */
 SYSCALL_DEFINE1(nice, int, increment)
 {
 	long nice, retval;
@@ -167,6 +185,7 @@ SYSCALL_DEFINE1(nice, int, increment)
  * fifo, rr             [-2 ... -100]     [98 ... 0]  [1 ... 99]
  * deadline                     -101             -1           0
  */
+/* 返回 /proc 使用的用户视角 priority 编码，不改变 @p。 */
 int task_prio(const struct task_struct *p)
 {
 	return p->prio - MAX_RT_PRIO;
@@ -178,6 +197,7 @@ int task_prio(const struct task_struct *p)
  *
  * Return: 1 if the CPU is currently idle. 0 otherwise.
  */
+/* 返回 @cpu rq 是否当前 idle；值是无锁瞬时判断。 */
 int idle_cpu(int cpu)
 {
 	return idle_rq(cpu_rq(cpu));
@@ -189,12 +209,14 @@ int idle_cpu(int cpu)
  *
  * Return: The idle task for the CPU @cpu.
  */
+/* 借用并返回 @cpu 永久 idle task 指针，不增加引用。 */
 struct task_struct *idle_task(int cpu)
 {
 	return cpu_rq(cpu)->idle;
 }
 
 #ifdef CONFIG_SCHED_CORE
+/* core scheduling 启用时按 rq->curr==idle 判断，否则沿用普通 idle_cpu。 */
 int sched_core_idle_cpu(int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -212,11 +234,13 @@ int sched_core_idle_cpu(int cpu)
  *
  * The task of @pid, if found. %NULL otherwise.
  */
+/* RCU 读侧按 vpid 查 task；pid==0 选择 current，返回借用指针或 NULL。 */
 static struct task_struct *find_process_by_pid(pid_t pid)
 {
 	return pid ? find_task_by_vpid(pid) : current;
 }
 
+/* RCU 查找后取得 task_struct 引用；调用者必须 put，未找到返回 NULL。 */
 static struct task_struct *find_get_task(pid_t pid)
 {
 	struct task_struct *p;
@@ -238,6 +262,7 @@ DEFINE_CLASS(find_get_task, struct task_struct *, if (_T) put_task_struct(_T),
  */
 #define SETPARAM_POLICY	-1
 
+/* 已在 sched_change 临界区内提交 policy/class 参数、timer slack、prio 与负载权重。 */
 static void __setscheduler_params(struct task_struct *p,
 		const struct sched_attr *attr)
 {
@@ -274,6 +299,7 @@ static void __setscheduler_params(struct task_struct *p,
 /*
  * Check the target process has a UID that matches the current process's:
  */
+/* RCU 下比较 current euid 与目标 uid/euid，返回是否具同一用户所有权。 */
 static bool check_same_owner(struct task_struct *p)
 {
 	const struct cred *cred = current_cred(), *pcred;
@@ -285,6 +311,7 @@ static bool check_same_owner(struct task_struct *p)
 }
 
 #ifdef CONFIG_RT_MUTEXES
+/* 降低被 DL PI boost 的 task 策略时继承 top waiter 参数并请求下次 enqueue 补充。 */
 static inline void __setscheduler_dl_pi(int newprio, int policy,
 			      struct task_struct *p,
 			      struct sched_change_ctx *scope)
@@ -306,6 +333,7 @@ static inline void __setscheduler_dl_pi(int newprio, int policy,
 	}
 }
 #else /* !CONFIG_RT_MUTEXES */
+/* 未配置 RT_MUTEXES 时不存在 PI deadline 参数需要继承。 */
 static inline void __setscheduler_dl_pi(int newprio, int policy,
 			      struct task_struct *p,
 			      struct sched_change_ctx *scope)
@@ -315,6 +343,7 @@ static inline void __setscheduler_dl_pi(int newprio, int policy,
 
 #ifdef CONFIG_UCLAMP_TASK
 
+/* 合并 @p 旧 clamp 与 attr 指定端点，校验范围及 min<=max；成功在锁外启用 static key。 */
 static int uclamp_validate(struct task_struct *p,
 			   const struct sched_attr *attr)
 {
@@ -350,6 +379,7 @@ static int uclamp_validate(struct task_struct *p,
 	return 0;
 }
 
+/* 判断 @clamp_id 是否应恢复策略默认值：类切换的非用户值或显式 -1。 */
 static bool uclamp_reset(const struct sched_attr *attr,
 			 enum uclamp_id clamp_id,
 			 struct uclamp_se *uc_se)
@@ -375,6 +405,7 @@ static bool uclamp_reset(const struct sched_attr *attr,
 	return false;
 }
 
+/* 在调度状态修改临界区重置策略默认 clamp，再提交 attr 显式用户 clamp。 */
 static void __setscheduler_uclamp(struct task_struct *p,
 				  const struct sched_attr *attr)
 {
@@ -418,11 +449,13 @@ static void __setscheduler_uclamp(struct task_struct *p,
 
 #else /* !CONFIG_UCLAMP_TASK: */
 
+/* 未配置 UCLAMP 时任何 clamp 请求返回 -EOPNOTSUPP。 */
 static inline int uclamp_validate(struct task_struct *p,
 				  const struct sched_attr *attr)
 {
 	return -EOPNOTSUPP;
 }
+/* 未配置 UCLAMP 时提交 helper 无副作用。 */
 static void __setscheduler_uclamp(struct task_struct *p,
 				  const struct sched_attr *attr) { }
 #endif /* !CONFIG_UCLAMP_TASK */
@@ -431,6 +464,10 @@ static void __setscheduler_uclamp(struct task_struct *p,
  * Allow unprivileged RT tasks to decrease priority.
  * Only issue a capable test if needed and only once to avoid an audit
  * event on permitted non-privileged operations:
+ */
+/*
+ * 用 RLIMIT_NICE/RTPRIO、ownership、reset-on-fork 约束普通用户；只有确需
+ * 越权时才检查 CAP_SYS_NICE，避免对本来允许的请求产生审计事件。
  */
 static int user_check_sched_setscheduler(struct task_struct *p,
 					 const struct sched_attr *attr,
@@ -490,6 +527,11 @@ req_priv:
 	return 0;
 }
 
+/*
+ * 策略变更核心：先做可睡眠校验，再锁 task rq，竞态时 recheck；将 task
+ * 从旧 class 队列暂时摘下，提交参数/PI/uclamp，按新 class 重新入队并回调。
+ * 成功返回 0；参数、权限、admission、LSM 或竞态约束失败返回负 errno。
+ */
 int __sched_setscheduler(struct task_struct *p,
 			 const struct sched_attr *attr,
 			 bool user, bool pi)
@@ -722,6 +764,7 @@ unlock:
 	return retval;
 }
 
+/* 将旧 sched_param ABI 转成 sched_attr，并拆出 policy 高位的 RESET_ON_FORK。 */
 static int _sched_setscheduler(struct task_struct *p, int policy,
 			       const struct sched_param *param, bool check)
 {
@@ -755,17 +798,20 @@ static int _sched_setscheduler(struct task_struct *p, int policy,
  *
  * NOTE that the task may be already dead.
  */
+/* 内核入口但执行用户权限检查；返回 0 或 __sched_setscheduler 的 errno。 */
 int sched_setscheduler(struct task_struct *p, int policy,
 		       const struct sched_param *param)
 {
 	return _sched_setscheduler(p, policy, param, true);
 }
 
+/* 以扩展 attr 修改 @p，并执行权限/LSM/资源限制检查。 */
 int sched_setattr(struct task_struct *p, const struct sched_attr *attr)
 {
 	return __sched_setscheduler(p, attr, true, true);
 }
 
+/* 可信内核调用入口，跳过用户权限检查但仍保留参数和调度不变量校验。 */
 int sched_setattr_nocheck(struct task_struct *p, const struct sched_attr *attr)
 {
 	return __sched_setscheduler(p, attr, false, true);
@@ -785,6 +831,7 @@ EXPORT_SYMBOL_GPL(sched_setattr_nocheck);
  *
  * Return: 0 on success. An error code otherwise.
  */
+/* 可信内核旧 ABI 入口；跳过 capability 检查，成功 0、失败负 errno。 */
 int sched_setscheduler_nocheck(struct task_struct *p, int policy,
 			       const struct sched_param *param)
 {
@@ -809,6 +856,7 @@ int sched_setscheduler_nocheck(struct task_struct *p, int policy,
  * The administrator _MUST_ configure the system, the kernel simply doesn't
  * know enough information to make a sensible choice.
  */
+/* 将内核线程设为中等 SCHED_FIFO；失败仅 WARN，资源管理仍由管理员配置。 */
 void sched_set_fifo(struct task_struct *p)
 {
 	struct sched_param sp = { .sched_priority = MAX_RT_PRIO / 2 };
@@ -819,6 +867,7 @@ EXPORT_SYMBOL_GPL(sched_set_fifo);
 /*
  * For when you don't much care about FIFO, but want to be above SCHED_NORMAL.
  */
+/* 将 @p 设为最低 RT FIFO，使其仅高于普通策略；失败仅 WARN。 */
 void sched_set_fifo_low(struct task_struct *p)
 {
 	struct sched_param sp = { .sched_priority = 1 };
@@ -833,12 +882,14 @@ EXPORT_SYMBOL_GPL(sched_set_fifo_low);
  * emulating the behavior of a non-PREEMPT_RT system where the primary handler
  * runs in hard interrupt context.
  */
+/* 为线程化次级 IRQ 设置略低于主处理线程的 FIFO priority。 */
 void sched_set_fifo_secondary(struct task_struct *p)
 {
 	struct sched_param sp = { .sched_priority = MAX_RT_PRIO / 2 - 1 };
 	WARN_ON_ONCE(sched_setscheduler_nocheck(p, SCHED_FIFO, &sp) != 0);
 }
 
+/* 可信内核入口把 @p 切回 SCHED_NORMAL 并设置 @nice；失败仅 WARN。 */
 void sched_set_normal(struct task_struct *p, int nice)
 {
 	struct sched_attr attr = {
@@ -849,6 +900,7 @@ void sched_set_normal(struct task_struct *p, int nice)
 }
 EXPORT_SYMBOL_GPL(sched_set_normal);
 
+/* 复制旧 sched_param、按 pid 取得 task 引用并调用权限检查入口。 */
 static int
 do_sched_setscheduler(pid_t pid, int policy, struct sched_param __user *param)
 {
@@ -868,6 +920,10 @@ do_sched_setscheduler(pid_t pid, int policy, struct sched_param __user *param)
 
 /*
  * Mimics kernel/events/core.c perf_copy_attr().
+ */
+/*
+ * 按 size 版本化复制用户 attr；短结构零填充，未知非零尾部拒绝，size 错误
+ * 回写内核期望大小并返回 -E2BIG，nice 为兼容旧 ABI 被夹到合法范围。
  */
 static int sched_copy_attr(struct sched_attr __user *uattr, struct sched_attr *attr)
 {
@@ -911,6 +967,7 @@ err_size:
 	return -E2BIG;
 }
 
+/* 按 @p 当前 class 把 DL/RT/fair 参数填入调用者 attr，不修改 task。 */
 static void get_params(struct task_struct *p, struct sched_attr *attr, unsigned int flags)
 {
 	if (task_has_dl_policy(p)) {
@@ -931,6 +988,7 @@ static void get_params(struct task_struct *p, struct sched_attr *attr, unsigned 
  *
  * Return: 0 on success. An error code otherwise.
  */
+/* 用户旧 ABI 设置 policy/RT priority；负 policy 拒绝，其余交共同路径。 */
 SYSCALL_DEFINE3(sched_setscheduler, pid_t, pid, int, policy, struct sched_param __user *, param)
 {
 	if (policy < 0)
@@ -946,6 +1004,7 @@ SYSCALL_DEFINE3(sched_setscheduler, pid_t, pid, int, policy, struct sched_param 
  *
  * Return: 0 on success. An error code otherwise.
  */
+/* 只更新目标的策略参数而保留 policy，以 SETPARAM_POLICY 哨兵进入共同路径。 */
 SYSCALL_DEFINE2(sched_setparam, pid_t, pid, struct sched_param __user *, param)
 {
 	return do_sched_setscheduler(pid, SETPARAM_POLICY, param);
@@ -957,6 +1016,7 @@ SYSCALL_DEFINE2(sched_setparam, pid_t, pid, struct sched_param __user *, param)
  * @uattr: structure containing the extended parameters.
  * @flags: for future extension.
  */
+/* 扩展 ABI：复制版本化 attr、处理 KEEP 标志、持有目标引用后提交。 */
 SYSCALL_DEFINE3(sched_setattr, pid_t, pid, struct sched_attr __user *, uattr,
 			       unsigned int, flags)
 {
@@ -992,6 +1052,7 @@ SYSCALL_DEFINE3(sched_setattr, pid_t, pid, struct sched_attr __user *, uattr,
  * Return: On success, the policy of the thread. Otherwise, a negative error
  * code.
  */
+/* RCU 查目标并经 LSM 返回 policy，可在高位附带 RESET_ON_FORK。 */
 SYSCALL_DEFINE1(sched_getscheduler, pid_t, pid)
 {
 	struct task_struct *p;
@@ -1022,6 +1083,7 @@ SYSCALL_DEFINE1(sched_getscheduler, pid_t, pid)
  * Return: On success, 0 and the RT priority is in @param. Otherwise, an error
  * code.
  */
+/* RCU 下读取 RT priority，退出 RCU 后才 copy_to_user；非 RT 输出 0。 */
 SYSCALL_DEFINE2(sched_getparam, pid_t, pid, struct sched_param __user *, param)
 {
 	struct sched_param lp = { .sched_priority = 0 };
@@ -1057,6 +1119,7 @@ SYSCALL_DEFINE2(sched_getparam, pid_t, pid, struct sched_param __user *, param)
  * @usize: sizeof(attr) for fwd/bwd comp.
  * @flags: for future extension.
  */
+/* 读取扩展属性快照并按用户 usize 版本化复制；uclamp 并发读可见旧值或新值。 */
 SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
 		unsigned int, usize, unsigned int, flags)
 {
@@ -1104,6 +1167,10 @@ SYSCALL_DEFINE4(sched_getattr, pid_t, pid, struct sched_attr __user *, uattr,
 	return copy_struct_to_user(uattr, usize, &kattr, sizeof(kattr), NULL);
 }
 
+/*
+ * admission control 开启时要求普通 DL task 的新 mask 覆盖整个 root_domain；
+ * 非 DL、特殊 DL 或带宽控制关闭时返回 0，不满足返回 -EBUSY。
+ */
 int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 {
 	/*
@@ -1133,6 +1200,10 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 	return 0;
 }
 
+/*
+ * 将请求 mask 与 cpuset 相交并提交；提交后重读 cpuset 检测并发收缩，必要时
+ * 再限制一次并向用户返回 -EINVAL。临时 mask 在全部出口释放。
+ */
 int __sched_setaffinity(struct task_struct *p, struct affinity_context *ctx)
 {
 	int retval;
@@ -1194,6 +1265,7 @@ out_free_cpus_allowed:
 	return retval;
 }
 
+/* 查找并持有目标、检查 owner/capability/LSM，建立 user_mask 后提交 affinity。 */
 long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 {
 	struct affinity_context ac;
@@ -1240,6 +1312,7 @@ long sched_setaffinity(pid_t pid, const struct cpumask *in_mask)
 	return retval;
 }
 
+/* 从用户复制最多内核 cpumask 大小；短输入先清高位，失败返回 -EFAULT。 */
 static int get_user_cpu_mask(unsigned long __user *user_mask_ptr, unsigned len,
 			     struct cpumask *new_mask)
 {
@@ -1259,6 +1332,7 @@ static int get_user_cpu_mask(unsigned long __user *user_mask_ptr, unsigned len,
  *
  * Return: 0 on success. An error code otherwise.
  */
+/* 分配内核 mask、复制用户位图并调用权限/cpuset 约束路径；所有出口释放 mask。 */
 SYSCALL_DEFINE3(sched_setaffinity, pid_t, pid, unsigned int, len,
 		unsigned long __user *, user_mask_ptr)
 {
@@ -1275,6 +1349,7 @@ SYSCALL_DEFINE3(sched_setaffinity, pid_t, pid, unsigned int, len,
 	return retval;
 }
 
+/* RCU/LSM 校验后在 pi_lock 下输出 task 允许且 CPU active 的交集。 */
 long sched_getaffinity(pid_t pid, struct cpumask *mask)
 {
 	struct task_struct *p;
@@ -1304,6 +1379,7 @@ long sched_getaffinity(pid_t pid, struct cpumask *mask)
  * Return: size of CPU mask copied to user_mask_ptr on success. An
  * error code otherwise.
  */
+/* 校验用户缓冲长度/对齐，读取 affinity 后复制并返回实际字节数。 */
 SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
 		unsigned long __user *, user_mask_ptr)
 {
@@ -1332,6 +1408,7 @@ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
 	return ret;
 }
 
+/* 在本 rq 锁下调用当前 class yield hook，解锁后 schedule；yield 不保证换人运行。 */
 static void do_sched_yield(void)
 {
 	struct rq_flags rf;
@@ -1357,6 +1434,7 @@ static void do_sched_yield(void)
  *
  * Return: 0.
  */
+/* 用户 yield syscall；执行一次调度尝试后恒返回 0。 */
 SYSCALL_DEFINE0(sched_yield)
 {
 	do_sched_yield();
@@ -1385,6 +1463,7 @@ SYSCALL_DEFINE0(sched_yield)
  * If you want to use yield() to be 'nice' for others, use cond_resched().
  * If you still want to use yield(), do not!
  */
+/* 内核 yield 包装：保持 TASK_RUNNING 并尝试重调度，不能作为等待进度保证。 */
 void __sched yield(void)
 {
 	set_current_state(TASK_RUNNING);
@@ -1406,6 +1485,10 @@ EXPORT_SYMBOL(yield);
  *	true (>0) if we indeed boosted the target task.
  *	false (0) if we failed to boost the target.
  *	-ESRCH if there's no task to yield to.
+ */
+/*
+ * 在 @p pi_lock 与双 rq 锁下验证同 class/可运行/未在 CPU，再调用 class
+ * yield_to hook；成功可 resched 远端并由当前 task schedule，返回 1/0/-ESRCH。
  */
 int __sched yield_to(struct task_struct *p, bool preempt)
 {
@@ -1466,6 +1549,7 @@ EXPORT_SYMBOL_GPL(yield_to);
  * rt_priority that can be used by a given scheduling class.
  * On failure, a negative error code is returned.
  */
+/* 返回指定 policy 的最大用户 RT priority；未知策略 -EINVAL。 */
 SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
 {
 	int ret = -EINVAL;
@@ -1494,6 +1578,7 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
  * rt_priority that can be used by a given scheduling class.
  * On failure, a negative error code is returned.
  */
+/* 返回指定 policy 的最小用户 RT priority；非 RT 为 0，未知策略 -EINVAL。 */
 SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 {
 	int ret = -EINVAL;
@@ -1513,6 +1598,7 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 	return ret;
 }
 
+/* 查 task、LSM 校验并在 rq 锁下调用 class interval hook，输出 timespec64。 */
 static int sched_rr_get_interval(pid_t pid, struct timespec64 *t)
 {
 	unsigned int time_slice = 0;
@@ -1552,6 +1638,7 @@ static int sched_rr_get_interval(pid_t pid, struct timespec64 *t)
  * Return: On success, 0 and the time-slice is in @interval. Otherwise,
  * an error code.
  */
+/* 获取 timespec64 interval 后复制到用户；0 表示无限时间片。 */
 SYSCALL_DEFINE2(sched_rr_get_interval, pid_t, pid,
 		struct __kernel_timespec __user *, interval)
 {
@@ -1565,6 +1652,7 @@ SYSCALL_DEFINE2(sched_rr_get_interval, pid_t, pid,
 }
 
 #ifdef CONFIG_COMPAT_32BIT_TIME
+/* 32 位时间兼容入口；共用查询逻辑，再转换为 old_timespec32。 */
 SYSCALL_DEFINE2(sched_rr_get_interval_time32, pid_t, pid,
 		struct old_timespec32 __user *, interval)
 {

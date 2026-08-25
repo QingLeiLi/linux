@@ -136,6 +136,13 @@
  */
 
 /*
+ * 上述 A/B 证明发 IPI 前后的两道完整屏障都不可省：前一道把调用者先前访问排在远端
+ * IPI 屏障之前，后一道把远端先前访问排在调用者后续访问之前。C/D/E 说明即使扫描时
+ * 看到 rq->curr->mm 为 NULL，也必须依靠调度切换、exit_mm 和 kthread use/unuse mm 的
+ * 配对屏障闭合顺序；因此“跳过内核线程”不是没有同步，而是同步责任转交给切换边界。
+ */
+
+/*
  * Bitmask made from a "or" of all commands within enum membarrier_cmd,
  * except MEMBARRIER_CMD_QUERY.
  */
@@ -168,6 +175,11 @@
  * Scoped guard for memory barriers on entry and exit.
  * Matches memory barriers before & after rq->curr modification in scheduler.
  */
+/*
+ * mb guard 在作用域进入和任意退出路径各执行一次 smp_mb()，与调度器修改 rq->curr 前后
+ * 的屏障配对。全局 mutex 串行整批 IPI，per-CPU mutex 串行只针对一个 CPU 的 rseq IPI，
+ * 防止多个请求对同一观察窗口交错。
+ */
 DEFINE_LOCK_GUARD_0(mb, smp_mb(), smp_mb())
 static DEFINE_MUTEX(membarrier_ipi_mutex);
 static DEFINE_PER_CPU(struct mutex, membarrier_cpu_mutexes);
@@ -175,6 +187,7 @@ static DEFINE_PER_CPU(struct mutex, membarrier_cpu_mutexes);
 #define SERIALIZE_IPI() guard(mutex)(&membarrier_ipi_mutex)
 #define SERIALIZE_IPI_CPU(cpu_id) guard(mutex)(&per_cpu(membarrier_cpu_mutexes, cpu_id))
 
+/* core init 阶段初始化所有 possible CPU 的串行 mutex；无失败路径，也不依赖 CPU 在线。 */
 static int __init membarrier_init(void)
 {
 	int i;
@@ -185,11 +198,16 @@ static int __init membarrier_init(void)
 }
 core_initcall(membarrier_init);
 
+/* 普通 expedited IPI 回调只提供完整屏障；info 未使用，等待型发送保证回调完成后返回。 */
 static void ipi_mb(void *info)
 {
 	smp_mb();	/* IPIs should be serializing but paranoid. */
 }
 
+/*
+ * SYNC_CORE IPI 先显式提供内存屏障，再请求返回用户态前同步指令执行上下文。显式屏障
+ * 不能只依赖可能延迟的 sync_core_before_usermode，否则会落到调用方结束屏障之后。
+ */
 static void ipi_sync_core(void *info)
 {
 	/*
@@ -202,11 +220,16 @@ static void ipi_sync_core(void *info)
 	 * sync_core_before_usermode() might end up being deferred until
 	 * after membarrier()'s smp_mb().
 	 */
+	/* 原文结论：远端 IPI 前的访问必须在发起者的结束屏障前可见，延迟 core sync 不足以保证。 */
 	smp_mb();	/* IPIs should be serializing but paranoid. */
 
 	sync_core_before_usermode();
 }
 
+/*
+ * RSEQ IPI 先让发起线程此前写入对被中断任务可见，再按 ABI 模式使临界区重启：v2
+ * 记录一次调度切换事件，legacy 立即重写 CPU/节点 id 并检查临界区。
+ */
 static void ipi_rseq(void *info)
 {
 	/*
@@ -216,6 +239,7 @@ static void ipi_rseq(void *info)
 	 * time we've already sent an IPI, the cost of the extra smp_mb()
 	 * is negligible.
 	 */
+	/* 多数架构或可省略，但 IPI 已是主成本，保留屏障换取清晰的可见性保证。 */
 	smp_mb();
 	/*
 	 * Legacy mode requires that IDs are written and the critical section is
@@ -223,12 +247,17 @@ static void ipi_rseq(void *info)
 	 * only updated if they change as a consequence of preemption after
 	 * return from this IPI.
 	 */
+	/* legacy 强制更新 id 和临界区；v2 只在随后抢占确实改变状态时更新 id。 */
 	if (rseq_v2(current))
 		rseq_sched_switch_event(current);
 	else
 		rseq_force_update();
 }
 
+/*
+ * 在目标 CPU 上把当前 mm 的注册状态复制到本 rq；若 CPU 已切换到别的 mm 则无需写。
+ * 写后屏障保证注册之后的用户访问不会被重排到状态发布之前。
+ */
 static void ipi_sync_rq_state(void *info)
 {
 	struct mm_struct *mm = (struct mm_struct *) info;
@@ -246,6 +275,10 @@ static void ipi_sync_rq_state(void *info)
 	smp_mb();
 }
 
+/*
+ * exec 建立新地址空间语义时清空继承的所有注册：清零前屏障把旧映像的访问留在边界
+ * 之前，并同步清当前 CPU rq 快照。调用者在 mm 切换/exec 串行协议内持有该对象。
+ */
 void membarrier_exec_mmap(struct mm_struct *mm)
 {
 	/*
@@ -262,6 +295,10 @@ void membarrier_exec_mmap(struct mm_struct *mm)
 	this_cpu_write(runqueues.membarrier_state, 0);
 }
 
+/*
+ * 当前任务切换/借用 mm 时，把 next_mm 的原子注册位发布到本 rq；NULL 对应内核线程
+ * 状态 0。值未变快速返回，READ/WRITE_ONCE 防止编译器合并与并发观察不一致。
+ */
 void membarrier_update_current_mm(struct mm_struct *next_mm)
 {
 	struct rq *rq = this_rq();
@@ -274,6 +311,11 @@ void membarrier_update_current_mm(struct mm_struct *next_mm)
 	WRITE_ONCE(rq->membarrier_state, membarrier_state);
 }
 
+/*
+ * 向所有在线且 rq 已登记 GLOBAL_EXPEDITED、当前运行用户 mm 的远端 CPU 发送屏障 IPI。
+ * 单 CPU 快速成功；cpumask 分配失败返回 -ENOMEM。mb guard 包围扫描和等待，IPI mutex
+ * 串行并发全局请求，cpus_read_lock 稳定在线集合，RCU 稳定 rq->curr 借用指针。
+ */
 static int membarrier_global_expedited(void)
 {
 	cpumask_var_t __free(free_cpumask_var) tmpmask = CPUMASK_VAR_NULL;
@@ -301,6 +343,10 @@ static int membarrier_global_expedited(void)
 		 * thread. Therefore, we can skip this CPU from the
 		 * iteration.
 		 */
+		/*
+		 * 发起线程即使随后迁移，读取 raw CPU 的动作仍与其程序序有序；当前 CPU
+		 * 由 guard 的本地屏障覆盖，迁移涉及的调度屏障覆盖旧/新 CPU。
+		 */
 		if (cpu == raw_smp_processor_id())
 			continue;
 
@@ -312,6 +358,7 @@ static int membarrier_global_expedited(void)
 		 * Skip the CPU if it runs a kernel thread which is not using
 		 * a task mm.
 		 */
+		/* 跳过 mm==NULL 的纯内核线程；它返回用户 mm 前必经调度切换配对屏障。 */
 		p = rcu_dereference(cpu_rq(cpu)->curr);
 		if (!p->mm)
 			continue;
@@ -327,6 +374,12 @@ static int membarrier_global_expedited(void)
 	return 0;
 }
 
+/*
+ * 对 current->mm 执行普通、SYNC_CORE 或 RSEQ 私有 expedited 请求。先验证配置和该 mm
+ * 已完成对应注册，未注册返回 -EPERM；普通/RSEQ 在单 mm 用户或单 CPU 时可快速成功，
+ * SYNC_CORE 仍需覆盖本 CPU 指令流。cpu_id>=0 只检查并中断指定 CPU，否则扫描所有运行
+ * 同一 mm 的在线 CPU；掩码分配失败返回 -ENOMEM，无效/离线/已切换目标视为无需处理。
+ */
 static int membarrier_private_expedited(int flags, int cpu_id)
 {
 	struct mm_struct *mm = current->mm;
@@ -370,8 +423,13 @@ static int membarrier_private_expedited(int flags, int cpu_id)
 	 * waiting for the last IPI. Matches memory barriers before
 	 * rq->curr modification in scheduler.
 	 */
+	/*
+	 * 作用域首尾屏障分别与调度器 rq->curr 更新后/前屏障配对；RISC-V 的 SYNC_CORE
+	 * 进程切换也依赖此配对，故不能因回调已有同步核心操作而删除。
+	 */
 	guard(mb)();
 	if (cpu_id >= 0) {
+		/* UAPI 对不可能或越界 CPU 定义为没有目标工作，返回成功而不是参数错误。 */
 		if (cpu_id >= nr_cpu_ids || !cpu_possible(cpu_id))
 			return 0;
 
@@ -393,6 +451,7 @@ static int membarrier_private_expedited(int flags, int cpu_id)
 		 * smp_call_function_single() will call ipi_func() if cpu_id
 		 * is the calling CPU.
 		 */
+		/* 指定当前 CPU 也会同步执行回调，因此 RSEQ/CORE 语义不会被跳过。 */
 		smp_call_function_single(cpu_id, ipi_func, NULL, 1);
 	} else {
 		cpumask_var_t __free(free_cpumask_var) tmpmask = CPUMASK_VAR_NULL;
@@ -430,6 +489,10 @@ static int membarrier_private_expedited(int flags, int cpu_id)
 		 * caller.  User code is not supposed to issue syscalls at
 		 * all from inside an rseq critical section.
 		 */
+		/*
+		 * 普通/RSEQ 的 many 接口跳过当前 CPU，结束屏障或 syscall 禁入 rseq CS 足够；
+		 * SYNC_CORE 必须连当前 CPU 一并执行，防止同 mm 的替换线程未经 core sync 运行。
+		 */
 		if (flags != MEMBARRIER_FLAG_SYNC_CORE) {
 			preempt_disable();
 			smp_call_function_many(tmpmask, ipi_func, NULL, true);
@@ -442,6 +505,12 @@ static int membarrier_private_expedited(int flags, int cpu_id)
 	return 0;
 }
 
+/*
+ * 注册位写入 mm 后，把状态同步到当前正在运行该 mm 的所有 rq。单用户/单 CPU 可直接
+ * 更新本 rq 并用屏障发布；多用户先 synchronize_rcu() 越过旧调度观察，再锁定 CPU
+ * 在线集合、扫描 curr 并同步 IPI。分配失败返回 -ENOMEM，调用者保留已置的非 READY 位，
+ * 后续注册可重试；只有同步成功后上层才发布 READY。
+ */
 static int sync_runqueues_membarrier_state(struct mm_struct *mm)
 {
 	int membarrier_state = atomic_read(&mm->membarrier_state);
@@ -458,6 +527,7 @@ static int sync_runqueues_membarrier_state(struct mm_struct *mm)
 		 * access following registration is reordered before
 		 * registration.
 		 */
+		/* 单 mm 用户没有其他并行执行者，本 CPU rq 写入加完整屏障即可建立注册边界。 */
 		smp_mb();
 		return 0;
 	}
@@ -470,6 +540,7 @@ static int sync_runqueues_membarrier_state(struct mm_struct *mm)
 	 * scheduler executions will observe @mm's new membarrier
 	 * state.
 	 */
+	/* 等待既有 RCU 读侧退出，使后续调度/扫描不会继续使用注册前的观察状态。 */
 	synchronize_rcu();
 
 	/*
@@ -479,6 +550,7 @@ static int sync_runqueues_membarrier_state(struct mm_struct *mm)
 	 * between threads which are users of @mm has its membarrier state
 	 * updated.
 	 */
+	/* 只向扫描瞬间运行该 mm 的 CPU 发 IPI；未来切入者由 scheduler switch 路径同步。 */
 	SERIALIZE_IPI();
 	cpus_read_lock();
 	rcu_read_lock();
@@ -500,6 +572,10 @@ static int sync_runqueues_membarrier_state(struct mm_struct *mm)
 	return 0;
 }
 
+/*
+ * 幂等注册 GLOBAL_EXPEDITED：先设置功能位，使 rq 同步逻辑知道要传播什么；传播成功
+ * 后再设置 READY，防止 syscall 在 rq 状态尚未覆盖所有执行者时提前使用。失败可重试。
+ */
 static int membarrier_register_global_expedited(void)
 {
 	struct task_struct *p = current;
@@ -519,6 +595,11 @@ static int membarrier_register_global_expedited(void)
 	return 0;
 }
 
+/*
+ * 幂等注册私有 expedited 及可选 SYNC_CORE/RSEQ 能力。配置不支持返回 -EINVAL；状态
+ * 属于 mm 而非线程组，覆盖 CLONE_VM 但非 CLONE_THREAD 的共享者。先发布功能位并同步
+ * rq，成功后才发布对应 READY；同步分配失败返回 -ENOMEM 且保留可重试的功能位。
+ */
 static int membarrier_register_private_expedited(int flags)
 {
 	struct task_struct *p = current;
@@ -546,6 +627,7 @@ static int membarrier_register_private_expedited(int flags)
 	 * groups, which use the same mm. (CLONE_VM but not
 	 * CLONE_THREAD).
 	 */
+	/* 原文强调：不能只遍历 current 线程组，因为不同线程组也可能共享同一个 mm。 */
 	if ((atomic_read(&mm->membarrier_state) & ready_state) == ready_state)
 		return 0;
 	if (flags & MEMBARRIER_FLAG_SYNC_CORE)
@@ -561,6 +643,10 @@ static int membarrier_register_private_expedited(int flags)
 	return 0;
 }
 
+/*
+ * 把 mm 内部功能位/READY 位对转换成 UAPI REGISTER 命令掩码；任一配对位存在即报告
+ * 该注册，随后清除已识别状态并警告未知残留。纯原子快照，不发送 IPI、不分配内存。
+ */
 static int membarrier_get_registrations(void)
 {
 	struct task_struct *p = current;
@@ -631,6 +717,12 @@ static int membarrier_get_registrations(void)
  *        smp_mb()           X           O            O
  *        sys_membarrier()   O           O            O
  */
+/*
+ * 系统调用分派首先限制 flags：仅 PRIVATE_EXPEDITED_RSEQ 接受 CPU 定向标志，否则必须
+ * 为 0；未定向时把 cpu_id 规范为 -1。QUERY 返回本内核/配置支持集，nohz_full 下移除
+ * GLOBAL；传统 GLOBAL 以 synchronize_rcu() 建立慢速全局屏障且与 nohz_full 不兼容。
+ * 其余命令分别进入注册或 expedited 路径，未知命令返回 -EINVAL。
+ */
 SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
 {
 	switch (cmd) {
@@ -652,11 +744,13 @@ SYSCALL_DEFINE3(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
 		int cmd_mask = MEMBARRIER_CMD_BITMASK;
 
 		if (tick_nohz_full_enabled())
+			/* GLOBAL 依赖周期性内核/RCU 边界，full-nohz CPU 不能提供该保证。 */
 			cmd_mask &= ~MEMBARRIER_CMD_GLOBAL;
 		return cmd_mask;
 	}
 	case MEMBARRIER_CMD_GLOBAL:
 		/* MEMBARRIER_CMD_GLOBAL is not compatible with nohz_full. */
+		/* 传统全局命令不能用于 nohz_full；expedited IPI 变体仍可使用。 */
 		if (tick_nohz_full_enabled())
 			return -EINVAL;
 		if (num_online_cpus() > 1)

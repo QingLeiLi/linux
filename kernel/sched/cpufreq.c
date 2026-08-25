@@ -53,7 +53,7 @@ DEFINE_PER_CPU(struct update_util_data __rcu *, cpufreq_update_util_data);
  * called or it will WARN() and return with no effect.
  */
 /*
- * 原文说明：cpufreq_add_update_util_hook() 填充指定 CPU 的 update_util_data
+ * cpufreq_add_update_util_hook() 填充指定 CPU 的 update_util_data
  * 指针。@cpu 是要设置槽位的 CPU，@data 是新指针值，@func 是为该 CPU 安装的
  * 回调。函数设置并发布该 CPU 的指针，同时把目标 update_util_data 的 func 字段
  * 设为 @func。cpufreq_update_util() 会在 RCU-sched 读侧临界区调用它，因此回调
@@ -114,7 +114,7 @@ EXPORT_SYMBOL_GPL(cpufreq_add_update_util_hook);
  * right after this function to avoid use-after-free.
  */
 /*
- * 原文说明：cpufreq_remove_update_util_hook() 清除指定 CPU 的
+ * cpufreq_remove_update_util_hook() 清除指定 CPU 的
  * update_util_data 指针。调用者必须通过 RCU 回调释放任何可能经旧指针访问的内存，
  * 或在本函数之后立即调用 synchronize_rcu()，从而避免 use-after-free。
  *
@@ -152,7 +152,7 @@ EXPORT_SYMBOL_GPL(cpufreq_remove_update_util_hook);
  *   offline (in which case it is not expected to run cpufreq updates any more).
  */
 /*
- * 原文说明：cpufreq_this_cpu_can_update() 检查 CPUFreq policy 能否从当前 CPU
+ * cpufreq_this_cpu_can_update() 检查 CPUFreq policy 能否从当前 CPU
  * 更新。以下任一条件成立就返回 true：本地 CPU 与被更新的远端 CPU 共享 @policy；
  * 或者 @policy 允许任意 CPU 发起 DVFS，且本地 CPU 没有正在下线——下线中的 CPU
  * 不应再执行 CPUFreq 更新。

@@ -9,6 +9,17 @@
  * Copyright (c) 2022 David Vernet <dvernet@meta.com>
  * Copyright (c) 2024 Andrea Righi <arighi@nvidia.com>
  */
+/*
+ * 本文件维护 sched_ext 内建的“可领取 idle CPU”索引，并向 BPF scheduler
+ * 暴露受校验的选 CPU kfunc。cpu mask 表示当前可领取的逻辑 CPU，smt mask
+ * 只保留整个 SMT core 都空闲的 CPU；test-and-clear 是领取点，但它只是
+ * 与并发 idle 转换竞速后的候选，不是任务必然在该 CPU 运行的承诺。
+ *
+ * 全局或 per-NUMA-node mask 在 scheduler enable/disable 与 CPU hotplug
+ * 边界重建；per-CPU 临时 mask 依赖禁止抢占。拓扑 span 在 RCU 下借用，
+ * BPF acquire/release 仅建立 verifier 的 trusted-pointer 生命周期，底层
+ * 永久 cpumask 并没有引用计数或释放动作。
+ */
 #include "internal.h"
 #include "cid.h"
 #include "idle.h"
@@ -30,6 +41,10 @@ static DEFINE_STATIC_KEY_FALSE(scx_selcpu_topo_numa);
  *
  * If SCX_OPS_BUILTIN_IDLE_PER_NODE is not enabled, a single global cpumask
  * from is used to track all the idle CPUs in the system.
+ */
+/*
+ * 每个容器同时保存可领取逻辑 CPU 位图 @cpu 与“整个 SMT core 均空闲”的
+ * 派生位图 @smt；全局容器或各 node 容器在启动时创建、整个内核生命周期保留。
  */
 struct scx_idle_cpus {
 	cpumask_var_t cpu;
@@ -59,6 +74,7 @@ static DEFINE_PER_CPU(cpumask_var_t, local_numa_idle_cpumask);
  *
  * NUMA_NO_NODE identifies the global idle cpumask.
  */
+/* 返回 @node 的永久 mask 容器；NUMA_NO_NODE 选择全局容器，调用者仅借用。 */
 static struct scx_idle_cpus *idle_cpumask(int node)
 {
 	return node == NUMA_NO_NODE ? &scx_idle_global_masks : scx_idle_node_masks[node];
@@ -68,6 +84,7 @@ static struct scx_idle_cpus *idle_cpumask(int node)
  * Returns the NUMA node ID associated with a @cpu, or NUMA_NO_NODE if
  * per-node idle cpumasks are disabled.
  */
+/* per-node 跟踪开启时返回 @cpu 的 node，否则返回 NUMA_NO_NODE。 */
 static int scx_cpu_node_if_enabled(int cpu)
 {
 	if (!static_branch_maybe(CONFIG_NUMA, &scx_builtin_idle_per_node))
@@ -76,6 +93,7 @@ static int scx_cpu_node_if_enabled(int cpu)
 	return cpu_to_node(cpu);
 }
 
+/* 原子领取 @cpu，并清除其整个 SMT core 的“全闲”候选；成功返回原 idle 位。 */
 static bool scx_idle_test_and_clear_cpu(int cpu)
 {
 	int node = scx_cpu_node_if_enabled(cpu);
@@ -112,6 +130,7 @@ static bool scx_idle_test_and_clear_cpu(int cpu)
 /*
  * Pick an idle CPU in a specific NUMA node.
  */
+/* 在 @node 先选全闲 SMT core 再选任意 idle CPU；成功同时领取，失败 -EBUSY。 */
 static s32 pick_idle_cpu_in_node(const struct cpumask *cpus_allowed, int node, u64 flags)
 {
 	int cpu;
@@ -147,6 +166,7 @@ static DEFINE_PER_CPU(nodemask_t, per_cpu_unvisited);
 /*
  * Search for an idle CPU across all nodes, excluding @node.
  */
+/* 禁抢占使用本 CPU nodemask，按距离搜索除 @node 外的在线 node。 */
 static s32 pick_idle_cpu_from_online_nodes(const struct cpumask *cpus_allowed, int node, u64 flags)
 {
 	nodemask_t *unvisited;
@@ -187,6 +207,7 @@ static s32 pick_idle_cpu_from_online_nodes(const struct cpumask *cpus_allowed, i
 	return cpu;
 }
 #else
+/* 无 NUMA 配置时不存在其他 node 可搜索，恒返回 -EBUSY。 */
 static inline s32
 pick_idle_cpu_from_online_nodes(const struct cpumask *cpus_allowed, int node, u64 flags)
 {
@@ -197,6 +218,7 @@ pick_idle_cpu_from_online_nodes(const struct cpumask *cpus_allowed, int node, u6
 /*
  * Find an idle CPU in the system, starting from @node.
  */
+/* 先搜起始 @node，允许时再扩展到其他 node；返回已领取 CPU 或 -EBUSY。 */
 static s32 scx_pick_idle_cpu(const struct cpumask *cpus_allowed, int node, u64 flags)
 {
 	s32 cpu;
@@ -228,6 +250,7 @@ static s32 scx_pick_idle_cpu(const struct cpumask *cpus_allowed, int node, u64 f
  * Return the amount of CPUs in the same LLC domain of @cpu (or zero if the LLC
  * domain is not defined).
  */
+/* RCU 读侧返回 @cpu LLC span 的 CPU 数；拓扑不存在返回 0。 */
 static unsigned int llc_weight(s32 cpu)
 {
 	struct sched_domain *sd;
@@ -243,6 +266,7 @@ static unsigned int llc_weight(s32 cpu)
  * Return the cpumask representing the LLC domain of @cpu (or NULL if the LLC
  * domain is not defined).
  */
+/* RCU 读侧借用 @cpu 的 LLC span；拓扑不存在返回 NULL。 */
 static struct cpumask *llc_span(s32 cpu)
 {
 	struct sched_domain *sd;
@@ -258,6 +282,7 @@ static struct cpumask *llc_span(s32 cpu)
  * Return the amount of CPUs in the same NUMA domain of @cpu (or zero if the
  * NUMA domain is not defined).
  */
+/* RCU 读侧返回 @cpu NUMA group 的 CPU 数；domain/group 缺失返回 0。 */
 static unsigned int numa_weight(s32 cpu)
 {
 	struct sched_domain *sd;
@@ -277,6 +302,7 @@ static unsigned int numa_weight(s32 cpu)
  * Return the cpumask representing the NUMA domain of @cpu (or NULL if the NUMA
  * domain is not defined).
  */
+/* RCU 读侧借用 @cpu NUMA group span；domain/group 缺失返回 NULL。 */
 static struct cpumask *numa_span(s32 cpu)
 {
 	struct sched_domain *sd;
@@ -296,6 +322,7 @@ static struct cpumask *numa_span(s32 cpu)
  * Return true if the LLC domains do not perfectly overlap with the NUMA
  * domains, false otherwise.
  */
+/* 扫描在线 CPU，判断是否至少一个 NUMA domain 含多个 LLC。 */
 static bool llc_numa_mismatch(void)
 {
 	int cpu;
@@ -340,6 +367,10 @@ static bool llc_numa_mismatch(void)
  * Assumption: the kernel's internal topology representation assumes that each
  * CPU belongs to a single LLC domain, and that each LLC domain is entirely
  * contained within a single NUMA node.
+ */
+/*
+ * CPU hotplug 稳定期间检查在线拓扑并切换 LLC/NUMA static key；per-node
+ * 模式天然限定 NUMA 搜索，故不重复启用全局 NUMA 优化。
  */
 void scx_idle_update_selcpu_topology(struct sched_ext_ops *ops)
 {
@@ -408,6 +439,7 @@ void scx_idle_update_selcpu_topology(struct sched_ext_ops *ops)
 /*
  * Return true if @p can run on all possible CPUs, false otherwise.
  */
+/* 返回 @p 的亲和性是否覆盖所有 possible CPU；仅读 nr_cpus_allowed 快照。 */
 static inline bool task_affinity_all(const struct task_struct *p)
 {
 	return p->nr_cpus_allowed >= num_possible_cpus();
@@ -453,6 +485,10 @@ static inline bool task_affinity_all(const struct task_struct *p)
  *
  * NOTE: tasks that can only run on 1 CPU are excluded by this logic, because
  * we never call ops.select_cpu() for them, see select_task_rq().
+ */
+/*
+ * 在稳定 @p 亲和性、禁止抢占且 RCU 保护拓扑下，按同步唤醒、全闲 core、
+ * prev CPU/sibling、LLC、NUMA、全局顺序领取 idle CPU；返回 CPU 或负 errno。
  */
 s32 scx_select_cpu_dfl(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
 		       const struct cpumask *cpus_allowed, u64 flags)
@@ -673,6 +709,7 @@ out_enable:
 /*
  * Initialize global and per-node idle cpumasks.
  */
+/* 启动期分配全局、各 node 与各 CPU 临时 mask；分配失败 BUG，成功后永久存在。 */
 void scx_idle_init_masks(void)
 {
 	int i;
@@ -705,6 +742,7 @@ void scx_idle_init_masks(void)
 	}
 }
 
+/* 更新 @cpu idle 位，并以“所有 sibling 均 idle”派生 SMT mask；竞态可自修复。 */
 static void update_builtin_idle(int cpu, bool idle)
 {
 	int node = scx_cpu_node_if_enabled(cpu);
@@ -745,6 +783,10 @@ static void update_builtin_idle(int cpu, bool idle)
  * without invoking ops.update_idle() ensures accurate idle state tracking
  * while avoiding unnecessary updates and maintaining balanced state
  * transitions.
+ */
+/*
+ * 在已持 @rq 锁下先更新内建 mask，再可选调用 BPF update_idle；顺序保证
+ * enqueue 要么看到 idle 位，要么 update_idle 回调看到已排队任务。
  */
 void __scx_update_idle(struct rq *rq, bool idle, bool do_notify)
 {
@@ -788,6 +830,7 @@ void __scx_update_idle(struct rq *rq, bool idle, bool do_notify)
 		SCX_CALL_OP(sch, update_idle, rq, scx_cpu_arg(cpu_of(rq)), idle);
 }
 
+/* 启用策略时把在线 CPU 乐观标为 idle，并按 ops flags 选择全局或 node mask。 */
 static void reset_idle_masks(struct sched_ext_ops *ops)
 {
 	int node;
@@ -810,6 +853,7 @@ static void reset_idle_masks(struct sched_ext_ops *ops)
 	}
 }
 
+/* CPU 集稳定时配置内建/per-node static key 并重置 mask；无直接返回值。 */
 void scx_idle_enable(struct sched_ext_ops *ops)
 {
 	if (!ops->update_idle || (ops->flags & SCX_OPS_KEEP_BUILTIN_IDLE))
@@ -825,6 +869,7 @@ void scx_idle_enable(struct sched_ext_ops *ops)
 	reset_idle_masks(ops);
 }
 
+/* 关闭两个 idle 跟踪 static key；永久 mask 保留供下次启用重建。 */
 void scx_idle_disable(void)
 {
 	static_branch_disable(&scx_builtin_idle_enabled);
@@ -835,6 +880,7 @@ void scx_idle_disable(void)
  * Helpers that can be called from the BPF scheduler.
  */
 
+/* 校验 per-node 模式与 @node；成功原样返回 node，失败记录 scx_error 并返回 errno。 */
 static int validate_node(struct scx_sched *sch, int node)
 {
 	if (!static_branch_likely(&scx_builtin_idle_per_node)) {
@@ -863,6 +909,7 @@ static int validate_node(struct scx_sched *sch, int node)
 
 __bpf_kfunc_start_defs();
 
+/* 检查内建 idle static key；关闭时向 @sch 报错并返回 false。 */
 static bool check_builtin_idle_enabled(struct scx_sched *sch)
 {
 	if (static_branch_likely(&scx_builtin_idle_enabled))
@@ -895,6 +942,7 @@ static bool check_builtin_idle_enabled(struct scx_sched *sch)
  *
  * Returns true if @p is migration-disabled, false otherwise.
  */
+/* 排除 PREEMPT_RCU BPF prolog 的一次临时禁止迁移，判断 @p 原本是否被固定。 */
 static bool is_bpf_migration_disabled(const struct task_struct *p)
 {
 	if (p->migration_disabled == 1) {
@@ -905,6 +953,10 @@ static bool is_bpf_migration_disabled(const struct task_struct *p)
 	return p->migration_disabled;
 }
 
+/*
+ * 统一 BPF 选 CPU 入口：验证 scheduler/prev_cpu/内建跟踪，并确认现有 rq/pi
+ * 锁确实覆盖 @p；无锁上下文自行取 pi_lock，成功返回已领取 CPU，否则 errno。
+ */
 static s32 select_cpu_from_kfunc(struct scx_sched *sch, struct task_struct *p,
 				 s32 prev_cpu, u64 wake_flags,
 				 const struct cpumask *allowed, u64 flags)
@@ -979,6 +1031,7 @@ cross_task:
  * @cpu: target CPU
  * @aux: implicit BPF argument to access bpf_prog_aux hidden from BPF progs
  */
+/* 校验 @aux 所属 scheduler 与 @cpu，成功返回 NUMA node，失败返回 NUMA_NO_NODE。 */
 __bpf_kfunc s32 scx_bpf_cpu_node(s32 cpu, const struct bpf_prog_aux *aux)
 {
 	struct scx_sched *sch;
@@ -1007,6 +1060,7 @@ __bpf_kfunc s32 scx_bpf_cpu_node(s32 cpu, const struct bpf_prog_aux *aux)
  * Returns the picked CPU with *@is_idle indicating whether the picked CPU is
  * currently idle and thus a good candidate for direct dispatching.
  */
+/* 返回默认选择 CPU，并通过 @is_idle 输出是否成功领取；无 idle 候选时退回 prev_cpu。 */
 __bpf_kfunc s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 				       u64 wake_flags, bool *is_idle,
 				       const struct bpf_prog_aux *aux)
@@ -1029,6 +1083,10 @@ __bpf_kfunc s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 	return prev_cpu;
 }
 
+/*
+ * 把 BPF 五参数上限之外的输入封装成借用结构：prev_cpu 是上次 CPU，
+ * wake_flags 描述唤醒关系，flags 控制 idle/core/node 搜索边界。
+ */
 struct scx_bpf_select_cpu_and_args {
 	/* @p and @cpus_allowed can't be packed together as KF_RCU is not transitive */
 	s32			prev_cpu;
@@ -1061,6 +1119,7 @@ struct scx_bpf_select_cpu_and_args {
  * returning from ops.select_cpu() and can be used for direct dispatch, or
  * a negative value if no idle CPU is available.
  */
+/* 以参数结构绕过 BPF 五参数上限，返回已领取 idle CPU 或负 errno。 */
 __bpf_kfunc s32
 __scx_bpf_select_cpu_and(struct task_struct *p, const struct cpumask *cpus_allowed,
 			 struct scx_bpf_select_cpu_and_args *args,
@@ -1081,6 +1140,7 @@ __scx_bpf_select_cpu_and(struct task_struct *p, const struct cpumask *cpus_allow
 /*
  * COMPAT: Will be removed in v6.22.
  */
+/* 兼容旧五参数 ABI；存在 sub-scheduler 时无法判定调用者，拒绝并返回 -EINVAL。 */
 __bpf_kfunc s32 scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu, u64 wake_flags,
 				       const struct cpumask *cpus_allowed, u64 flags)
 {
@@ -1117,6 +1177,7 @@ __bpf_kfunc s32 scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu, u64 
  * not valid, or running on a UP kernel. In this case the actual error will
  * be reported to the BPF scheduler via scx_error().
  */
+/* 获取指定 node 的 idle mask verifier 引用；校验失败返回永久空 mask。 */
 __bpf_kfunc const struct cpumask *
 scx_bpf_get_idle_cpumask_node(s32 node, const struct bpf_prog_aux *aux)
 {
@@ -1143,6 +1204,7 @@ scx_bpf_get_idle_cpumask_node(s32 node, const struct bpf_prog_aux *aux)
  * Returns an empty mask if idle tracking is not enabled, or running on a
  * UP kernel.
  */
+/* 获取全局 idle mask 的 verifier 引用；per-node/禁用/无 scheduler 时返回空 mask。 */
 __bpf_kfunc const struct cpumask *scx_bpf_get_idle_cpumask(const struct bpf_prog_aux *aux)
 {
 	struct scx_sched *sch;
@@ -1175,6 +1237,7 @@ __bpf_kfunc const struct cpumask *scx_bpf_get_idle_cpumask(const struct bpf_prog
  * not valid, or running on a UP kernel. In this case the actual error will
  * be reported to the BPF scheduler via scx_error().
  */
+/* 获取指定 node 的全闲 SMT mask；无 SMT 时返回该 node 的逻辑 idle mask。 */
 __bpf_kfunc const struct cpumask *
 scx_bpf_get_idle_smtmask_node(s32 node, const struct bpf_prog_aux *aux)
 {
@@ -1205,6 +1268,7 @@ scx_bpf_get_idle_smtmask_node(s32 node, const struct bpf_prog_aux *aux)
  * Returns an empty mask if idle tracking is not enabled, or running on a
  * UP kernel.
  */
+/* 获取全局全闲 SMT mask；无 SMT 时退回逻辑 idle mask，错误返回空 mask。 */
 __bpf_kfunc const struct cpumask *scx_bpf_get_idle_smtmask(const struct bpf_prog_aux *aux)
 {
 	struct scx_sched *sch;
@@ -1234,6 +1298,7 @@ __bpf_kfunc const struct cpumask *scx_bpf_get_idle_smtmask(const struct bpf_prog
  * either the percpu, or SMT idle-tracking cpumask.
  * @idle_mask: &cpumask to use
  */
+/* 结束 verifier 的 acquire 生命周期；全局 mask 永久存在，运行时无需真正 put。 */
 __bpf_kfunc void scx_bpf_put_idle_cpumask(const struct cpumask *idle_mask)
 {
 	/*
@@ -1255,6 +1320,7 @@ __bpf_kfunc void scx_bpf_put_idle_cpumask(const struct cpumask *idle_mask)
  * Unavailable if ops.update_idle() is implemented and
  * %SCX_OPS_KEEP_BUILTIN_IDLE is not set.
  */
+/* 校验调用 scheduler 与 CPU 后尝试领取 idle 位；成功 true，任一条件失败 false。 */
 __bpf_kfunc bool scx_bpf_test_and_clear_cpu_idle(s32 cpu, const struct bpf_prog_aux *aux)
 {
 	struct scx_sched *sch;
@@ -1294,6 +1360,7 @@ __bpf_kfunc bool scx_bpf_test_and_clear_cpu_idle(s32 cpu, const struct bpf_prog_
  * %SCX_OPS_KEEP_BUILTIN_IDLE is not set, or if
  * %SCX_OPS_BUILTIN_IDLE_PER_NODE is not set.
  */
+/* 校验 node 后在允许集合中领取 idle CPU；成功返回 CPU，失败返回具体 errno。 */
 __bpf_kfunc s32 scx_bpf_pick_idle_cpu_node(const struct cpumask *cpus_allowed,
 					   s32 node, u64 flags,
 					   const struct bpf_prog_aux *aux)
@@ -1336,6 +1403,7 @@ __bpf_kfunc s32 scx_bpf_pick_idle_cpu_node(const struct cpumask *cpus_allowed,
  * Always returns an error if %SCX_OPS_BUILTIN_IDLE_PER_NODE is set, use
  * scx_bpf_pick_idle_cpu_node() instead.
  */
+/* 全局模式领取 idle CPU；per-node 模式或跟踪关闭时返回 -EBUSY。 */
 __bpf_kfunc s32 scx_bpf_pick_idle_cpu(const struct cpumask *cpus_allowed,
 				      u64 flags, const struct bpf_prog_aux *aux)
 {
@@ -1380,6 +1448,7 @@ __bpf_kfunc s32 scx_bpf_pick_idle_cpu(const struct cpumask *cpus_allowed,
  * set, this function can't tell which CPUs are idle and will always pick any
  * CPU.
  */
+/* 优先领取 node 内 idle CPU，无候选时分散选择任意允许 CPU；空集合 -EBUSY。 */
 __bpf_kfunc s32 scx_bpf_pick_any_cpu_node(const struct cpumask *cpus_allowed,
 					  s32 node, u64 flags,
 					  const struct bpf_prog_aux *aux)
@@ -1429,6 +1498,7 @@ __bpf_kfunc s32 scx_bpf_pick_any_cpu_node(const struct cpumask *cpus_allowed,
  * Always returns an error if %SCX_OPS_BUILTIN_IDLE_PER_NODE is set, use
  * scx_bpf_pick_any_cpu_node() instead.
  */
+/* 全局模式优先 idle、再任选允许 CPU；per-node 模式拒绝，空集合 -EBUSY。 */
 __bpf_kfunc s32 scx_bpf_pick_any_cpu(const struct cpumask *cpus_allowed,
 				     u64 flags, const struct bpf_prog_aux *aux)
 {
@@ -1504,6 +1574,7 @@ static const struct btf_kfunc_id_set scx_kfunc_set_select_cpu = {
 	.filter			= scx_kfunc_context_filter,
 };
 
+/* 为允许的 BPF program type 注册 idle/select_cpu kfunc 集；首个失败 errno 终止链。 */
 int scx_idle_init(void)
 {
 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &scx_kfunc_set_idle) ?:

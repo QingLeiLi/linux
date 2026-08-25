@@ -6,6 +6,13 @@
  *
  * Copyright(C) 2007, Red Hat, Inc., Ingo Molnar
  */
+/*
+ * 本文件是调度器的只读诊断面与少量 debugfs 控制面。输出路径把同一套
+ * SEQ_printf 同时用于 seq_file 和 SysRq 控制台；展示的是逐字段即时快照，
+ * 除显式持 rq 锁复制的红黑树边界外，不保证所有字段来自同一时刻。
+ * 写路径先解析并验证用户输入，再在 CPU hotplug、domain mutex 或 rq 锁的
+ * 对应保护下发布配置；失败必须保持旧配置或返回明确 errno。
+ */
 #include <linux/debugfs.h>
 #include <linux/nmi.h>
 #include <linux/log2.h>
@@ -26,6 +33,7 @@
 /*
  * Ease the printing of nsec fields:
  */
+/* 将有符号纳秒的整数微秒部分取出，供 SPLIT_NS 保持负值打印符号。 */
 static long long nsec_high(unsigned long long nsec)
 {
 	if ((long long)nsec < 0) {
@@ -38,6 +46,7 @@ static long long nsec_high(unsigned long long nsec)
 	return nsec;
 }
 
+/* 返回纳秒绝对值除以一百万后的六位余数，与 nsec_high() 配对显示。 */
 static unsigned long nsec_low(unsigned long long nsec)
 {
 	if ((long long)nsec < 0)
@@ -57,6 +66,7 @@ static const char * const sched_feat_names[] = {
 
 #undef SCHED_FEAT
 
+/* 将所有调度 feature 及 NO_ 前缀写到 @m；@v 未使用，成功恒返回 0。 */
 static int sched_feat_show(struct seq_file *m, void *v)
 {
 	int i;
@@ -85,20 +95,25 @@ struct static_key sched_feat_keys[__SCHED_FEAT_NR] = {
 
 #undef SCHED_FEAT
 
+/* CPU 热插拔读锁下关闭第 @i 个 static key，使 feature 位与跳转标签一致。 */
 static void sched_feat_disable(int i)
 {
 	static_key_disable_cpuslocked(&sched_feat_keys[i]);
 }
 
+/* CPU 热插拔读锁下开启第 @i 个 static key；无直接返回值。 */
 static void sched_feat_enable(int i)
 {
 	static_key_enable_cpuslocked(&sched_feat_keys[i]);
 }
 #else /* !CONFIG_JUMP_LABEL: */
+/* 无 JUMP_LABEL 时位图本身就是唯一状态，静态键同步为空操作。 */
 static void sched_feat_disable(int i) { };
+/* 与上面的关闭 stub 对称，@i 不产生副作用。 */
 static void sched_feat_enable(int i) { };
 #endif /* !CONFIG_JUMP_LABEL */
 
+/* 解析可选 NO_ 的 feature 名，更新位图及静态键；未知名称返回负 errno。 */
 static int sched_feat_set(char *cmp)
 {
 	int i;
@@ -124,6 +139,10 @@ static int sched_feat_set(char *cmp)
 	return 0;
 }
 
+/*
+ * 从用户缓冲区截取至多 63 字节并原子更新 feature 位与 static key；
+ * inode 锁串行写者，cpus_read_lock 稳定 static-key CPU 集，成功返回消费字节数。
+ */
 static ssize_t
 sched_feat_write(struct file *filp, const char __user *ubuf,
 		size_t cnt, loff_t *ppos)
@@ -157,6 +176,7 @@ sched_feat_write(struct file *filp, const char __user *ubuf,
 	return cnt;
 }
 
+/* 为 sched_features 建立 single_open seq_file；返回分配结果或负 errno。 */
 static int sched_feat_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, sched_feat_show, NULL);
@@ -170,6 +190,7 @@ static const struct file_operations sched_feat_fops = {
 	.release	= single_release,
 };
 
+/* 写入 tunable scaling 枚举；越界或全局重算失败返回 -EINVAL，成功消费 @cnt。 */
 static ssize_t sched_scaling_write(struct file *filp, const char __user *ubuf,
 				   size_t cnt, loff_t *ppos)
 {
@@ -191,12 +212,14 @@ static ssize_t sched_scaling_write(struct file *filp, const char __user *ubuf,
 	return cnt;
 }
 
+/* 输出当前 scaling 枚举；读取是瞬时值，不冻结并发写者。 */
 static int sched_scaling_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "%d\n", sysctl_sched_tunable_scaling);
 	return 0;
 }
 
+/* 把 scaling show 回调绑定到 @filp，失败返回 single_open 的 errno。 */
 static int sched_scaling_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, sched_scaling_show, NULL);
@@ -211,6 +234,7 @@ static const struct file_operations sched_scaling_fops = {
 };
 
 #ifdef CONFIG_SCHED_CACHE
+/* 解析布尔输入并重算 cache active 状态；解析失败不修改全局请求值。 */
 static ssize_t
 sched_cache_enable_write(struct file *filp, const char __user *ubuf,
 			 size_t cnt, loff_t *ppos)
@@ -231,12 +255,14 @@ sched_cache_enable_write(struct file *filp, const char __user *ubuf,
 	return cnt;
 }
 
+/* 输出用户请求的 sched cache 开关，不等同于所有运行时条件均已满足。 */
 static int sched_cache_enable_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "%d\n", sysctl_sched_cache_user);
 	return 0;
 }
 
+/* 建立 cache enable 的 single_open 文件上下文。 */
 static int sched_cache_enable_open(struct inode *inode,
 				   struct file *filp)
 {
@@ -254,6 +280,7 @@ static const struct file_operations sched_cache_enable_fops = {
 
 #ifdef CONFIG_PREEMPT_DYNAMIC
 
+/* 解析 preemption 模式名并调用全局动态补丁入口；非法字符串返回负 errno。 */
 static ssize_t sched_dynamic_write(struct file *filp, const char __user *ubuf,
 				   size_t cnt, loff_t *ppos)
 {
@@ -278,6 +305,7 @@ static ssize_t sched_dynamic_write(struct file *filp, const char __user *ubuf,
 	return cnt;
 }
 
+/* 枚举本配置支持的抢占模式，并用括号标出 READ_ONCE 取得的当前模式。 */
 static int sched_dynamic_show(struct seq_file *m, void *v)
 {
 	int i = (IS_ENABLED(CONFIG_PREEMPT_RT) || IS_ENABLED(CONFIG_ARCH_HAS_PREEMPT_LAZY)) * 2;
@@ -303,6 +331,7 @@ static int sched_dynamic_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/* 为动态抢占状态建立 single_open 读取上下文。 */
 static int sched_dynamic_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, sched_dynamic_show, NULL);
@@ -323,6 +352,10 @@ __read_mostly bool sched_debug_verbose;
 static struct dentry           *sd_dentry;
 
 
+/*
+ * 在 CPU hotplug 读锁与 sched_domains_mutex 下切换 verbose；0→1 重建
+ * domain debugfs，1→0 摘除整棵目录，返回 debugfs bool 写入结果。
+ */
 static ssize_t sched_verbose_write(struct file *filp, const char __user *ubuf,
 				  size_t cnt, loff_t *ppos)
 {
@@ -357,6 +390,7 @@ static const struct file_operations sched_verbose_fops = {
 
 static const struct seq_operations sched_debug_sops;
 
+/* 建立遍历 header 加 online CPU 的 seq_file；返回 seq_open 结果。 */
 static int sched_debug_open(struct inode *inode, struct file *filp)
 {
 	return seq_open(filp, &sched_debug_sops);
@@ -377,6 +411,10 @@ enum dl_param {
 static unsigned long dl_server_period_max = (1UL << 22) * NSEC_PER_USEC; /* ~4 seconds */
 static unsigned long dl_server_period_min = (100) * NSEC_PER_USEC;     /* 100 us */
 
+/*
+ * 修改指定 CPU 的 fair/ext deadline server runtime 或 period；rq irqsave 锁
+ * 串行 stop→apply→start，范围、runtime<=period、CPU online 任一失败均返回 errno。
+ */
 static ssize_t sched_server_write_common(struct file *filp, const char __user *ubuf,
 					 size_t cnt, loff_t *ppos, enum dl_param param,
 					 void *server)
@@ -440,6 +478,7 @@ static ssize_t sched_server_write_common(struct file *filp, const char __user *u
 	return cnt;
 }
 
+/* 输出 server 的 runtime 或 period 纳秒；返回 0，值是无锁诊断快照。 */
 static size_t sched_server_show_common(struct seq_file *m, void *v, enum dl_param param,
 				       void *server)
 {
@@ -459,6 +498,7 @@ static size_t sched_server_show_common(struct seq_file *m, void *v, enum dl_para
 	return 0;
 }
 
+/* 将 fair server runtime 写请求转交共同校验/加锁实现。 */
 static ssize_t
 sched_fair_server_runtime_write(struct file *filp, const char __user *ubuf,
 				size_t cnt, loff_t *ppos)
@@ -470,6 +510,7 @@ sched_fair_server_runtime_write(struct file *filp, const char __user *ubuf,
 					&rq->fair_server);
 }
 
+/* 输出 @m 私有 CPU 的 fair server runtime。 */
 static int sched_fair_server_runtime_show(struct seq_file *m, void *v)
 {
 	unsigned long cpu = (unsigned long) m->private;
@@ -478,6 +519,7 @@ static int sched_fair_server_runtime_show(struct seq_file *m, void *v)
 	return sched_server_show_common(m, v, DL_RUNTIME, &rq->fair_server);
 }
 
+/* 以 inode 私有 CPU 号建立 fair runtime single_open 上下文。 */
 static int sched_fair_server_runtime_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, sched_fair_server_runtime_show, inode->i_private);
@@ -494,6 +536,7 @@ static const struct file_operations fair_server_runtime_fops = {
 static struct dentry *debugfs_sched;
 
 #ifdef CONFIG_SCHED_CLASS_EXT
+/* 将 ext server runtime 写请求转交共同校验/加锁实现。 */
 static ssize_t
 sched_ext_server_runtime_write(struct file *filp, const char __user *ubuf,
 			       size_t cnt, loff_t *ppos)
@@ -505,6 +548,7 @@ sched_ext_server_runtime_write(struct file *filp, const char __user *ubuf,
 					&rq->ext_server);
 }
 
+/* 输出 @m 私有 CPU 的 ext server runtime 纳秒。 */
 static int sched_ext_server_runtime_show(struct seq_file *m, void *v)
 {
 	unsigned long cpu = (unsigned long) m->private;
@@ -513,6 +557,7 @@ static int sched_ext_server_runtime_show(struct seq_file *m, void *v)
 	return sched_server_show_common(m, v, DL_RUNTIME, &rq->ext_server);
 }
 
+/* 建立 ext runtime 的 single_open 上下文。 */
 static int sched_ext_server_runtime_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, sched_ext_server_runtime_show, inode->i_private);
@@ -526,6 +571,7 @@ static const struct file_operations ext_server_runtime_fops = {
 	.release	= single_release,
 };
 
+/* 将 ext server period 写请求转交共同校验/加锁实现。 */
 static ssize_t
 sched_ext_server_period_write(struct file *filp, const char __user *ubuf,
 			      size_t cnt, loff_t *ppos)
@@ -537,6 +583,7 @@ sched_ext_server_period_write(struct file *filp, const char __user *ubuf,
 					&rq->ext_server);
 }
 
+/* 输出 @m 私有 CPU 的 ext server period 纳秒。 */
 static int sched_ext_server_period_show(struct seq_file *m, void *v)
 {
 	unsigned long cpu = (unsigned long) m->private;
@@ -545,6 +592,7 @@ static int sched_ext_server_period_show(struct seq_file *m, void *v)
 	return sched_server_show_common(m, v, DL_PERIOD, &rq->ext_server);
 }
 
+/* 建立 ext period 的 single_open 上下文。 */
 static int sched_ext_server_period_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, sched_ext_server_period_show, inode->i_private);
@@ -558,6 +606,7 @@ static const struct file_operations ext_server_period_fops = {
 	.release	= single_release,
 };
 
+/* 为每个 possible CPU 创建 ext server runtime/period 节点；目录失败则安静退化。 */
 static void debugfs_ext_server_init(void)
 {
 	struct dentry *d_ext;
@@ -580,6 +629,7 @@ static void debugfs_ext_server_init(void)
 }
 #endif /* CONFIG_SCHED_CLASS_EXT */
 
+/* 将 fair server period 写请求转交共同校验/加锁实现。 */
 static ssize_t
 sched_fair_server_period_write(struct file *filp, const char __user *ubuf,
 			       size_t cnt, loff_t *ppos)
@@ -591,6 +641,7 @@ sched_fair_server_period_write(struct file *filp, const char __user *ubuf,
 					&rq->fair_server);
 }
 
+/* 输出 @m 私有 CPU 的 fair server period 纳秒。 */
 static int sched_fair_server_period_show(struct seq_file *m, void *v)
 {
 	unsigned long cpu = (unsigned long) m->private;
@@ -599,6 +650,7 @@ static int sched_fair_server_period_show(struct seq_file *m, void *v)
 	return sched_server_show_common(m, v, DL_PERIOD, &rq->fair_server);
 }
 
+/* 以 inode 私有 CPU 号建立 fair period single_open 上下文。 */
 static int sched_fair_server_period_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, sched_fair_server_period_show, inode->i_private);
@@ -612,6 +664,7 @@ static const struct file_operations fair_server_period_fops = {
 	.release	= single_release,
 };
 
+/* 为每个 possible CPU 创建 fair server runtime/period 节点；不持有 dentry 引用。 */
 static void debugfs_fair_server_init(void)
 {
 	struct dentry *d_fair;
@@ -633,6 +686,7 @@ static void debugfs_fair_server_init(void)
 	}
 }
 
+/* late init 阶段创建 sched debugfs 树；单个节点失败不阻止其余诊断接口。 */
 static __init int sched_init_debug(void)
 {
 	struct dentry __maybe_unused *numa, *llc;
@@ -697,6 +751,7 @@ late_initcall(sched_init_debug);
 
 static cpumask_var_t		sd_sysctl_cpus;
 
+/* 把 inode 私有的 sched-domain flags 位图展开成名称列表。 */
 static int sd_flags_show(struct seq_file *m, void *v)
 {
 	unsigned long flags = *(unsigned int *)m->private;
@@ -711,6 +766,7 @@ static int sd_flags_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/* 将 sched-domain flags 地址作为 single_open 私有数据传给 show。 */
 static int sd_flags_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, sd_flags_show, inode->i_private);
@@ -723,6 +779,7 @@ static const struct file_operations sd_flags_fops = {
 	.release	= single_release,
 };
 
+/* 在 @parent 下暴露 @sd 的可调字段和只读拓扑字段；仅借用 sd/dentry。 */
 static void register_sd(struct sched_domain *sd, struct dentry *parent)
 {
 #define SDM(type, mode, member)	\
@@ -747,6 +804,10 @@ static void register_sd(struct sched_domain *sd, struct dentry *parent)
 				   (u32 *)&sd->groups->asym_prefer_cpu);
 }
 
+/*
+ * 重建被 dirty CPU 的 domain debugfs 子树；调用者持 hotplug/domain 串行化，
+ * 未初始化、verbose 关闭或 cpumask 分配失败时保留待办并直接返回。
+ */
 void update_sched_domain_debugfs(void)
 {
 	int cpu, i;
@@ -799,6 +860,7 @@ void update_sched_domain_debugfs(void)
 	}
 }
 
+/* 将 @cpu 标成 domain debugfs 待重建；cpumask 尚未分配时无需记录。 */
 void dirty_sched_domain_sysctl(int cpu)
 {
 	if (cpumask_available(sd_sysctl_cpus))
@@ -806,6 +868,7 @@ void dirty_sched_domain_sysctl(int cpu)
 }
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
+/* 输出 @tg 在 @cpu 的 sched_entity 与可选 schedstats；无实体时为空输出。 */
 static void print_cfs_group_stats(struct seq_file *m, int cpu, struct task_group *tg)
 {
 	struct sched_entity *se = tg_se(tg, cpu);
@@ -856,6 +919,7 @@ static void print_cfs_group_stats(struct seq_file *m, int cpu, struct task_group
 static DEFINE_SPINLOCK(sched_debug_lock);
 static char group_path[PATH_MAX];
 
+/* 优先生成 autogroup 路径，否则写入 cgroup 路径；@path 由调用者提供。 */
 static void task_group_path(struct task_group *tg, char *path, int plen)
 {
 	if (autogroup_path(tg, path, plen))
@@ -887,6 +951,7 @@ static void task_group_path(struct task_group *tg, char *path, int plen)
 }
 #endif
 
+/* 输出一个 task 的状态、EEVDF、运行时间、切换、NUMA 与 cgroup 列；不取得引用。 */
 static void
 print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
 {
@@ -921,6 +986,10 @@ print_task(struct seq_file *m, struct rq *rq, struct task_struct *p)
 	SEQ_printf(m, "\n");
 }
 
+/*
+ * 遍历全局 tasklist 并输出当前标记在 @rq_cpu 的任务；RCU 只保证 task
+ * 生命周期，字段会并发变化，因此各行是诊断快照而非原子队列转储。
+ */
 static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 {
 	struct task_struct *g, *p;
@@ -958,6 +1027,10 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 	rcu_read_unlock();
 }
 
+/*
+ * 输出 CFS rq 的树边界、加权平均与 PELT/带宽字段；树节点先在 rq 锁下
+ * 复制，解锁后打印，其他统计允许稍有时差以避免长时间持锁。
+ */
 void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 {
 	s64 left_vruntime = -1, right_vruntime = -1, left_deadline = -1, spread;
@@ -1048,6 +1121,7 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 #endif
 }
 
+/* 输出 RT rq 的 runnable 数及组调度限流字段；不修改队列。 */
 void print_rt_rq(struct seq_file *m, int cpu, struct rt_rq *rt_rq)
 {
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -1078,6 +1152,7 @@ void print_rt_rq(struct seq_file *m, int cpu, struct rt_rq *rt_rq)
 #undef P
 }
 
+/* 输出 DL runnable 数和 root-domain 带宽快照；@dl_rq 仅借用。 */
 void print_dl_rq(struct seq_file *m, int cpu, struct dl_rq *dl_rq)
 {
 	struct dl_bw *dl_bw;
@@ -1096,6 +1171,7 @@ void print_dl_rq(struct seq_file *m, int cpu, struct dl_rq *dl_rq)
 #undef PU
 }
 
+/* 汇总 @cpu 的 rq 时钟、调度类统计和 runnable task；@m 为 NULL 时写控制台。 */
 static void print_cpu(struct seq_file *m, int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
@@ -1161,6 +1237,7 @@ static const char *sched_tunable_scaling_names[] = {
 	"linear"
 };
 
+/* 关本地中断取得三种时钟样本并输出全局调度开关；不保证与后续 CPU 行同刻。 */
 static void sched_debug_header(struct seq_file *m)
 {
 	u64 ktime, sched_clk, cpu_clk;
@@ -1210,6 +1287,7 @@ static void sched_debug_header(struct seq_file *m)
 	SEQ_printf(m, "\n");
 }
 
+/* seq 位置 1 输出 header，其余编码为 CPU+2；成功恒返回 0。 */
 static int sched_debug_show(struct seq_file *m, void *v)
 {
 	int cpu = (unsigned long)(v - 2);
@@ -1222,6 +1300,7 @@ static int sched_debug_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/* SysRq 控制台入口：输出 header 和所有在线 CPU，并触碰 watchdog 避免长转储误报。 */
 void sysrq_sched_debug_show(void)
 {
 	int cpu;
@@ -1246,6 +1325,10 @@ void sysrq_sched_debug_show(void)
  * In a hotplugged system some CPUs, including CPU 0, may be missing so we have
  * to use cpumask_* to iterate over the CPUs.
  */
+/*
+ * 位置 0 返回 header 哨兵 1，位置 CPU+1 返回编码 CPU+2；用 online mask
+ * 跳过热拔插造成的洞，越过 nr_cpu_ids 时返回 NULL 结束迭代。
+ */
 static void *sched_debug_start(struct seq_file *file, loff_t *offset)
 {
 	unsigned long n = *offset;
@@ -1268,12 +1351,14 @@ static void *sched_debug_start(struct seq_file *file, loff_t *offset)
 	return NULL;
 }
 
+/* 推进 offset 后复用 start 的 hotplug-aware CPU 查找；末尾返回 NULL。 */
 static void *sched_debug_next(struct seq_file *file, void *data, loff_t *offset)
 {
 	(*offset)++;
 	return sched_debug_start(file, offset);
 }
 
+/* 迭代器未取得长期锁或引用，stop 无需释放资源。 */
 static void sched_debug_stop(struct seq_file *file, void *data)
 {
 }
@@ -1295,6 +1380,7 @@ static const struct seq_operations sched_debug_sops = {
 
 
 #ifdef CONFIG_NUMA_BALANCING
+/* 输出单 NUMA node 的 task/group 私有与共享 fault 计数。 */
 void print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
 		unsigned long tpf, unsigned long gsf, unsigned long gpf)
 {
@@ -1305,6 +1391,7 @@ void print_numa_stats(struct seq_file *m, int node, unsigned long tsf,
 #endif
 
 
+/* 配置启用时输出 @p 的 NUMA 扫描、迁移和分组快照；关闭时为空操作。 */
 static void sched_show_numa(struct task_struct *p, struct seq_file *m)
 {
 #ifdef CONFIG_NUMA_BALANCING
@@ -1320,6 +1407,10 @@ static void sched_show_numa(struct task_struct *p, struct seq_file *m)
 #endif /* CONFIG_NUMA_BALANCING */
 }
 
+/*
+ * 为 /proc/PID/sched 输出 @p 在 @ns 可见的身份、EEVDF/PELT、切换、
+ * schedstats、uclamp 与 NUMA 字段；调用者稳定 task，输出字段允许并发更新。
+ */
 void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 						  struct seq_file *m)
 {
@@ -1441,6 +1532,7 @@ void proc_sched_show_task(struct task_struct *p, struct pid_namespace *ns,
 	sched_show_numa(p, m);
 }
 
+/* exec 等重置点清零 @p 的可选 schedstats；无配置时不产生副作用。 */
 void proc_sched_set_task(struct task_struct *p)
 {
 #ifdef CONFIG_SCHEDSTATS
@@ -1448,6 +1540,7 @@ void proc_sched_set_task(struct task_struct *p)
 #endif
 }
 
+/* need_resched 长期未调度时按小时限速打印 @cpu/@latency 并转储栈。 */
 void resched_latency_warn(int cpu, u64 latency)
 {
 	static DEFINE_RATELIMIT_STATE(latency_check_ratelimit, 60 * 60 * HZ, 1);

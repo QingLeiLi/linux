@@ -24,6 +24,16 @@
 #include "pelt.h"
 
 /*
+ * SCHED_DEADLINE 把每个实体建模为 CBS 服务器：runtime 是每个 period 可消费的
+ * 预算，absolute deadline 同时是 EDF 红黑树的排序键。rq 锁保护实体的排队、
+ * 预算和 timer 状态；root_domain 的 dl_bw 锁负责跨 CPU 的准入总量。任务用尽
+ * 预算后被 throttle，由 replenish timer 推进 deadline 并恢复 runtime；SMP
+ * push/pull 只把 cpupri/cpudl 候选当提示，迁移前必须双 rq 加锁并重新验证。
+ * inactive timer 延迟归还仍可能被任务再次消费的带宽，避免睡眠/迁移窗口破坏
+ * GRUB 记账；PI boost 则借用等待者的 deadline，但不能绕过带宽所有权。
+ */
+
+/*
  * Default limits for DL period; on the top end we guard against small util
  * tasks still getting ridiculously long effective runtimes, on the bottom end we
  * guard against timer DoS.
@@ -50,6 +60,7 @@ static const struct ctl_table sched_dl_sysctls[] = {
 	},
 };
 
+/* 注册 period 上下界；边界互相引用，用户写入不可能形成反向区间。 */
 static int __init sched_dl_sysctl_init(void)
 {
 	register_sysctl_init("kernel", sched_dl_sysctls);
@@ -58,11 +69,13 @@ static int __init sched_dl_sysctl_init(void)
 late_initcall(sched_dl_sysctl_init);
 #endif /* CONFIG_SYSCTL */
 
+/* dl_rq 内嵌于 rq，返回值仅借用，访问可变字段仍需持 rq 锁。 */
 static inline struct rq *rq_of_dl_rq(struct dl_rq *dl_rq)
 {
 	return container_of(dl_rq, struct rq, dl);
 }
 
+/* server 记录所属 rq，普通任务则以 task_rq() 为准，覆盖迁移后的归属。 */
 static inline struct rq *rq_of_dl_se(struct sched_dl_entity *dl_se)
 {
 	struct rq *rq = dl_se->rq;
@@ -78,6 +91,7 @@ static inline struct dl_rq *dl_rq_of_se(struct sched_dl_entity *dl_se)
 	return &rq_of_dl_se(dl_se)->dl;
 }
 
+/* RB 节点非空表示实体已链接 EDF 树，不等同于当前正在执行。 */
 static inline int on_dl_rq(struct sched_dl_entity *dl_se)
 {
 	return !RB_EMPTY_NODE(&dl_se->rb_node);
@@ -118,6 +132,7 @@ static inline u8 dl_get_type(struct sched_dl_entity *dl_se, struct rq *rq)
 	return DL_OTHER;
 }
 
+/* root_domain 可由拓扑重建替换，调用者必须处于 sched RCU 读侧。 */
 static inline struct dl_bw *dl_bw_of(int i)
 {
 	RCU_LOCKDEP_WARN(!rcu_read_lock_sched_held(),
@@ -150,6 +165,7 @@ static inline unsigned long __dl_bw_capacity(const struct cpumask *mask)
  * XXX Fix: If 'rq->rd == def_root_domain' perform AC against capacity
  * of the CPU the task is running on rather rd's \Sum CPU capacity.
  */
+/* 对称机器用 CPU 数快算，否则累加实际 capacity 作为准入分母。 */
 static inline unsigned long dl_bw_capacity(int i)
 {
 	if (!sched_asym_cpucap_active() &&
@@ -163,6 +179,7 @@ static inline unsigned long dl_bw_capacity(int i)
 	}
 }
 
+/* 用 root_domain cookie 去重跨 CPU 遍历；调用方负责 cookie 的本轮唯一性。 */
 bool dl_bw_visited(int cpu, u64 cookie)
 {
 	struct root_domain *rd = cpu_rq(cpu)->rd;
@@ -175,6 +192,7 @@ bool dl_bw_visited(int cpu, u64 cookie)
 }
 
 static inline
+/* 在 sched RCU 下把 root_domain 带宽变化摊入各活动 rq 的可回收余量。 */
 void __dl_update(struct dl_bw *dl_b, s64 bw)
 {
 	struct root_domain *rd = container_of(dl_b, struct root_domain, dl_bw);
@@ -203,6 +221,7 @@ void __dl_add(struct dl_bw *dl_b, u64 tsk_bw, int cpus)
 	__dl_update(dl_b, -((s32)tsk_bw / cpus));
 }
 
+/* 比较替换 old_bw 后的总量与容量上限；bw==-1 明确表示关闭准入限制。 */
 static inline bool
 __dl_overflow(struct dl_bw *dl_b, unsigned long cap, u64 old_bw, u64 new_bw)
 {
@@ -210,6 +229,7 @@ __dl_overflow(struct dl_bw *dl_b, unsigned long cap, u64 old_bw, u64 new_bw)
 	       cap_scale(dl_b->bw, cap) < dl_b->total_bw - old_bw + new_bw;
 }
 
+/* running_bw 只统计当前可运行实体，必须在 rq 锁下修改并通知 cpufreq。 */
 static inline
 void __add_running_bw(u64 dl_bw, struct dl_rq *dl_rq)
 {
@@ -223,6 +243,7 @@ void __add_running_bw(u64 dl_bw, struct dl_rq *dl_rq)
 	cpufreq_update_util(rq_of_dl_rq(dl_rq), 0);
 }
 
+/* 下溢时钳位为 0，避免损坏值继续传播到 reclaim/cpufreq。 */
 static inline
 void __sub_running_bw(u64 dl_bw, struct dl_rq *dl_rq)
 {
@@ -237,6 +258,7 @@ void __sub_running_bw(u64 dl_bw, struct dl_rq *dl_rq)
 	cpufreq_update_util(rq_of_dl_rq(dl_rq), 0);
 }
 
+/* this_bw 是该 rq 拥有的全部保留量，包括暂时不运行的实体。 */
 static inline
 void __add_rq_bw(u64 dl_bw, struct dl_rq *dl_rq)
 {
@@ -247,6 +269,7 @@ void __add_rq_bw(u64 dl_bw, struct dl_rq *dl_rq)
 	WARN_ON_ONCE(dl_rq->this_bw < old); /* overflow */
 }
 
+/* 归还 rq 保留量并校验 running_bw 不超过所有权总量。 */
 static inline
 void __sub_rq_bw(u64 dl_bw, struct dl_rq *dl_rq)
 {
@@ -288,6 +311,7 @@ void sub_running_bw(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq)
 		__sub_running_bw(dl_se->dl_bw, dl_rq);
 }
 
+/* 修改 reservation 前取消 0-lag 延迟状态，并原子替换 rq 的 this_bw。 */
 static void dl_rq_change_utilization(struct rq *rq, struct sched_dl_entity *dl_se, u64 new_bw)
 {
 	if (dl_se->dl_non_contending) {
@@ -310,6 +334,7 @@ static void dl_rq_change_utilization(struct rq *rq, struct sched_dl_entity *dl_s
 	__add_rq_bw(new_bw, &rq->dl);
 }
 
+/* try_to_cancel 返回 1 才由本路径释放任务引用；回调运行中则由回调释放。 */
 static __always_inline
 void cancel_dl_timer(struct sched_dl_entity *dl_se, struct hrtimer *timer)
 {
@@ -333,6 +358,7 @@ void cancel_inactive_timer(struct sched_dl_entity *dl_se)
 	cancel_dl_timer(dl_se, &dl_se->inactive_timer);
 }
 
+/* 仅离队任务可直接改带宽；在队任务由 dequeue/enqueue 路径维护一致性。 */
 static void dl_change_utilization(struct task_struct *p, u64 new_bw)
 {
 	WARN_ON_ONCE(p->dl.flags & SCHED_FLAG_SUGOV);
@@ -399,6 +425,7 @@ static void __dl_clear_params(struct sched_dl_entity *dl_se);
  * up, and checks if the task is still in the "ACTIVE non contending"
  * state or not (in the second case, it updates running_bw).
  */
+/* 阻塞时到 0-lag 才移出 running_bw；此前由 inactive timer 延迟归还。 */
 static void task_non_contending(struct sched_dl_entity *dl_se, bool dl_task)
 {
 	struct hrtimer *timer = &dl_se->inactive_timer;
@@ -463,6 +490,7 @@ static void task_non_contending(struct sched_dl_entity *dl_se, bool dl_task)
 	hrtimer_start(timer, ns_to_ktime(zerolag_time), HRTIMER_MODE_REL_HARD);
 }
 
+/* 唤醒与 timer 用 dl_non_contending 交接，保证 running_bw 只恢复一次。 */
 static void task_contending(struct sched_dl_entity *dl_se, int flags)
 {
 	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
@@ -506,6 +534,7 @@ static inline int is_leftmost(struct sched_dl_entity *dl_se, struct dl_rq *dl_rq
 
 static void init_dl_rq_bw_ratio(struct dl_rq *dl_rq);
 
+/* root_domain 的 DL 上限沿用全局 RT 配额；无限 RT runtime 关闭准入限制。 */
 void init_dl_bw(struct dl_bw *dl_b)
 {
 	raw_spin_lock_init(&dl_b->lock);
@@ -516,6 +545,7 @@ void init_dl_bw(struct dl_bw *dl_b)
 	dl_b->total_bw = 0;
 }
 
+/* 初始化 EDF 树、可迁移树和带宽计数；0 deadline 表示当前无实体。 */
 void init_dl_rq(struct dl_rq *dl_rq)
 {
 	dl_rq->root = RB_ROOT_CACHED;
@@ -536,6 +566,7 @@ static inline int dl_overloaded(struct rq *rq)
 	return atomic_read(&rq->rd->dlo_count);
 }
 
+/* 先发布 mask 再增加计数，与 pull 侧读屏障配对，避免漏扫过载 rq。 */
 static inline void dl_set_overload(struct rq *rq)
 {
 	if (!rq->online)
@@ -578,6 +609,7 @@ static inline int has_pushable_dl_tasks(struct rq *rq)
  * The list of pushable -deadline task is not a plist, like in
  * sched_rt.c, it is an rb-tree with tasks ordered by deadline.
  */
+/* 按 deadline 将非当前且可迁移任务加入 push 树，并发布 rq 过载状态。 */
 static void enqueue_pushable_dl_task(struct rq *rq, struct task_struct *p)
 {
 	struct rb_node *leftmost;
@@ -596,6 +628,7 @@ static void enqueue_pushable_dl_task(struct rq *rq, struct task_struct *p)
 	}
 }
 
+/* 删除 push 候选并刷新 next deadline；最后一项离开时清除过载标记。 */
 static void dequeue_pushable_dl_task(struct rq *rq, struct task_struct *p)
 {
 	struct dl_rq *dl_rq = &rq->dl;
@@ -721,6 +754,7 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags);
 static void dequeue_dl_entity(struct sched_dl_entity *dl_se, int flags);
 static void wakeup_preempt_dl(struct rq *rq, struct task_struct *p, int flags);
 
+/* 从当前 rq 时钟开始新实例，恢复完整预算；defer server 可先保持 throttle。 */
 static inline void replenish_dl_new_period(struct sched_dl_entity *dl_se,
 					    struct rq *rq)
 {
@@ -751,6 +785,7 @@ static inline void replenish_dl_new_period(struct sched_dl_entity *dl_se,
  * one, and to (try to!) reconcile itself with its own scheduling
  * parameters.
  */
+/* 显式开始新实例；若 replenish timer 正在接管则不与回调重复充值。 */
 static inline void setup_new_dl_entity(struct sched_dl_entity *dl_se)
 {
 	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
@@ -796,6 +831,7 @@ static bool dl_entity_overflow(struct sched_dl_entity *dl_se, u64 t);
  * could happen are, typically, a entity voluntarily trying to overcome its
  * runtime, or it just underestimated it during sched_setattr().
  */
+/* CBS 逐 period 前推 deadline/runtime，直到预算为正且 deadline 不落后于时钟。 */
 static void replenish_dl_entity(struct sched_dl_entity *dl_se)
 {
 	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
@@ -917,6 +953,7 @@ static void replenish_dl_entity(struct sched_dl_entity *dl_se)
  * task with deadline equal to period this is the same of using
  * dl_period instead of dl_deadline in the equation above.
  */
+/* 交叉相乘判断剩余预算密度是否超 reservation，避免除法与精度损失。 */
 static bool dl_entity_overflow(struct sched_dl_entity *dl_se, u64 t)
 {
 	u64 left, right;
@@ -1385,6 +1422,7 @@ static u64 grub_reclaim(u64 delta, struct rq *rq, struct sched_dl_entity *dl_se)
 	return (delta * u_act) >> BW_SHIFT;
 }
 
+/* reclaim 实体用 GRUB-PA，普通实体按频率和 CPU capacity 缩放预算消耗。 */
 s64 dl_scaled_delta_exec(struct rq *rq, struct sched_dl_entity *dl_se, s64 delta_exec)
 {
 	s64 scaled_delta_exec;
@@ -1413,6 +1451,7 @@ s64 dl_scaled_delta_exec(struct rq *rq, struct sched_dl_entity *dl_se, s64 delta
 static inline void
 update_stats_dequeue_dl(struct dl_rq *dl_rq, struct sched_dl_entity *dl_se, int flags);
 
+/* 扣减当前实体预算；超限时离队并启动补充 timer，yield 也走同一 throttle 出口。 */
 static void update_curr_dl_se(struct rq *rq, struct sched_dl_entity *dl_se, s64 delta_exec)
 {
 	bool idle = idle_rq(rq);
@@ -1575,12 +1614,14 @@ throttle:
  * time available for the dl_server, avoiding a penalty for the rt
  * scheduler that did not consumed that time.
  */
+/* defer server 把 idle 时间视为可用窗口，避免无工作时错误消耗实时保证。 */
 void dl_server_update_idle(struct sched_dl_entity *dl_se, s64 delta_exec)
 {
 	if (dl_se->dl_server_active && dl_se->dl_runtime && dl_se->dl_defer)
 		update_curr_dl_se(dl_se->rq, dl_se, delta_exec);
 }
 
+/* client class 运行时同步消耗其保护 server 的 CBS 预算。 */
 void dl_server_update(struct sched_dl_entity *dl_se, s64 delta_exec)
 {
 	/* 0 runtime = fair server disabled */
@@ -1792,6 +1833,7 @@ void dl_server_update(struct sched_dl_entity *dl_se, s64 delta_exec)
  *  - When idle it will push the actication forward once, and then wait
  *    for the timer to hit or a non-idle update to restart things.
  */
+/* 在 rq 锁下激活已附带宽的 server；必要时抢占较晚 deadline 的当前任务。 */
 void dl_server_start(struct sched_dl_entity *dl_se)
 {
 	struct rq *rq = dl_se->rq;
@@ -1816,6 +1858,7 @@ void dl_server_start(struct sched_dl_entity *dl_se)
 		resched_curr(dl_se->rq);
 }
 
+/* 停止 server、取消 timer 并清空 defer 状态，但保留配置与带宽附着。 */
 void dl_server_stop(struct sched_dl_entity *dl_se)
 {
 	if (!dl_server(dl_se) || !dl_server_active(dl_se))
@@ -1902,6 +1945,7 @@ void __dl_server_attach_root(struct sched_dl_entity *dl_se, struct rq *rq)
 	__dl_add(dl_b, new_bw, dl_bw_cpus(cpu));
 }
 
+/* 在 dl_bw 锁下先做准入，再同时替换 root_domain、rq 和实体参数。 */
 int dl_server_apply_params(struct sched_dl_entity *dl_se, u64 runtime, u64 period, bool init)
 {
 	u64 old_bw = (init || !dl_se->dl_bw_attached) ? 0 :
@@ -2025,6 +2069,7 @@ static void __dl_server_detach_bw_locked(struct sched_dl_entity *dl_se,
  *
  * Returns -EBUSY if attaching would overflow the root domain capacity.
  */
+/* 动态附着 reservation；溢出返回 -EBUSY，成功后补偿可能错过的启动边沿。 */
 int dl_server_attach_bw(struct sched_dl_entity *dl_se)
 {
 	struct rq *rq = dl_se->rq;
@@ -2066,6 +2111,7 @@ int dl_server_attach_bw(struct sched_dl_entity *dl_se)
  * preserving its configured @dl_runtime / @dl_period. No-op if @dl_se is
  * not currently attached.
  */
+/* 在同一 dl_bw 锁域停止 server 并归还 rq/root_domain 两级带宽。 */
 void dl_server_detach_bw(struct sched_dl_entity *dl_se)
 {
 	int cpu = cpu_of(dl_se->rq);
@@ -2090,6 +2136,7 @@ void dl_server_detach_bw(struct sched_dl_entity *dl_se)
  * result of the attach: -EBUSY if attaching @attach_se would overflow root
  * domain capacity (in which case both servers end up detached).
  */
+/* 同锁先 detach 后 attach，防止并发 sched_setattr 抢走刚释放的容量。 */
 int dl_server_swap_bw(struct sched_dl_entity *detach_se,
 		      struct sched_dl_entity *attach_se)
 {
@@ -2125,6 +2172,7 @@ int dl_server_swap_bw(struct sched_dl_entity *detach_se,
  * Update the current task's runtime statistics (provided it is still
  * a -deadline task and has not been removed from the dl_rq).
  */
+/* 仅当前 donor 仍为排队 DL 实体时扣预算；IRQ 时间不算执行但 deadline 走墙钟。 */
 static void update_curr_dl(struct rq *rq)
 {
 	struct task_struct *donor = rq->donor;
@@ -2146,6 +2194,7 @@ static void update_curr_dl(struct rq *rq)
 	update_curr_dl_se(rq, dl_se, delta_exec);
 }
 
+/* 0-lag 到期后在 rq 锁下移出 active utilization，并处理退出/改策略的最终归还。 */
 static enum hrtimer_restart inactive_task_timer(struct hrtimer *timer)
 {
 	struct sched_dl_entity *dl_se = container_of(timer,
@@ -2214,6 +2263,7 @@ static void init_dl_inactive_task_timer(struct sched_dl_entity *dl_se)
 #define __node_2_dle(node) \
 	rb_entry((node), struct sched_dl_entity, rb_node)
 
+/* 新最早 deadline 同步发布到 cpudl，并把 cpupri 提升到 DL 档。 */
 static void inc_dl_deadline(struct dl_rq *dl_rq, u64 deadline)
 {
 	struct rq *rq = rq_of_dl_rq(dl_rq);
@@ -2227,6 +2277,7 @@ static void inc_dl_deadline(struct dl_rq *dl_rq, u64 deadline)
 	}
 }
 
+/* 删除后从 EDF 树重算最早值；空队列同时清除 cpudl 并恢复 RT 优先级。 */
 static void dec_dl_deadline(struct dl_rq *dl_rq, u64 deadline)
 {
 	struct rq *rq = rq_of_dl_rq(dl_rq);
@@ -2353,6 +2404,7 @@ update_stats_dequeue_dl(struct dl_rq *dl_rq, struct sched_dl_entity *dl_se,
 	}
 }
 
+/* rq 锁下链接 EDF 缓存红黑树并更新 runnable/deadline 索引。 */
 static void __enqueue_dl_entity(struct sched_dl_entity *dl_se)
 {
 	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
@@ -2364,6 +2416,7 @@ static void __enqueue_dl_entity(struct sched_dl_entity *dl_se)
 	inc_dl_tasks(dl_se, dl_rq);
 }
 
+/* 幂等删除 EDF 节点并清空节点标记，随后修正 rq 的最早 deadline。 */
 static void __dequeue_dl_entity(struct sched_dl_entity *dl_se)
 {
 	struct dl_rq *dl_rq = dl_rq_of_se(dl_se);
@@ -2378,6 +2431,7 @@ static void __dequeue_dl_entity(struct sched_dl_entity *dl_se)
 	dec_dl_tasks(dl_se, dl_rq);
 }
 
+/* 按唤醒、补充或迁移语义先更新 CBS；仍 throttle 时只保留带宽记账。 */
 static void
 enqueue_dl_entity(struct sched_dl_entity *dl_se, int flags)
 {
@@ -2458,6 +2512,7 @@ enqueue_dl_entity(struct sched_dl_entity *dl_se, int flags)
 	__enqueue_dl_entity(dl_se);
 }
 
+/* 离队时分别处理迁移所有权和阻塞 0-lag，二者不能混为立即归还。 */
 static void dequeue_dl_entity(struct sched_dl_entity *dl_se, int flags)
 {
 	__dequeue_dl_entity(dl_se);
@@ -2482,6 +2537,7 @@ static void dequeue_dl_entity(struct sched_dl_entity *dl_se, int flags)
 		task_non_contending(dl_se, true);
 }
 
+/* PI boost 可覆盖 throttle；普通可迁移任务在入 EDF 树后再进入 push 树。 */
 static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_dl_entity *dl_se = &p->dl;
@@ -2548,6 +2604,7 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 		enqueue_pushable_dl_task(rq, p);
 }
 
+/* 先结算当前执行，再同步移出 EDF 与 push 两棵树。 */
 static bool dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
 	update_curr_dl(rq);
@@ -2572,6 +2629,7 @@ static bool dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
  *   yield_task_dl will indicate that some spare budget
  *   is available for other task instances to use it.
  */
+/* yield 把本实例预算置零并等待下一次 replenish，而不是同 deadline 内轮转。 */
 static void yield_task_dl(struct rq *rq)
 {
 	/*
@@ -2602,6 +2660,7 @@ static inline bool dl_task_is_earliest_deadline(struct task_struct *p,
 
 static int find_later_rq(struct task_struct *task);
 
+/* 唤醒时优先保留更紧迫任务；当前不可迁移或容量不足才查询较晚 deadline rq。 */
 static int
 select_task_rq_dl(struct task_struct *p, int cpu, int flags)
 {
@@ -2651,6 +2710,7 @@ select_task_rq_dl(struct task_struct *p, int cpu, int flags)
 	return cpu;
 }
 
+/* TASK_WAKING 迁移时旧 rq 锁下取消 inactive 状态并撤销旧 rq 带宽。 */
 static void migrate_task_rq_dl(struct task_struct *p, int new_cpu __maybe_unused)
 {
 	struct rq_flags rf;
@@ -2704,6 +2764,7 @@ static void check_preempt_equal_dl(struct rq *rq, struct task_struct *p)
 	resched_curr(rq);
 }
 
+/* pick 前可暂时放开 rq 锁执行 pull，重新加锁后必须以当前 donor 重新判断。 */
 static int balance_dl(struct rq *rq, struct rq_flags *rf)
 {
 	/*
@@ -2731,6 +2792,7 @@ static int balance_dl(struct rq *rq, struct rq_flags *rf)
  * Only called when both the current and waking task are -deadline
  * tasks.
  */
+/* 更早 absolute deadline 立即抢占；相同 deadline 尝试通过迁移避免无效切换。 */
 static void wakeup_preempt_dl(struct rq *rq, struct task_struct *p, int flags)
 {
 	/*
@@ -2770,6 +2832,7 @@ static void start_hrtick_dl(struct rq *rq, struct sched_dl_entity *dl_se)
  * DL keeps current in tree, because ->deadline is not typically changed while
  * a task is runnable.
  */
+/* 当前任务仍留在 EDF 树，但必须从 push 树移除；首次切入再安排均衡/hrtick。 */
 static void set_next_task_dl(struct rq *rq, struct task_struct *p, bool first)
 {
 	struct sched_dl_entity *dl_se = &p->dl;
@@ -2797,6 +2860,7 @@ static void set_next_task_dl(struct rq *rq, struct task_struct *p, bool first)
 		start_hrtick_dl(rq, &p->dl);
 }
 
+/* 缓存红黑树最左节点即 EDF 选择；空树返回 NULL。 */
 static struct sched_dl_entity *pick_next_dl_entity(struct dl_rq *dl_rq)
 {
 	struct rb_node *left = rb_first_cached(&dl_rq->root);
@@ -2811,6 +2875,7 @@ static struct sched_dl_entity *pick_next_dl_entity(struct dl_rq *dl_rq)
  * __pick_next_task_dl - Helper to pick the next -deadline task to run.
  * @rq: The runqueue to pick the next task from.
  */
+/* server 无 client 时先停 server 再重选，保证不会返回虚假的 runnable 实体。 */
 static struct task_struct *__pick_task_dl(struct rq *rq, struct rq_flags *rf)
 {
 	struct sched_dl_entity *dl_se;
@@ -2843,6 +2908,7 @@ static struct task_struct *pick_task_dl(struct rq *rq, struct rq_flags *rf)
 	return __pick_task_dl(rq, rf);
 }
 
+/* 结算预算并清空 curr；仍可运行且可迁移的前任务重新加入 push 树。 */
 static void put_prev_task_dl(struct rq *rq, struct task_struct *p, struct task_struct *next)
 {
 	struct sched_dl_entity *dl_se = &p->dl;
@@ -2873,6 +2939,7 @@ static void put_prev_task_dl(struct rq *rq, struct task_struct *p, struct task_s
  * and everything must be accessed through the @rq and @curr passed in
  * parameters.
  */
+/* tick 可能远程执行，只依赖传入 rq/p；扣预算后仅给仍最早实体续 hrtick。 */
 static void task_tick_dl(struct rq *rq, struct task_struct *p, int queued)
 {
 	update_curr_dl(rq);
@@ -2903,6 +2970,7 @@ static void task_fork_dl(struct task_struct *p)
  * Return the earliest pushable rq's task, which is suitable to be executed
  * on the CPU, NULL otherwise:
  */
+/* 遍历源 rq 的 deadline 有序候选，返回首个亲和性和容量均允许的任务。 */
 static struct task_struct *pick_earliest_pushable_dl_task(struct rq *rq, int cpu)
 {
 	struct task_struct *p = NULL;
@@ -3318,6 +3386,7 @@ static void task_woken_dl(struct rq *rq, struct task_struct *p)
 	}
 }
 
+/* 跨 root_domain 改亲和性时目的端已预留，函数只归还源端后再发布 mask。 */
 static void set_cpus_allowed_dl(struct task_struct *p,
 				struct affinity_context *ctx)
 {
@@ -3349,6 +3418,7 @@ static void set_cpus_allowed_dl(struct task_struct *p,
 	set_cpus_allowed_common(p, ctx);
 }
 
+/* 新 mask 与当前 root_domain 无交集才需要迁移 reservation 所有权。 */
 bool dl_task_needs_bw_move(struct task_struct *p,
 			   const struct cpumask *new_mask)
 {
@@ -3379,6 +3449,7 @@ static void rq_offline_dl(struct rq *rq)
 	cpudl_clear(&rq->rd->cpudl, rq->cpu, false);
 }
 
+/* 为每 CPU 分配迁移搜索临时 mask；节点亲和分配减少热路径远端访问。 */
 void __init init_sched_dl_class(void)
 {
 	unsigned int i;
@@ -3393,6 +3464,7 @@ void __init init_sched_dl_class(void)
  * if a root domain has reserved bandwidth for DL tasks, the DL bandwidth
  * check will prevent CPU hotplug from deactivating all CPUs in that domain.
  */
+/* 在 cpuset_mutex 下取得任务所属有效分区，isolcpus domain 使用隔离集合。 */
 static void dl_get_task_effective_cpus(struct task_struct *p, struct cpumask *cpus)
 {
 	const struct cpumask *hk_msk;
@@ -3418,6 +3490,7 @@ static void dl_get_task_effective_cpus(struct task_struct *p, struct cpumask *cp
 }
 
 /* The caller should hold cpuset_mutex */
+/* cpuset 重建后在 pi_lock 与 dl_bw 锁下把普通 DL reservation 加入新 root_domain。 */
 void dl_add_task_root_domain(struct task_struct *p)
 {
 	struct rq_flags rf;
@@ -3477,6 +3550,7 @@ static u64 dl_server_read_bw(int cpu)
 	return dl_bw;
 }
 
+/* 重建前清零任务带宽基线，并显式重新计入不属于 task 的 DL servers。 */
 void dl_clear_root_domain(struct root_domain *rd)
 {
 	int i;
@@ -3504,6 +3578,7 @@ void dl_clear_root_domain_cpu(int cpu)
 	dl_clear_root_domain(cpu_rq(cpu)->rd);
 }
 
+/* 离开 DL 时按 0-lag 处理 reservation，并防止随后以其他策略迁移造成错账。 */
 static void switched_from_dl(struct rq *rq, struct task_struct *p)
 {
 	/*
@@ -3558,6 +3633,7 @@ static void switched_from_dl(struct rq *rq, struct task_struct *p)
  * When switching to -deadline, we may overload the rq, then
  * we try to push someone off, if possible.
  */
+/* 取消旧 inactive timer，恢复 rq 带宽并按是否排队触发 push/抢占。 */
 static void switched_to_dl(struct rq *rq, struct task_struct *p)
 {
 	cancel_inactive_timer(&p->dl);
@@ -3602,6 +3678,7 @@ static u64 get_prio_dl(struct rq *rq, struct task_struct *p)
  * If the scheduling parameters of a -deadline task changed,
  * a push or pull operation might be needed.
  */
+/* absolute deadline 改变后分别触发 pull、当前重调度或唤醒抢占。 */
 static void prio_changed_dl(struct rq *rq, struct task_struct *p, u64 old_deadline)
 {
 	if (!task_on_rq_queued(p))
@@ -3681,6 +3758,7 @@ DEFINE_SCHED_CLASS(dl) = {
  */
 u64 dl_cookie;
 
+/* 用 cookie 每个 root_domain 只验一次，拒绝低于既有 reservation 的全局上限。 */
 int sched_dl_global_validate(void)
 {
 	u64 runtime = global_rt_runtime();
@@ -3733,6 +3811,7 @@ static void init_dl_rq_bw_ratio(struct dl_rq *dl_rq)
 	}
 }
 
+/* 全局 RT 配额通过校验后更新所有 rq 比例和各 root_domain 的准入上限。 */
 void sched_dl_do_global(void)
 {
 	u64 new_bw = -1;
@@ -3773,6 +3852,7 @@ void sched_dl_do_global(void)
  *
  * This function is called while holding p's rq->lock.
  */
+/* rq 锁下做任务级准入和总量替换；退出 DL 的归还延迟到正确的 0-lag。 */
 int sched_dl_overflow(struct task_struct *p, int policy,
 		      const struct sched_attr *attr)
 {
@@ -3839,6 +3919,7 @@ int sched_dl_overflow(struct task_struct *p, int policy,
  * absolute deadline will be properly calculated when the task is enqueued
  * for the first time with its new policy.
  */
+/* 只复制静态 reservation；absolute deadline/runtime 在首次 enqueue 时生成。 */
 void __setparam_dl(struct task_struct *p, const struct sched_attr *attr)
 {
 	struct sched_dl_entity *dl_se = &p->dl;
@@ -3886,6 +3967,7 @@ void __getparam_dl(struct task_struct *p, struct sched_attr *attr, unsigned int 
  * below 2^63 ns (we have to check both sched_deadline and
  * sched_period, as the latter can be zero).
  */
+/* 验证 runtime <= deadline <= period、内部精度、符号位和 sysctl 周期范围。 */
 bool __checkparam_dl(const struct sched_attr *attr)
 {
 	u64 period, max, min;
@@ -3934,6 +4016,7 @@ bool __checkparam_dl(const struct sched_attr *attr)
 /*
  * This function clears the sched_dl_entity static params.
  */
+/* 清空静态及运行状态并恢复 PI 自指；timer/RB 生命周期由调用路径先处理。 */
 static void __dl_clear_params(struct sched_dl_entity *dl_se)
 {
 	dl_se->dl_runtime		= 0;
@@ -3957,6 +4040,7 @@ static void __dl_clear_params(struct sched_dl_entity *dl_se)
 #endif
 }
 
+/* 初始化两类 timer 和空 RB 节点后建立无 reservation 的基线状态。 */
 void init_dl_entity(struct sched_dl_entity *dl_se)
 {
 	RB_CLEAR_NODE(&dl_se->rb_node);
@@ -3978,6 +4062,7 @@ bool dl_param_changed(struct task_struct *p, const struct sched_attr *attr)
 	return false;
 }
 
+/* 以 trial 的实际 capacity 预演缩容，已有 total_bw 放不下则拒绝。 */
 int dl_cpuset_cpumask_can_shrink(const struct cpumask *cur,
 				 const struct cpumask *trial)
 {
@@ -4003,6 +4088,7 @@ enum dl_bw_request {
 	dl_bw_req_free
 };
 
+/* 在 sched RCU 与 dl_bw 锁下统一处理预留、归还和 CPU 下线容量预演。 */
 static int dl_bw_manage(enum dl_bw_request req, int cpu, u64 dl_bw)
 {
 	unsigned long flags, cap;

@@ -93,7 +93,7 @@ enum scx_consts {
  * @node_idx: global index of that node, in [0, nr_nodes_at_init)
  */
 /*
- * 原文说明：scx_cid_topo 保存每个 cid 在 core、LLC 和 NUMA node 三层拓扑中的信息。
+ * scx_cid_topo 保存每个 cid 在 core、LLC 和 NUMA node 三层拓扑中的信息。
  * 每层记录该单元第一个 cid 以及按 cid 遍历顺序分配的连续全局索引；例如 core_idx 在
  * [0, nr_cores_at_init) 内无空洞。缺少拓扑的 cid 六个字段都为 -1。
  *
@@ -132,7 +132,7 @@ struct scx_cid_topo {
  * with no bit-shifting, regardless of how the two bases relate mod 64.
  */
 /*
- * 原文说明：cmask 是覆盖 cid 空间的“可变长度、带 base 窗口”位图。active 范围为
+ * cmask 是覆盖 cid 空间的“可变长度、带 base 窗口”位图。active 范围为
  * [base, base + nr_cids)，bits[0] 对齐到包含 base 的全局 64-cid word；其前
  * (base & 63) 位是头 padding，最后 active cid 之后是尾 padding，所有修改 helper 都保持
  * 二者为 0。最后 active word 之后的已分配 word 不会被 helper 读取，内容无约束。
@@ -161,7 +161,7 @@ struct scx_cmask {
  * catch the overflow instead of seeing a small value.
  */
 /*
- * 原文说明：计算覆盖 @nr_cids 所需的 u64 word 数时无条件多分配一个 word，用它吸收 base
+ * 计算覆盖 @nr_cids 所需的 u64 word 数时无条件多分配一个 word，用它吸收 base
  * 非 64 对齐时最多 63 位头 padding，比按 base 分支或拆分公式更简单。先转 u64 再加 63，
  * 防止 @nr_cids 接近 U32_MAX 时加法回绕成小值；调用者随后用 alloc_words 做容量检查。
  * 返回值是存储上界而非当前 active word 精确数，@nr_cids 本身不决定 base 对齐。
@@ -180,7 +180,7 @@ struct scx_cmask {
  * @ALLOC_CIDS.
  */
 /*
- * 原文说明：__SCX_CMASK_DEFINE() 在栈上定义具有显式容量的 cmask。@NAME 是生成的变量名；
+ * __SCX_CMASK_DEFINE() 在栈上定义具有显式容量的 cmask。@NAME 是生成的变量名；
  * @BASE/@NR_CIDS 设置 active 区间；@ALLOC_CIDS 是不少于 active 长度的容量。@NAME 指向
  * 零初始化 `_DEFINE_FLEX` 存储，之后可由 scx_cmask_reframe() 在容量内改变窗口。
  *
@@ -203,7 +203,7 @@ struct scx_cmask {
  * both [BASE, BASE + NR_CIDS).
  */
 /*
- * 原文说明：SCX_CMASK_DEFINE() 用紧凑容量定义栈上 cmask；@NAME 为变量名，@BASE 为首 cid，
+ * SCX_CMASK_DEFINE() 用紧凑容量定义栈上 cmask；@NAME 为变量名，@BASE 为首 cid，
  * @NR_CIDS 同时是 active 长度和容量。它转发到通用宏，仍会按最坏 base 对齐多留一个 word；
  * 后续不能 reframe 成更长区间，ownership 与作用域规则同上。
  */
@@ -222,7 +222,7 @@ struct scx_cmask {
  * operations will overrun.
  */
 /*
- * 原文说明：SCX_CMASK_DEFINE_SHARD() 定义容量固定为 SCX_CID_SHARD_MAX_CPUS 的栈上 cmask，
+ * SCX_CMASK_DEFINE_SHARD() 定义容量固定为 SCX_CID_SHARD_MAX_CPUS 的栈上 cmask，
  * active 窗口由 @BASE/@NR_CIDS 指定，且 @NR_CIDS 必须不超过 shard 上限。若违反，结构会
  * 声称拥有超出真实 bits[] 的 active 位，后续 helper 将越界；宏本身不检查也不截断。
  * 该形式用于在不同实际 shard 长度间复用固定最大栈布局。

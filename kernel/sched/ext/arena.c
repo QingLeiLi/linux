@@ -21,7 +21,7 @@
  *
  * 中文学习注释模型：OpenAI Codex（GPT-5）。
  *
- * 原文说明：scx_arena_pool 是叠加在 BPF arena 页之上的内核子分配器。加入
+ * scx_arena_pool 是叠加在 BPF arena 页之上的内核子分配器。加入
  * sch->arena_pool 的每个 chunk 都来自一次 bpf_arena_alloc_pages_sleepable()，并按内核
  * 映射地址登记；需要 BPF arena 地址形式的调用者自行转换。池不足时按需扩容，底层页在
  * arena map 本身拆除时释放。
@@ -92,7 +92,7 @@ static void scx_arena_clear_chunk(struct gen_pool *pool, struct gen_pool_chunk *
  * arena pages are released when the arena map itself is torn down.
  */
 /*
- * 原文说明：拆除池时，先由 scx_arena_clear_chunk() 归还仍未释放的 gen_pool 分配，避免
+ * 拆除池时，先由 scx_arena_clear_chunk() 归还仍未释放的 gen_pool 分配，避免
  * gen_pool_destroy() 因非空池触发 BUG；底层 arena 页在 arena map 自身拆除时释放。
  *
  * scx_arena_pool_destroy() - 销毁 scheduler 的内核侧 arena 池元数据
@@ -117,7 +117,7 @@ void scx_arena_pool_destroy(struct scx_sched *sch)
  * context.
  */
 /*
- * 原文说明：按 @page_cnt 页扩容；bpf_arena_alloc_pages_sleepable() 与会调用
+ * 按 @page_cnt 页扩容；bpf_arena_alloc_pages_sleepable() 与会调用
  * vzalloc(GFP_KERNEL) 的 gen_pool_add() 都要求可睡眠上下文。
  *
  * scx_arena_grow() - 从 BPF arena 取得整页并作为内核 VA chunk 加入 gen_pool
@@ -173,7 +173,7 @@ static int scx_arena_grow(struct scx_sched *sch, u32 page_cnt)
  * be in a GFP_KERNEL context.
  */
 /*
- * 原文说明：从 arena pool 分配 @size 字节；成功返回内核 VA，失败返回 NULL。池不足会经
+ * 从 arena pool 分配 @size 字节；成功返回内核 VA，失败返回 NULL。池不足会经
  * 可睡眠的 scx_arena_grow() 扩容，因此调用者必须处于允许 GFP_KERNEL 的上下文。
  *
  * scx_arena_alloc() - 取得一个 arena 子区间的独占使用权

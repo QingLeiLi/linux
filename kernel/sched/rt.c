@@ -3,6 +3,18 @@
  * Real-Time Scheduling Class (mapped to the SCHED_FIFO and SCHED_RR
  * policies)
  */
+/*
+ * 本文件实现 SCHED_FIFO/RR：每个 rt_rq 用 priority bitmap 找到数值最小的
+ * 最高优先级队列，FIFO 保持队首直到阻塞/抢占，RR 在时间片耗尽后移到同优先级
+ * 队尾。组调度把 task entity 与 group entity 递归串成层级，任何 enqueue/dequeue
+ * 都必须从叶到根维持“子 rt_rq 非空才让父 entity 在队列中”的不变量。
+ *
+ * SMP 负载均衡把可迁移的非当前 RT task 放进 pushable plist；overload 位图和
+ * cpupri 只提供无锁候选，最终迁移在双 rq 锁下复核亲和性、优先级和 on_rq。
+ * 带宽控制以 period/runtime 限制每层 rt_rq，runtime_lock 保护借用/归还，耗尽时
+ * throttle 并摘父 entity，period hrtimer 补充后重新入队。锁顺序、屏障和 push IPI
+ * 共同保证不会因过期候选迁错任务或漏扫新 overload CPU。
+ */
 
 #include "sched.h"
 #include "pelt.h"
@@ -57,6 +69,7 @@ static const struct ctl_table sched_rt_sysctls[] = {
 	},
 };
 
+/* 启动期注册 RT period/runtime 与 RR timeslice sysctl；注册失败不向外传播。 */
 static int __init sched_rt_sysctl_init(void)
 {
 	register_sysctl_init("kernel", sched_rt_sysctls);
@@ -65,6 +78,7 @@ static int __init sched_rt_sysctl_init(void)
 late_initcall(sched_rt_sysctl_init);
 #endif /* CONFIG_SYSCTL */
 
+/* 初始化空 rt_rq 的优先级队列/哨兵位、pushable 集及可选带宽锁和计数。 */
 void init_rt_rq(struct rt_rq *rt_rq)
 {
 	struct rt_prio_array *array;
@@ -98,6 +112,7 @@ void init_rt_rq(struct rt_rq *rt_rq)
 
 static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun);
 
+/* period hard hrtimer 追赶 overrun 并补充各 rt_rq；全 idle 时停止，否则重启。 */
 static enum hrtimer_restart sched_rt_period_timer(struct hrtimer *timer)
 {
 	struct rt_bandwidth *rt_b =
@@ -122,6 +137,7 @@ static enum hrtimer_restart sched_rt_period_timer(struct hrtimer *timer)
 	return idle ? HRTIMER_NORESTART : HRTIMER_RESTART;
 }
 
+/* 初始化 bandwidth 的纳秒 period/runtime、锁和 pinned hard hrtimer。 */
 void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime)
 {
 	rt_b->rt_period = ns_to_ktime(period);
@@ -133,6 +149,7 @@ void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime)
 		      HRTIMER_MODE_REL_HARD);
 }
 
+/* runtime_lock 下仅首次激活 period timer，并立即 forward 修复 DL 已消耗的旧周期。 */
 static inline void do_start_rt_bandwidth(struct rt_bandwidth *rt_b)
 {
 	raw_spin_lock(&rt_b->rt_runtime_lock);
@@ -153,6 +170,7 @@ static inline void do_start_rt_bandwidth(struct rt_bandwidth *rt_b)
 	raw_spin_unlock(&rt_b->rt_runtime_lock);
 }
 
+/* 仅在全局带宽启用且 runtime 有限时启动周期计时器。 */
 static void start_rt_bandwidth(struct rt_bandwidth *rt_b)
 {
 	if (!rt_bandwidth_enabled() || rt_b->rt_runtime == RUNTIME_INF)
@@ -161,6 +179,7 @@ static void start_rt_bandwidth(struct rt_bandwidth *rt_b)
 	do_start_rt_bandwidth(rt_b);
 }
 
+/* 同步取消 bandwidth hrtimer，返回后回调不再访问 @rt_b。 */
 static void destroy_rt_bandwidth(struct rt_bandwidth *rt_b)
 {
 	hrtimer_cancel(&rt_b->rt_period_timer);
@@ -168,6 +187,7 @@ static void destroy_rt_bandwidth(struct rt_bandwidth *rt_b)
 
 #define rt_entity_is_task(rt_se) (!(rt_se)->my_q)
 
+/* 由叶子 rt entity 反查 task；group entity 属于调用错误并 WARN。 */
 static inline struct task_struct *rt_task_of(struct sched_rt_entity *rt_se)
 {
 	WARN_ON_ONCE(!rt_entity_is_task(rt_se));
@@ -175,6 +195,7 @@ static inline struct task_struct *rt_task_of(struct sched_rt_entity *rt_se)
 	return container_of(rt_se, struct task_struct, rt);
 }
 
+/* 从顶层或组 rt_rq 找到所属 CPU rq；调用者必须处于对应锁/RCU 保护。 */
 static inline struct rq *rq_of_rt_rq(struct rt_rq *rt_rq)
 {
 	/* Cannot fold with non-CONFIG_RT_GROUP_SCHED version, layout */
@@ -182,12 +203,14 @@ static inline struct rq *rq_of_rt_rq(struct rt_rq *rt_rq)
 	return rt_rq->rq;
 }
 
+/* 返回 entity 当前排队的 rt_rq，task/group 两类共用。 */
 static inline struct rt_rq *rt_rq_of_se(struct sched_rt_entity *rt_se)
 {
 	WARN_ON(!rt_group_sched_enabled() && rt_se->rt_rq->tg != &root_task_group);
 	return rt_se->rt_rq;
 }
 
+/* 经 entity 的 rt_rq 返回底层 CPU rq。 */
 static inline struct rq *rq_of_rt_se(struct sched_rt_entity *rt_se)
 {
 	struct rt_rq *rt_rq = rt_se->rt_rq;
@@ -196,6 +219,7 @@ static inline struct rq *rq_of_rt_se(struct sched_rt_entity *rt_se)
 	return rt_rq->rq;
 }
 
+/* 从每 CPU rt_rq 摘除 @tg 的父 entity，阻止新任务沿该组进入 RT 层级。 */
 void unregister_rt_sched_group(struct task_group *tg)
 {
 	if (!rt_group_sched_enabled())
@@ -205,6 +229,7 @@ void unregister_rt_sched_group(struct task_group *tg)
 		destroy_rt_bandwidth(&tg->rt_bandwidth);
 }
 
+/* 释放 @tg 所有 per-CPU rt_rq/entity 数组；调用前必须已注销且无引用。 */
 void free_rt_sched_group(struct task_group *tg)
 {
 	int i;
@@ -223,6 +248,7 @@ void free_rt_sched_group(struct task_group *tg)
 	kfree(tg->rt_se);
 }
 
+/* 初始化 @cpu 的组 rt_rq 和连接 parent 的 rt entity；root 没有父 entity。 */
 void init_tg_rt_entry(struct task_group *tg, struct rt_rq *rt_rq,
 		struct sched_rt_entity *rt_se, int cpu,
 		struct sched_rt_entity *parent)
@@ -250,6 +276,7 @@ void init_tg_rt_entry(struct task_group *tg, struct rt_rq *rt_rq,
 	INIT_LIST_HEAD(&rt_se->run_list);
 }
 
+/* 分配并逐 CPU 初始化组 RT 状态；失败逆序释放，成功返回 1。 */
 int alloc_rt_sched_group(struct task_group *tg, struct task_group *parent)
 {
 	struct rt_rq *rt_rq;
@@ -330,17 +357,20 @@ int alloc_rt_sched_group(struct task_group *tg, struct task_group *parent)
 }
 #endif /* !CONFIG_RT_GROUP_SCHED */
 
+/* 当前 RT 优先级降低且 root_domain overload 时返回 true，请求稍后 pull。 */
 static inline bool need_pull_rt_task(struct rq *rq, struct task_struct *prev)
 {
 	/* Try to pull RT tasks here if we lower this rq's prio */
 	return rq->online && rq->rt.highest_prio.curr > prev->prio;
 }
 
+/* 无锁读取 root_domain 中 overload rt_rq 数；与发布屏障配对后再扫 mask。 */
 static inline int rt_overloaded(struct rq *rq)
 {
 	return atomic_read(&rq->rd->rto_count);
 }
 
+/* rq 锁下先置 rto_mask 再发布 overload count，使 pull reader 不漏掉该 CPU。 */
 static inline void rt_set_overload(struct rq *rq)
 {
 	if (!rq->online)
@@ -360,6 +390,7 @@ static inline void rt_set_overload(struct rq *rq)
 	atomic_inc(&rq->rd->rto_count);
 }
 
+/* rq 锁下撤销 overload CPU 位和计数，保持二者最终一致。 */
 static inline void rt_clear_overload(struct rq *rq)
 {
 	if (!rq->online)
@@ -370,6 +401,7 @@ static inline void rt_clear_overload(struct rq *rq)
 	cpumask_clear_cpu(rq->cpu, rq->rd->rto_mask);
 }
 
+/* 返回 pushable plist 是否非空；无锁调用只能作为需要加 rq 锁复核的提示。 */
 static inline int has_pushable_tasks(struct rq *rq)
 {
 	return !plist_head_empty(&rq->rt.pushable_tasks);
@@ -381,6 +413,7 @@ static DEFINE_PER_CPU(struct balance_callback, rt_pull_head);
 static void push_rt_tasks(struct rq *);
 static void pull_rt_task(struct rq *);
 
+/* 将 push balance callback 挂到 rq，出锁后的 callback 迁移多余 RT task。 */
 static inline void rt_queue_push_tasks(struct rq *rq)
 {
 	if (!has_pushable_tasks(rq))
@@ -389,11 +422,13 @@ static inline void rt_queue_push_tasks(struct rq *rq)
 	queue_balance_callback(rq, &per_cpu(rt_push_head, rq->cpu), push_rt_tasks);
 }
 
+/* 将 pull callback 挂到 rq，低优先级切入时从其他 overload rq 拉取任务。 */
 static inline void rt_queue_pull_task(struct rq *rq)
 {
 	queue_balance_callback(rq, &per_cpu(rt_pull_head, rq->cpu), pull_rt_task);
 }
 
+/* 把非当前且可迁移 @p 按 priority 加入 pushable plist，并更新 next highest。 */
 static void enqueue_pushable_task(struct rq *rq, struct task_struct *p)
 {
 	plist_del(&p->pushable_tasks, &rq->rt.pushable_tasks);
@@ -410,6 +445,7 @@ static void enqueue_pushable_task(struct rq *rq, struct task_struct *p)
 	}
 }
 
+/* 从 pushable plist 摘 @p，并用新表头刷新 highest_prio.next。 */
 static void dequeue_pushable_task(struct rq *rq, struct task_struct *p)
 {
 	plist_del(&p->pushable_tasks, &rq->rt.pushable_tasks);
@@ -432,6 +468,7 @@ static void dequeue_pushable_task(struct rq *rq, struct task_struct *p)
 static void enqueue_top_rt_rq(struct rt_rq *rt_rq);
 static void dequeue_top_rt_rq(struct rt_rq *rt_rq, unsigned int count);
 
+/* run_list 非空表示 entity 当前在某个 priority 队列中。 */
 static inline int on_rt_rq(struct sched_rt_entity *rt_se)
 {
 	return rt_se->on_rq;
@@ -452,6 +489,7 @@ static inline int on_rt_rq(struct sched_rt_entity *rt_se)
  * Note that uclamp_min will be clamped to uclamp_max if uclamp_min
  * > uclamp_max.
  */
+/* 在非对称容量系统判断 @cpu 是否满足 RT task uclamp/容量需求；否则恒 true。 */
 static inline bool rt_task_fits_capacity(struct task_struct *p, int cpu)
 {
 	unsigned int min_cap;
@@ -478,11 +516,13 @@ static inline bool rt_task_fits_capacity(struct task_struct *p, int cpu)
 
 #ifdef CONFIG_RT_GROUP_SCHED
 
+/* 返回 @rt_rq 所属 bandwidth 的每周期 runtime 纳秒。 */
 static inline u64 sched_rt_runtime(struct rt_rq *rt_rq)
 {
 	return rt_rq->rt_runtime;
 }
 
+/* 返回 @rt_rq 所属 bandwidth 的 period 纳秒。 */
 static inline u64 sched_rt_period(struct rt_rq *rt_rq)
 {
 	return ktime_to_ns(rt_rq->tg->rt_bandwidth.rt_period);
@@ -490,6 +530,7 @@ static inline u64 sched_rt_period(struct rt_rq *rt_rq)
 
 typedef struct task_group *rt_rq_iter_t;
 
+/* RCU 下按深度优先次序返回下一个 task_group，用于遍历各层 rt_rq。 */
 static inline struct task_group *next_task_group(struct task_group *tg)
 {
 	if (!rt_group_sched_enabled()) {
@@ -516,6 +557,7 @@ static inline struct task_group *next_task_group(struct task_group *tg)
 #define for_each_sched_rt_entity(rt_se) \
 	for (; rt_se; rt_se = rt_se->parent)
 
+/* group entity 返回其子 rt_rq；task entity 返回 NULL。 */
 static inline struct rt_rq *group_rt_rq(struct sched_rt_entity *rt_se)
 {
 	return rt_se->my_q;
@@ -524,6 +566,7 @@ static inline struct rt_rq *group_rt_rq(struct sched_rt_entity *rt_se)
 static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags);
 static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags);
 
+/* 子 rt_rq 有 runnable 且未 throttle 时把父 entity 逐层入队到 CPU rq。 */
 static void sched_rt_rq_enqueue(struct rt_rq *rt_rq)
 {
 	struct task_struct *donor = rq_of_rt_rq(rt_rq)->donor;
@@ -545,6 +588,7 @@ static void sched_rt_rq_enqueue(struct rt_rq *rt_rq)
 	}
 }
 
+/* 子 rt_rq 变空或 throttle 时逐层摘除父 entity，避免选择不可运行层级。 */
 static void sched_rt_rq_dequeue(struct rt_rq *rt_rq)
 {
 	struct sched_rt_entity *rt_se;
@@ -561,11 +605,13 @@ static void sched_rt_rq_dequeue(struct rt_rq *rt_rq)
 		dequeue_rt_entity(rt_se, 0);
 }
 
+/* 只有 marked throttled 且没有 PI-boost entity 时才真正阻止选择。 */
 static inline int rt_rq_throttled(struct rt_rq *rt_rq)
 {
 	return rt_rq->rt_throttled && !rt_rq->rt_nr_boosted;
 }
 
+/* 沿 entity/parent 检查 task 是否因 PI 获得高于 normal_prio 的 RT 优先级。 */
 static int rt_se_boosted(struct sched_rt_entity *rt_se)
 {
 	struct rt_rq *rt_rq = group_rt_rq(rt_se);
@@ -578,22 +624,26 @@ static int rt_se_boosted(struct sched_rt_entity *rt_se)
 	return p->prio != p->normal_prio;
 }
 
+/* bandwidth timer 需要扫描的 CPU 集；通常是 online CPU。 */
 static inline const struct cpumask *sched_rt_period_mask(void)
 {
 	return this_rq()->rd->span;
 }
 
 static inline
+/* 由 bandwidth 与 @cpu 找到对应组/根 rt_rq；调用者只借用。 */
 struct rt_rq *sched_rt_period_rt_rq(struct rt_bandwidth *rt_b, int cpu)
 {
 	return container_of(rt_b, struct task_group, rt_bandwidth)->rt_rq[cpu];
 }
 
+/* 返回 @rt_rq 所属 task_group 的共享 bandwidth 对象。 */
 static inline struct rt_bandwidth *sched_rt_bandwidth(struct rt_rq *rt_rq)
 {
 	return &rt_rq->tg->rt_bandwidth;
 }
 
+/* 判断当前 rt_rq 是否需要 runtime 计费；无限额度快速返回 false。 */
 bool sched_rt_bandwidth_account(struct rt_rq *rt_rq)
 {
 	struct rt_bandwidth *rt_b = sched_rt_bandwidth(rt_rq);
@@ -605,6 +655,7 @@ bool sched_rt_bandwidth_account(struct rt_rq *rt_rq)
 /*
  * We ran out of runtime, see if we can borrow some from our neighbours.
  */
+/* 从同 root_domain 其他 rt_rq 的闲置额度借 runtime，所有转移在双方 runtime_lock 下。 */
 static void do_balance_runtime(struct rt_rq *rt_rq)
 {
 	struct rt_bandwidth *rt_b = sched_rt_bandwidth(rt_rq);
@@ -657,6 +708,7 @@ next:
 /*
  * Ensure this RQ takes back all the runtime it lend to its neighbours.
  */
+/* CPU offline 前归还本 rq 借入/借出的 runtime，恢复每个组的基准额度。 */
 static void __disable_runtime(struct rq *rq)
 {
 	struct root_domain *rd = rq->rd;
@@ -739,6 +791,7 @@ balanced:
 	}
 }
 
+/* CPU online 时重新启用每个组 rt_rq 的 runtime 计费并清过期 throttle 状态。 */
 static void __enable_runtime(struct rq *rq)
 {
 	rt_rq_iter_t iter;
@@ -763,6 +816,7 @@ static void __enable_runtime(struct rq *rq)
 	}
 }
 
+/* runtime 不足且特性开启时尝试借额；无限/足额快速返回。 */
 static void balance_runtime(struct rt_rq *rt_rq)
 {
 	if (!sched_feat(RT_RUNTIME_SHARE))
@@ -775,6 +829,7 @@ static void balance_runtime(struct rt_rq *rt_rq)
 	}
 }
 
+/* 按 @overrun 个周期补充所有 CPU rt_rq，解除可运行队列 throttle；全 idle 返回 1。 */
 static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun)
 {
 	int i, idle = 1, throttled = 0;
@@ -860,6 +915,7 @@ static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun)
 	return idle;
 }
 
+/* 更新已用 runtime，超配额时 throttle 并启动 period timer；PI boost 可临时绕过。 */
 static int sched_rt_runtime_exceeded(struct rt_rq *rt_rq)
 {
 	u64 runtime = sched_rt_runtime(rt_rq);
@@ -955,6 +1011,7 @@ static void __disable_runtime(struct rq *rq) { }
 
 #endif /* !CONFIG_RT_GROUP_SCHED */
 
+/* 返回 task entity 的有效 prio，group entity 返回其子 rt_rq 当前最高 prio。 */
 static inline int rt_se_prio(struct sched_rt_entity *rt_se)
 {
 #ifdef CONFIG_RT_GROUP_SCHED
@@ -971,6 +1028,7 @@ static inline int rt_se_prio(struct sched_rt_entity *rt_se)
  * Update the current task's runtime statistics. Skip current tasks that
  * are not in our scheduling class.
  */
+/* 用 rq clock_task 给当前 RT donor 累计运行时间/组 runtime，并在超额时请求重调度。 */
 static void update_curr_rt(struct rq *rq)
 {
 	struct task_struct *donor = rq->donor;
@@ -1007,6 +1065,7 @@ static void update_curr_rt(struct rq *rq)
 #endif /* CONFIG_RT_GROUP_SCHED */
 }
 
+/* 顶层 rt_rq runnable 数减少 @count，首次变空时从 rq 调度类负载中注销。 */
 static void
 dequeue_top_rt_rq(struct rt_rq *rt_rq, unsigned int count)
 {
@@ -1024,6 +1083,7 @@ dequeue_top_rt_rq(struct rt_rq *rt_rq, unsigned int count)
 
 }
 
+/* 非 throttle 且首次变为 runnable 时把顶层 rt_rq 发布给 CPU rq。 */
 static void
 enqueue_top_rt_rq(struct rt_rq *rt_rq)
 {
@@ -1046,6 +1106,7 @@ enqueue_top_rt_rq(struct rt_rq *rt_rq)
 	cpufreq_update_util(rq, 0);
 }
 
+/* SMP 下更新 highest curr/next、cpupri 与 overload 派生索引。 */
 static void
 inc_rt_prio_smp(struct rt_rq *rt_rq, int prio, int prev_prio)
 {
@@ -1061,6 +1122,7 @@ inc_rt_prio_smp(struct rt_rq *rt_rq, int prio, int prev_prio)
 		cpupri_set(&rq->rd->cpupri, rq->cpu, prio);
 }
 
+/* 最高优先级离开后刷新 curr/next 与 root-domain cpupri 候选。 */
 static void
 dec_rt_prio_smp(struct rt_rq *rt_rq, int prio, int prev_prio)
 {
@@ -1076,6 +1138,7 @@ dec_rt_prio_smp(struct rt_rq *rt_rq, int prio, int prev_prio)
 		cpupri_set(&rq->rd->cpupri, rq->cpu, rt_rq->highest_prio.curr);
 }
 
+/* entity 加入后将 @prio 合入 rt_rq 最高优先级。 */
 static void
 inc_rt_prio(struct rt_rq *rt_rq, int prio)
 {
@@ -1087,6 +1150,7 @@ inc_rt_prio(struct rt_rq *rt_rq, int prio)
 	inc_rt_prio_smp(rt_rq, prio, prev_prio);
 }
 
+/* 最后一个 @prio entity 离开时扫描 bitmap 并刷新最高优先级索引。 */
 static void
 dec_rt_prio(struct rt_rq *rt_rq, int prio)
 {
@@ -1146,6 +1210,7 @@ void dec_rt_group(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq) {}
 
 #endif /* !CONFIG_RT_GROUP_SCHED */
 
+/* task entity 贡献 1，group entity 贡献其子 rt_rq 的 runnable task 数。 */
 static inline
 unsigned int rt_se_nr_running(struct sched_rt_entity *rt_se)
 {
@@ -1157,6 +1222,7 @@ unsigned int rt_se_nr_running(struct sched_rt_entity *rt_se)
 		return 1;
 }
 
+/* 返回 entity 覆盖的 SCHED_RR task 数。 */
 static inline
 unsigned int rt_se_rr_nr_running(struct sched_rt_entity *rt_se)
 {
@@ -1171,6 +1237,7 @@ unsigned int rt_se_rr_nr_running(struct sched_rt_entity *rt_se)
 	return (tsk->policy == SCHED_RR) ? 1 : 0;
 }
 
+/* entity 入队时增加 runnable/RR/迁移计数并更新顶层/cpupri/overload。 */
 static inline
 void inc_rt_tasks(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 {
@@ -1184,6 +1251,7 @@ void inc_rt_tasks(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 	inc_rt_group(rt_se, rt_rq);
 }
 
+/* entity 出队时对称减少计数并撤销不再成立的 overload/cpupri 状态。 */
 static inline
 void dec_rt_tasks(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
 {
@@ -1201,6 +1269,7 @@ void dec_rt_tasks(struct sched_rt_entity *rt_se, struct rt_rq *rt_rq)
  *
  * assumes ENQUEUE/DEQUEUE flags match
  */
+/* SAVE/RESTORE 属性更新时可保持队列位置，普通操作才真正移动 entity。 */
 static inline bool move_entity(unsigned int flags)
 {
 	if ((flags & (DEQUEUE_SAVE | DEQUEUE_MOVE)) == DEQUEUE_SAVE)
@@ -1209,6 +1278,7 @@ static inline bool move_entity(unsigned int flags)
 	return true;
 }
 
+/* 从 priority list 摘 entity；该优先级变空时清 bitmap 位。 */
 static void __delist_rt_entity(struct sched_rt_entity *rt_se, struct rt_prio_array *array)
 {
 	list_del_init(&rt_se->run_list);
@@ -1328,6 +1398,7 @@ update_stats_dequeue_rt(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se,
 	}
 }
 
+/* 将单层 entity 按 HEAD/尾部插入 priority list，并更新 bitmap 与计数。 */
 static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct rt_rq *rt_rq = rt_rq_of_se(rt_se);
@@ -1362,6 +1433,7 @@ static void __enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flag
 	inc_rt_tasks(rt_se, rt_rq);
 }
 
+/* 从单层 priority queue 摘 entity 并更新等待统计和 runnable 计数。 */
 static void __dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct rt_rq *rt_rq = rt_rq_of_se(rt_se);
@@ -1380,6 +1452,7 @@ static void __dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flag
  * Because the prio of an upper entry depends on the lower
  * entries, we must remove entries top - down.
  */
+/* 先从叶到根摘整条 entity 栈，避免父节点仍代表已变化的子队列。 */
 static void dequeue_rt_stack(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct sched_rt_entity *back = NULL;
@@ -1400,6 +1473,7 @@ static void dequeue_rt_stack(struct sched_rt_entity *rt_se, unsigned int flags)
 	dequeue_top_rt_rq(rt_rq_of_se(back), rt_nr_running);
 }
 
+/* 层级安全入队：先清旧祖先位置，再按当前子队列状态自根向叶发布。 */
 static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct rq *rq = rq_of_rt_se(rt_se);
@@ -1412,6 +1486,7 @@ static void enqueue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 	enqueue_top_rt_rq(&rq->rt);
 }
 
+/* 层级安全出队：整栈摘除后按仍非空的子队列从根到叶重建。 */
 static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 {
 	struct rq *rq = rq_of_rt_se(rt_se);
@@ -1432,6 +1507,7 @@ static void dequeue_rt_entity(struct sched_rt_entity *rt_se, unsigned int flags)
 /*
  * Adding/removing a task to/from a priority array:
  */
+/* rq 锁下更新 curr、加入 task entity/可 push 集并启动 bandwidth。 */
 static void
 enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
@@ -1452,6 +1528,7 @@ enqueue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 		enqueue_pushable_task(rq, p);
 }
 
+/* rq 锁下结算 curr、摘 entity/pushable，并返回 task 是否仍在 class 队列。 */
 static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
@@ -1468,6 +1545,7 @@ static bool dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
  * Put task to the head or the end of the run list without the overhead of
  * dequeue followed by enqueue.
  */
+/* 保持计数不变，把单层 entity 移到同优先级队头或队尾。 */
 static void
 requeue_rt_entity(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se, int head)
 {
@@ -1482,6 +1560,7 @@ requeue_rt_entity(struct rt_rq *rt_rq, struct sched_rt_entity *rt_se, int head)
 	}
 }
 
+/* 把 @p 及必要祖先移到同优先级头或尾，保持层级可选择性。 */
 static void requeue_task_rt(struct rq *rq, struct task_struct *p, int head)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
@@ -1493,6 +1572,7 @@ static void requeue_task_rt(struct rq *rq, struct task_struct *p, int head)
 	}
 }
 
+/* 当前 RT task 主动 yield 时移到同优先级队尾；独占时不保证换人运行。 */
 static void yield_task_rt(struct rq *rq)
 {
 	requeue_task_rt(rq, rq->donor, 0);
@@ -1500,6 +1580,7 @@ static void yield_task_rt(struct rq *rq)
 
 static int find_lowest_rq(struct task_struct *task);
 
+/* 唤醒/迁移时用 cpupri、亲和性与容量选候选 CPU，锁后路径仍会复核。 */
 static int
 select_task_rq_rt(struct task_struct *p, int cpu, int flags)
 {
@@ -1573,6 +1654,7 @@ out:
 	return cpu;
 }
 
+/* 同优先级唤醒时若 current 被固定而 @p 可迁移，resched 以创造 push 机会。 */
 static void check_preempt_equal_prio(struct rq *rq, struct task_struct *p)
 {
 	if (rq->curr->nr_cpus_allowed == 1 ||
@@ -1596,6 +1678,7 @@ static void check_preempt_equal_prio(struct rq *rq, struct task_struct *p)
 	resched_curr(rq);
 }
 
+/* pick 前在需要时临时出锁，从 overload CPU 拉取更高优先级 RT task。 */
 static int balance_rt(struct rq *rq, struct rq_flags *rf)
 {
 	/*
@@ -1622,6 +1705,7 @@ static int balance_rt(struct rq *rq, struct rq_flags *rf)
 /*
  * Preempt the current task with a newly woken task if needed:
  */
+/* 新 RT task 更高优先级时立即 resched；相等时检查迁移/push 条件。 */
 static void wakeup_preempt_rt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *donor = rq->donor;
@@ -1653,6 +1737,7 @@ static void wakeup_preempt_rt(struct rq *rq, struct task_struct *p, int flags)
 		check_preempt_equal_prio(rq, p);
 }
 
+/* 选中 @p 时从 pushable 摘除、结束等待统计并建立 exec_start/PELT 基线。 */
 static inline void set_next_task_rt(struct rq *rq, struct task_struct *p, bool first)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
@@ -1679,6 +1764,7 @@ static inline void set_next_task_rt(struct rq *rq, struct task_struct *p, bool f
 	rt_queue_push_tasks(rq);
 }
 
+/* 由 bitmap 找最高非空 priority，并返回对应 FIFO list 队首 entity。 */
 static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 {
 	struct rt_prio_array *array = &rt_rq->active;
@@ -1697,6 +1783,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rt_rq *rt_rq)
 	return next;
 }
 
+/* 从顶层 entity 沿 group rt_rq 下钻到叶子 task；throttle/空队列返回 NULL。 */
 static struct task_struct *_pick_next_task_rt(struct rq *rq)
 {
 	struct sched_rt_entity *rt_se;
@@ -1712,6 +1799,7 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
 	return rt_task_of(rt_se);
 }
 
+/* 先执行 balance/pull，再选择最高优先级 task；无 RT 可运行返回 NULL。 */
 static struct task_struct *pick_task_rt(struct rq *rq, struct rq_flags *rf)
 {
 	struct task_struct *p;
@@ -1724,6 +1812,7 @@ static struct task_struct *pick_task_rt(struct rq *rq, struct rq_flags *rf)
 	return p;
 }
 
+/* 切出 @p 前结算运行时间，若仍 runnable 则重新加入 pushable 候选。 */
 static void put_prev_task_rt(struct rq *rq, struct task_struct *p, struct task_struct *next)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
@@ -1753,6 +1842,7 @@ static void put_prev_task_rt(struct rq *rq, struct task_struct *p, struct task_s
  * Return the highest pushable rq's task, which is suitable to be executed
  * on the CPU, NULL otherwise
  */
+/* 从 @rq pushable plist 找亲和性允许 @cpu 的最高优先级 task；仅返回候选。 */
 static struct task_struct *pick_highest_pushable_task(struct rq *rq, int cpu)
 {
 	struct plist_head *head = &rq->rt.pushable_tasks;
@@ -1771,6 +1861,7 @@ static struct task_struct *pick_highest_pushable_task(struct rq *rq, int cpu)
 
 static DEFINE_PER_CPU(cpumask_var_t, local_cpu_mask);
 
+/* 用 cpupri/亲和性/容量为 @task 找最低优先级 CPU；无合适目标返回 -1。 */
 static int find_lowest_rq(struct task_struct *task)
 {
 	struct sched_domain *sd;
@@ -1862,6 +1953,7 @@ static int find_lowest_rq(struct task_struct *task)
 	return -1;
 }
 
+/* 返回并校验 pushable plist 表头不是 current、已排队且可迁移。 */
 static struct task_struct *pick_next_pushable_task(struct rq *rq)
 {
 	struct plist_head *head = &rq->rt.pushable_tasks;
@@ -1893,6 +1985,7 @@ static struct task_struct *pick_next_pushable_task(struct rq *rq)
 }
 
 /* Will lock the rq it finds */
+/* 尝试锁目标 rq 并复核 task/优先级/亲和性；竞态时有限重试，失败返回 NULL。 */
 static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
 {
 	struct rq *lowest_rq = NULL;
@@ -1956,6 +2049,7 @@ static struct rq *find_lock_lowest_rq(struct task_struct *task, struct rq *rq)
  * running task can migrate over to a CPU that is running a task
  * of lesser priority.
  */
+/* 从 overload @rq 迁出一个 pushable task；双 rq 锁复核后移动，成功返回 1。 */
 static int push_rt_task(struct rq *rq, bool pull)
 {
 	struct task_struct *next_task;
@@ -2074,6 +2168,7 @@ out:
 	return ret;
 }
 
+/* 循环 push 直到当前 rq 不再有可迁出的多余 RT task。 */
 static void push_rt_tasks(struct rq *rq)
 {
 	/* push_rt_task will return true if it moved an RT */
@@ -2124,6 +2219,7 @@ static void push_rt_tasks(struct rq *rq)
  * the rt_loop_next will cause the iterator to perform another scan.
  *
  */
+/* 在 rto_lock 下轮转 overload mask；loop_next 变化时再扫一轮，结束返回 -1。 */
 static int rto_next_cpu(struct root_domain *rd)
 {
 	int this_cpu = smp_processor_id();
@@ -2176,16 +2272,19 @@ static int rto_next_cpu(struct root_domain *rd)
 	return -1;
 }
 
+/* acquire cmpxchg 竞争 RT push IPI 扫描启动权。 */
 static inline bool rto_start_trylock(atomic_t *v)
 {
 	return !atomic_cmpxchg_acquire(v, 0, 1);
 }
 
+/* release 清启动权，使下一发起者看到本轮 rto 状态更新。 */
 static inline void rto_start_unlock(atomic_t *v)
 {
 	atomic_set_release(v, 0);
 }
 
+/* 合并并发请求，取得 root-domain 引用后把 irq_work 发往首个 overload CPU。 */
 static void tell_cpu_to_push(struct rq *rq)
 {
 	int cpu = -1;
@@ -2220,6 +2319,7 @@ static void tell_cpu_to_push(struct rq *rq)
 }
 
 /* Called from hardirq context */
+/* hardirq 中推空本 CPU 可迁 RT task，再把持引用的 irq_work 传给下一 CPU。 */
 void rto_push_irq_work_func(struct irq_work *work)
 {
 	struct root_domain *rd =
@@ -2257,6 +2357,7 @@ void rto_push_irq_work_func(struct irq_work *work)
 }
 #endif /* HAVE_RT_PUSH_IPI */
 
+/* 从其他 overload rq 拉取能抢占本 rq 的最高 RT task；双锁后复核所有候选。 */
 static void pull_rt_task(struct rq *this_rq)
 {
 	int this_cpu = this_rq->cpu, cpu;
@@ -2370,6 +2471,7 @@ skip:
  * If we are not running and we are not going to reschedule soon, we should
  * try to push tasks away now
  */
+/* 唤醒后若本 rq 不会很快调度且可迁移，主动 push 防止高优先级任务滞留。 */
 static void task_woken_rt(struct rq *rq, struct task_struct *p)
 {
 	bool need_to_push = !task_on_cpu(rq, p) &&
@@ -2384,6 +2486,7 @@ static void task_woken_rt(struct rq *rq, struct task_struct *p)
 }
 
 /* Assumes rq->lock is held */
+/* rq 锁下发布 overload/runtime/cpupri，使新在线 CPU 参与 RT 选择。 */
 static void rq_online_rt(struct rq *rq)
 {
 	if (rq->rt.overloaded)
@@ -2395,6 +2498,7 @@ static void rq_online_rt(struct rq *rq)
 }
 
 /* Assumes rq->lock is held */
+/* rq 锁下撤销 overload/cpupri 并归还 runtime，阻止选择下线 CPU。 */
 static void rq_offline_rt(struct rq *rq)
 {
 	if (rq->rt.overloaded)
@@ -2409,6 +2513,7 @@ static void rq_offline_rt(struct rq *rq)
  * When switch from the rt queue, we bring ourselves to a position
  * that we might want to pull RT tasks from other runqueues.
  */
+/* 最后一个 RT task 离开 class 后请求 pull，利用本 rq 新出现的承载空间。 */
 static void switched_from_rt(struct rq *rq, struct task_struct *p)
 {
 	/*
@@ -2424,6 +2529,7 @@ static void switched_from_rt(struct rq *rq, struct task_struct *p)
 	rt_queue_pull_task(rq);
 }
 
+/* 启动期为每个 possible CPU 分配选核临时 mask。 */
 void __init init_sched_rt_class(void)
 {
 	unsigned int i;
@@ -2439,6 +2545,7 @@ void __init init_sched_rt_class(void)
  * with RT tasks. In this case we try to push them off to
  * other runqueues.
  */
+/* task 切入 RT 后更新 PELT；若已排队则按优先级触发 push 或 resched。 */
 static void switched_to_rt(struct rq *rq, struct task_struct *p)
 {
 	/*
@@ -2467,6 +2574,7 @@ static void switched_to_rt(struct rq *rq, struct task_struct *p)
  * Priority of the task has changed. This may cause
  * us to initiate a push or pull.
  */
+/* RT priority 改变后，运行者降级触发 pull/重调度，等待者升级触发抢占。 */
 static void
 prio_changed_rt(struct rq *rq, struct task_struct *p, u64 oldprio)
 {
@@ -2502,6 +2610,7 @@ prio_changed_rt(struct rq *rq, struct task_struct *p, u64 oldprio)
 }
 
 #ifdef CONFIG_POSIX_TIMERS
+/* tick 检查 RLIMIT_RTTIME，超过软/硬门槛时交 POSIX CPU timer 发信号。 */
 static void watchdog(struct rq *rq, struct task_struct *p)
 {
 	unsigned long soft, hard;
@@ -2526,6 +2635,7 @@ static void watchdog(struct rq *rq, struct task_struct *p)
 	}
 }
 #else /* !CONFIG_POSIX_TIMERS: */
+/* 无 POSIX_TIMERS 配置时 RT watchdog 为空操作。 */
 static inline void watchdog(struct rq *rq, struct task_struct *p) { }
 #endif /* !CONFIG_POSIX_TIMERS */
 
@@ -2537,6 +2647,7 @@ static inline void watchdog(struct rq *rq, struct task_struct *p) { }
  * and everything must be accessed through the @rq and @curr passed in
  * parameters.
  */
+/* tick 结算 runtime/PELT/watchdog；RR 时间片耗尽时移到同优先级队尾并 resched。 */
 static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 {
 	struct sched_rt_entity *rt_se = &p->rt;
@@ -2571,6 +2682,7 @@ static void task_tick_rt(struct rq *rq, struct task_struct *p, int queued)
 	}
 }
 
+/* RR 返回全局 timeslice jiffies，FIFO 返回 0 表示无限。 */
 static unsigned int get_rr_interval_rt(struct rq *rq, struct task_struct *task)
 {
 	/*
@@ -2583,6 +2695,7 @@ static unsigned int get_rr_interval_rt(struct rq *rq, struct task_struct *task)
 }
 
 #ifdef CONFIG_SCHED_CORE
+/* core scheduling 查询 @p 在 @cpu 所属 rt_rq 是否真正 throttle。 */
 static int task_is_throttled_rt(struct task_struct *p, int cpu)
 {
 	struct rt_rq *rt_rq;
@@ -2642,6 +2755,7 @@ DEFINE_SCHED_CLASS(rt) = {
  */
 static DEFINE_MUTEX(rt_constraints_mutex);
 
+/* 遍历 @tg tasks 判断是否已有 RT task；autogroup 按设计恒无 RT task。 */
 static inline int tg_has_rt_tasks(struct task_group *tg)
 {
 	struct task_struct *task;
@@ -2662,12 +2776,14 @@ static inline int tg_has_rt_tasks(struct task_group *tg)
 	return ret;
 }
 
+/* 带宽可调候选值，walk_tg_tree 用它临时替代目标组当前 period/runtime。 */
 struct rt_schedulable_data {
 	struct task_group *tg;
 	u64 rt_period;
 	u64 rt_runtime;
 };
 
+/* 校验单组 runtime<=period、全局上限及子组 ratio 总和不超过父组。 */
 static int tg_rt_schedulable(struct task_group *tg, void *data)
 {
 	struct rt_schedulable_data *d = data;
@@ -2725,6 +2841,7 @@ static int tg_rt_schedulable(struct task_group *tg, void *data)
 	return 0;
 }
 
+/* RCU 遍历整棵 task_group 树模拟候选配置；任一层违规返回负 errno。 */
 static int __rt_schedulable(struct task_group *tg, u64 period, u64 runtime)
 {
 	int ret;
@@ -2742,6 +2859,7 @@ static int __rt_schedulable(struct task_group *tg, u64 period, u64 runtime)
 	return ret;
 }
 
+/* 在 constraints mutex 下先全树 admission，再原子发布组及逐 CPU runtime。 */
 static int tg_set_rt_bandwidth(struct task_group *tg,
 		u64 rt_period, u64 rt_runtime)
 {
@@ -2787,6 +2905,7 @@ unlock:
 	return err;
 }
 
+/* 将用户微秒 runtime 转纳秒，-1 表示无限，溢出返回 -EINVAL。 */
 int sched_group_set_rt_runtime(struct task_group *tg, long rt_runtime_us)
 {
 	u64 rt_runtime, rt_period;
@@ -2801,6 +2920,7 @@ int sched_group_set_rt_runtime(struct task_group *tg, long rt_runtime_us)
 	return tg_set_rt_bandwidth(tg, rt_period, rt_runtime);
 }
 
+/* 返回组 runtime 微秒；无限额度映射为 -1。 */
 long sched_group_rt_runtime(struct task_group *tg)
 {
 	u64 rt_runtime_us;
@@ -2813,6 +2933,7 @@ long sched_group_rt_runtime(struct task_group *tg)
 	return rt_runtime_us;
 }
 
+/* 将微秒 period 安全转纳秒并复用带宽 admission/发布路径。 */
 int sched_group_set_rt_period(struct task_group *tg, u64 rt_period_us)
 {
 	u64 rt_runtime, rt_period;
@@ -2826,6 +2947,7 @@ int sched_group_set_rt_period(struct task_group *tg, u64 rt_period_us)
 	return tg_set_rt_bandwidth(tg, rt_period, rt_runtime);
 }
 
+/* 返回组 period 的微秒表示。 */
 long sched_group_rt_period(struct task_group *tg)
 {
 	u64 rt_period_us;
@@ -2835,6 +2957,7 @@ long sched_group_rt_period(struct task_group *tg)
 	return rt_period_us;
 }
 
+/* 组调度开启时拒绝把 RT task 挂到 runtime 为零的组；允许返回 1。 */
 int sched_rt_can_attach(struct task_group *tg, struct task_struct *tsk)
 {
 	/* Don't accept real-time tasks when there is no way for them to run */
@@ -2847,6 +2970,7 @@ int sched_rt_can_attach(struct task_group *tg, struct task_struct *tsk)
 #endif /* !CONFIG_RT_GROUP_SCHED */
 
 #ifdef CONFIG_SYSCTL
+/* 校验全局 runtime/period、最大可表示额度及整棵组层级 admission。 */
 static int sched_rt_global_validate(void)
 {
 	if ((sysctl_sched_rt_runtime != RUNTIME_INF) &&
@@ -2865,6 +2989,7 @@ static int sched_rt_global_validate(void)
 	return 0;
 }
 
+/* 串行 sysctl 写，联合验证 RT/DL 后提交；失败恢复旧值并重建 domains。 */
 static int sched_rt_handler(const struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos)
 {
@@ -2907,6 +3032,7 @@ undo:
 	return ret;
 }
 
+/* 读写 RR 毫秒 timeslice；零/负写恢复默认，并将内核值保持为 jiffies。 */
 static int sched_rr_handler(const struct ctl_table *table, int write, void *buffer,
 		size_t *lenp, loff_t *ppos)
 {
@@ -2933,6 +3059,7 @@ static int sched_rr_handler(const struct ctl_table *table, int write, void *buff
 }
 #endif /* CONFIG_SYSCTL */
 
+/* RCU 下遍历 @cpu 的根及组 rt_rq 并输出诊断快照。 */
 void print_rt_stats(struct seq_file *m, int cpu)
 {
 	rt_rq_iter_t iter;

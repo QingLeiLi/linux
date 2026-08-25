@@ -1,6 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Scheduler internal types and methods:
+ *
+ * 本头文件是调度器各实现文件共享的内部 ABI：struct rq 是每 CPU 状态与主锁域，
+ * cfs_rq/rt_rq/dl_rq/scx_rq 分别由对应调度类在 rq 锁下维护；root_domain 把
+ * 独占 cpuset 中的 CPU 连接为迁移和准入岛，拓扑替换通过 RCU 发布。无锁 helper
+ * 只提供瞬时提示，真正迁移或状态改变必须重新取得 rq 锁并复验。多 rq 加锁统一按
+ * 地址排序，timer、RCU 和引用计数分别承担延迟执行、读侧生命周期和对象所有权。
  */
 #ifndef _KERNEL_SCHED_SCHED_H
 #define _KERNEL_SCHED_SCHED_H
@@ -186,6 +192,7 @@ extern struct list_head asym_cap_list;
  */
 #define RUNTIME_INF		((u64)~0ULL)
 
+/* policy 分类 helper 只解释策略号，不证明 task 当前仍保持该策略。 */
 static inline int idle_policy(int policy)
 {
 	return policy == SCHED_IDLE;
@@ -215,6 +222,7 @@ static inline int dl_policy(int policy)
 	return policy == SCHED_DEADLINE;
 }
 
+/* 仅接受已编译进内核且归属现有调度类的用户策略。 */
 static inline bool valid_policy(int policy)
 {
 	return idle_policy(policy) || fair_policy(policy) ||
@@ -238,6 +246,7 @@ static inline int task_has_dl_policy(struct task_struct *p)
 
 #define cap_scale(v, s)		((v)*(s) >> SCHED_CAPACITY_SHIFT)
 
+/* 以 1/8 步长更新低成本指数平均；调用者负责并发串行化。 */
 static inline void update_avg(u64 *avg, u64 sample)
 {
 	s64 diff = sample - *avg;
@@ -258,6 +267,7 @@ static inline void update_avg(u64 *avg, u64 sample)
  * maps pretty well onto the shares value used by scheduler and the round-trip
  * conversions preserve the original value over the entire range.
  */
+/* 在 cgroup [1,10000] 权重与调度器 1024 基准间做可逆近似映射。 */
 static inline unsigned long sched_weight_from_cgroup(unsigned long cgrp_weight)
 {
 	return DIV_ROUND_CLOSEST_ULL(cgrp_weight * 1024, CGROUP_WEIGHT_DFL);
@@ -286,6 +296,7 @@ static inline unsigned long sched_weight_to_cgroup(unsigned long weight)
 
 #define SCHED_DL_FLAGS		(SCHED_FLAG_RECLAIM | SCHED_FLAG_DL_OVERRUN | SCHED_FLAG_SUGOV)
 
+/* schedutil 特殊实体不占普通 DL reservation，且在 EDF 比较中始终优先。 */
 static inline bool dl_entity_is_special(const struct sched_dl_entity *dl_se)
 {
 #ifdef CONFIG_CPU_FREQ_GOV_SCHEDUTIL
@@ -308,11 +319,13 @@ static inline bool dl_entity_preempt(const struct sched_dl_entity *a,
 /*
  * This is the priority-queue data structure of the RT scheduling class:
  */
+/* bitmap 找最高优先级，queue 保持同优先级 FIFO/RR 顺序；末位是哨兵。 */
 struct rt_prio_array {
 	DECLARE_BITMAP(bitmap, MAX_RT_PRIO+1); /* include 1 bit for delimiter */
 	struct list_head queue[MAX_RT_PRIO];
 };
 
+/* RT 配额及补充 timer；runtime_lock 嵌套在 rq 锁内，反序会死锁。 */
 struct rt_bandwidth {
 	/* nests inside the rq lock: */
 	raw_spinlock_t		rt_runtime_lock;
@@ -345,6 +358,7 @@ static inline int dl_bandwidth_enabled(void)
  *  - bw (< 100%) is the deadline bandwidth of each CPU;
  *  - total_bw is the currently allocated bandwidth in each root domain;
  */
+/* root_domain 级 DL 准入账本，所有 total_bw 替换都在 lock 下完成。 */
 struct dl_bw {
 	raw_spinlock_t		lock;
 	u64			bw;
@@ -448,6 +462,7 @@ static inline u64 default_bw_period_us(void)
 }
 #endif /* CONFIG_GROUP_SCHED_BANDWIDTH */
 
+/* task_group 的 CFS 配额池；throttled 列表和 timer 均由本结构 lock 串行化。 */
 struct cfs_bandwidth {
 #ifdef CONFIG_CFS_BANDWIDTH
 	raw_spinlock_t		lock;
@@ -475,6 +490,10 @@ struct cfs_bandwidth {
 };
 
 /* Task group related information */
+/*
+ * cgroup 调度节点：每 CPU 子 rq 由该组拥有，父子/兄弟链经 RCU 遍历；销毁时
+ * 必须先从层级摘除并等待读者，再释放 per-CPU 实体与带宽状态。
+ */
 struct task_group {
 	struct cgroup_subsys_state css;
 
@@ -554,6 +573,7 @@ extern int walk_tg_tree_from(struct task_group *from,
  *
  * Caller must hold rcu_lock or sufficient equivalent.
  */
+/* 深度优先遍历完整 task_group 树；调用者持 RCU 或等价生命周期保护。 */
 static inline int walk_tg_tree(tg_visitor down, tg_visitor up, void *data)
 {
 	return walk_tg_tree_from(&root_task_group, down, up, data);
@@ -671,12 +691,18 @@ do {									\
 # define u64_u32_load(var)		u64_u32_load_copy(var, var##_copy)
 # define u64_u32_store(var, val)	u64_u32_store_copy(var, var##_copy, val)
 
+/* rq 解锁前串行执行的延迟均衡回调；next 由 rq 锁保护。 */
 struct balance_callback {
 	struct balance_callback *next;
 	void (*func)(struct rq *rq);
 };
 
 /* Fair scheduling SCHED_{NORMAL,BATCH,IDLE} related fields in a runqueue: */
+/*
+ * CFS 的 per-CPU（或 per-group/per-CPU）队列：tasks_timeline 按虚拟时间排序，
+ * curr 仍计入层级负载；removed 子结构另有锁，允许跨 CPU 移除 PELT 贡献。
+ * 组调度下 rq/tg 是借用指针，task_group 生命周期覆盖该 cfs_rq。
+ */
 struct cfs_rq {
 	struct load_weight	load;
 	unsigned int		nr_queued;
@@ -776,6 +802,7 @@ struct cfs_rq {
 
 #ifdef CONFIG_SCHED_CLASS_EXT
 /* scx_rq->flags, protected by the rq lock */
+/* SCX rq 状态在 rq 锁下变化，wakeup/balance 位还限定 BPF helper 上下文。 */
 enum scx_rq_flags {
 	/*
 	 * A hotplugged CPU starts scheduling before rq_online_scx(). Track
@@ -792,6 +819,7 @@ enum scx_rq_flags {
 	SCX_RQ_IN_BALANCE	= 1 << 17,
 };
 
+/* SCX 的 per-CPU 队列和异步 kick/reenqueue 状态；本地 DSQ 所有权归该 rq。 */
 struct scx_rq {
 	struct scx_dispatch_q	local_dsq;
 	struct list_head	runnable_list;		/* runnable tasks on this rq */
@@ -837,6 +865,7 @@ static inline int rt_bandwidth_enabled(void)
 #endif
 
 /* Real-Time classes' related field in a runqueue: */
+/* RT per-CPU/组队列：active 与 pushable 分属执行顺序和 SMP 迁移候选。 */
 struct rt_rq {
 	struct rt_prio_array	active;
 	unsigned int		rt_nr_running;
@@ -872,6 +901,7 @@ static inline bool rt_rq_is_runnable(struct rt_rq *rt_rq)
 }
 
 /* Deadline class' related fields in a runqueue */
+/* DL per-CPU 队列：root 是 EDF 执行树，pushable 树只含可迁移非当前任务。 */
 struct dl_rq {
 	/* runqueue is an rbtree, ordered by deadline */
 	struct rb_root_cached	root;
@@ -984,6 +1014,7 @@ static inline bool sched_asym_prefer(int a, int b)
 	return arch_asym_cpu_priority(a) > arch_asym_cpu_priority(b);
 }
 
+/* 能耗模型 domain 链由 root_domain 持有并通过 RCU 延迟回收。 */
 struct perf_domain {
 	struct em_perf_domain *em_pd;
 	struct perf_domain *next;
@@ -997,6 +1028,11 @@ struct perf_domain {
  * exclusive cpuset is created, we also create and attach a new root-domain
  * object.
  *
+ */
+/*
+ * 独占 cpuset 的调度岛：span 是成员全集，online 是当前可调度子集；DL/RT
+ * 过载 mask 是无锁搜索提示，迁移方锁住目标 rq 后仍须复验。refcount 管所有
+ * rq 附着，归零后对象经 RCU 回收，避免 topology 读者看到悬空索引。
  */
 struct root_domain {
 	atomic_t		refcount;
@@ -1090,6 +1126,7 @@ extern void rto_push_irq_work_func(struct irq_work *work);
  * Keep track of how many tasks are RUNNABLE for a given utilization
  * clamp value.
  */
+/* bucket 统计 runnable 引用，最后一个任务离开时才可撤销该 clamp 值。 */
 struct uclamp_bucket {
 	unsigned long value : bits_per(SCHED_CAPACITY_SCALE);
 	unsigned long tasks : BITS_PER_LONG - bits_per(SCHED_CAPACITY_SCALE);
@@ -1117,6 +1154,7 @@ struct uclamp_bucket {
  * utilization clamp values (UCLAMP_BUCKETS), use a simple array to track
  * the metrics required to compute all the per-rq utilization clamp values.
  */
+/* rq 的有效 clamp 是非空 bucket 的聚合值，更新受 rq 锁保护。 */
 struct uclamp_rq {
 	unsigned int value;
 	struct uclamp_bucket bucket[UCLAMP_BUCKETS];
@@ -1131,6 +1169,12 @@ DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
  * Locking rule: those places that want to lock multiple runqueues
  * (such as the load balancing or the thread migration code), lock
  * acquire operations must be ordered by ascending &runqueue.
+ */
+/*
+ * 每 CPU 主运行队列。__lock 保护调度类队列、curr/donor 切换和大多数计数；
+ * 标成 RCU 的指针允许受控无锁观察但不能据此直接修改任务。跨 rq 操作必须按
+ * 地址顺序加锁，必要时在放锁后重新读取 donor/curr，CPU 热插拔则额外约束
+ * online/active 与 root_domain 的附着时序。
  */
 struct rq {
 	/*
@@ -1374,6 +1418,7 @@ struct rq {
 #ifdef CONFIG_FAIR_GROUP_SCHED
 
 /* CPU runqueue to which this cfs_rq is attached */
+/* 组调度 cfs_rq 显式记录所属 CPU rq；返回借用指针且不提供锁保护。 */
 static inline struct rq *rq_of(struct cfs_rq *cfs_rq)
 {
 	return cfs_rq->rq;
@@ -1387,6 +1432,7 @@ static inline struct rq *rq_of(struct cfs_rq *cfs_rq)
 }
 #endif /* !CONFIG_FAIR_GROUP_SCHED */
 
+/* rq 的 CPU 归属在初始化后稳定，热插拔不会改变编号。 */
 static inline int cpu_of(struct rq *rq)
 {
 	return rq->cpu;
@@ -1418,6 +1464,7 @@ static __always_inline struct rq *__this_rq(void)
 #define cpu_curr(cpu)		(cpu_rq(cpu)->curr)
 #define raw_rq()		raw_cpu_ptr(&runqueues)
 
+/* idle task、零 runnable 且无待处理远程唤醒三者同时满足才是真空闲。 */
 static inline bool idle_rq(struct rq *rq)
 {
 	return rq->curr == rq->idle && !rq->nr_running && !rq->ttwu_pending;
@@ -1429,6 +1476,7 @@ static inline bool idle_rq(struct rq *rq)
  *
  * Return: 1 if the CPU is currently idle. 0 otherwise.
  */
+/* 虚拟 CPU 被宿主抢占时即使 rq idle 也不可视为立即可用。 */
 static inline bool available_idle_cpu(int cpu)
 {
 	if (!idle_rq(cpu_rq(cpu)))
@@ -1471,6 +1519,7 @@ static inline bool sched_core_disabled(void)
  * Be careful with this function; not for general use. The return value isn't
  * stable unless you actually hold a relevant rq->__lock.
  */
+/* core scheduling 可把 SMT 兄弟映射到共享锁；无锁读取结果不稳定。 */
 static inline raw_spinlock_t *rq_lockp(struct rq *rq)
 {
 	if (sched_core_enabled(rq))
@@ -1635,6 +1684,7 @@ static inline bool rt_group_sched_enabled(void)
 # define rt_group_sched_enabled()	false
 #endif /* !CONFIG_RT_GROUP_SCHED */
 
+/* 断言的是动态 rq_lockp()，因此同时覆盖普通 rq 锁和 core 共享锁。 */
 static inline void lockdep_assert_rq_held(struct rq *rq)
 	__assumes_ctx_lock(__rq_lockp(rq))
 {
@@ -1647,6 +1697,7 @@ extern void raw_spin_rq_lock_nested(struct rq *rq, int subclass)
 extern bool raw_spin_rq_trylock(struct rq *rq)
 	__cond_acquires(true, __rq_lockp(rq));
 
+/* 所有 rq 加锁包装都经 rq_lockp()，避免 core 模式锁错每 CPU 私锁。 */
 static inline void raw_spin_rq_lock(struct rq *rq)
 	__acquires(__rq_lockp(rq))
 {
@@ -1792,6 +1843,7 @@ static inline void assert_clock_updated(struct rq *rq)
 	WARN_ON_ONCE(rq->clock_update_flags < RQCF_ACT_SKIP);
 }
 
+/* rq 时钟只可在锁内且本次 pin 已更新后读取。 */
 static inline u64 rq_clock(struct rq *rq)
 {
 	lockdep_assert_rq_held(rq);
@@ -1800,6 +1852,7 @@ static inline u64 rq_clock(struct rq *rq)
 	return rq->clock;
 }
 
+/* task clock 排除不可归责时间；锁和 UPDATED 约束与 rq_clock 相同。 */
 static inline u64 rq_clock_task(struct rq *rq)
 {
 	lockdep_assert_rq_held(rq);
@@ -1846,6 +1899,7 @@ static inline void rq_clock_stop_loop_update(struct rq *rq)
 	rq->clock_update_flags &= ~RQCF_ACT_SKIP;
 }
 
+/* 保存 IRQ 状态、lockdep pin cookie 和放锁重锁间的时钟更新证据。 */
 struct rq_flags {
 	unsigned long flags;
 	struct pin_cookie cookie;
@@ -1908,6 +1962,7 @@ static inline void assert_balance_callbacks_empty(struct rq *rq)
  *
  * Also see Documentation/locking/lockdep-design.rst.
  */
+/* pin 防止深层 helper 意外解锁，并为本次临界区重置时钟审计状态。 */
 static inline void rq_pin_lock(struct rq *rq, struct rq_flags *rf)
 {
 	rf->cookie = lockdep_pin_lock(__rq_lockp(rq));
@@ -1917,6 +1972,7 @@ static inline void rq_pin_lock(struct rq *rq, struct rq_flags *rf)
 	assert_balance_callbacks_empty(rq);
 }
 
+/* 暂时放锁前保存 UPDATED 并使 SCX 时钟失效，重锁后不得沿用旧快照。 */
 static inline void rq_unpin_lock(struct rq *rq, struct rq_flags *rf)
 {
 	if (rq->clock_update_flags > RQCF_ACT_SKIP)
@@ -1943,6 +1999,7 @@ extern struct rq *___task_rq_lock(struct task_struct *p, struct rq_flags *rf) __
 extern struct rq *_task_rq_lock(struct task_struct *p, struct rq_flags *rf)
 	__acquires(&p->pi_lock) __acquires_ret;
 
+/* 只释放 rq 锁；调用者若同时持 pi_lock 必须用 task_rq_unlock()。 */
 static inline void
 __task_rq_unlock(struct rq *rq, struct task_struct *p, struct rq_flags *rf)
 	__releases(__rq_lockp(rq))
@@ -2158,6 +2215,7 @@ static const unsigned int SD_SHARED_CHILD_MASK =
  * Returns the highest sched_domain of a CPU which contains @flag. If @flag has
  * the SDF_SHARED_CHILD metaflag, all the children domains also have @flag.
  */
+/* 在禁抢占/RCU 保护下找最高匹配层；shared-child 标志允许提前终止。 */
 static inline struct sched_domain *highest_flag_domain(int cpu, int flag)
 {
 	struct sched_domain *sd, *hsd = NULL;
@@ -2179,6 +2237,7 @@ static inline struct sched_domain *highest_flag_domain(int cpu, int flag)
 	return hsd;
 }
 
+/* 返回首个匹配层或 NULL，返回指针不能越过调用者的拓扑读侧区间。 */
 static inline struct sched_domain *lowest_flag_domain(int cpu, int flag)
 {
 	struct sched_domain *sd;
@@ -2209,6 +2268,7 @@ static __always_inline bool sched_asym_cpucap_active(void)
 	return static_branch_unlikely(&sched_asym_cpucapacity);
 }
 
+/* 相同 group 共享的容量快照，以 ref 管理，balance_mask 决定唯一执行 CPU。 */
 struct sched_group_capacity {
 	atomic_t		ref;
 	/*
@@ -2226,6 +2286,7 @@ struct sched_group_capacity {
 	unsigned long		cpumask[];		/* Balance mask */
 };
 
+/* domain 的横向组环；next 必须闭环，span 与 ref 在拓扑发布后只读。 */
 struct sched_group {
 	struct sched_group	*next;			/* Must be a circular list */
 	atomic_t		ref;
@@ -2582,6 +2643,10 @@ struct affinity_context {
 
 extern s64 update_curr_common(struct rq *rq);
 
+/*
+ * 调度类虚表。每个回调上方列出的锁是 ABI 的一部分；实现不能假定比调用点
+ * 更多的保护。链接脚本按优先级排列实例，遍历顺序就是跨类抢占顺序。
+ */
 struct sched_class {
 
 #ifdef CONFIG_UCLAMP_TASK
@@ -2755,6 +2820,7 @@ __put_prev_set_next_dl_server(struct rq *rq,
 	rq->dl_server = NULL;
 }
 
+/* 同 rq 锁内完成前后类交接；next==prev 只转移 DL server 上下文。 */
 static inline void put_prev_set_next_task(struct rq *rq,
 					  struct task_struct *prev,
 					  struct task_struct *next)
@@ -2799,6 +2865,7 @@ extern const struct sched_class idle_sched_class;
  * Iterate only active classes. SCX can take over all fair tasks or be
  * completely disabled. If the former, skip fair. If the latter, skip SCX.
  */
+/* 根据 SCX 静态键跳过被接管的 fair 或未启用的 ext 类。 */
 static inline const struct sched_class *next_active_class(const struct sched_class *class)
 {
 	class++;
@@ -2871,6 +2938,7 @@ extern void sched_balance_trigger(struct rq *rq);
 extern int __set_cpus_allowed_ptr(struct task_struct *p, struct affinity_context *ctx);
 extern void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx);
 
+/* 同时检查动态亲和性和用户任务的 possible mask；结果仍受热插拔竞态影响。 */
 static inline bool task_allowed_on_cpu(struct task_struct *p, int cpu)
 {
 	/* When not in the task's cpumask, no point in looking further. */
@@ -2894,6 +2962,7 @@ static inline cpumask_t *alloc_user_cpus_ptr(int node)
 	return kmalloc_node(size, GFP_KERNEL, node);
 }
 
+/* rq 锁下取得当前 donor 引用并设置单飞标志；失败表示不可迁移或已有 push。 */
 static inline struct task_struct *get_push_task(struct rq *rq)
 {
 	struct task_struct *p = rq->donor;
@@ -3003,6 +3072,7 @@ static inline int sched_tick_offload_init(void) { return 0; }
 static inline void sched_update_tick_dependency(struct rq *rq) { }
 #endif /* !CONFIG_NO_HZ_FULL */
 
+/* rq 锁下增加总 runnable；跨过 2 的阈值发布 root_domain 过载提示。 */
 static inline void add_nr_running(struct rq *rq, unsigned count)
 {
 	unsigned prev_nr = rq->nr_running;
@@ -3018,6 +3088,7 @@ static inline void add_nr_running(struct rq *rq, unsigned count)
 	sched_update_tick_dependency(rq);
 }
 
+/* 减少 runnable 并重算 nohz tick 依赖；过载清理由均衡路径精确处理。 */
 static inline void sub_nr_running(struct rq *rq, unsigned count)
 {
 	rq->nr_running -= count;
@@ -3029,6 +3100,7 @@ static inline void sub_nr_running(struct rq *rq, unsigned count)
 	sched_update_tick_dependency(rq);
 }
 
+/* release 清零 on_rq 后任务所有权可立即转给唤醒方，调用者不得再解引用 p。 */
 static inline void __block_task(struct rq *rq, struct task_struct *p)
 {
 	if (p->sched_contributes_to_load)
@@ -3080,6 +3152,7 @@ extern void wakeup_preempt(struct rq *rq, struct task_struct *p, int flags);
 /*
  * attach_task() -- attach the task detached by detach_task() to its new rq.
  */
+/* 目标 rq 锁下激活已完成 set_task_cpu() 的任务，并立即检查抢占。 */
 static inline void attach_task(struct rq *rq, struct task_struct *p)
 {
 	lockdep_assert_rq_held(rq);
@@ -3208,6 +3281,7 @@ static __always_inline void __class_##_name##_cleanup_ctx2(class_##_name##_t **_
 	*__UNIQUE_ID(unlock1) __cleanup(__class_##_name##_cleanup_ctx1) = (void *)(_T1),\
 	*__UNIQUE_ID(unlock2) __cleanup(__class_##_name##_cleanup_ctx2) = (void *)(_T2)
 
+/* 双 rq 锁的全序：core 模式先按共享 core、再按 CPU，防止 AB-BA。 */
 static inline bool rq_order_less(struct rq *rq1, struct rq *rq2)
 {
 #ifdef CONFIG_SCHED_CORE
@@ -3297,6 +3371,7 @@ static inline int _double_lock_balance(struct rq *this_rq, struct rq *busiest)
 /*
  * double_lock_balance - lock the busiest runqueue, this_rq is locked already.
  */
+/* IRQ 已关闭且 this_rq 已锁；返回值说明过程中是否曾释放 this_rq。 */
 static inline int double_lock_balance(struct rq *this_rq, struct rq *busiest)
 	__must_hold(__rq_lockp(this_rq))
 	__acquires(__rq_lockp(busiest))
@@ -3306,6 +3381,7 @@ static inline int double_lock_balance(struct rq *this_rq, struct rq *busiest)
 	return _double_lock_balance(this_rq, busiest);
 }
 
+/* 共享 core 锁只做一次真实 unlock，另一份 lockdep 获取用伪释放配平。 */
 static inline void double_unlock_balance(struct rq *this_rq, struct rq *busiest)
 	__releases(__rq_lockp(busiest))
 {
@@ -3370,6 +3446,7 @@ DECLARE_LOCK_GUARD_2_ATTRS(double_raw_spinlock,
  * Note this does not restore interrupts like task_rq_unlock,
  * you need to do so manually after calling.
  */
+/* 两 rq 可能映射到同一 core 锁，必须避免重复解锁；本 helper 不恢复 IRQ。 */
 static inline void double_rq_unlock(struct rq *rq1, struct rq *rq2)
 	__releases(__rq_lockp(rq1), __rq_lockp(rq2))
 {
@@ -3479,6 +3556,7 @@ static inline void sched_core_tick(struct rq *rq) { }
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 
+/* 32 位读者通过 u64_stats_sync 获取一致的 IRQ 累计时间快照。 */
 struct irqtime {
 	u64			total;
 	u64			tick_delta;
@@ -3548,6 +3626,7 @@ DECLARE_PER_CPU(struct update_util_data __rcu *, cpufreq_update_util_data);
  * but that really is a band-aid.  Going forward it should be replaced with
  * solutions targeted more specifically at RT tasks.
  */
+/* sched RCU 下读取 governor 回调；注册方负责 RCU 替换与回收。 */
 static inline void cpufreq_update_util(struct rq *rq, unsigned int flags)
 {
 	struct update_util_data *data;
@@ -3586,6 +3665,7 @@ unsigned long sugov_effective_cpu_perf(int cpu, unsigned long actual,
  * greater than or equal to task's deadline density right shifted by
  * (BW_SHIFT - SCHED_CAPACITY_SHIFT) and false otherwise.
  */
+/* 比较原始 CPU capacity 与任务 deadline density，不承诺目标 CPU 当前在线。 */
 static inline bool dl_task_fits_capacity(struct task_struct *p, int cpu)
 {
 	unsigned long cap = arch_scale_cpu_capacity(cpu);
@@ -3624,6 +3704,7 @@ unsigned long uclamp_eff_value(struct task_struct *p, enum uclamp_id clamp_id);
  * Returns true if userspace opted-in to use uclamp and aggregation at rq level
  * hence is active.
  */
+/* 静态键一旦启用不再关闭，避免未使用系统承担 rq 聚合开销。 */
 static inline bool uclamp_is_used(void)
 {
 	return static_branch_likely(&sched_uclamp_used);
@@ -3659,6 +3740,7 @@ static inline bool uclamp_rq_is_idle(struct rq *rq)
 }
 
 /* Is the rq being capped/throttled by uclamp_max? */
+/* CFS+RT 利用率达到有效 max clamp 时视为受限；关闭 uclamp 快速返回。 */
 static inline bool uclamp_rq_is_capped(struct rq *rq)
 {
 	unsigned long rq_util;
@@ -3804,6 +3886,7 @@ static inline bool sched_energy_enabled(void) { return false; }
  * - store to rq->membarrier_state and following user-space memory accesses.
  * In the same way it provides those guarantees around store to rq->curr.
  */
+/* context switch 时缓存 next mm 状态；外围屏障保证用户内存访问的规定顺序。 */
 static inline void membarrier_switch_mm(struct rq *rq,
 					struct mm_struct *prev_mm,
 					struct mm_struct *next_mm)
@@ -3914,6 +3997,7 @@ static __always_inline void mm_drop_cid_on_cpu(struct mm_struct *mm, struct mm_c
 	}
 }
 
+/* 原子占用首个空闲 CID；并发抢占同一位时返回 UNSET 让上层重试。 */
 static inline unsigned int __mm_get_cid(struct mm_struct *mm, unsigned int max_cids)
 {
 	unsigned int cid = find_first_zero_bit(mm_cidmask(mm), max_cids);
@@ -3925,6 +4009,7 @@ static inline unsigned int __mm_get_cid(struct mm_struct *mm, unsigned int max_c
 	return cid;
 }
 
+/* 先尝试收敛区间，耗尽时扩到 possible CPU 数并自旋等待可用位。 */
 static inline unsigned int mm_get_cid(struct mm_struct *mm)
 {
 	unsigned int cid = __mm_get_cid(mm, READ_ONCE(mm->mm_cid.max_cids));
@@ -3936,6 +4021,7 @@ static inline unsigned int mm_get_cid(struct mm_struct *mm)
 	return cid;
 }
 
+/* 尽量把旧 CID 换入新上限，失败则保留原所有权并维持 ONCPU 模式。 */
 static inline unsigned int mm_cid_converge(struct mm_struct *mm, unsigned int orig_cid,
 					   unsigned int max_cids)
 {
@@ -4036,6 +4122,7 @@ static __always_inline void mm_cid_from_task(struct task_struct *t, unsigned int
 	mm_cid_update_task_cid(t, tcid);
 }
 
+/* 调入时按 mode 在 task 与 per-CPU 槽之间交接 CID，非 active 任务跳过。 */
 static __always_inline void mm_cid_schedin(struct task_struct *next)
 {
 	struct mm_struct *mm = next->mm;
@@ -4052,6 +4139,7 @@ static __always_inline void mm_cid_schedin(struct task_struct *next)
 		mm_cid_from_cpu(next, cpu_cid, mode);
 }
 
+/* 仅 transition CID 需要调出收尾：可收敛则转移，否则清位并设 UNSET。 */
 static __always_inline void mm_cid_schedout(struct task_struct *prev)
 {
 	struct mm_struct *mm = prev->mm;
@@ -4116,6 +4204,7 @@ extern void init_sched_mm(struct task_struct *p);
 
 extern u64 avg_vruntime(struct cfs_rq *cfs_rq);
 extern int entity_eligible(struct cfs_rq *cfs_rq, struct sched_entity *se);
+/* 源、目的 rq 均已锁时完成离队、改 CPU、入队和抢占检查。 */
 static inline
 void move_queued_task_locked(struct rq *src_rq, struct rq *dst_rq, struct task_struct *task)
 {
@@ -4128,6 +4217,7 @@ void move_queued_task_locked(struct rq *src_rq, struct rq *dst_rq, struct task_s
 	wakeup_preempt(dst_rq, task, 0);
 }
 
+/* push 候选必须不在执行且目标在亲和性内；调用者锁住 rq 后使用。 */
 static inline
 bool task_is_pushable(struct rq *rq, struct task_struct *p, int cpu)
 {

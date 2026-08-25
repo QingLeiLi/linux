@@ -18,6 +18,11 @@
  * before it returns. As long as the BPF scheduler only uses the tables from
  * those points onward, it sees a consistent view.
  */
+/*
+ * 三张表只在首次启用时分配并永久保留：默认映射在 BPF ops.init 前写完，自定义映射
+ * 在 override 返回前写完，因此运行期读者无需为表指针取得引用。元素在当前 scheduler
+ * 生命周期内视为稳定；发布边界之外的并发读写不受本契约保护。
+ */
 s16 *scx_cid_to_cpu_tbl;
 s16 *scx_cpu_to_cid_tbl;
 struct scx_cid_topo *scx_cid_topo;
@@ -32,6 +37,10 @@ struct scx_cid_topo *scx_cid_topo;
  * !present), record @cpu in @fallbacks and return its node mask instead - the
  * worst that can happen is that the cpu's LLC becomes coarser than reality.
  */
+/*
+ * 返回 CPU 最末级 cache 的共享 mask；离线/缺 cacheinfo 时记录降级 CPU 并退化到 NUMA
+ * node mask，结果可能把多个真实 LLC 合并但不会把 CPU 排除。返回指针由拓扑子系统拥有。
+ */
 static const struct cpumask *cpu_llc_mask(int cpu, struct cpumask *fallbacks)
 {
 	struct cpu_cacheinfo *ci = get_cpu_cacheinfo(cpu);
@@ -44,6 +53,10 @@ static const struct cpumask *cpu_llc_mask(int cpu, struct cpumask *fallbacks)
 }
 
 /* Allocate the cid tables once on first enable; never freed. */
+/*
+ * 首次启用分配双向映射和拓扑数组；任一分配失败回滚本次三个临时对象并返回 -ENOMEM。
+ * 成功后用 WRITE_ONCE 逐个发布，之后快速返回 0，表故意不释放以简化跨 scheduler 读侧。
+ */
 static s32 scx_cid_arrays_alloc(void)
 {
 	u32 npossible = num_possible_cpus();
@@ -80,6 +93,12 @@ static s32 scx_cid_arrays_alloc(void)
  * straddling two NUMA nodes into two LLC units. The caller must hold
  * cpus_read_lock.
  */
+/*
+ * 在持 cpus_read_lock 时构建稠密 cid：按 node→LLC→core 逐层取父范围与子 mask 交集，
+ * 因而每层天然连续且跨 NUMA 的 LLC 会被拆开。每个 CPU 写双向表和三层起点/序号；
+ * possible 但未分配者追加到无拓扑尾段。表/临时 mask 分配失败返回 -ENOMEM，拓扑交集
+ * 自相矛盾时 WARN 并返回 -EINVAL；已永久分配的表不回滚，下一次初始化会重新填充。
+ */
 s32 scx_cid_init(struct scx_sched *sch)
 {
 	cpumask_var_t to_walk __free(free_cpumask_var) = CPUMASK_VAR_NULL;
@@ -93,6 +112,7 @@ s32 scx_cid_init(struct scx_sched *sch)
 	s32 cpu, ret;
 
 	/* CMASK_MAX_WORDS in cid.bpf.h covers NR_CPUS up to 8192 */
+	/* 编译期拒绝 BPF cmask 固定上限无法表达的内核 NR_CPUS 配置。 */
 	BUILD_BUG_ON(NR_CPUS > 8192);
 
 	lockdep_assert_cpus_held();
@@ -110,6 +130,7 @@ s32 scx_cid_init(struct scx_sched *sch)
 		return -ENOMEM;
 
 	/* -1 sentinels for sparse-possible cpu id holes (0 is a valid cid) */
+	/* raw CPU 编号洞必须用 -1 标识，不能用合法 cid 0。 */
 	for (cpu = 0; cpu < nr_cpu_ids; cpu++)
 		scx_cpu_to_cid_tbl[cpu] = -1;
 
@@ -125,6 +146,7 @@ s32 scx_cid_init(struct scx_sched *sch)
 		 * No NUMA info: skip and let the tail loop assign a no-topo
 		 * cid. cpumask_of_node(-1) is undefined.
 		 */
+		/* 缺 NUMA id 时暂时移出拓扑遍历，尾段稍后仍会给它唯一 cid。 */
 		if (nid < 0) {
 			cpumask_clear_cpu(next_cpu, to_walk);
 			continue;
@@ -187,6 +209,10 @@ s32 scx_cid_init(struct scx_sched *sch)
 	 * not-online ones. Collect any currently-online cpus that land here in
 	 * @online_no_topo so we can warn about them at the end.
 	 */
+	/*
+	 * 所有尚无 cid 的 possible CPU（通常离线）按 raw CPU 顺序追加并填 -1
+	 * 拓扑；意外在线者仍获得可用映射，同时收集到 warning mask 暴露拓扑缺失。
+	 */
 	for_each_cpu(cpu, cpu_possible_mask) {
 		s32 cid;
 
@@ -217,6 +243,7 @@ s32 scx_cid_init(struct scx_sched *sch)
  *
  * Storage past the active range is left as is.
  */
+/* 只清 active range 覆盖的完整存储 word；空范围快速返回，范围外容量保持原值。 */
 void scx_cmask_clear(struct scx_cmask *m)
 {
 	u32 nr_words;
@@ -232,6 +259,10 @@ void scx_cmask_clear(struct scx_cmask *m)
  * @m: cmask to fill
  *
  * Counterpart to scx_cmask_clear(). Storage past the active range is left as is.
+ */
+/*
+ * 把 active range 覆盖 word 先全置 1，再清首 word 的 base 前缀和尾 word 的范围后缀，
+ * 保持 padding 恒为 0；空范围无写入，调用者须独占 dst。
  */
 void scx_cmask_fill(struct scx_cmask *m)
 {
@@ -261,6 +292,10 @@ void scx_cmask_fill(struct scx_cmask *m)
  * Clear @dst's active range and set the bit for each cid whose cpu is in
  * @src and lies within that range. Out-of-range cids are silently ignored.
  */
+/*
+ * 先清空 dst，再逐 raw CPU 查 cid 并调用有范围检查的 set；raw 编号洞/不在 dst 窗口的
+ * cid 被忽略。src/dst 均为借用对象，函数不分配且要求调用者稳定映射和掩码。
+ */
 void scx_cpumask_to_cmask(const struct cpumask *src, struct scx_cmask *dst)
 {
 	s32 cpu;
@@ -287,6 +322,12 @@ __bpf_kfunc_start_defs();
  * must map to a unique cid in [0, num_possible_cpus()). Topo info is cleared.
  * On invalid input, trigger scx_error() to abort the scheduler.
  */
+/*
+ * 仅 root scheduler 的 sleepable ops.init 可覆盖映射。先在进入 RCU 前分配 seen mask，
+ * 再校验活动 scheduler、root 身份、精确字节长度以及每个 possible CPU 的 cid 有效且唯一；
+ * 任何失败通过 scx_error 终止加载。成功写完双向表并把旧拓扑全部置 -1，自定义映射不
+ * 声称 core/LLC/node 连续关系。输入数组由 BPF verifier 保证可读，不取得所有权。
+ */
 __bpf_kfunc void scx_bpf_cid_override(const s32 *cpu_to_cid, u32 cpu_to_cid__sz,
 				      const struct bpf_prog_aux *aux)
 {
@@ -296,6 +337,7 @@ __bpf_kfunc void scx_bpf_cid_override(const s32 *cpu_to_cid, u32 cpu_to_cid__sz,
 	s32 cpu, cid;
 
 	/* GFP_KERNEL alloc must happen before the rcu read section */
+	/* 可睡眠分配不能放进随后 guard(rcu) 的不可睡眠读侧区间。 */
 	alloced = zalloc_cpumask_var(&seen, GFP_KERNEL);
 
 	guard(rcu)();
@@ -334,6 +376,7 @@ __bpf_kfunc void scx_bpf_cid_override(const s32 *cpu_to_cid, u32 cpu_to_cid__sz,
 	}
 
 	/* Invalidate stale topo info - the override carries no topology. */
+	/* 覆盖只承诺一一映射，必须清除默认探测留下的拓扑，防止 BPF 误用陈旧分片。 */
 	for (cid = 0; cid < num_possible_cpus(); cid++)
 		scx_cid_topo[cid] = SCX_CID_TOPO_NEG;
 }
@@ -347,6 +390,10 @@ __bpf_kfunc void scx_bpf_cid_override(const s32 *cpu_to_cid, u32 cpu_to_cid__sz,
  * @cid is invalid. The cid<->cpu mapping is static for the lifetime of the
  * loaded scheduler, so the BPF side can cache the result to avoid repeated
  * kfunc invocations.
+ */
+/*
+ * 在 RCU 下解析发起 BPF 程序所属 scheduler；无活动 scheduler 返回 -EINVAL，有效时
+ * 复用带 scx_error 的边界检查并返回稳定 raw CPU。映射生命周期允许 BPF 缓存结果。
  */
 __bpf_kfunc s32 scx_bpf_cid_to_cpu(s32 cid, const struct bpf_prog_aux *aux)
 {
@@ -370,6 +417,7 @@ __bpf_kfunc s32 scx_bpf_cid_to_cpu(s32 cid, const struct bpf_prog_aux *aux)
  * scheduler, so the BPF side can cache the result to avoid repeated kfunc
  * invocations.
  */
+/* 与 cid_to_cpu 对偶：验证 BPF 上下文和 possible CPU，成功返回当前 scheduler 稳定 cid。 */
 __bpf_kfunc s32 scx_bpf_cpu_to_cid(s32 cpu, const struct bpf_prog_aux *aux)
 {
 	struct scx_sched *sch;
@@ -399,6 +447,11 @@ __bpf_kfunc s32 scx_bpf_cpu_to_cid(s32 cpu, const struct bpf_prog_aux *aux)
  * read @src word-by-word via data_race(). Memory ordering with concurrent
  * writers is the caller's responsibility.
  */
+/*
+ * 双掩码操作共用按 word 遍历器，公开入口传入编译期常量 op，使 inline switch 在生成
+ * 代码中折叠。只操作两个 active range 的交集，dst 交集外保持不变；谓词命中即短路。
+ * _RACY 仅用 data_race 允许 src 并发更新，得到逐 word 混合时刻快照，不建立内存序。
+ */
 enum cmask_op2 {
 	/* mutating */
 	CMASK_OP2_AND,
@@ -412,11 +465,16 @@ enum cmask_op2 {
 	CMASK_OP2_INTERSECTS,
 };
 
+/* 标识需要在首个 true word 处短路的两种只读谓词；变更操作必须遍历全部交集。 */
 static __always_inline bool cmask_op2_is_pred(const enum cmask_op2 op)
 {
 	return op == CMASK_OP2_SUBSET || op == CMASK_OP2_INTERSECTS;
 }
 
+/*
+ * 在 mask 指定的一个全局 cid word 区间执行 op。变更操作仅更新 av 的 mask 位并返回
+ * false；subset 把 bp 解释为 sub、av 为 super，intersects 测共同位，二者返回是否命中。
+ */
 static __always_inline bool cmask_word_op2(u64 *av, const u64 *bp, u64 mask,
 					   const enum cmask_op2 op)
 {
@@ -441,6 +499,7 @@ static __always_inline bool cmask_word_op2(u64 *av, const u64 *bp, u64 mask,
 		return false;
 	case CMASK_OP2_SUBSET:
 		/* stop on the first bit in @sub not set in @super */
+		/* 找到 sub 中存在而 super 中缺失的首个 word 即可判定不是子集。 */
 		return (*bp & ~*av) & mask;
 	case CMASK_OP2_INTERSECTS:
 		return (*av & *bp) & mask;
@@ -457,6 +516,11 @@ static __always_inline bool cmask_word_op2(u64 *av, const u64 *bp, u64 mask,
  *
  * Base/nr_cids are taken as parameters so callers with snapshotted bounds can
  * drive the walk with values independent of the cmask's header.
+ */
+/*
+ * 计算两半开区间交集，把全局 word 编号换算成各 bits[] 局部下标；首尾分别用 head/
+ * tail mask 遮掉 padding，同 word 时合并两 mask。空交集返回 false，谓词可早停，变更
+ * 操作处理到尾 word。独立 base/长度参数允许调用者使用已快照的 header。
  */
 static __always_inline bool cmask_walk_op2(u64 *a_bits, u32 a_base, u32 a_nr_cids,
 					   const u64 *b_bits, u32 b_base, u32 b_nr_cids,
@@ -499,6 +563,7 @@ enum cmask_op1 {
 	CMASK_OP1_ANY_SET,
 };
 
+/* 单 word 谓词当前仅检测 mask 范围内是否有任一置位。 */
 static __always_inline bool cmask_word_op1(const u64 *ap, u64 mask,
 					   const enum cmask_op1 op)
 {
@@ -515,6 +580,10 @@ static __always_inline bool cmask_word_op1(const u64 *ap, u64 mask,
  * no word matches or the range is empty. All current op1s short-circuit on
  * per-word true; if a non-predicate op1 lands here, add a cmask_op1_is_pred()
  * guard analogous to cmask_op2_is_pred().
+ */
+/*
+ * 单掩码版按 word 扫描半开区间，首尾遮 padding，首个置位即返回 true；空范围或全零
+ * 返回 false。若未来加入变更 op，必须另加谓词判断，不能沿用当前无条件短路结构。
  */
 static __always_inline bool cmask_walk_op1(const u64 *a_bits, u32 a_base,
 					   u32 a_nr_cids,
@@ -544,12 +613,14 @@ static __always_inline bool cmask_walk_op1(const u64 *a_bits, u32 a_base,
 	return cmask_word_op1(&a_bits[hi_word - a_word_off], tail_mask, op);
 }
 
+/* 对 active range 交集执行 dst &= src；交集外 dst 不变，调用者负责同步读写。 */
 void scx_cmask_and(struct scx_cmask *dst, const struct scx_cmask *src)
 {
 	cmask_walk_op2(dst->bits, dst->base, dst->nr_cids,
 		       src->bits, src->base, src->nr_cids, CMASK_OP2_AND);
 }
 
+/* 对 active range 交集执行 dst |= src；交集外 dst 不变。 */
 void scx_cmask_or(struct scx_cmask *dst, const struct scx_cmask *src)
 {
 	cmask_walk_op2(dst->bits, dst->base, dst->nr_cids,
@@ -563,12 +634,14 @@ void scx_cmask_or(struct scx_cmask *dst, const struct scx_cmask *src)
  * rationale as scx_cmask_copy_racy(). Memory ordering with writers is the
  * caller's responsibility.
  */
+/* 允许 src 并发变化的 OR；逐 word data_race 快照可能来自不同时刻，dst 仍须独占。 */
 void scx_cmask_or_racy(struct scx_cmask *dst, const struct scx_cmask *src)
 {
 	cmask_walk_op2(dst->bits, dst->base, dst->nr_cids,
 		       src->bits, src->base, src->nr_cids, CMASK_OP2_OR_RACY);
 }
 
+/* 用 src 覆盖两个 active range 的交集；不会清除 dst 位于 src 范围外的位。 */
 void scx_cmask_copy(struct scx_cmask *dst, const struct scx_cmask *src)
 {
 	cmask_walk_op2(dst->bits, dst->base, dst->nr_cids,
@@ -583,12 +656,14 @@ void scx_cmask_copy(struct scx_cmask *dst, const struct scx_cmask *src)
  * just leave some bits fresher than others. Memory ordering with writers is
  * the caller's responsibility.
  */
+/* copy 的无锁 src 版本；各 bit 独立使混合快照可用，但一致性和发布次序由调用者定义。 */
 void scx_cmask_copy_racy(struct scx_cmask *dst, const struct scx_cmask *src)
 {
 	cmask_walk_op2(dst->bits, dst->base, dst->nr_cids,
 		       src->bits, src->base, src->nr_cids, CMASK_OP2_COPY_RACY);
 }
 
+/* 对交集执行 dst &= ~src；src 范围外不会意外清除 dst。 */
 void scx_cmask_andnot(struct scx_cmask *dst, const struct scx_cmask *src)
 {
 	cmask_walk_op2(dst->bits, dst->base, dst->nr_cids,
@@ -598,6 +673,10 @@ void scx_cmask_andnot(struct scx_cmask *dst, const struct scx_cmask *src)
 /*
  * Return true if @cm has any bit set in [@lo, @hi). Caller must ensure
  * [@lo, @hi) is contained in @cm's range.
+ */
+/*
+ * 检查 cm 内已保证有效的子区间是否有置位；把 bits 指针预偏移到 lo 所在 word 后复用
+ * op1 遍历器。空区间为 false，越界是调用者错误且本层不检查。
  */
 static bool cmask_any_set_in_range(const struct scx_cmask *cm, u32 lo, u32 hi)
 {
@@ -614,6 +693,10 @@ static bool cmask_any_set_in_range(const struct scx_cmask *cm, u32 lo, u32 hi)
  *
  * Return true iff every set bit of @sub is also set in @super.
  */
+/*
+ * 子集判断先扫描 sub 落在 super active range 左右之外的部分，任何置位都直接失败；
+ * 再在交集内查找 sub 有而 super 无的位。空 sub 自然为 true，范围无需相同。
+ */
 bool scx_cmask_subset(const struct scx_cmask *sub, const struct scx_cmask *super)
 {
 	u32 super_end = super->base + super->nr_cids;
@@ -624,6 +707,7 @@ bool scx_cmask_subset(const struct scx_cmask *sub, const struct scx_cmask *super
 	 * such bit means not a subset. The walk below only visits words
 	 * common to both ranges, so these need a separate scan.
 	 */
+	/* 交集遍历看不到 super 范围外的 sub 位，必须分别补查左右两段。 */
 	if (sub->base < super->base &&
 	    cmask_any_set_in_range(sub, sub->base, min(super->base, sub_end)))
 		return false;
@@ -635,6 +719,7 @@ bool scx_cmask_subset(const struct scx_cmask *sub, const struct scx_cmask *super
 			       sub->bits, sub->base, sub->nr_cids, CMASK_OP2_SUBSET);
 }
 
+/* 返回两个 active range 交集内是否存在共同置位；空交集为 false，不修改任一对象。 */
 bool scx_cmask_intersects(const struct scx_cmask *a, const struct scx_cmask *b)
 {
 	return cmask_walk_op2((u64 *)a->bits, a->base, a->nr_cids,
@@ -647,6 +732,7 @@ bool scx_cmask_intersects(const struct scx_cmask *a, const struct scx_cmask *b)
  *
  * Return true iff @m's active range has no bits set.
  */
+/* 对完整 active range 做 any-set 的逻辑取反；空范围按集合语义返回 true。 */
 bool scx_cmask_empty(const struct scx_cmask *m)
 {
 	return !cmask_any_set_in_range(m, m->base, m->base + m->nr_cids);
@@ -661,6 +747,10 @@ bool scx_cmask_empty(const struct scx_cmask *m)
  * Fill @out__uninit with the topology info for @cid. Trigger scx_error() if
  * @cid is out of range. If @cid is valid but in the no-topo section, all fields
  * are set to -1.
+ */
+/*
+ * 在 RCU 下取得活动 scheduler 并验证 cid；失败时也完整写出全 -1，避免 BPF 观察未初始化
+ * 输出。成功按值复制稳定拓扑项，无拓扑尾段本身即为全 -1。
  */
 __bpf_kfunc void scx_bpf_cid_topo(s32 cid, struct scx_cid_topo *out__uninit,
 				  const struct bpf_prog_aux *aux)
@@ -701,6 +791,10 @@ static const struct btf_kfunc_id_set scx_kfunc_set_cid = {
 	.set	= &scx_kfunc_ids_cid,
 };
 
+/*
+ * 依次为 STRUCT_OPS init 专用集合及 STRUCT_OPS/TRACING/SYSCALL 通用查询集合注册 BTF
+ * kfunc；GNU `?:` 在首个非零错误处短路并返回，全部成功才返回 0，无回滚已注册集合。
+ */
 int scx_cid_kfunc_init(void)
 {
 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS, &scx_kfunc_set_init) ?:

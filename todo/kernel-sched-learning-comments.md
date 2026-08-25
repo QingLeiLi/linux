@@ -29,7 +29,7 @@
 ### 构建入口、公共数据结构与调度特性
 
 - [x] `kernel/sched/Makefile`
-- [ ] `kernel/sched/sched.h`
+- [x] `kernel/sched/sched.h`
 - [x] `kernel/sched/smp.h`
 - [x] `kernel/sched/features.h`
 - [x] `kernel/sched/rq-offsets.c`
@@ -38,17 +38,17 @@
 
 ### 系统调用、等待与跨 CPU 调度接口
 
-- [ ] `kernel/sched/syscalls.c`
+- [x] `kernel/sched/syscalls.c`
 - [x] `kernel/sched/wait.c`
 - [x] `kernel/sched/wait_bit.c`
-- [ ] `kernel/sched/membarrier.c`
-- [~] `kernel/sched/clock.c`
+- [x] `kernel/sched/membarrier.c`
+- [x] `kernel/sched/clock.c`
 
 ### 调度类与运行队列策略
 
-- [ ] `kernel/sched/fair.c`
-- [ ] `kernel/sched/rt.c`
-- [ ] `kernel/sched/deadline.c`
+- [x] `kernel/sched/fair.c`
+- [x] `kernel/sched/rt.c`
+- [x] `kernel/sched/deadline.c`
 - [x] `kernel/sched/stop_task.c`
 - [x] `kernel/sched/core_sched.c`
 - [x] `kernel/sched/autogroup.h`
@@ -60,7 +60,7 @@
 - [x] `kernel/sched/cpupri.c`
 - [x] `kernel/sched/cpudeadline.h`
 - [x] `kernel/sched/cpudeadline.c`
-- [ ] `kernel/sched/topology.c`
+- [x] `kernel/sched/topology.c`
 
 ### PELT、负载、统计与 CPU 时间
 
@@ -68,30 +68,30 @@
 - [x] `kernel/sched/pelt.h`
 - [x] `kernel/sched/pelt.c`
 - [x] `kernel/sched/loadavg.c`
-- [ ] `kernel/sched/cputime.c`
+- [x] `kernel/sched/cputime.c`
 - [x] `kernel/sched/cpuacct.c`
 - [x] `kernel/sched/stats.h`
 - [x] `kernel/sched/stats.c`
-- [ ] `kernel/sched/debug.c`
-- [ ] `kernel/sched/psi.c`
+- [x] `kernel/sched/debug.c`
+- [x] `kernel/sched/psi.c`
 
 ### CPU 频率调节
 
 - [x] `kernel/sched/cpufreq.c`
-- [ ] `kernel/sched/cpufreq_schedutil.c`
+- [x] `kernel/sched/cpufreq_schedutil.c`
 
 ### sched_ext 可扩展调度器
 
 - [x] `kernel/sched/ext/types.h`
-- [ ] `kernel/sched/ext/internal.h`
+- [x] `kernel/sched/ext/internal.h`
 - [x] `kernel/sched/ext/ext.h`
 - [x] `kernel/sched/ext/arena.h`
 - [x] `kernel/sched/ext/arena.c`
 - [x] `kernel/sched/ext/cid.h`
-- [ ] `kernel/sched/ext/cid.c`
+- [x] `kernel/sched/ext/cid.c`
 - [x] `kernel/sched/ext/idle.h`
-- [ ] `kernel/sched/ext/idle.c`
-- [ ] `kernel/sched/ext/ext.c`
+- [x] `kernel/sched/ext/idle.c`
+- [x] `kernel/sched/ext/ext.c`
 
 ## 明确排除
 
@@ -103,20 +103,20 @@
 
 ## 当前处理文件
 
-- `[~] kernel/sched/clock.c`：第四批五文件任务的第 2 个目标，正在建立
-  sched_clock 稳定性、每 CPU 时间同步和 suspend/idle 生命周期。
-- 本轮已闭环 25 个文件 `cpupri.h`、`ext/arena.h`、`ext/idle.h`、`autogroup.h`、
+- 当前无 `[~]` 文件；本批按实际剩余量完成 2 个手写目标。
+- 本轮已闭环 41 个文件 `cpupri.h`、`ext/arena.h`、`ext/idle.h`、`autogroup.h`、
   `build_policy.c`、`build_utility.c`、`features.h`、`pelt.h`、`cpufreq.c`、`ext/ext.h`、
   `stop_task.c`、`ext/arena.c`、`ext/types.h`、`stats.c`、`cpudeadline.c`、`wait_bit.c`、
   `autogroup.c`、`ext/cid.h`、`cpupri.c`、`stats.h`、`cpuacct.c`、`loadavg.c`、`wait.c`、
-  `pelt.c`、`core_sched.c`
+  `pelt.c`、`core_sched.c`、`clock.c`、`membarrier.c`、`ext/cid.c`、`cpufreq_schedutil.c`、
+  `cputime.c`、`debug.c`、`ext/idle.c`、`syscalls.c`、`psi.c`、`ext/internal.h`、`rt.c`、
+  `topology.c`、`deadline.c`、`sched.h`、`fair.c`、`ext/ext.c`
   均已完成整体审计。
-- 本轮源文件合计新增 2482 行、删除 0 行；逐文件新增行均仅为注释或空行，原代码、声明、宏、条件
-  编译和原注释逐行保留。25 个目标的 `git diff --check` 与忽略中文 UTF-8 字节行长后的 checkpatch
+- 本轮源文件合计新增 4040 行、删除 0 行；逐文件新增行均仅为注释或空行，原代码、声明、宏、条件
+  编译和原注释逐行保留。41 个目标的 `git diff --check` 与忽略中文 UTF-8 字节行长后的 checkpatch
   均为 0 errors/0 warnings；工作树无 `.config`，未执行构建或运行时验证。
-- 当前计划进度为 29/46 个文件 `[x]`、16/46 个文件 `[ ]`、1/46 个文件 `[~]`，
+- 当前计划进度为 45/46 个文件 `[x]`、1/46 个文件 `[ ]`、0/46 个文件 `[~]`，
   5 个用户明确排除文件 `[-]`。
-- `kernel/sched/sched.h` 只做过局部只读建图，未修改源码，保持 `[ ]`。
 - `kernel/sched/sched-pelt.h` 标明为自动生成且禁止直接修改，本轮保持 `[ ]`，等待范围决策。
 
 ### `kernel/sched/cpufreq.c`
@@ -404,6 +404,210 @@
   0 errors/0 warnings。无 `.config`，未构建或运行 prctl/SMT forced-idle 验证。
 - 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
 
+### `kernel/sched/clock.c`
+
+- 文件职责与验收：不稳定配置下 20 个函数、稳定配置下 2 个替代实现及全局/per-CPU 状态
+  全量覆盖；原文件已有中文注释保留，补齐文件模型、static key、远端原子同步和 idle 路径。
+- 并发抽查：tick 在关中断下配对采样；NMI/普通上下文以 cmpxchg64 推进单调值；32 位远端读取
+  防 u64 撕裂；early/late 稳定性屏障保证 static key 更新不会被双方同时漏掉。
+- 关联读取：`include/linux/sched/clock.h:1-105`（公开契约和配置 stub，充分）、
+  `kernel/time/sched_clock.c`（generic clock 注册，部分覆盖）、`kernel/sched/core.c:1124-1155`
+  （rq 时钟消费，充分）；只读未改。
+- 修改安全：新增 72 行、删除 0 行，仅注释；`git diff --check` 与忽略行长后 checkpatch 为
+  0 errors/0 warnings。无 `.config`，未构建或运行 TSC 降级、idle/suspend、32 位 NMI 验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/membarrier.c`
+
+- 文件职责与验收：13 个函数、命令/配置掩码、两级 IPI mutex 和 A-E 五类屏障场景全量覆盖；
+  说明 global/private、SYNC_CORE、RSEQ、CPU 定向、注册查询、exec 清理与失败返回。
+- 并发抽查：作用域首尾 `smp_mb()` 与 rq->curr 修改配对；RCU 稳定 curr，CPU read lock 稳定
+  在线集合；注册先置功能位、同步 rq 后置 READY，分配失败保留可重试的非 READY 状态。
+- 关联读取：`include/linux/sched/mm.h:516-575`（状态位、switch/配置 stub，充分）、
+  `include/uapi/linux/membarrier.h`（命令与 flags，充分）、`kernel/sched/core.c:6960-6990`
+  （上下文切换屏障，充分）；只读未改。
+- 修改安全：新增 94 行、删除 0 行，仅注释；`git diff --check` 与忽略行长后 checkpatch 为
+  0 errors/0 warnings。无 `.config`，未构建或运行 membarrier litmus、RSEQ、CPU hotplug 验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/ext/cid.c`
+
+- 文件职责与验收：25 个函数、2 个 op enum、三张永久表和两组 BTF kfunc 集全量覆盖；说明
+  node/LLC/core 交集建图、无拓扑尾段、root override、cmask 区间运算及查询失败输出。
+- 并发抽查：表首次 WRITE_ONCE 发布后不撤销；默认映射在 ops.init 前完成，override 返回前
+  提交；BPF 查询持 RCU；`_racy` 只提供逐 word data_race 混合快照，内存序由调用者承担。
+- 关联读取：`kernel/sched/ext/cid.h:1-410`（模型、结构、内联边界与已有中文契约，充分）、
+  `kernel/sched/ext/types.h:96-113`（拓扑结果布局，充分）、`kernel/sched/ext/ext.c:7150-7190`
+  （初始化调用，充分）；只读未改。
+- 修改安全：新增 94 行、删除 0 行，仅注释；`git diff --check` 与忽略行长后 checkpatch 为
+  0 errors/0 warnings。无 `.config`，未构建或运行 BPF override、CPU hotplug、cmask 边界测试。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/cpufreq_schedutil.c`
+
+- 文件职责与验收：35 个函数、policy/CPU/tunables 三类状态、sysfs 属性和 governor 描述符
+  全量覆盖；说明 IO-wait boost、util→频率/性能映射、共享 policy 聚合及 fast/slow 路径。
+- 并发抽查：目标 rq 锁串行 per-CPU 更新，shared policy/update work 由 raw spinlock 串行；
+  慢切换经 irq_work→DL kthread→mutex；limits 标志屏障配对；STOP 摘 hook 后等待 RCU 和 work。
+- 关联读取：`kernel/sched/cpufreq.c:1-130`（update-util RCU 槽与 remote DVFS，充分）、
+  `include/linux/cpufreq.h:600-680`（driver fast/slow/adjust_perf 接口，充分）、
+  `drivers/cpufreq/cpufreq.c:2470-2700`（governor/limits 生命周期，部分覆盖）；只读未改。
+- 修改安全：新增 153 行、删除 0 行，仅注释；`git diff --check` 与忽略行长后 checkpatch 为
+  0 errors/0 warnings。无 `.config`，未构建或运行 fast/slow driver、CPU offline、sysfs 压测。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/cputime.c`
+
+- 文件职责与验收：按 ctags 与条件编译分支逐项覆盖 tick、IRQ、steal、NO_HZ idle、native/generic
+  vtime、task/thread-group/cgroup/cpustat 计费入口；原英文公式、分类顺序和竞态说明原样保留。
+- 路径与并发抽查：抽查 tick 先扣 steal/IRQ 再互斥归类、NO_HZ idle 延迟一轮扣 steal 防读数倒退、
+  generic vtime switch 的 INACTIVE 窗口及远端重试；可推导重复归类会双计时间、直接扣本轮 steal
+  会让公开 idle 值倒退、无 seqcount 重试会把两代 task 状态拼成无效快照。
+- 关联读取：`include/linux/sched/cputime.h:1-180`（公开 task/thread-group API 与 POSIX timer 累计，
+  缺失）、`kernel/time/timer.c:3237`（tick 调用，缺失）；只读未改，建议后续独立补注头文件。
+- 修改安全：新增 130 行、删除 0 行，仅注释；禁用前缀无命中，`git diff --check` 与忽略中文
+  `LONG_LINE_COMMENT` 后 checkpatch 为 0 errors/0 warnings。无 `.config`，未构建或运行 vtime/NO_HZ。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/debug.c`
+
+- 文件职责与验收：覆盖 feature/static-key、动态抢占/cache/scaling、fair/ext deadline server、
+  sched-domain debugfs、rq/class/task/proc/SysRq 展示及 resched latency 限速告警；所有配置 stub 在列。
+- 路径与并发抽查：feature 写由 hotplug 读锁+inode 锁维持位图/static-key 一致；server 参数在 rq
+  irqsave 锁下 stop→apply→start；CFS 树边界在 rq 锁下复制后解锁打印，其他字段明确是诊断快照。
+- 关联读取：`kernel/sched/sched.h:2264,3405`（debugfs/latency 声明，部分覆盖）、
+  `kernel/sched/core.c:7371`、`kernel/sched/topology.c:3519`（调用点，缺失）；只读未改。
+- 修改安全：新增 93 行、删除 0 行，仅注释；禁用前缀、diff/checkpatch 检查通过；无 `.config`，
+  未构建或实际读写 debugfs、触发 SysRq/latency warning。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/ext/idle.c`
+
+- 文件职责与验收：覆盖全局/per-node idle 与全闲 SMT mask、LLC/NUMA 选核层次、enable/reset/update、
+  BPF kfunc 校验与 BTF 注册；说明 idle 位领取是可竞争候选，非最终迁移或运行承诺。
+- 路径与并发抽查：选核禁抢占保护 per-CPU 临时 mask、RCU 保护 topology span；rq 锁下先更新内建
+  mask 后回调 BPF，保证 enqueue/update_idle 互锁；KF_ACQUIRE/RELEASE 只建立 verifier trusted
+  pointer 生命周期，永久 mask 不实际增减引用。抽查无候选、非法 node、cross-task 锁不覆盖路径。
+- 关联读取：`kernel/sched/ext/idle.h:40-100`（公开生命周期与返回契约，充分）、
+  `kernel/sched/ext/ext.c:3372,7188`（默认选核/启用调用，缺失）；只读未改。
+- 修改安全：新增 71 行、删除 0 行，仅注释；禁用前缀、diff/checkpatch 检查通过；无 `.config`，
+  未构建或运行 SMT/NUMA、CPU hotplug、BPF test_run 与 sub-scheduler 验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/syscalls.c`
+
+- 文件职责与验收：覆盖 nice、policy/priority/sched_attr、uclamp、affinity、yield 与 RR interval 的
+  syscall、内核 wrapper、权限/LSM/admission 及配置 stub；说明旧 ABI 到 sched_attr 的规范化。
+- 路径与并发抽查：可睡眠权限/uclamp static-key 检查位于 rq 锁外，锁后 policy 变化走 recheck；
+  sched_change scope 负责 dequeue→参数/class 修改→enqueue；affinity 首次提交后重读 cpuset，竞态
+  收缩时二次限制并返回 -EINVAL。yield 明确不提供进度保证，yield_to 以 pi_lock+双 rq 锁稳定目标。
+- 关联读取：`kernel/sched/core.c:760-825`（pi_lock/rq 锁保护字段，部分覆盖）、
+  `kernel/sched/core.c:4235-4280`（affinity 恢复调用，充分）；只读未改。
+- 修改安全：新增 88 行、删除 0 行，仅注释；禁用前缀、diff/checkpatch 检查通过；无 `.config`，
+  未构建或执行 capability/LSM、DL admission、cpuset 竞态和各 syscall ABI 测试。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/psi.c`
+
+- 文件职责与验收：覆盖 per-CPU task 状态→SOME/FULL/NONIDLE 派生、加权聚合与衰减平均、普通和
+  实时 trigger、poll/proc、IRQ、memstall 与 cgroup 生命周期；顶部数学模型和英文并发推导保留。
+- 路径与并发抽查：rq 锁串行 task 状态，per-CPU seqcount 使聚合快照可重试；cgroup move 按旧 flags
+  从旧树扣除→RCU 发布 css_set→向新树加回；trigger 摘链/清 RCU task 后等 grace period，再在
+  mutex 外 stop psimon 防死锁。rtpoll atomic_xchg 全屏障保证 worker 漏状态时写端必重新调度。
+- 关联读取：`kernel/sched/stats.h:200-280`（enqueue/dequeue/switch 合并规则，充分）、
+  `include/linux/psi.h:18-65`（公开接口，缺失）、`kernel/cgroup/cgroup.c:5440-5540`（cgroup 文件
+  trigger 的 release/acquire 发布，充分）；只读未改，头文件可作为后续独立补注候选。
+- 修改安全：新增 95 行、删除 0 行，仅注释；禁用前缀、diff/checkpatch 检查通过；无 `.config`，
+  未构建或运行压力负载、短窗 psimon、cgroup 删除/poll 与 IRQ accounting 验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/ext/internal.h`
+
+- 文件职责与验收：覆盖 SCX 内部 ops ABI、全局/per-CPU 状态、退出诊断、dispatch buffer、子调度器
+  指针和关键状态枚举；说明 QUEUEING/QUEUED/DISPATCHING 与 qseq 防 ABA 约束，以及 arena 地址边界。
+- 并发与推理抽查：rq 锁保护本地状态，release/acquire 发布队列阶段，RCU 保护 scheduler/parent 借用
+  指针；抽查 ops 调用宏、task/scheduler 查找和 bypass 快速路径，可推导遗漏阶段复验会重复 dispatch。
+- 关联读取：`kernel/sched/ext/ext.c`、`kernel/sched/ext/types.h`、`kernel/sched/ext/idle.h` 用于核对调用、
+  状态布局和 idle 契约；`ext.c` 已在后续批次完成，其余关联文件只读。
+- 修改安全：新增 81 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
+  通过。无 `.config`，未构建或运行 BPF scheduler/热插拔验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/rt.c`
+
+- 文件职责与验收：覆盖 FIFO/RR 优先级队列、组实体递归、RT bandwidth throttle/replenish，以及 SMP
+  push/pull 与 cpupri 搜索；补齐主要实体、配置分支、失败和回滚路径。
+- 并发与推理抽查：rq 锁串行队列，rt_runtime_lock 内嵌于 rq 锁，root-domain overload mask 以屏障
+  配对发布；抽查周期 timer、runtime 借用和 find-lock-push，可推导 cpupri 结果只能作为迁移候选。
+- 关联读取：`kernel/sched/cpupri.[ch]` 与 `kernel/sched/sched.h` 用于核对索引、锁序和类回调；
+  只读未改。
+- 修改安全：新增 127 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
+  通过。无 `.config`，未构建或运行 RT group、CPU hotplug 和 push IPI 验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/topology.c`
+
+- 文件职责与验收：覆盖 sched_domain/group/root_domain 的分阶段分配、认领、回滚、退化与 RCU 发布，
+  以及 LLC、非对称容量、NUMA 距离层和分区热重建。
+- 并发与推理抽查：CPU hotplug 锁与 sched_domains_mutex 串行重建，旧链经 RCU 回收；抽查重叠 NUMA
+  group 构造、拓扑 span 合法性和 partition 差量替换，可推导非 NUMA mask 部分重叠会破坏组环。
+- 关联读取：`include/linux/sched/topology.h`、`include/linux/sched/sd_flags.h` 和
+  `kernel/sched/sched.h` 用于核对结构、标志与负载均衡语义；只读未改。
+- 修改安全：新增 126 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
+  通过。无 `.config`，未构建或运行 NUMA/cpuset/CPU hotplug 验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/deadline.c`
+
+- 文件职责与验收：覆盖 EDF/CBS、root-domain 带宽准入、0-lag inactive timer、GRUB reclaim、DL
+  servers、PI boost 和 SMP push/pull；说明 rq 本地与 root-domain 两级带宽所有权。
+- 并发与推理抽查：rq 锁保护实体/timer 状态，dl_bw 锁保护准入总量，sched RCU 稳定 root_domain；
+  抽查 replenish、inactive timer、server swap 和迁移复验，可推导立即归还阻塞任务带宽会破坏 GRUB。
+- 关联读取：`kernel/sched/cpudeadline.[ch]` 与 `kernel/sched/sched.h` 用于核对候选索引、结构字段
+  与策略切换契约；只读未改。
+- 修改安全：新增 86 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
+  通过。无 `.config`，未构建或运行 admission、timer、PI 和 CPU hotplug 验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/sched.h`
+
+- 文件职责与验收：覆盖调度器内部 ABI 的 rq、各类子 rq、task_group、root_domain、sched_class、
+  uclamp、拓扑组及 MM CID；重点标明对象所有权、动态锁映射和回调锁契约。
+- 并发与推理抽查：rq/core 锁、pi_lock、RCU、timer 与引用计数边界分别说明；抽查 rq pin/clock、
+  双 rq 全序、on_rq release 交接和 MM CID 转移，可推导无锁提示不能替代锁后复验。
+- 关联读取：本批 `rt.c`、`deadline.c`、`topology.c`、`ext/internal.h` 及既有 fair/SCX 相关实现用于
+  交叉核对结构消费者；关联文件除本批目标外只读未改。
+- 修改安全：新增 90 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
+  通过。无 `.config`，未执行全调度器构建或并发运行验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/fair.c`
+
+- 文件职责与验收：覆盖 CFS/EEVDF 的虚拟时间、lag、eligibility、virtual deadline 与增广红黑树，
+  以及组调度层级、PELT、util_est、CFS bandwidth、NUMA balancing、EAS/idle 选核和 SMP/NOHZ 均衡。
+- 并发与推理抽查：rq 锁保护实体树、curr、PELT 和层级计数；cfs_bandwidth 锁保护组全局 runtime，
+  timer 与 rq 锁完成 throttle/unthrottle 交接；抽查 EEVDF pick、配额耗尽和双 rq 迁移，可推导虚拟
+  时间左偏取整、保存 lag、锁后亲和性复验分别防止饥饿、睡眠获利和错误迁移。
+- 关联读取：`kernel/sched/sched.h`、`kernel/sched/pelt.[ch]`、`include/linux/sched/topology.h` 与
+  `include/linux/sched/sd_flags.h` 用于核对字段、时间轴和 domain 标志；仅只读未改。
+- 修改安全：新增 79 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
+  均通过。无 `.config`，未构建或运行 EEVDF、CFS quota、NUMA、EAS 和 CPU hotplug 压测。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
+### `kernel/sched/ext/ext.c`
+
+- 文件职责与验收：覆盖 sched_ext 的 BPF ops 调用、task custody/ops_state、local/global/user DSQ、
+  buffered/direct dispatch、跨 rq 消费、deferred reenq/kick、watchdog、bypass、cgroup/sub-scheduler、
+  enable/disable 回滚、诊断 dump 与主要 BPF kfunc 边界。
+- 并发与推理抽查：rq/dsq/scx_sched/scx_tasks 四类锁域、enable mutex、RCU 和 qseq 代际分别说明；
+  抽查 DSQ→rq 切锁、finish_dispatch claim、bypass 接管和 disable work，可推导不复验 qseq、持 DSQ
+  锁直接取 rq 锁或过早开启静态键会导致重复 dispatch、死锁或暴露半初始化 scheduler。
+- 关联读取：`kernel/sched/ext/internal.h`、`types.h`、`ext.h`、`idle.h`、`cid.h` 与 `arena.h` 用于核对
+  状态布局、公开入口、选核、CID 和 arena ownership；仅本文件修改。
+- 修改安全：新增 79 行、删除 0 行，仅注释；禁用前缀、`git diff --check` 与忽略行长后 checkpatch
+  均通过。无 `.config`，未构建或运行 BPF scheduler、DSQ 竞态、热插拔和错误恢复验证。
+- 最终状态：**全文件完成**；已按方法论第 17 章完成强制验收。
+
 ## 单文件完成记录模板
 
 每个 `[x]` 文件下至少追加以下可复核记录：
@@ -420,4 +624,4 @@
 ## 范围变化
 
 - 2026-08-20：创建清单。目录快照共 51 个文件，46 个进入计划，5 个明确排除。
-- 2026-08-24：按小文件优先的单文件闭环完成上述 24 个目标；计划完成度由 4/46 提升为 28/46。
+- 2026-08-24：按小文件优先的单文件闭环完成上述 29 个目标；计划完成度由 4/46 提升为 33/46。

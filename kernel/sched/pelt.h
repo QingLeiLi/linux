@@ -161,13 +161,13 @@ static inline void cfs_se_util_change(struct sched_avg *avg)
 		return;
 
 	/* Avoid store if the flag has been already reset */
-	/* 原文说明：若标志已被其他更新清除，避免一次无意义且会扰动 cache line 的写入。 */
+	/* 若标志已被其他更新清除，避免一次无意义且会扰动 cache line 的写入。 */
 	enqueued = avg->util_est;
 	if (!(enqueued & UTIL_AVG_UNCHANGED))
 		return;
 
 	/* Reset flag to report util_avg has been updated */
-	/* 原文说明：清位向 util_est 消费路径报告 util_avg 已变化；其余估值位逐位保留。 */
+	/* 清位向 util_est 消费路径报告 util_avg 已变化；其余估值位逐位保留。 */
 	enqueued &= ~UTIL_AVG_UNCHANGED;
 	WRITE_ONCE(avg->util_est, enqueued);
 }
@@ -188,7 +188,7 @@ static inline u64 rq_clock_pelt(struct rq *rq)
 
 /* The rq is idle, we can sync to clock_task */
 /*
- * 原文说明：rq 已进入 idle，因此容量缩放的工作时间轴可以追平 clock_task。
+ * rq 已进入 idle，因此容量缩放的工作时间轴可以追平 clock_task。
  *
  * _update_idle_rq_clock_pelt() - 发布 rq 最近一次 idle 的两份配对时钟快照
  * @rq: 输入输出、不可为 NULL；调用者持 rq 锁且时钟已更新，并确认 curr 是 idle task。
@@ -205,7 +205,7 @@ static inline void _update_idle_rq_clock_pelt(struct rq *rq)
 	/* 先发布未缩放 rq clock；它是迁移方估计 idle 后经过真实时间的基准。 */
 	u64_u32_store(rq->clock_idle, rq_clock(rq));
 	/* Paired with smp_rmb in migrate_se_pelt_lag() */
-	/* 原文说明：与 migrate_se_pelt_lag() 的 smp_rmb 配对，约束两份快照的可见顺序。 */
+	/* 与 migrate_se_pelt_lag() 的 smp_rmb 配对，约束两份快照的可见顺序。 */
 	smp_wmb();
 	/* 后发布有效 PELT 时钟，使观察到新值的 reader 必然也能观察到前一份真实时钟。 */
 	u64_u32_store(rq->clock_pelt_idle, rq_clock_pelt(rq));
@@ -224,7 +224,7 @@ static inline void _update_idle_rq_clock_pelt(struct rq *rq)
  *
  */
 /*
- * 原文说明：clock_pelt 把实际经过时间缩放成“以最大算力完成了多少计算”，但 rq idle 时
+ * clock_pelt 把实际经过时间缩放成“以最大算力完成了多少计算”，但 rq idle 时
  * 又同步回 clock_task。示意图中半容量执行同样工作需要两倍墙上时间，PELT 时钟只推进
  * 一半；进入 idle 后跳到 task clock，差值作为从低容量忙碌阶段借来的 idle 时间处理。
  *
@@ -254,7 +254,7 @@ static inline void update_rq_clock_pelt(struct rq *rq, s64 delta)
 	 * rq_clock_task.
 	 */
 	/*
-	 * 原文说明：低算力 CPU 完成同样工作需要更久；若直接用墙上时间，PELT 会把“运行更久”
+	 * 低算力 CPU 完成同样工作需要更久；若直接用墙上时间，PELT 会把“运行更久”
 	 * 错当成更多工作并挤占未来 idle。这里按原始容量和频率容量缩小 delta，使信号对算力
 	 * 不变；其墙上时间差在 rq 后续 idle、clock_pelt 追平 clock_task 时自然显现。
 	 */
@@ -263,7 +263,7 @@ static inline void update_rq_clock_pelt(struct rq *rq, s64 delta)
 	 * Scale the elapsed time to reflect the real amount of
 	 * computation
 	 */
-	/* 原文说明：两次 cap_scale 分别校正 CPU 最大容量差异和当前频率造成的算力差异。 */
+	/* 两次 cap_scale 分别校正 CPU 最大容量差异和当前频率造成的算力差异。 */
 	delta = cap_scale(delta, arch_scale_cpu_capacity(cpu_of(rq)));
 	delta = cap_scale(delta, arch_scale_freq_capacity(cpu_of(rq)));
 
@@ -281,7 +281,7 @@ static inline void update_rq_clock_pelt(struct rq *rq, s64 delta)
  * bound of util_sum to decide.
  */
 /*
- * 原文说明：rq 转 idle 时要判断低容量满载阶段是否“借走”了理论 idle。完整利用时，
+ * rq 转 idle 时要判断低容量满载阶段是否“借走”了理论 idle。完整利用时，
  * cfs/RT/DL util_sum 之和达到与当前 PELT 分母对应的满量程阈值；为减少计算和统一舍入，
  * 这里忽略当前窗口位置 period_contrib，采用 util_sum 上界作保守判定。
  *
@@ -310,7 +310,7 @@ static inline void update_idle_rq_clock_pelt(struct rq *rq)
 	 * rq's clock_task.
 	 */
 	/*
-	 * 原文说明：只有最大容量下本应出现 idle、而低容量导致任务延长运行时，“被偷走”的
+	 * 只有最大容量下本应出现 idle、而低容量导致任务延长运行时，“被偷走”的
 	 * idle 才应反映进时间轴。信号已经满量程表示该 rq 可视为一直运行，没有可偷 idle；
 	 * 此时把 clock_task 与较慢 clock_pelt 的差记为永久丢失，后续返回的 rq_clock_pelt()
 	 * 会持续扣除它，避免 idle 同步凭空增加可衰减时间。
@@ -347,7 +347,7 @@ static inline void update_idle_cfs_rq_clock_pelt(struct cfs_rq *cfs_rq)
 
 /* rq->task_clock normalized against any time this cfs_rq has spent throttled */
 /*
- * 原文说明：返回的 cfs_rq PELT 时钟以 rq task clock 为基础，但扣除本组被 throttle 的
+ * 返回的 cfs_rq PELT 时钟以 rq task clock 为基础，但扣除本组被 throttle 的
  * 全部时间；限流不是实体自愿 idle，不能让负载信号在无法运行期间自然衰减。
  *
  * cfs_rq_clock_pelt() - 取得排除 CFS bandwidth 限流区间的组 PELT 时间

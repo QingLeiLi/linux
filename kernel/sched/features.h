@@ -148,7 +148,7 @@ SCHED_FEAT(TTWU_QUEUE, false)
  * using the scheduler IPI. Reduces rq->lock contention/bounces.
  */
 /*
- * 原文说明：远端唤醒先在目标 CPU 排队并由调度 IPI 处理，可减少唤醒 CPU 争用及来回
+ * 远端唤醒先在目标 CPU 排队并由调度 IPI 处理，可减少唤醒 CPU 争用及来回
  * 传递目标 rq->lock；代价是一次队列发布/IPI 和可能的处理延迟。
  */
 SCHED_FEAT(TTWU_QUEUE, true)
@@ -186,7 +186,7 @@ SCHED_FEAT(WARN_DOUBLE_CLOCK, false)
  * it only default enabled for PREEMPT_RT.
  */
 /*
- * 原文说明：多个 CPU 同时降低 RT 优先级时，若都争抢唯一持有可迁移 RT task 的 rq 锁，
+ * 多个 CPU 同时降低 RT 优先级时，若都争抢唯一持有可迁移 RT task 的 rq 锁，
  * 会形成惊群；向源 CPU 发 IPI、由它主动 push 可集中仲裁并减少锁争用。PREEMPT_RT 的
  * 抢占延迟更可控，故默认开启；非 RT 可能长时间关抢占而延误 IPI，默认关闭。
  */
