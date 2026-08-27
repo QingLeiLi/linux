@@ -10,7 +10,7 @@
 ### 构建入口、公共数据结构与调度特性
 
 - [x] `kernel/sched/Makefile`
-- [ ] `kernel/sched/sched.h`
+- [x] `kernel/sched/sched.h`
 - [x] `kernel/sched/smp.h`
 - [x] `kernel/sched/features.h`
 - [x] `kernel/sched/rq-offsets.c`
@@ -84,4 +84,4 @@
 
 ## 当前处理文件
 
-- 无（暂停）
+- 无（`kernel/sched/sched.h` 已完成第 17 章验收）
