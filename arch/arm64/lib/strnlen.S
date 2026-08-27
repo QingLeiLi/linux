@@ -21,6 +21,11 @@
  *	x1 - maximal string length
  * Returns:
  *	x0 - the return length of specific string
+ *
+ * 中文算法：返回 min(首个 NUL 的位置, limit)。源按 16B 对齐后每轮检查
+ * 两个 64 位字；limit_wd 是预减形式的 16B 块计数。首地址不对齐时向下
+ * 加载，并把起点前字节强制成 0xff 以免误报 NUL；块数采用分段算术计算，
+ * 避免 limit 接近 ULONG_MAX 时执行 limit+offset 发生溢出。
  */
 
 /* Arguments and results.  */
@@ -48,9 +53,9 @@ limit_wd	.req	x14
 #define REP8_80 0x8080808080808080
 
 SYM_FUNC_START(__pi_strnlen)
-	cbz	limit, .Lhit_limit
+	cbz	limit, .Lhit_limit	/* limit=0 时绝不能访问 src。 */
 	mov	zeroones, #REP8_01
-	bic	src, srcin, #15
+	bic	src, srcin, #15	/* 取得 16 字节向下对齐的加载基址。 */
 	ands	tmp1, srcin, #15
 	b.ne	.Lmisaligned
 	/* Calculate the number of full and partial words -1.  */
@@ -69,7 +74,7 @@ SYM_FUNC_START(__pi_strnlen)
 	* cycle, as we get much better parallelism out of the operations.
 	*/
 .Lloop:
-	ldp	data1, data2, [src], #16
+	ldp	data1, data2, [src], #16 /* 一轮读取 16B 并推进 src。 */
 .Lrealigned:
 	sub	tmp1, data1, zeroones
 	orr	tmp2, data1, #REP8_7f

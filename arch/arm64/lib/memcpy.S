@@ -57,16 +57,29 @@
    The loop tail is handled by always copying 64 bytes from the end.
 */
 
+/*
+ * 中文阅读地图：
+ * - 0..32 字节：从首尾重叠取数，用长度的 bit3/bit2 选择 8/4 字节路径；
+ * - 33..128 字节：固定读取首尾若干 16 字节块，覆盖整个范围；
+ * - >128 字节：先用 dst-src 与 count 判断是否危险重叠。安全时向高地址复制，
+ *   dst 落在源区内部时向低地址复制，这正是 memmove 保证不覆盖未读源数据的关键；
+ * - 大循环每轮 64 字节，load 与 store 交错；最后固定从真正首/尾再取 64 字节，
+ *   所以 count 的预减偏差不会形成复杂的零碎尾循环。
+ *
+ * 地址形如 [srcend,-16] 表示“最后 16 字节”。首块和尾块可以重叠，但都在
+ * [src,src+count) 内。函数始终保留 dstin=x0，符合 memcpy 返回原目的指针。
+ */
+
 SYM_FUNC_START_LOCAL(__pi_memcpy_generic)
-	add	srcend, src, count
-	add	dstend, dstin, count
+	add	srcend, src, count	/* 源的排他终点。 */
+	add	dstend, dstin, count	/* 目的排他终点。 */
 	cmp	count, 128
 	b.hi	L(copy_long)
 	cmp	count, 32
 	b.hi	L(copy32_128)
 
 	/* Small copies: 0..32 bytes.  */
-	cmp	count, 16
+	cmp	count, 16		/* 16..32：首尾各搬 16 字节。 */
 	b.lo	L(copy16)
 	ldp	A_l, A_h, [src]
 	ldp	D_l, D_h, [srcend, -16]
@@ -76,7 +89,7 @@ SYM_FUNC_START_LOCAL(__pi_memcpy_generic)
 
 	/* Copy 8-15 bytes.  */
 L(copy16):
-	tbz	count, 3, L(copy8)
+	tbz	count, 3, L(copy8)	/* bit3=1 表示长度至少 8。 */
 	ldr	A_l, [src]
 	ldr	A_h, [srcend, -8]
 	str	A_l, [dstin]
@@ -86,7 +99,7 @@ L(copy16):
 	.p2align 3
 	/* Copy 4-7 bytes.  */
 L(copy8):
-	tbz	count, 2, L(copy4)
+	tbz	count, 2, L(copy4)	/* bit2=1 表示长度至少 4。 */
 	ldr	A_lw, [src]
 	ldr	B_lw, [srcend, -4]
 	str	A_lw, [dstin]
@@ -96,7 +109,7 @@ L(copy8):
 	/* Copy 0..3 bytes using a branchless sequence.  */
 L(copy4):
 	cbz	count, L(copy0)
-	lsr	tmp1, count, 1
+	lsr	tmp1, count, 1		/* 中间索引 floor(count/2)。 */
 	ldrb	A_lw, [src]
 	ldrb	C_lw, [srcend, -1]
 	ldrb	B_lw, [src, tmp1]
@@ -145,16 +158,16 @@ L(copy96):
 	/* Copy more than 128 bytes.  */
 L(copy_long):
 	/* Use backwards copy if there is an overlap.  */
-	sub	tmp1, dstin, src
+	sub	tmp1, dstin, src	/* 正向距离；无符号比较同时处理地址回绕方向。 */
 	cbz	tmp1, L(copy0)
-	cmp	tmp1, count
+	cmp	tmp1, count		/* dst 落入 [src,src+count) 才必须反向。 */
 	b.lo	L(copy_long_backwards)
 
 	/* Copy 16 bytes and then align dst to 16-byte alignment.  */
 
 	ldp	D_l, D_h, [src]
 	and	tmp1, dstin, 15
-	bic	dst, dstin, 15
+	bic	dst, dstin, 15		/* dst 向下对齐；后续用正偏移 16 开始写。 */
 	sub	src, src, tmp1
 	add	count, count, tmp1	/* Count is now 16 too large.  */
 	ldp	A_l, A_h, [src, 16]
@@ -174,7 +187,7 @@ L(loop64):
 	ldp	C_l, C_h, [src, 48]
 	stp	D_l, D_h, [dst, 64]!
 	ldp	D_l, D_h, [src, 64]!
-	subs	count, count, 64
+	subs	count, count, 64	/* 一轮提交 64B，条件码决定是否继续。 */
 	b.hi	L(loop64)
 
 	/* Write the last iteration and copy 64 bytes from the end.  */

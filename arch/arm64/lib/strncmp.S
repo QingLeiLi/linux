@@ -13,6 +13,11 @@
  *
  * ARMv8-a, AArch64.
  * MTE compatible.
+ *
+ * 中文要点：停止原因有字符不同、遇到 NUL、到达 n 三种。主循环每次预减
+ * 8，full_check 判断 syndrome 中的首个事件是否真在 limit 内。两字符串
+ * 若同余 8 可一起向下对齐并屏蔽前导字节；不同余时先逐字节对齐 src1，再
+ * 用相邻的 src2 加载拼出对应窗口。大端重算零检测以避免借位传播误报。
  */
 
 #define L(label) .L ## label
@@ -59,8 +64,8 @@
 #endif
 
 SYM_FUNC_START(__pi_strncmp)
-	cbz	limit, L(ret0)
-	eor	tmp1, src1, src2
+	cbz	limit, L(ret0)		/* n==0：不解引用任何指针，直接相等。 */
+	eor	tmp1, src1, src2	/* 低 3 位是否相同决定能否共同对齐。 */
 	mov	zeroones, #REP8_01
 	tst	tmp1, #7
 	and	count, src1, #7
@@ -75,11 +80,11 @@ L(loop_aligned):
 	ldr	data1, [src1], #8
 	ldr	data2, [src2], #8
 L(start_realigned):
-	subs	limit, limit, #8
+	subs	limit, limit, #8	/* 预扣当前 8B；负值表示边界在本字内。 */
 	sub	tmp1, data1, zeroones
 	orr	tmp2, data1, #REP8_7f
 	eor	diff, data1, data2	/* Non-zero if differences found.  */
-	csinv	endloop, diff, xzr, hi	/* Last Dword or differences.  */
+	csinv	endloop, diff, xzr, hi	/* 末字或发现差异时强制结束循环。 */
 	bics	has_nul, tmp1, tmp2	/* Non-zero if NUL terminator.  */
 	ccmp	endloop, #0, #0, eq
 	b.eq	L(loop_aligned)
