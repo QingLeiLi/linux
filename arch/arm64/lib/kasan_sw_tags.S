@@ -38,23 +38,23 @@
  * incremented by 256 prior to return).
  */
 SYM_CODE_START(__hwasan_tag_mismatch)
-	bti	c
-	add	x29, sp, #232
-	stp	x2, x3, [sp, #8 * 2]
+	bti	c			/* BTI：只允许以函数调用类型的间接分支进入。 */
+	add	x29, sp, #232		/* 建立指向调用者已保存 x29/x30 的帧记录。 */
+	stp	x2, x3, [sp, #8 * 2]	/* 保存非标准约定要求保持的 x2、x3。 */
 	stp	x4, x5, [sp, #8 * 4]
 	stp	x6, x7, [sp, #8 * 6]
 	stp	x8, x9, [sp, #8 * 8]
 	stp	x10, x11, [sp, #8 * 10]
 	stp	x12, x13, [sp, #8 * 12]
-	stp	x14, x15, [sp, #8 * 14]
+	stp	x14, x15, [sp, #8 * 14]	/* 至此 x2..x15 全部入栈。 */
 #ifndef CONFIG_SHADOW_CALL_STACK
-	str	x18, [sp, #8 * 18]
+	str	x18, [sp, #8 * 18]	/* 无影子调用栈时，普通平台寄存器也需保存。 */
 #endif
 
-	mov	x2, x30
-	bl	kasan_tag_mismatch
+	mov	x2, x30		/* 常规 C 函数第 3 参数：发生问题处的返回 PC。 */
+	bl	kasan_tag_mismatch	/* x0=地址、x1=描述，调用真正的报告函数。 */
 
-	ldp	x0, x1, [sp]
+	ldp	x0, x1, [sp]		/* 按 thunk 约定恢复最初的 x0、x1。 */
 	ldp	x2, x3, [sp, #8 * 2]
 	ldp	x4, x5, [sp, #8 * 4]
 	ldp	x6, x7, [sp, #8 * 6]
@@ -65,10 +65,10 @@ SYM_CODE_START(__hwasan_tag_mismatch)
 #ifndef CONFIG_SHADOW_CALL_STACK
 	ldr	x18, [sp, #8 * 18]
 #endif
-	ldp	x29, x30, [sp, #8 * 29]
+	ldp	x29, x30, [sp, #8 * 29]	/* 恢复帧指针和原返回地址。 */
 
 	/* remove the structure from the stack */
-	add	sp, sp, #256
-	ret
+	add	sp, sp, #256		/* 释放调用者预留的整块非标准保存区。 */
+	ret				/* 返回编译器生成的检查 thunk。 */
 SYM_CODE_END(__hwasan_tag_mismatch)
 EXPORT_SYMBOL(__hwasan_tag_mismatch)

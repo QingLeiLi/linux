@@ -20,6 +20,11 @@
  *	x2 - n
  * Returns:
  *	x0 - dest
+ *
+ * 这是被 copy_{from,to}_user.S 文本包含的模板，不独立生成函数。调用文件先
+ * 定义 load/store 宏，所以这里的 ldr1/stp1 在用户一侧实际带异常表。
+ * src/dst 指向下一未处理字节；大路径预取 64 字节，并交错“存上一块、取
+ * 下一块”来隐藏加载延迟。
  */
 dstin	.req	x0
 src	.req	x1
@@ -39,7 +44,7 @@ C_h	.req	x12
 D_l	.req	x13
 D_h	.req	x14
 
-	mov	dst, dstin
+	mov	dst, dstin		/* 工作目的指针；dstin 保留原始起点。 */
 
 #ifdef CONFIG_AS_HAS_MOPS
 alternative_if_not ARM64_HAS_MOPS
@@ -50,21 +55,21 @@ alternative_else_nop_endif
 .Lno_mops:
 #endif
 
-	cmp	count, #16
+	cmp	count, #16		/* 少于 16 字节时不值得做对齐准备。 */
 	/*When memory length is less than 16, the accessed are not aligned.*/
 	b.lo	.Ltiny15
 
 	neg	tmp2, src
-	ands	tmp2, tmp2, #15/* Bytes to reach alignment. */
+	ands	tmp2, tmp2, #15	/* (-src)&15=到下一 16B 边界的距离。 */
 	b.eq	.LSrcAligned
-	sub	count, count, tmp2
+	sub	count, count, tmp2	/* 先从余量扣掉即将复制的对齐前缀。 */
 	/*
 	* Copy the leading memory data from src to dst in an increasing
 	* address order.By this way,the risk of overwriting the source
 	* memory data is eliminated when the distance between src and
 	* dst is less than 16. The memory accesses here are alignment.
 	*/
-	tbz	tmp2, #0, 1f
+	tbz	tmp2, #0, 1f		/* 位 0/1/2/3 分别控制 1/2/4/8 字节。 */
 	ldrb1	tmp1w, src, #1
 	strb1	tmp1w, dst, #1
 1:
@@ -81,7 +86,7 @@ alternative_else_nop_endif
 	str1	tmp1, dst, #8
 
 .LSrcAligned:
-	cmp	count, #64
+	cmp	count, #64		/* 对齐后按是否有完整 64B 块分流。 */
 	b.ge	.Lcpy_over64
 	/*
 	* Deal with small copies quickly by dropping straight into the
@@ -92,7 +97,7 @@ alternative_else_nop_endif
 	* Copy up to 48 bytes of data. At this point we only need the
 	* bottom 6 bits of count to be accurate.
 	*/
-	ands	tmp1, count, #0x30
+	ands	tmp1, count, #0x30	/* 提取 16/32 位，决定 16B 块数量。 */
 	b.eq	.Ltiny15
 	cmp	tmp1w, #0x20
 	b.eq	1f
@@ -117,7 +122,7 @@ alternative_else_nop_endif
 	* call memcpy directly. To make memmove simpler and decouple the
 	* memcpy's dependency on memmove, withdrew the original process.
 	*/
-	tbz	count, #3, 1f
+	tbz	count, #3, 1f		/* 低 4 位再按 8+4+2+1 精确分解。 */
 	ldr1	tmp1, src, #8
 	str1	tmp1, dst, #8
 1:
@@ -136,7 +141,7 @@ alternative_else_nop_endif
 	b	.Lexitfunc
 
 .Lcpy_over64:
-	subs	count, count, #128
+	subs	count, count, #128	/* 预留流水线窗口并用符号判断大小。 */
 	b.ge	.Lcpy_body_large
 	/*
 	* Less than 128 bytes to copy, so handle 64 here and then jump
@@ -179,7 +184,7 @@ alternative_else_nop_endif
 	ldp1	C_l, C_h, src, #16
 	stp1	D_l, D_h, dst, #16
 	ldp1	D_l, D_h, src, #16
-	subs	count, count, #64
+	subs	count, count, #64	/* 每轮提交 64B，同时已预取下一 64B。 */
 	b.ge	1b
 	stp1	A_l, A_h, dst, #16
 	stp1	B_l, B_h, dst, #16

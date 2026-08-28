@@ -17,6 +17,24 @@
 #include <asm/insn.h>
 #include <asm/kprobes.h>
 
+/*
+ * 学习导读
+ * --------
+ * A64 指令固定为 32 位。这个文件不是解释执行器，而是给 kprobe、动态跳转和
+ * 内核代码修补使用的“小型编码器”：从某条合法 opcode 模板开始，清掉字段原值，
+ * 再把寄存器号、立即数、寻址方式等写入架构手册规定的 bit 位。
+ *
+ * 阅读每个 gen_* 函数可按同一套路：
+ *  1. 检查寄存器枚举、位宽 variant、寻址/内存序类型是否合法；
+ *  2. 选择定义在 asm/insn.h 中的基础 opcode；
+ *  3. encode_register/encode_immediate 只改目标字段，保留其余 opcode；
+ *  4. 分支类先计算 addr-pc，再检查对齐和立即数字段能否表示该距离；
+ *  5. 失败统一返回 AARCH64_BREAK_FAULT，执行它会可靠陷入而非跑错误代码。
+ *
+ * BIT(n) 是单个位，GENMASK(h,l) 是连续位掩码。字段值写入的通式是
+ * ``insn = (insn & ~(mask << shift)) | ((value & mask) << shift)``。
+ */
+
 #define AARCH64_INSN_SF_BIT	BIT(31)
 #define AARCH64_INSN_N_BIT	BIT(22)
 #define AARCH64_INSN_LSL_12	BIT(22)
@@ -24,6 +42,7 @@
 static int __kprobes aarch64_get_imm_shift_mask(enum aarch64_insn_imm_type type,
 						u32 *maskp, int *shiftp)
 {
+	/* 同名“立即数”在不同指令族里占用不同宽度和起始 bit。 */
 	u32 mask;
 	int shift;
 
@@ -88,11 +107,13 @@ static int __kprobes aarch64_get_imm_shift_mask(enum aarch64_insn_imm_type type,
 
 u64 aarch64_insn_decode_immediate(enum aarch64_insn_imm_type type, u32 insn)
 {
+	/* 返回字段的无符号原始值；是否符号扩展/按 2 或 4 缩放由调用者决定。 */
 	u32 immlo, immhi, mask;
 	int shift;
 
 	switch (type) {
 	case AARCH64_INSN_IMM_ADR:
+		/* ADR/ADRP 特殊：immlo 在 [30:29]，immhi 在 [23:5]。 */
 		shift = 0;
 		immlo = (insn >> ADR_IMM_LOSHIFT) & ADR_IMM_LOMASK;
 		immhi = (insn >> ADR_IMM_HISHIFT) & ADR_IMM_HIMASK;
@@ -137,7 +158,7 @@ u32 __kprobes aarch64_insn_encode_immediate(enum aarch64_insn_imm_type type,
 		}
 	}
 
-	/* Update the immediate field. */
+	/* 先清字段再 OR 新值；&mask 也阻止 imm 污染相邻 opcode 位。 */
 	insn &= ~(mask << shift);
 	insn |= (imm & mask) << shift;
 
@@ -170,6 +191,7 @@ u32 aarch64_insn_decode_register(enum aarch64_insn_register_type type,
 		return 0;
 	}
 
+	/* A64 通用寄存器字段固定 5 位，可编码 x0..x30 与 31(sp/zr)。 */
 	return (insn >> shift) & GENMASK(4, 0);
 }
 

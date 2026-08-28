@@ -13,6 +13,11 @@
 /* Assumptions:
  *
  * ARMv8-a, AArch64, unaligned accesses, min page size 4k.
+ *
+ * 中文路线：先尝试一次读取开头 16B，因为短字符串最常见；读取前检查是否
+ * 跨 4K 页（硬件标签 KASAN 下缩为 16B granule）。长字符串把 src 对齐后
+ * 每轮查 32B。快速公式只对 ASCII 保证无误，遇到高位字符转入精确公式。
+ * 找到 NUL 后用 rev+clz 得到槽位，再加 src-srcin 算出最终长度。
  */
 
 #define L(label) .L ## label
@@ -80,11 +85,11 @@
 	   boundary.  */
 
 SYM_FUNC_START(__pi_strlen)
-	and	tmp1, srcin, MIN_PAGE_SIZE - 1
+	and	tmp1, srcin, MIN_PAGE_SIZE - 1 /* 页/granule 内偏移。 */
 	mov	zeroones, REP8_01
 	cmp	tmp1, MIN_PAGE_SIZE - 16
-	b.gt	L(page_cross)
-	ldp	data1, data2, [srcin]
+	b.gt	L(page_cross)		/* 剩余不足 16B，不能直接非对齐 ldp。 */
+	ldp	data1, data2, [srcin]	/* 常见快路：一次查看最初 16 字节。 */
 #ifdef __AARCH64EB__
 	/* For big-endian, carry propagation (if the final byte in the
 	   string is 0x01) means we cannot use has_nul1/2 directly.
@@ -116,7 +121,7 @@ SYM_FUNC_START(__pi_strlen)
 	   loop with the accurate NUL check.  */
 	.p2align 4
 L(main_loop_entry):
-	bic	src, srcin, 15
+	bic	src, srcin, 15		/* 向下对齐，后续宽加载不再跨意外边界。 */
 	sub	src, src, 16
 L(main_loop):
 	ldp	data1, data2, [src, 32]!

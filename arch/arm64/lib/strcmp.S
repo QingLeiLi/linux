@@ -13,6 +13,12 @@
  *
  * ARMv8-a, AArch64.
  * MTE compatible.
+ *
+ * 中文要点：每次把 s1 的 8 字节与 s2 异或得到 diff，并对 s1 做并行
+ * NUL 检测得到 has_nul；syndrome=diff|has_nul，最靠前的置位表示第一个
+ * “字符不同或 s1 结束”的位置。rev+clz 把它变成字节索引，再提取双方的
+ * unsigned char 相减。对齐路径的掩码会把字符串起点之前的字节排除；两指针
+ * 对齐关系不同时，通过拼接相邻加载避免跨越不安全的页/MTE 边界。
  */
 
 #define L(label) .L ## label
@@ -54,10 +60,10 @@
 
 
 SYM_FUNC_START(__pi_strcmp)
-	sub	off2, src2, src1
+	sub	off2, src2, src1		/* 固定地址差，src2 可表示为 src1+off2。 */
 	mov	zeroones, REP8_01
-	and	tmp, src1, 7
-	tst	off2, 7
+	and	tmp, src1, 7		/* src1 的 8 字节内偏移。 */
+	tst	off2, 7			/* 两指针是否有相同的对齐余数。 */
 	b.ne	L(misaligned8)
 	cbnz	tmp, L(mutual_align)
 
@@ -81,8 +87,8 @@ L(start_realigned):
 #ifdef __AARCH64EB__
 	rev	has_nul, has_nul
 #endif
-	eor	diff, data1, data2
-	orr	syndrome, diff, has_nul
+	eor	diff, data1, data2	/* 不同字符产生非零 bit。 */
+	orr	syndrome, diff, has_nul /* 合并“不同”和“字符串结束”两种事件。 */
 L(end):
 #ifndef __AARCH64EB__
 	rev	syndrome, syndrome

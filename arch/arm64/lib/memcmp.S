@@ -12,6 +12,11 @@
 /* Assumptions:
  *
  * ARMv8-a, AArch64, unaligned accesses.
+ *
+ * 中文要点：memcmp 比较的是 unsigned char 的字典序，不能只比较小端机器上
+ * 两个 64 位整数的数值大小。因此主体先快速判断“整字是否相等”；发现不同后，
+ * 小端用 rev 把最低地址字节换到最高有效端，再做整数比较，最终返回 -1/0/1。
+ * 短尾从范围末端加载，可能与已比较部分重叠，但不会越过 n 字节边界。
  */
 
 #define L(label) .L ## label
@@ -33,7 +38,7 @@
 #define tmp2		x8
 
 SYM_FUNC_START(__pi_memcmp)
-	subs	limit, limit, 8
+	subs	limit, limit, 8	/* 预扣首个 8B；借位(C=0)代表 n<8。 */
 	b.lo	L(less8)
 
 	ldr	data1, [src1], 8
@@ -78,7 +83,7 @@ L(loop16):
 	ldp	data1, data1h, [src1], 16
 	ldp	data2, data2h, [src2], 16
 	subs	limit, limit, 16
-	ccmp	data1, data2, 0, hi
+	ccmp	data1, data2, 0, hi	/* 仍有数据时比较低半，否则强制退出。 */
 	ccmp	data1h, data2h, 0, eq
 	b.eq	L(loop16)
 
@@ -104,13 +109,13 @@ L(last_bytes):
 	/* Compare data bytes and set return value to 0, -1 or 1.  */
 L(return):
 #ifndef __AARCH64EB__
-	rev	data1, data1
+	rev	data1, data1		/* 小端内存顺序转为整数高位优先顺序。 */
 	rev	data2, data2
 #endif
 	cmp	data1, data2
 L(ret_eq):
-	cset	result, ne
-	cneg	result, result, lo
+	cset	result, ne		/* 相等为 0，不等先置 1。 */
+	cneg	result, result, lo	/* data1<data2 时把 1 变 -1。 */
 	ret
 
 	.p2align 4

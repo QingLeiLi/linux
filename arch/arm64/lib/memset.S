@@ -23,6 +23,12 @@
  *	x2 - n
  * Returns:
  *	x0 - buf
+ *
+ * 中文算法概览：先把 c 的低字节复制成八份，得到可一次写 8 字节的 A_l。
+ * <=15 字节按 count 的 8/4/2/1 位拆分；更长时先用一个允许非对齐的 16B
+ * 写把 dst 推到 16B 边界。非零填充以 64B 展开循环完成；零填充还会查询
+ * DCZID_EL0，若 DC ZVA 可用且块长合适，就用缓存块清零。尾部允许重叠写，
+ * 但写入值相同且不越过 [dstin,dstin+原 count)。
  */
 
 dstin		.req	x0
@@ -44,11 +50,11 @@ tmp3w		.req	w9
 tmp3		.req	x9
 
 SYM_FUNC_START_LOCAL(__pi_memset_generic)
-	mov	dst, dstin	/* Preserve return value.  */
-	and	A_lw, val, #255
-	orr	A_lw, A_lw, A_lw, lsl #8
-	orr	A_lw, A_lw, A_lw, lsl #16
-	orr	A_l, A_l, A_l, lsl #32
+	mov	dst, dstin	/* 工作指针另存，x0 保留 API 返回值。 */
+	and	A_lw, val, #255	/* memset 的 c 只采用低 8 位。 */
+	orr	A_lw, A_lw, A_lw, lsl #8	/* 广播成 16 位。 */
+	orr	A_lw, A_lw, A_lw, lsl #16	/* 广播成 32 位。 */
+	orr	A_l, A_l, A_l, lsl #32	/* 广播成 64 位。 */
 
 	cmp	count, #15
 	b.hi	.Lover16_proc
@@ -70,7 +76,7 @@ SYM_FUNC_START_LOCAL(__pi_memset_generic)
 .Lover16_proc:
 	/*Whether  the start address is aligned with 16.*/
 	neg	tmp2, dst
-	ands	tmp2, tmp2, #15
+	ands	tmp2, tmp2, #15	/* 到下一 16 字节边界的距离。 */
 	b.eq	.Laligned
 /*
 * The count is not less than 16, we can use stp to store the start 16 bytes,
@@ -83,7 +89,7 @@ SYM_FUNC_START_LOCAL(__pi_memset_generic)
 	add	dst, dst, tmp2
 
 .Laligned:
-	cbz	A_l, .Lzero_mem
+	cbz	A_l, .Lzero_mem	/* 只有填充值为零才可能使用 DC ZVA。 */
 
 .Ltail_maybe_long:
 	cmp	count, #64
@@ -146,7 +152,7 @@ SYM_FUNC_START_LOCAL(__pi_memset_generic)
 	cmp	count, #128
 	b.lt	.Lnot_short /*count is at least  128 bytes*/
 
-	mrs	tmp1, dczid_el0
+	mrs	tmp1, dczid_el0	/* DZP 位与 BS 块大小编码。 */
 	tbnz	tmp1, #4, .Lnot_short
 	mov	tmp3w, #4
 	and	zva_len, tmp1w, #15	/* Safety: other bits reserved.  */
@@ -195,7 +201,7 @@ SYM_FUNC_START_LOCAL(__pi_memset_generic)
 2:
 	sub	count, count, zva_len_x
 3:
-	dc	zva, dst
+	dc	zva, dst		/* 对齐后一次清零 zva_len 字节。 */
 	add	dst, dst, zva_len_x
 	subs	count, count, zva_len_x
 	b.ge	3b
@@ -212,9 +218,9 @@ alternative_if_not ARM64_HAS_MOPS
 alternative_else_nop_endif
 
 	mov	dst, dstin
-	setp	[dst]!, count!, val_x
-	setm	[dst]!, count!, val_x
-	sete	[dst]!, count!, val_x
+	setp	[dst]!, count!, val_x	/* MOPS prologue。 */
+	setm	[dst]!, count!, val_x	/* MOPS main。 */
+	sete	[dst]!, count!, val_x	/* MOPS epilogue。 */
 	ret
 SYM_FUNC_END(__pi_memset)
 #else

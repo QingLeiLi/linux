@@ -7,10 +7,16 @@
 
 #include <net/checksum.h>
 
-/* Looks dumb, but generates nice-ish code */
+/*
+ * 学习背景：Internet checksum 使用“一补数加法”。普通无符号加法溢出的
+ * 第 65 位不能丢掉，而要折回最低位（end-around carry）。借助 __uint128_t，
+ * 编译器可用 adds/adc 高效地产生这一步，而无需 C 代码显式判断溢出。
+ */
 static u64 accumulate(u64 sum, u64 data)
 {
+	/* tmp 保留完整 65 位结果；高 64 位在这里实际只可能是 0 或 1。 */
 	__uint128_t tmp = (__uint128_t)sum + data;
+	/* 低 64 位加进位；若再次进位，后续 accumulate/fold 会继续折叠。 */
 	return tmp + (tmp >> 64);
 }
 
@@ -27,6 +33,7 @@ unsigned int __no_sanitize_address do_csum(const unsigned char *buff, int len)
 	if (unlikely(len <= 0))
 		return 0;
 
+	/* offset 是首地址在 8 字节字中的位置；ptr 随后向下对齐。 */
 	offset = (unsigned long)buff & 7;
 	/*
 	 * This is to all intents and purposes safe, since rounding down cannot
@@ -38,6 +45,7 @@ unsigned int __no_sanitize_address do_csum(const unsigned char *buff, int len)
 	 */
 	kasan_check_read(buff, len);
 	ptr = (u64 *)(buff - offset);
+	/* 首次固定消耗一个 8 字节字，所以把循环余量预减 8。 */
 	len = len + offset - 8;
 
 	/*
@@ -45,7 +53,7 @@ unsigned int __no_sanitize_address do_csum(const unsigned char *buff, int len)
 	 * amount should be at least as fast as any other way of handling the
 	 * odd/even alignment, and means we can ignore it until the very end.
 	 */
-	shift = offset * 8;
+	shift = offset * 8;	/* 字节偏移换算成位偏移。 */
 	data = *ptr++;
 #ifdef __LITTLE_ENDIAN
 	data = (data >> shift) << shift;
@@ -59,6 +67,7 @@ unsigned int __no_sanitize_address do_csum(const unsigned char *buff, int len)
 	 * main loop strictly excludes the tail, so the second loop will always
 	 * run at least once.
 	 */
+	/* 每轮 64 字节、四条 128 位加载；多累加链可提高指令级并行度。 */
 	while (unlikely(len > 64)) {
 		__uint128_t tmp1, tmp2, tmp3, tmp4;
 
@@ -85,6 +94,7 @@ unsigned int __no_sanitize_address do_csum(const unsigned char *buff, int len)
 		tmp1 += (tmp1 >> 64) | (tmp1 << 64);
 		sum64 = tmp1 >> 64;
 	}
+	/* 处理剩余完整数据，同时把最后一个可能越界读取的字留给尾部掩码。 */
 	while (len > 8) {
 		__uint128_t tmp;
 
@@ -111,6 +121,7 @@ unsigned int __no_sanitize_address do_csum(const unsigned char *buff, int len)
 	 * Tail: zero any over-read bytes similarly to the head, again
 	 * preserving odd/even alignment.
 	 */
+	/* 此时 len 在 -7..0；-len 是末字中真正有效的字节数。 */
 	shift = len * -8;
 #ifdef __LITTLE_ENDIAN
 	data = (data << shift) >> shift;
@@ -119,10 +130,11 @@ unsigned int __no_sanitize_address do_csum(const unsigned char *buff, int len)
 #endif
 	sum64 = accumulate(sum64, data);
 
-	/* Finally, folding */
+	/* 把 64 位和折成 32 位，再折成最终 16 位一补数和。 */
 	sum64 += (sum64 >> 32) | (sum64 << 32);
 	sum = sum64 >> 32;
 	sum += (sum >> 16) | (sum << 16);
+	/* 奇地址会交换校验和的字节相位，最后统一纠正。 */
 	if (offset & 1)
 		return (u16)swab32(sum);
 
@@ -133,6 +145,7 @@ __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
 			const struct in6_addr *daddr,
 			__u32 len, __u8 proto, __wsum csum)
 {
+	/* IPv6 伪首部 = 128 位源/目的地址 + 32 位长度 + 8 位 next-header。 */
 	__uint128_t src, dst;
 	u64 sum = (__force u64)csum;
 
@@ -145,6 +158,7 @@ __sum16 csum_ipv6_magic(const struct in6_addr *saddr,
 #else
 	sum += proto;
 #endif
+	/* 每个 128 位地址的两个 64 位半部相加，并保留端回进位。 */
 	src += (src >> 64) | (src << 64);
 	dst += (dst >> 64) | (dst << 64);
 
