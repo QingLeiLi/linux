@@ -27,7 +27,7 @@
 
 ### 调度类与运行队列策略
 
-- [ ] `kernel/sched/fair.c`
+- [x] `kernel/sched/fair.c`
 - [x] `kernel/sched/rt.c`
 - [ ] `kernel/sched/deadline.c`
 - [x] `kernel/sched/stop_task.c`
@@ -84,4 +84,4 @@
 
 ## 当前处理文件
 
-- 无（`kernel/sched/sched.h` 已完成第 17 章验收）
+- `kernel/sched/fair.c`（全文件已按第 17 章闭环：函数契约、复杂路径、英文注释邻接翻译与密度检查均已完成）
