@@ -2,14 +2,22 @@
 
 menu "Memory Management options"
 
+# 本菜单是内存管理能力的配置入口。depends on 隐藏不满足前置条件的选项，
+# select 强制补齐实现依赖，default 只给出初始策略；最终值还可被架构 Kconfig
+# 和用户配置覆盖，随后由 mm/Makefile 把 y/m 符号转换为具体对象集合。
+
 #
 # For some reason microblaze and nios2 hard code SWAP=n.  Hopefully we can
 # add proper SWAP support to them, in which case this can be remove.
 #
+# microblaze 与 nios2 目前在架构配置中固定禁用 SWAP；若将来具备完整交换支持，
+# 便可删除这个反向能力标志。ARCH_NO_SWAP 由架构选择，不直接呈现给用户。
 config ARCH_NO_SWAP
 	bool
 
 menuconfig SWAP
+# 匿名页换出总开关；要求 MMU、块层且架构未声明禁用。关闭后 zswap 与交换文件
+# 实现均不可达，不能仅靠运行期 sysctl 补回这项编译期能力。
 	bool "Support for paging of anonymous memory (swap)"
 	depends on MMU && BLOCK && !ARCH_NO_SWAP
 	default y
@@ -20,6 +28,8 @@ menuconfig SWAP
 	  in your computer.  If unsure say Y.
 
 config ZSWAP
+# zswap 在真正写交换设备前把页压缩到 RAM 池；它必须同时取得压缩 API 与
+# zsmalloc 后端。内存压力下仍可能回写，因此它是缓存而不是持久交换介质。
 	bool "Compressed cache for swap pages"
 	depends on SWAP
 	select CRYPTO
@@ -33,6 +43,7 @@ config ZSWAP
 	  reads, can also improve workload performance.
 
 config ZSWAP_DEFAULT_ON
+# 只设置启动默认值，zswap.enabled= 可在引导时覆盖，不改变 ZSWAP 是否编译。
 	bool "Enable the compressed cache for swap pages by default"
 	depends on ZSWAP
 	help
@@ -43,6 +54,8 @@ config ZSWAP_DEFAULT_ON
 	  command line 'zswap.enabled=' option.
 
 config ZSWAP_SHRINKER_DEFAULT_ON
+# 决定 shrinker 是否默认参与回收；开启可更早把冷压缩页写回交换设备，用 I/O
+# 换取 zswap 池不长期占用 RAM，同样属于运行策略默认值而非能力开关。
 	bool "Shrink the zswap pool on memory pressure"
 	depends on ZSWAP
 	default n
@@ -57,6 +70,8 @@ config ZSWAP_SHRINKER_DEFAULT_ON
 	  and consume memory indefinitely.
 
 choice
+# choice 保证默认压缩器恰选一个；各分支 select 对应 crypto 实现，隐藏的字符串
+# ZSWAP_COMPRESSOR_DEFAULT 再把布尔选择转换为传给 zswap 的算法名称。
 	prompt "Default compressor"
 	depends on ZSWAP
 	default ZSWAP_COMPRESSOR_DEFAULT_LZO
@@ -75,36 +90,42 @@ choice
 	  command line 'zswap.compressor=' option.
 
 config ZSWAP_COMPRESSOR_DEFAULT_DEFLATE
+# Deflate 压缩率较高但 CPU 成本通常更大，选择时同时编入 CRYPTO_DEFLATE。
 	bool "Deflate"
 	select CRYPTO_DEFLATE
 	help
 	  Use the Deflate algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_LZO
+# LZO 偏重吞吐与低延迟，是本 choice 的保守默认，并选择 CRYPTO_LZO。
 	bool "LZO"
 	select CRYPTO_LZO
 	help
 	  Use the LZO algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_842
+# 842 面向具备相应实现/加速场景，选择 CRYPTO_842 后才可作为 zswap 默认算法。
 	bool "842"
 	select CRYPTO_842
 	help
 	  Use the 842 algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_LZ4
+# LZ4 以快速压缩/解压为主，选择其 crypto 实现。
 	bool "LZ4"
 	select CRYPTO_LZ4
 	help
 	  Use the LZ4 algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_LZ4HC
+# LZ4HC 用更高压缩 CPU 成本换取更好压缩率，仍保持 LZ4 格式族。
 	bool "LZ4HC"
 	select CRYPTO_LZ4HC
 	help
 	  Use the LZ4HC algorithm as the default compression algorithm.
 
 config ZSWAP_COMPRESSOR_DEFAULT_ZSTD
+# zstd 在压缩率与速度间取另一折中，选择 CRYPTO_ZSTD 实现。
 	bool "zstd"
 	select CRYPTO_ZSTD
 	help
@@ -112,6 +133,8 @@ config ZSWAP_COMPRESSOR_DEFAULT_ZSTD
 endchoice
 
 config ZSWAP_COMPRESSOR_DEFAULT
+# 这是派生字符串而非用户选项；条件 default 必须与上面的 choice 分支一一对应，
+# 空串只是防御性兜底，正常的 choice 解析不会落到它。
        string
        depends on ZSWAP
        default "deflate" if ZSWAP_COMPRESSOR_DEFAULT_DEFLATE
@@ -123,6 +146,8 @@ config ZSWAP_COMPRESSOR_DEFAULT
        default ""
 
 config ZSMALLOC
+# zsmalloc 是 zswap/zram 共用的紧凑对象分配后端，由使用者 select；tristate 让
+# 独立消费者在允许时可模块化。下面的菜单仅在后端确实启用时出现。
 	tristate
 
 if ZSMALLOC
@@ -131,8 +156,10 @@ menu "Zsmalloc allocator options"
 	depends on ZSMALLOC
 
 comment "Zsmalloc is a common backend allocator for zswap & zram"
+# 菜单提示强调共享关系：调节 zspage 布局会同时影响 zswap 和 zram 的内存效率。
 
 config ZSMALLOC_STAT
+# 收集并通过 debugfs 导出池/size-class 统计，便于调优但增加计数开销。
 	bool "Export zsmalloc statistics"
 	select DEBUG_FS
 	help
@@ -142,6 +169,8 @@ config ZSMALLOC_STAT
 	  If unsure, say N.
 
 config ZSMALLOC_CHAIN_SIZE
+# 限制一个 zspage 聚合的物理页数（4..16）；初始化会按此上限重新计算各
+# size class 的对象数和合并关系，所以它改变碎片率与映射成本而非单纯容量。
 	int "Maximum number of physical pages per-zspage"
 	default 8
 	range 4 16
@@ -165,16 +194,22 @@ endif
 
 menu "Slab allocator options"
 
+# SLUB 是本树唯一 slab 分配器；本组在吞吐、内存占用与堆利用防护之间取舍。
+
 config SLUB
+# 隐藏的恒真能力符号，同时选择 IRQ_WORK 以支持延后处理等 SLUB 基础机制。
 	def_bool y
 	select IRQ_WORK
 
 config KVFREE_RCU_BATCHED
+# 在正常 SLUB/RCU 配置下批量延后 kvfree_rcu()，减少 grace-period 与回调开销；
+# tiny 或严格 grace period 模式不满足该优化的资源/时序假设。
 	def_bool y
 	depends on !SLUB_TINY && !TINY_RCU
 	depends on !RCU_STRICT_GRACE_PERIOD
 
 config SLUB_TINY
+# 为极小内存系统牺牲并发扩展与调试能力，并强制允许 cache 合并以减少元数据。
 	bool "Configure for minimal memory footprint"
 	depends on EXPERT && !COMPILE_TEST
 	select SLAB_MERGE_DEFAULT
@@ -188,6 +223,8 @@ config SLUB_TINY
 	   If unsure, say N.
 
 config SLAB_MERGE_DEFAULT
+# 尺寸与属性兼容的 cache 默认可合并以减碎片，但会扩大堆越界可触达的对象类型；
+# slab_nomerge 可在启动时覆盖默认策略。
 	bool "Allow slab caches to be merged"
 	default y
 	help
@@ -202,6 +239,7 @@ config SLAB_MERGE_DEFAULT
 	  command line.
 
 config SLAB_FREELIST_RANDOM
+# 新 slab 页建立 freelist 时打乱对象顺序，降低堆喷布局可预测性。
 	bool "Randomize slab freelist"
 	depends on !SLUB_TINY
 	help
@@ -210,6 +248,7 @@ config SLAB_FREELIST_RANDOM
 	  allocator against heap overflows.
 
 config SLAB_FREELIST_HARDENED
+# 对 freelist 元数据做轻量完整性强化，以少量性能换取常见篡改利用难度。
 	bool "Harden slab freelist metadata"
 	depends on !SLUB_TINY
 	help
@@ -219,6 +258,8 @@ config SLAB_FREELIST_HARDENED
 	  freelist exploit methods.
 
 config SLAB_BUCKETS
+# 为用户可控内容提供分离的 kmalloc bucket，减少它与敏感目标对象共置；代价是
+# 多维护少量 cache/page，默认跟随 freelist hardened 开启。
 	bool "Support allocation from separate kmalloc buckets"
 	depends on !SLUB_TINY
 	default SLAB_FREELIST_HARDENED
@@ -236,6 +277,7 @@ config SLAB_BUCKETS
 	  If unsure, say Y.
 
 config SLUB_STATS
+# 仅供分析 allocator 热点；每次分配/释放计数会拖慢热路径，生产配置应关闭。
 	default n
 	bool "Enable performance statistics"
 	depends on SYSFS && !SLUB_TINY
@@ -249,6 +291,8 @@ config SLUB_STATS
 	  Try running: slabinfo -DA
 
 config KMALLOC_PARTITION_CACHES
+# 创建多份普通 kmalloc cache，并由下方策略选择实例，把不同调用点或类型隔离；
+# 固定 16 份在防护强度和 CPU/内存额外成本之间折中。
 	depends on !SLUB_TINY
 	bool "Partitioned slab caches for normal kmalloc"
 	default RANDOM_KMALLOC_CACHES
@@ -265,6 +309,8 @@ config KMALLOC_PARTITION_CACHES
 	  and system workload.
 
 choice
+# 随机模式按启动种子与代码地址映射，类型模式依赖 Clang allocation token；
+# 编译器支持时优先类型隔离，否则回退到概率隔离。
 	prompt "Partitioned slab cache mode"
 	depends on KMALLOC_PARTITION_CACHES
 	default KMALLOC_PARTITION_TYPED if CC_HAS_ALLOC_TOKEN
@@ -273,6 +319,7 @@ choice
 	  Selects the slab cache partitioning mode.
 
 config KMALLOC_PARTITION_RANDOM
+# 同一调用位置的选择受每次启动随机种子影响，攻击者只能通过跨机器重试碰撞。
 	bool "Randomize slab caches for normal kmalloc"
 	help
 	  Randomly pick a slab cache based on code address and a per-boot
@@ -285,6 +332,8 @@ config KMALLOC_PARTITION_RANDOM
 	  the target objects are co-located.
 
 config KMALLOC_PARTITION_TYPED
+# allocation token 从分配类型派生，映射可预测但能确定隔离特定类型；编译器还
+# 将含指针与不含指针对象置于不相交 token 范围，阻断一类原始缓冲区越界。
 	bool "Type based slab cache selection for normal kmalloc"
 	depends on CC_HAS_ALLOC_TOKEN
 	help
@@ -313,6 +362,7 @@ config KMALLOC_PARTITION_TYPED
 endchoice
 
 config RANDOM_KMALLOC_CACHES
+# 仅保留旧配置迁移语义；transitional 符号不应成为新代码依赖。
 	bool
 	transitional
 	help
@@ -320,6 +370,8 @@ config RANDOM_KMALLOC_CACHES
 
 endmenu # Slab allocator options
 
+# 打乱伙伴系统自由页顺序可改善直映内存侧缓存的平均利用率，并附带降低页布局
+# 可预测性；没有相应缓存的平台可能受损，实际启用还可由 page_alloc.shuffle 控制。
 config SHUFFLE_PAGE_ALLOCATOR
 	bool "Page allocator randomization"
 	default SLAB_FREELIST_RANDOM && ACPI_NUMA
@@ -344,6 +396,8 @@ config SHUFFLE_PAGE_ALLOCATOR
 	  Say Y if unsure.
 
 config COMPAT_BRK
+# y 表示兼容老二进制而默认关闭 heap 随机化；现代发行版通常选 n，以降低利用
+# 可预测性。运行期 randomize_va_space 仍可覆盖启动默认。
 	bool "Disable heap randomization"
 	default y
 	help
@@ -356,6 +410,8 @@ config COMPAT_BRK
 	  On non-ancient distros (post-2000 ones) N is usually a safe choice.
 
 config MMAP_ALLOW_UNINITIALIZED
+# 仅 NOMMU 专家系统允许 MAP_UNINITIALIZED 跳过匿名映射清零；这可加速受控嵌入式
+# 设备，却会把旧数据暴露给用户态，因此不适用于运行不可信程序的系统。
 	bool "Allow mmapped anonymous memory to be uninitialized"
 	depends on EXPERT && !MMU
 	default n
@@ -378,10 +434,13 @@ config MMAP_ALLOW_UNINITIALIZED
 	  See Documentation/admin-guide/mm/nommu-mmap.rst for more information.
 
 config SELECT_MEMORY_MODEL
+# 架构允许用户选择时才显示下面的 FLATMEM/SPARSEMEM choice；否则架构直接决定。
 	def_bool y
 	depends on ARCH_SELECT_MEMORY_MODEL
 
 choice
+# 物理内存模型决定 PFN 到 struct page 的组织方式：FLATMEM 简单低开销，
+# SPARSEMEM 支持地址洞、NUMA 与热插拔。choice 只选用户可见的手工策略。
 	prompt "Memory model"
 	depends on SELECT_MEMORY_MODEL
 	default SPARSEMEM_MANUAL if ARCH_SPARSEMEM_DEFAULT
@@ -393,6 +452,7 @@ choice
 	  configuration. This is normal.
 
 config FLATMEM_MANUAL
+# 手工选择单一连续 mem_map，适合物理地址洞少的非 NUMA 小系统。
 	bool "Flat Memory"
 	depends on !ARCH_SPARSEMEM_ENABLE || ARCH_FLATMEM_ENABLE
 	help
@@ -408,6 +468,7 @@ config FLATMEM_MANUAL
 	  If unsure, choose this option (Flat Memory) over any other.
 
 config SPARSEMEM_MANUAL
+# 手工选择按 section 管理的稀疏模型，为 NUMA、地址洞与内存热插拔提供基础。
 	bool "Sparse Memory"
 	depends on ARCH_SPARSEMEM_ENABLE
 	help
@@ -423,10 +484,12 @@ config SPARSEMEM_MANUAL
 endchoice
 
 config SPARSEMEM
+# 把架构默认或手工选择归一为最终 SPARSEMEM 能力符号。
 	def_bool y
 	depends on (!SELECT_MEMORY_MODEL && ARCH_SPARSEMEM_ENABLE) || SPARSEMEM_MANUAL
 
 config FLATMEM
+# 与 SPARSEMEM 互补的派生能力；显式 FLATMEM_MANUAL 可固定平坦模型。
 	def_bool y
 	depends on !SPARSEMEM || FLATMEM_MANUAL
 
@@ -440,6 +503,8 @@ config FLATMEM
 # This option will also potentially produce smaller runtime code
 # with gcc 3.4 and later.
 #
+# SPARSEMEM_EXTREME 默认在 sparse_init() 动态分配 mem_section；无法早期动态
+# 分配的架构可选 STATIC，但静态数组可能大量占用 .bss，旧 GCC 下也可能减代码。
 config SPARSEMEM_STATIC
 	bool
 
@@ -448,14 +513,18 @@ config SPARSEMEM_STATIC
 # must select this option. This is usually for architecture platforms with
 # an extremely sparse physical address space.
 #
+# 极稀疏物理地址空间需要两级 mem_section；除非架构选 STATIC，否则默认采用。
 config SPARSEMEM_EXTREME
 	def_bool y
 	depends on SPARSEMEM && !SPARSEMEM_STATIC
 
 config SPARSEMEM_VMEMMAP_ENABLE
+# 架构声明能以虚拟连续映射承载 memmap；下一个派生符号才表示最终启用。
 	bool
 
 config SPARSEMEM_VMEMMAP
+# 为 struct page 建立虚拟连续 vmemmap，使 pfn_to_page/page_to_pfn 保持简单快速，
+# 前提是架构提供地址空间与映射资源。
 	def_bool y
 	depends on SPARSEMEM && SPARSEMEM_VMEMMAP_ENABLE
 	help
@@ -464,47 +533,60 @@ config SPARSEMEM_VMEMMAP
 	  efficient option when sufficient kernel resources are available.
 
 config SPARSEMEM_VMEMMAP_PREINIT
+# 架构能力：要求在更早阶段预初始化 vmemmap，供后续巨页/设备内存路径使用。
 	bool
 #
 # Select this config option from the architecture Kconfig, if it is preferred
 # to enable the feature of HugeTLB/dev_dax vmemmap optimization.
 #
+# 架构希望默认启用 dev_dax/HugeTLB 的 vmemmap 优化；这些只表达偏好，真正能力
+# 与回收实现还需相应架构和 HugeTLB/DAX 配置。
 config ARCH_WANT_OPTIMIZE_DAX_VMEMMAP
 	bool
 
 config ARCH_WANT_OPTIMIZE_HUGETLB_VMEMMAP
+# 架构希望默认回收 HugeTLB 尾页对应的冗余 vmemmap。
 	bool
 
 config ARCH_WANT_HUGETLB_VMEMMAP_PREINIT
 	bool
 
 config HAVE_MEMBLOCK_PHYS_MAP
+# 架构的 memblock 记录包含可用 physical map，供早期内存代码选择相应路径。
 	bool
 
 config HAVE_GUP_FAST
+# 架构提供 fast GUP 页表遍历；只有 MMU 系统有该能力，调用者仍须处理回退。
 	depends on MMU
 	bool
 
 # Enable memblock support for scratch memory which is needed for kexec handover
+# 为 kexec handover 保留并管理 scratch memblock；没有该协议时不携带额外记录。
 config MEMBLOCK_KHO_SCRATCH
 	bool
 
 # Don't discard allocated memory used to track "memory" and "reserved" memblocks
 # after early boot, so it can still be used to test for validity of memory.
 # Also, memblocks are updated with memory hot(un)plug.
+# 启动后保留 memory/reserved memblock 元数据，并随热插拔更新，供有效性检查继续
+# 使用；代价是不能像普通配置那样释放这些早期元数据。
 config ARCH_KEEP_MEMBLOCK
 	bool
 
 # Keep arch NUMA mapping infrastructure post-init.
+# 启动后保留架构 NUMA 映射，供内存热插拔为新增范围恢复节点归属。
 config NUMA_KEEP_MEMINFO
 	bool
 
 config MEMORY_ISOLATION
+# 隐藏基础能力：提供 pageblock 隔离，供 hotplug、CMA、连续分配等上层选择。
 	bool
 
 # IORESOURCE_SYSTEM_RAM regions in the kernel resource tree that are marked
 # IORESOURCE_EXCLUSIVE cannot be mapped to user space, for example, via
 # /dev/mem.
+# 当 /dev/mem 不存在或执行严格过滤时，带 IORESOURCE_EXCLUSIVE 的 System RAM
+# 区域不会被用户态映射，形成设备/保留内存的访问边界。
 config EXCLUSIVE_SYSTEM_RAM
 	def_bool y
 	depends on !DEVMEM || STRICT_DEVMEM
@@ -513,13 +595,17 @@ config EXCLUSIVE_SYSTEM_RAM
 # Only be set on architectures that have completely implemented memory hotplug
 # feature. If you are not sure, don't touch it.
 #
+# 只有完整实现内存热插拔的架构才能选择；它保留节点启动内存信息供热移除使用。
 config HAVE_BOOTMEM_INFO_NODE
 	def_bool n
 
 config ARCH_ENABLE_MEMORY_HOTPLUG
+# 架构声明已提供热插拔所需页表、映射和回调，不是用户可独立开启的功能。
 	bool
 
 # eventually, we can have this option just 'select SPARSEMEM'
+# 最终希望由本项直接选择 SPARSEMEM；当前仍要求 64 位 SPARSEMEM_VMEMMAP 和
+# 架构能力，开启后还选择 pageblock 隔离，并在 NUMA 下保留启动映射。
 menuconfig MEMORY_HOTPLUG
 	bool "Memory hotplug"
 	select MEMORY_ISOLATION
@@ -531,6 +617,8 @@ menuconfig MEMORY_HOTPLUG
 if MEMORY_HOTPLUG
 
 choice
+# 新增内存块注册后的默认状态策略；sysfs auto_online_blocks 可在运行期改写，
+# 因而这里只决定启动默认，不改变驱动显式 online/offline 的控制权。
 	prompt "Memory Hotplug Default Online Type"
 	default MHP_DEFAULT_ONLINE_TYPE_OFFLINE
 	help
@@ -553,6 +641,7 @@ choice
 	  See Documentation/admin-guide/mm/memory-hotplug.rst for more information.
 
 config MHP_DEFAULT_ONLINE_TYPE_OFFLINE
+# 默认保持 offline，把 zone 选择与上线时机留给驱动或用户空间策略。
 	bool "offline"
 	help
 	  Hotplugged memory will not be onlined by default.
@@ -560,6 +649,7 @@ config MHP_DEFAULT_ONLINE_TYPE_OFFLINE
 	  handle onlining of hotplug memory policy.
 
 config MHP_DEFAULT_ONLINE_TYPE_ONLINE_AUTO
+# 由内核按现有 zone 布局自动选择，允许新增内存承载内核不可迁移数据。
 	bool "auto"
 	help
 	  Select this if you want the kernel to automatically online
@@ -567,6 +657,7 @@ config MHP_DEFAULT_ONLINE_TYPE_ONLINE_AUTO
 	  This memory may be utilized for kernel data.
 
 config MHP_DEFAULT_ONLINE_TYPE_ONLINE_KERNEL
+# 明确上线到可放内核数据的 zone，通常是 ZONE_NORMAL。
 	bool "kernel"
 	help
 	  Select this if you want the kernel to automatically online
@@ -574,6 +665,8 @@ config MHP_DEFAULT_ONLINE_TYPE_ONLINE_KERNEL
 	  data. This typically means ZONE_NORMAL.
 
 config MHP_DEFAULT_ONLINE_TYPE_ONLINE_MOVABLE
+# 上线到 ZONE_MOVABLE，降低未来热移除阻力；描述这些页的 struct page 等元数据
+# 仍需现有 kernel-capable 内存，容量不足会使上线失败。
 	bool "movable"
 	help
 	  Select this if you want the kernel to automatically online
@@ -589,12 +682,15 @@ config MHP_DEFAULT_ONLINE_TYPE_ONLINE_MOVABLE
 endchoice
 
 config MEMORY_HOTREMOVE
+# 热移除必须能迁走页；x86_64 还需保留 bootmem 节点信息以恢复早期布局。
 	bool "Allow for memory hot remove"
 	select HAVE_BOOTMEM_INFO_NODE if X86_64
 	depends on MEMORY_HOTPLUG
 	select MIGRATION
 
 config MHP_MEMMAP_ON_MEMORY
+# 允许用热插入内存自身的一部分存放其 vmemmap，减少外部内存消耗；默认开启但
+# 仅在架构声明映射布局可支持时生效。
 	def_bool y
 	depends on MEMORY_HOTPLUG && SPARSEMEM_VMEMMAP
 	depends on ARCH_MHP_MEMMAP_ON_MEMORY_ENABLE
@@ -602,6 +698,7 @@ config MHP_MEMMAP_ON_MEMORY
 endif # MEMORY_HOTPLUG
 
 config ARCH_MHP_MEMMAP_ON_MEMORY_ENABLE
+# 架构对 memmap-on-memory 地址/映射约束的能力声明。
        bool
 
 # Heavily threaded applications may benefit from splitting the mm-wide
@@ -615,6 +712,9 @@ config ARCH_MHP_MEMMAP_ON_MEMORY_ENABLE
 # at the same time (e.g. copy_page_range()).
 # DEBUG_SPINLOCK and DEBUG_LOCK_ALLOC spinlock_t also enlarge struct page.
 #
+# 高线程数系统把 mm-wide page_table_lock 拆为每个 PTE 页锁，可让不同地址故障
+# 并行；但 ARM cache、PA-RISC struct page 大小、SPARC32 共享页表页等约束会
+# 破坏或放大成本，所以依赖式逐项排除，调试锁配置也会增加 struct page 开销。
 config SPLIT_PTE_PTLOCKS
 	def_bool y
 	depends on MMU
@@ -626,19 +726,24 @@ config SPLIT_PTE_PTLOCKS
 	depends on !UML
 
 config ARCH_ENABLE_SPLIT_PMD_PTLOCK
+# 架构声明 PMD 页表锁也可安全拆分。
 	bool
 
 config SPLIT_PMD_PTLOCKS
+# 只有 PTE 已拆锁且架构支持时，PMD 层才使用细粒度锁，保持锁层级一致。
 	def_bool y
 	depends on SPLIT_PTE_PTLOCKS && ARCH_ENABLE_SPLIT_PMD_PTLOCK
 
 #
 # support for memory balloon
+# 虚拟化 balloon 的隐藏基础能力，由具体驱动选择。
 config BALLOON
 	bool
 
 #
 # support for memory balloon page migration
+# 允许迁移已 balloon 的页，使其可来自 ZONE_MOVABLE/CMA 并参与 compaction；
+# 前提是迁移核心与 balloon 驱动都存在。
 config BALLOON_MIGRATION
 	bool "Allow for balloon memory migration"
 	default y
@@ -651,6 +756,8 @@ config BALLOON_MIGRATION
 
 #
 # support for memory compaction
+# compaction 通过迁移可移动页形成高阶连续空闲块，是高阶分配避免意外 OOM 的
+# 关键慢路径；它反向选择 MIGRATION，并只适用于 MMU。
 config COMPACTION
 	bool "Allow for memory compaction"
 	default y
@@ -667,6 +774,7 @@ config COMPACTION
 	  linux-mm@kvack.org.
 
 config COMPACT_UNEVICTABLE_DEFAULT
+# 默认是否扫描不可回收 LRU；PREEMPT_RT 为降低长延迟默认 0，其他配置默认 1。
 	int
 	depends on COMPACTION
 	default 0 if PREEMPT_RT
@@ -674,6 +782,8 @@ config COMPACT_UNEVICTABLE_DEFAULT
 
 #
 # support for free page reporting
+# 从伙伴系统增量取得空闲页并通知 hypervisor 等外部实体，使宿主可回收实际
+# 后备内存；报告过程中必须与页重新分配保持协议同步。
 config PAGE_REPORTING
 	bool "Free page reporting"
 	help
@@ -683,6 +793,7 @@ config PAGE_REPORTING
 	  memory can be freed within the host for other uses.
 
 config NUMA_MIGRATION
+# 向用户 API 与内存分层开放跨节点页迁移，同时选择通用 MIGRATION 核心。
 	bool "NUMA page migration"
 	default y
 	depends on NUMA && MMU
@@ -694,19 +805,23 @@ config NUMA_MIGRATION
 	  demotion for memory tiering.
 
 config MIGRATION
+# 隐藏基础符号，汇总 compaction、NUMA、hotremove 等消费者对页迁移的需求。
 	bool
 	depends on MMU
 
 config DEVICE_MIGRATION
+# ZONE_DEVICE 存在时把迁移框架扩展到设备私有页。
 	def_bool MIGRATION && ZONE_DEVICE
 
 config ARCH_ENABLE_HUGEPAGE_MIGRATION
+# 架构分别声明 HugeTLB/THP 页表与复制路径支持迁移。
 	bool
 
 config ARCH_ENABLE_THP_MIGRATION
 	bool
 
 config HUGETLB_PAGE_SIZE_VARIABLE
+# 多 HugeTLB 尺寸平台允许 pageblock_order 动态选择，但仍受 MAX_PAGE_ORDER 上限。
 	def_bool n
 	help
 	  Allows the pageblock_order value to be dynamic instead of just standard
@@ -717,9 +832,12 @@ config HUGETLB_PAGE_SIZE_VARIABLE
 	  clamped down to MAX_PAGE_ORDER.
 
 config CONTIG_ALLOC
+# 连续分配能力由“隔离+压缩”或 CMA 任一方案提供，调用者依赖此派生符号。
 	def_bool (MEMORY_ISOLATION && COMPACTION) || CMA
 
 config PCP_BATCH_SCALE_MAX
+# 限制每 CPU pageset 批量 refill/drain 的自适应倍率：值大提升吞吐但扩大单次
+# 临界区/延迟，范围 0..6，默认 5。
 	int "Maximum scale factor of PCP (Per-CPU pageset) batch allocate/free"
 	default 5
 	range 0 6
@@ -731,13 +849,17 @@ config PCP_BATCH_SCALE_MAX
 	  the maximum latency.
 
 config PHYS_ADDR_T_64BIT
+# 64 位架构派生出 64 位 phys_addr_t 能力，供类型/格式选择使用。
 	def_bool 64BIT
 
 config MMU_NOTIFIER
+# 让设备/虚拟化订阅进程页表失效，并选择 interval tree 管理被监视范围。
 	bool
 	select INTERVAL_TREE
 
 config KSM
+# KSM 只扫描用户显式 MADV_MERGEABLE 的范围，把内容相同页合并为写时复制页；
+# 节省内存的代价是扫描 CPU 与潜在侧信道，运行期还需 sysfs 启动。
 	bool "Enable KSM for page merging"
 	depends on MMU
 	select XXHASH
@@ -753,6 +875,8 @@ config KSM
 	  root has set /sys/kernel/mm/ksm/run to 1 (if CONFIG_SYSFS is set).
 
 config DEFAULT_MMAP_MIN_ADDR
+# 禁止普通用户映射低虚拟地址以削弱内核 NULL 解引用利用；默认值可由 sysctl
+# 改写，需低地址 ABI 的程序必须持 CAP_SYS_RAWIO 或显式降低它。
 	int "Low address space to protect from user allocation"
 	depends on MMU
 	default 4096
@@ -772,9 +896,11 @@ config DEFAULT_MMAP_MIN_ADDR
 	  /proc/sys/vm/mmap_min_addr tunable.
 
 config ARCH_SUPPORTS_MEMORY_FAILURE
+# 架构声明具备机器检查恢复与 poison 页处理基础。
 	bool
 
 config MEMORY_FAILURE
+# 在 ECC/MCA 报告不可纠正错误时隔离坏页并尝试继续运行；不是所有错误都可恢复。
 	depends on MMU
 	depends on ARCH_SUPPORTS_MEMORY_FAILURE
 	bool "Enable recovery from hardware memory errors"
@@ -786,11 +912,14 @@ config MEMORY_FAILURE
 	  special hardware support and typically ECC memory.
 
 config HWPOISON_INJECT
+# 提供 proc 测试注入器以演练 MEMORY_FAILURE，依赖调试内核和页监控接口。
 	tristate "HWPoison pages injector"
 	depends on MEMORY_FAILURE && DEBUG_KERNEL && PROC_FS
 	select PROC_PAGE_MONITOR
 
 config NOMMU_INITIAL_TRIM_EXCESS
+# NOMMU mmap 只能按 2^N 页取得连续块；该整数给出启动时最小裁剪页数，在归还
+# 多余页、增加碎片与保留浪费之间取舍，之后可通过 nr_trim_pages 修改。
 	int "Turn on mmap() excess space trimming before booting"
 	depends on !MMU
 	default 1
@@ -819,12 +948,16 @@ config NOMMU_INITIAL_TRIM_EXCESS
 	  See Documentation/admin-guide/mm/nommu-mmap.rst for more information.
 
 config ARCH_WANT_GENERAL_HUGETLB
+# 架构选择通用 HugeTLB 实现的能力/偏好标志。
 	bool
 
 config ARCH_WANTS_THP_SWAP
+# 架构确认 THP 尺寸适合整体 swap，默认关闭。
 	def_bool n
 
 config PERSISTENT_HUGE_ZERO_FOLIO
+# 一次分配并永久保留 PMD 大小零 folio，减少 refcount 与大块清零成本；固定占用
+# 一个 huge page，内存紧张系统应关闭。
 	bool "Allocate a PMD sized folio for zeroing"
 	depends on TRANSPARENT_HUGEPAGE
 	help
@@ -841,9 +974,12 @@ config PERSISTENT_HUGE_ZERO_FOLIO
 	  memory constrained.
 
 config MM_ID
+# 为 mm_struct 提供 THP 等消费者使用的稳定标识；由上层功能 select。
 	def_bool n
 
 menuconfig TRANSPARENT_HUGEPAGE
+# THP 在应用无须显式 HugeTLB 管理的情况下用大 folio 降低缺页和 TLB 开销；
+# 选择 compaction/XArray 多索引/MM_ID，PREEMPT_RT 当前排除该实现。
 	bool "Transparent Hugepage Support"
 	depends on HAVE_ARCH_TRANSPARENT_HUGEPAGE && !PREEMPT_RT
 	select COMPACTION
@@ -862,12 +998,15 @@ menuconfig TRANSPARENT_HUGEPAGE
 if TRANSPARENT_HUGEPAGE
 
 choice
+# anon THP 的 sysfs 初始策略：always 自动尝试，madvise 仅响应提示，never 默认
+# 禁用但允许运行期改写；三者只影响默认策略，不移除 THP 能力。
 	prompt "Transparent Hugepage Support sysfs defaults"
 	default TRANSPARENT_HUGEPAGE_ALWAYS
 	help
 	  Selects the sysfs defaults for Transparent Hugepage Support.
 
 	config TRANSPARENT_HUGEPAGE_ALWAYS
+	# anon VMA 默认自动尝试 THP，覆盖广但可能无收益地增大内存占用。
 		bool "always"
 	help
 	  Enabling Transparent Hugepage always, can increase the
@@ -875,6 +1014,7 @@ choice
 	  benefit but it will work automatically for all applications.
 
 	config TRANSPARENT_HUGEPAGE_MADVISE
+	# 仅对 MADV_HUGEPAGE 范围默认尝试，要求应用明确表达收益预期。
 		bool "madvise"
 	help
 	  Enabling Transparent Hugepage madvise, will only provide a
@@ -884,6 +1024,7 @@ choice
 	  benefit.
 
 	config TRANSPARENT_HUGEPAGE_NEVER
+	# 启动默认不自动分配 anon THP，但管理员仍可通过 sysfs 改为其他策略。
 		bool "never"
 	help
 	  Disable Transparent Hugepage by default. It can still be
@@ -891,6 +1032,8 @@ choice
 endchoice
 
 choice
+# 内部 shmem mount 的 THP 默认策略；启动参数/sysfs 可覆盖，MADV_COLLAPSE 即使
+# 在 never 下也可能显式折叠，因此“默认禁用”不等于禁止所有获取路径。
 	prompt "Shmem hugepage allocation defaults"
 	default TRANSPARENT_HUGEPAGE_SHMEM_HUGE_NEVER
 	help
@@ -901,6 +1044,7 @@ choice
 	  command line 'transparent_hugepage_shmem=' option.
 
 	config TRANSPARENT_HUGEPAGE_SHMEM_HUGE_NEVER
+	# 内部 shmem 默认不自动用 THP，显式 MADV_COLLAPSE 仍可触发折叠。
 		bool "never"
 	help
 	  Disable hugepage allocation for shmem mount by default. It can
@@ -911,6 +1055,7 @@ choice
 	  specified.
 
 	config TRANSPARENT_HUGEPAGE_SHMEM_HUGE_ALWAYS
+	# 内部 shmem 对所有合适分配都尝试 THP，可能增加无收益占用。
 		bool "always"
 	help
 	  Always attempt to allocate hugepage for shmem mount, can
@@ -919,6 +1064,7 @@ choice
 	  applications.
 
 	config TRANSPARENT_HUGEPAGE_SHMEM_HUGE_WITHIN_SIZE
+	# 仅在大页完全落入 i_size 时尝试，并结合应用 MADV_HUGEPAGE 提示。
 		bool "within_size"
 	help
 	  Enable hugepage allocation for shmem mount if the allocation
@@ -927,6 +1073,7 @@ choice
 	  provided by the applications.
 
 	config TRANSPARENT_HUGEPAGE_SHMEM_HUGE_ADVISE
+	# 只有应用显式 MADV_HUGEPAGE 时才为内部 shmem 尝试 THP。
 		bool "advise"
 	help
 	  Enable hugepage allocation for the shmem mount exclusively when
@@ -936,6 +1083,7 @@ choice
 endchoice
 
 choice
+# tmpfs mount 独立维护同一组策略，避免内部 shmem 默认值无意改变用户挂载行为。
 	prompt "Tmpfs hugepage allocation defaults"
 	default TRANSPARENT_HUGEPAGE_TMPFS_HUGE_NEVER
 	help
@@ -946,6 +1094,7 @@ choice
 	  command line 'transparent_hugepage_tmpfs=' option.
 
 	config TRANSPARENT_HUGEPAGE_TMPFS_HUGE_NEVER
+	# tmpfs 挂载默认不自动用 THP，仍保留显式 collapse 请求入口。
 		bool "never"
 	help
 	  Disable hugepage allocation for tmpfs mount by default. It can
@@ -955,6 +1104,7 @@ choice
 	  to be obtained even if this mode is specified.
 
 	config TRANSPARENT_HUGEPAGE_TMPFS_HUGE_ALWAYS
+	# tmpfs 对合适分配始终尝试 THP，以潜在额外占用换取页表/TLB 收益。
 		bool "always"
 	help
 	  Always attempt to allocate hugepage for tmpfs mount, can
@@ -963,6 +1113,7 @@ choice
 	  applications.
 
 	config TRANSPARENT_HUGEPAGE_TMPFS_HUGE_WITHIN_SIZE
+	# tmpfs 大页必须完整处于文件 i_size 内，避免为文件尾外空间分配大页。
 		bool "within_size"
 	help
 	  Enable hugepage allocation for tmpfs mount if the allocation
@@ -971,6 +1122,7 @@ choice
 	  provided by the applications.
 
 	config TRANSPARENT_HUGEPAGE_TMPFS_HUGE_ADVISE
+	# tmpfs 仅响应应用 MADV_HUGEPAGE 提示，保持默认行为保守。
 		bool "advise"
 	help
 	  Enable hugepage allocation for the tmpfs mount exclusively when
@@ -980,6 +1132,8 @@ choice
 endchoice
 
 config THP_SWAP
+# 架构同意且具备 swap/64 位时尝试整体换出 THP；当前换出后 backing cluster
+# 仍会拆分，注释中的 XXX 标明实现尚未完全保持整体生命周期。
 	def_bool y
 	depends on ARCH_WANTS_THP_SWAP && SWAP && 64BIT
 	help
@@ -990,6 +1144,8 @@ config THP_SWAP
 	  For selection by architectures with reasonable THP sizes.
 
 config NO_PAGE_MAPCOUNT
+# 实验性地省略大 folio 内逐页 mapcount，降低元数据更新但让接口退化为整个
+# allocation 的平均值，依赖精确逐页映射数的诊断会失真。
 	bool "No per-page mapcount (EXPERIMENTAL)"
 	help
 	  Do not maintain per-page mapcounts for pages part of larger
@@ -1005,35 +1161,42 @@ config NO_PAGE_MAPCOUNT
 endif # TRANSPARENT_HUGEPAGE
 
 # simple helper to make the code a bit easier to read
+# 简单派生符号让 C 代码直接判断“存在逐页 mapcount”，避免到处取反实验选项。
 config PAGE_MAPCOUNT
 	def_bool !NO_PAGE_MAPCOUNT
 
 #
 # The architecture supports pgtable leaves that is larger than PAGE_SIZE
 #
+# THP 或 HugeTLB 打开即表明页表 leaf 可能映射大于 PAGE_SIZE，通用遍历据此处理。
 config PGTABLE_HAS_HUGE_LEAVES
 	def_bool TRANSPARENT_HUGEPAGE || HUGETLB_PAGE
 
 #
 # We can end up creating gigantic folio.
 #
+# HugeTLB gigantic page 或设备 PUD THP 路径可能构造超大 folio，供边界检查使用。
 config HAVE_GIGANTIC_FOLIOS
 	def_bool (HUGETLB_PAGE && ARCH_HAS_GIGANTIC_PAGE) || \
 		 (ZONE_DEVICE && HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD)
 
 config ASYNC_KERNEL_PGTABLE_FREE
+# 架构可选择异步释放内核页表；默认关闭，避免未实现同步协议的平台误启用。
 	def_bool n
 
 # TODO: Allow to be enabled without THP
+# 当前 huge PFNMAP 能力暂时依赖 THP；TODO 表明这是实现耦合而非概念必然关系。
 config ARCH_SUPPORTS_HUGE_PFNMAP
 	def_bool n
 	depends on TRANSPARENT_HUGEPAGE
 
 config ARCH_SUPPORTS_PMD_PFNMAP
+# 在架构 huge PFNMAP 总能力下派生 PMD/PUD 粒度支持，分别受相应 THP 能力约束。
 	def_bool y
 	depends on ARCH_SUPPORTS_HUGE_PFNMAP && HAVE_ARCH_TRANSPARENT_HUGEPAGE
 
 config ARCH_SUPPORTS_PUD_PFNMAP
+# 架构同时支持 PUD 级透明大页时，允许同粒度 PFNMAP 映射。
 	def_bool y
 	depends on ARCH_SUPPORTS_HUGE_PFNMAP && HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
 
@@ -1041,30 +1204,39 @@ config ARCH_SUPPORTS_PUD_PFNMAP
 # Architectures that always use weak definitions for percpu
 # variables in modules should set this.
 #
+# 模块中的 percpu 变量若只能使用 weak 定义，架构选择此符号让通用声明采用兼容形式。
 config ARCH_MODULE_NEEDS_WEAK_PER_CPU
        bool
 
 #
 # UP and nommu archs use km based percpu allocator
 #
+# 单核或 NOMMU 架构使用基于 km 的 percpu allocator；这是由前置能力自动派生的
+# 实现选择，用户不应手工更改。
 config NEED_PER_CPU_KM
 	depends on !SMP || !MMU
 	bool
 	default y
 
 config NEED_PER_CPU_EMBED_FIRST_CHUNK
+# 架构要求把首个 percpu chunk 嵌入启动分配区，后续由通用 percpu 建立布局。
 	bool
 
 config NEED_PER_CPU_PAGE_FIRST_CHUNK
+# 架构要求首 chunk 采用逐页映射方案；与 EMBED 由架构按地址布局择一使用。
 	bool
 
 config USE_PERCPU_NUMA_NODE_ID
+# 用 percpu 缓存当前 NUMA 节点编号，降低热路径拓扑查询成本。
 	bool
 
 config HAVE_SETUP_PER_CPU_AREA
+# 架构提供 setup_per_cpu_areas()，通用启动代码据此避免重复建立区域。
 	bool
 
 config CMA
+# CMA 预留只容纳可迁移页的区域；平时可作 page cache，设备请求连续块时先迁走
+# 占用页再交付，因此必须选择 MIGRATION 与 MEMORY_ISOLATION。
 	bool "Contiguous Memory Allocator"
 	depends on MMU
 	select MIGRATION
@@ -1080,12 +1252,14 @@ config CMA
 	  If unsure, say "n".
 
 config CMA_DEBUGFS
+# 暴露 CMA 调试操作，仅在基础 CMA 与 debugfs 同时存在时可见。
 	bool "CMA debugfs interface"
 	depends on CMA && DEBUG_FS
 	help
 	  Turns on the DebugFS interface for CMA.
 
 config CMA_SYSFS
+# 通过 sysfs 导出 CMA 区域信息；它是只读观测前端，不替代 debugfs 调试能力。
 	bool "CMA information through sysfs interface"
 	depends on CMA && SYSFS
 	help
@@ -1093,6 +1267,8 @@ config CMA_SYSFS
 	  from CMA.
 
 config CMA_AREAS
+# 限制系统可注册 CMA area 数，NUMA 默认提高到 20 以容纳节点/设备专用区域；
+# 数值增大也会扩大全局管理数组等静态开销。
 	int "Maximum count of the CMA areas"
 	depends on CMA
 	default 20 if NUMA
@@ -1108,6 +1284,7 @@ config CMA_AREAS
 # Select this config option from the architecture Kconfig, if available, to set
 # the max page order for physically contiguous allocations.
 #
+# 架构可给出物理连续分配的硬性最大 order，通用配置不得超过该边界。
 config ARCH_FORCE_MAX_ORDER
 	int
 
@@ -1116,6 +1293,8 @@ config ARCH_FORCE_MAX_ORDER
 # the default page block order is MAX_PAGE_ORDER (10) as per
 # include/linux/mmzone.h.
 #
+# 未强制时 pageblock 上限默认为 MAX_PAGE_ORDER(10)；强制时范围和默认同步收窄。
+# 降低 pageblock 可改善某些布局，却可能减少 THP 形成成功率。
 config PAGE_BLOCK_MAX_ORDER
 	int "Page Block Order Upper Limit"
 	range 1 10 if ARCH_FORCE_MAX_ORDER = 0
@@ -1140,6 +1319,8 @@ config PAGE_BLOCK_MAX_ORDER
 	  Don't change if unsure.
 
 config MEM_SOFT_DIRTY
+# 为 checkpoint/restore 在 PTE 中跟踪“自上次清除后被写过”，并通过 proc pagemap
+# 观测；它不同于决定回写的普通 dirty 位。
 	bool "Track memory changes"
 	depends on CHECKPOINT_RESTORE && HAVE_ARCH_SOFT_DIRTY && PROC_FS
 	select PROC_PAGE_MONITOR
@@ -1152,9 +1333,12 @@ config MEM_SOFT_DIRTY
 	  See Documentation/admin-guide/mm/soft-dirty.rst for more details.
 
 config GENERIC_EARLY_IOREMAP
+# 架构选择通用 early_ioremap 固定槽实现，供完整 vmalloc/ioremap 可用前建立映射。
 	bool
 
 config STACK_MAX_DEFAULT_SIZE_MB
+# 向上增长的 32 位进程在 RLIMIT_STACK 无限时仍需 VM 布局上限；范围 8..2048 MB，
+# 当前主要约束 parisc 及 64 位兼容进程。
 	int "Default maximum user stack size for 32-bit processes (MB)"
 	default 100
 	range 8 2048
@@ -1167,6 +1351,8 @@ config STACK_MAX_DEFAULT_SIZE_MB
 	  A sane initial value is 100 MB.
 
 config DEFERRED_STRUCT_PAGE_INIT
+# 大型 64 位 SPARSEMEM 系统启动时只同步初始化部分 memmap，其余由 kthread 并行
+# 完成以缩短启动；早期任务可能因等待未初始化范围而付出瞬时延迟。
 	bool "Defer initialisation of struct pages to kthreads"
 	depends on SPARSEMEM
 	depends on !NEED_PER_CPU_KM
@@ -1183,6 +1369,8 @@ config DEFERRED_STRUCT_PAGE_INIT
 	  initialisation.
 
 config PAGE_IDLE_FLAG
+# 为 page 增加 idle/young 状态；32 位因 struct page 位紧张而选择 PAGE_EXTENSION，
+# 使清 Accessed 位的观测者不必反复扰动真实页表。
 	bool
 	select PAGE_EXTENSION if !64BIT
 	help
@@ -1191,6 +1379,8 @@ config PAGE_IDLE_FLAG
 	  Accessed bit readers may avoid disturbance.
 
 config IDLE_PAGE_TRACKING
+# sysfs 用户通过清标记、等待、再读取来估计区间内未访问页，常用于 memcg 调参
+# 与集群放置；它选择上面的底层页标志。
 	bool "Enable idle page tracking"
 	depends on SYSFS && MMU
 	select PAGE_IDLE_FLAG
@@ -1206,13 +1396,18 @@ config IDLE_PAGE_TRACKING
 # Architectures which implement cpu_dcache_is_aliasing() to query
 # whether the data caches are aliased (VIVT or VIPT with dcache
 # aliasing) need to select this.
+# 实现 cpu_dcache_is_aliasing() 的架构选择此能力，通用 MM 便会处理 VIVT/VIPT
+# alias 引起的同一物理页多虚拟地址一致性问题。
 config ARCH_HAS_CPU_CACHE_ALIASING
 	bool
 
 config ARCH_HAS_CACHE_LINE_SIZE
+# 架构可提供运行期 cache line 大小查询，供对齐与 flush 策略使用。
 	bool
 
 config ARCH_HAS_CURRENT_STACK_POINTER
+# 架构定义 current_stack_pointer 后，HARDENED_USERCOPY 可不依赖具体寄存器名检查
+# 栈变量生命周期和拷贝边界。
 	bool
 	help
 	  In support of HARDENED_USERCOPY performing stack variable lifetime
@@ -1222,18 +1417,23 @@ config ARCH_HAS_CURRENT_STACK_POINTER
 	  selected.
 
 config ARCH_HAS_ZONE_DMA_SET
+# 架构允许用户显式决定是否构建 DMA/DMA32 zone；否则下列默认值不可见。
 	bool
 
 config ZONE_DMA
+# 为只能寻址低端物理内存的旧 DMA 设备保留 zone；arm64/x86 默认启用。
 	bool "Support DMA zone" if ARCH_HAS_ZONE_DMA_SET
 	default y if ARM64 || X86
 
 config ZONE_DMA32
+# 为 32 位 DMA 地址限制保留低 4GiB zone；x86_32 没有单独划分它的意义。
 	bool "Support DMA32 zone" if ARCH_HAS_ZONE_DMA_SET
 	depends on !X86_32
 	default y if ARM64
 
 config ZONE_DEVICE
+# 把 pmem/GPU 等设备物理地址纳入 memmap，使 pfn_to_page 可描述 DAX、P2PDMA、
+# DEVICE_PRIVATE；要求完整 hotplug/hotremove/vmemmap，并会减少部分 x86 KASLR 熵。
 	bool "Device memory (pmem, HMM, etc...) hotplug support"
 	depends on MEMORY_HOTPLUG
 	depends on MEMORY_HOTREMOVE
@@ -1257,14 +1457,18 @@ config ZONE_DEVICE
 # Helpers to mirror range of the CPU page tables of a process into device page
 # tables.
 #
+# HMM mirror 让设备页表订阅并镜像进程 CPU 页表范围，失效同步依赖 MMU notifier。
 config HMM_MIRROR
 	bool
 	depends on MMU
 
 config GET_FREE_REGION
+# 为设备私有内存寻找空闲物理地址区域的内部 helper 能力。
 	bool
 
 config DEVICE_PRIVATE
+# 为 CPU 不可直接寻址的 GPU 等内存创建 struct page；设备可访问，CPU 访问通常
+# 触发迁移，实践中常与 HMM_MIRROR 配合。
 	bool "Unaddressable device memory (GPU memory, ...)"
 	depends on ZONE_DEVICE
 	select GET_FREE_REGION
@@ -1275,19 +1479,24 @@ config DEVICE_PRIVATE
 	  group of devices). You likely also want to select HMM_MIRROR.
 
 config VMAP_PFN
+# 架构允许把一组 PFN vmap 到内核虚拟地址；由使用该映射方式的代码选择。
 	bool
 
 config ARCH_USES_HIGH_VMA_FLAGS
+# 架构占用 VMA flags 的高位，通用布局需为其保留位段。
 	bool
 config ARCH_HAS_PKEYS
+# 架构具有用户页保护密钥，通用 mprotect/VMA 路径据此编译 pkey 支持。
 	bool
 
 config ARCH_USES_PG_ARCH_2
+# 架构分别占用 struct page 的 PG_arch_2/PG_arch_3 位，避免通用特性复用冲突。
 	bool
 config ARCH_USES_PG_ARCH_3
 	bool
 
 config VM_EVENT_COUNTERS
+# /proc/vmstat 的事件计数默认开启；专家系统可关闭以省热路径计数，仅保留页数量。
 	default y
 	bool "Enable VM event counters for /proc/vmstat" if EXPERT
 	help
@@ -1297,6 +1506,7 @@ config VM_EVENT_COUNTERS
 	  if VM event counters are disabled.
 
 config PERCPU_STATS
+# 通过 debugfs 导出 percpu allocator 的全局和 chunk 统计，供容量/碎片分析。
 	bool "Collect percpu memory statistics"
 	help
 	  This feature collects and exposes statistics via debugfs. The
@@ -1304,6 +1514,8 @@ config PERCPU_STATS
 	  be used to help understand percpu memory usage.
 
 config GUP_TEST
+# 构建 debugfs gup_test ioctl 入口，驱动内核执行 get_user_pages/pin_user_pages 的
+# fast/basic/longterm 与 dump 测试；ABI 定义在 mm/gup_test.h，用户驱动在 selftests。
 	bool "Enable infrastructure for get_user_pages()-related unit tests"
 	depends on DEBUG_FS
 	help
@@ -1324,12 +1536,15 @@ config GUP_TEST
 	  See tools/testing/selftests/mm/gup_test.c
 
 comment "GUP_TEST needs to have DEBUG_FS enabled"
+# 未启用 DEBUG_FS 时显示依赖提示，避免用户误以为 GUP_TEST 选项无故消失。
 	depends on !GUP_TEST && !DEBUG_FS
 
 config GUP_GET_PXX_LOW_HIGH
+# 架构 GUP 页表遍历需要同时取得页表项低/高部分的内部能力标志。
 	bool
 
 config DMAPOOL_TEST
+# 可模块化的 dma_pool 压测，重复分配/释放多尺寸块并报告耗时，只在有 DMA 时可用。
 	tristate "Enable a module to run time tests on dma_pool"
 	depends on HAS_DMA
 	help
@@ -1339,21 +1554,28 @@ config DMAPOOL_TEST
 	  dma_pool_alloc/free routines affect performance.
 
 config ARCH_HAS_PTE_SPECIAL
+# 架构 PTE 可编码 special 非普通页映射，GUP/fault 路径必须识别并避免普通 struct page 假设。
 	bool
 
 config MAPPING_DIRTY_HELPERS
+# 启用 address_space 脏页辅助接口的内部能力，由具体文件系统/架构选择。
 	bool
 
 config KMAP_LOCAL
+# 架构支持仅在当前执行上下文短期有效的高端页本地映射。
 	bool
 
 config KMAP_LOCAL_NON_LINEAR_PTE_ARRAY
+# kmap_local 的 PTE 槽在数组中非线性排列，通用索引必须走架构转换。
 	bool
 
 config MEMFD_CREATE
+# 专家可关闭 memfd_create 系统调用以减小攻击面/代码，普通配置默认由上层选择。
 	bool "Enable memfd_create() system call" if EXPERT
 
 config SECRETMEM
+# memfd_secret 建立仅所有进程上下文可见、从其他内核页表摘除的区域；要求架构
+# 能修改 direct map，默认开启但专家可裁剪。
 	default y
 	bool "Enable memfd_secret() system call" if EXPERT
 	depends on ARCH_HAS_SET_DIRECT_MAP
@@ -1363,6 +1585,8 @@ config SECRETMEM
 	  not mapped to other processes and other kernel page tables.
 
 config ANON_VMA_NAME
+# 允许通过 madvise 给匿名 VMA 命名并在 proc maps/smaps 显示；名字不同还会阻止
+# 相邻 VMA 合并，因此它既是诊断元数据也影响布局。
 	bool "Anonymous VMA name support"
 	depends on PROC_FS && ADVISE_SYSCALLS && MMU
 
@@ -1377,16 +1601,19 @@ config ANON_VMA_NAME
 	  difference in their name.
 
 config HAVE_ARCH_USERFAULTFD_WP
+# 架构分别声明 userfaultfd 写保护与 minor fault 协议支持。
 	bool
 	help
 	  Arch has userfaultfd write protection support
 
 config HAVE_ARCH_USERFAULTFD_MINOR
+# 架构支持把 minor fault 交给 userfaultfd 用户态处理器后选择此能力。
 	bool
 	help
 	  Arch has userfaultfd minor fault support
 
 menuconfig USERFAULTFD
+# 向用户态转交页故障处理，必须有 MMU；安全策略仍可在 sysctl/权限层限制使用。
 	bool "Enable userfaultfd() system call"
 	depends on MMU
 	help
@@ -1395,6 +1622,7 @@ menuconfig USERFAULTFD
 
 if USERFAULTFD
 config PTE_MARKER_UFFD_WP
+# 用 marker PTE 在 shmem/HugeTLB 等无普通 present PTE 的场景保存 UFFD-WP 状态。
 	bool "Userfaultfd write protection support for shmem/hugetlbfs"
 	default y
 	depends on HAVE_ARCH_USERFAULTFD_WP
@@ -1406,22 +1634,26 @@ config PTE_MARKER_UFFD_WP
 endif # USERFAULTFD
 
 # multi-gen LRU {
+# Multi-Gen LRU 用访问代际替代传统 active/inactive 近似，提高过量分配下的回收质量。
 config LRU_GEN
 	bool "Multi-Gen LRU"
 	depends on MMU
 	# make sure folio->flags has enough spare bits
+	# folio->flags 必须有足够空闲位保存代际状态；64 位或 vmemmap 布局满足约束。
 	depends on 64BIT || !SPARSEMEM || SPARSEMEM_VMEMMAP
 	help
 	  A high performance LRU implementation to overcommit memory. See
 	  Documentation/admin-guide/mm/multigen_lru.rst for details.
 
 config LRU_GEN_ENABLED
+# 只决定启动默认，运行期仍可切换 Multi-Gen LRU。
 	bool "Enable by default"
 	depends on LRU_GEN
 	help
 	  This option enables the multi-gen LRU by default.
 
 config LRU_GEN_STATS
+# 保留被淘汰代际的完整历史统计，按 memcg/node 增加内存，只适合调试。
 	bool "Full stats for debugging"
 	depends on LRU_GEN
 	help
@@ -1431,14 +1663,18 @@ config LRU_GEN_STATS
 	  This option has a per-memcg and per-node memory overhead.
 
 config LRU_GEN_WALKS_MMU
+# 架构硬件维护 PTE young 位时，MGLRU 可通过遍历页表收集访问热度。
 	def_bool y
 	depends on LRU_GEN && ARCH_HAS_HW_PTE_YOUNG
 # }
 
 config ARCH_SUPPORTS_PER_VMA_LOCK
+# 架构声明 page-fault 快路径与页表协议兼容 per-VMA 锁。
        def_bool n
 
 config PER_VMA_LOCK
+# SMP MMU 下用单 VMA 锁处理部分页故障，避免争用整个 mmap_lock；失败/变化时仍
+# 需回退到 mm 级锁并重新验证 VMA 生命周期。
 	def_bool y
 	depends on ARCH_SUPPORTS_PER_VMA_LOCK && MMU && SMP
 	help
@@ -1448,19 +1684,24 @@ config PER_VMA_LOCK
 	  handling page faults instead of taking mmap_lock.
 
 config LOCK_MM_AND_FIND_VMA
+# 向下增长栈架构可使用合并的 mmap 锁定与 VMA 查找 helper。
 	bool
 	depends on !STACK_GROWSUP
 
 config IOMMU_MM_DATA
+# mm_struct 携带 IOMMU 相关进程地址空间数据的内部能力。
 	bool
 
 config EXECMEM
+# 架构使用通用可执行内存分配层，mm/Makefile 据此链接 execmem.o。
 	bool
 
 config NUMA_MEMBLKS
+# 使用通用 NUMA memblock 拓扑解析；NUMA_EMU 依赖它改写节点范围。
 	bool
 
 config NUMA_EMU
+# 调试时用 numa=fake=N 把平坦机器切成虚拟节点，不代表硬件拓扑真实变化。
 	bool "NUMA emulation"
 	depends on NUMA_MEMBLKS
 	depends on X86 || GENERIC_ARCH_NUMA
@@ -1470,15 +1711,19 @@ config NUMA_EMU
 	  number of nodes. This is only useful for debugging.
 
 config ARCH_HAS_USER_SHADOW_STACK
+# 架构具有用户 shadow stack 硬件（如 CET/GCS/Zicfiss），通用 MM 据此处理映射属性。
 	bool
 	help
 	  The architecture has hardware support for userspace shadow call
 	  stacks (eg, x86 CET, arm64 GCS or RISC-V Zicfiss).
 
 config HAVE_ARCH_TLB_REMOVE_TABLE
+# 架构自带页表页回收 hook 时选择，通用 PT_RECLAIM 不再重复实现。
 	def_bool n
 
 config PT_RECLAIM
+# 在 munmap/exit_mmap 之外也尝试回收空用户 PTE 页；要求 RCU table free，且只在
+# 架构没有自定义 remove_table 时启用。
 	def_bool y
 	depends on MMU_GATHER_RCU_TABLE_FREE && !HAVE_ARCH_TLB_REMOVE_TABLE
 	help
@@ -1488,9 +1733,11 @@ config PT_RECLAIM
 	  Note: now only empty user PTE page table pages will be reclaimed.
 
 config FIND_NORMAL_PAGE
+# 架构/子系统需要把特殊映射解析为普通 page 的内部能力开关。
 	def_bool n
 
 config ARCH_HAS_LAZY_MMU_MODE
+# lazy MMU mode 把一批架构页表状态更新延后到退出模式时提交，减少昂贵同步。
 	bool
 	help
 	  The architecture uses the lazy MMU mode. This allows changes to
@@ -1498,6 +1745,7 @@ config ARCH_HAS_LAZY_MMU_MODE
 	  exited. See <linux/pgtable.h> for details.
 
 config LAZY_MMU_MODE_KUNIT_TEST
+# 只验证通用 lazy MMU 接口契约，不覆盖架构具体行为；依赖能力与 KUnit 框架。
 	tristate "KUnit tests for the lazy MMU mode" if !KUNIT_ALL_TESTS
 	depends on ARCH_HAS_LAZY_MMU_MODE
 	depends on KUNIT
@@ -1510,5 +1758,7 @@ config LAZY_MMU_MODE_KUNIT_TEST
 	  If unsure, say N.
 
 source "mm/damon/Kconfig"
+# 在同一 Memory Management 菜单内继续解析 DAMON 子系统配置，符号随后驱动
+# mm/damon/Makefile 的 core、ops、sysfs 与策略模块组合。
 
 endmenu

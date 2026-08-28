@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-only
+# 内存管理调试能力菜单片段：多数选项只编译检测基础设施，是否在启动或运行期
+# 真正启用还受命令行/sysfs/debugfs 控制。depends on 描述安全前置条件，select
+# 补齐元数据、栈仓库或页表转储等实现依赖。
 config PAGE_EXTENSION
+# 为每个 struct page 关联按需扩展区，供 page owner、idle 标志、页表检查等功能
+# 存放额外状态；扩展区可按启动配置分配，避免永久扩大所有 struct page。
 	bool "Extend memmap on extra space for more information on page"
 	help
 	  Extend memmap on extra space for more information on page. This
@@ -9,6 +14,9 @@ config PAGE_EXTENSION
 	  configuration.
 
 config DEBUG_PAGEALLOC
+# 释放页后从 linear map 解除映射，或在不支持的架构上退化为 poison 填充；分配
+# 前同步检查页状态，可捕获 UAF/double-free，但会破坏大页映射并显著拖慢系统。
+# hibernation 若不保存 free page 会在恢复后产生伪损坏，因此受架构条件限制。
 	bool "Debug page memory allocations"
 	depends on DEBUG_KERNEL
 	depends on !HIBERNATION || ARCH_SUPPORTS_DEBUG_PAGEALLOC && !PPC && !SPARC
@@ -39,6 +47,7 @@ config DEBUG_PAGEALLOC
 	  command line parameter.
 
 config DEBUG_PAGEALLOC_ENABLE_DEFAULT
+# 只把 debug pagealloc 的运行期默认值设为 on；debug_pagealloc=off|on 可覆盖。
 	bool "Enable debug page memory allocations by default?"
 	depends on DEBUG_PAGEALLOC
 	help
@@ -46,6 +55,8 @@ config DEBUG_PAGEALLOC_ENABLE_DEFAULT
 	  can be overridden by debug_pagealloc=off|on.
 
 config SLUB_DEBUG
+# 编译 SLUB 校验、追踪与 sysfs 控制能力；默认构建但通常运行期关闭，关闭本项
+# 可节省代码，SLUB_TINY 则因元数据预算直接排除。
 	default y
 	bool "Enable SLUB debugging support" if EXPERT
 	depends on SYSFS && !SLUB_TINY
@@ -57,6 +68,8 @@ config SLUB_DEBUG
 	  validation.
 
 config SLUB_DEBUG_ON
+# 启动即打开通用 SLUB 调试，近似 slab_debug 无细分参数；仍可用 slab_debug=-
+# 关闭。栈追踪架构还要求 STACKDEPOT 在更早阶段初始化。
 	bool "SLUB debugging on by default"
 	depends on SLUB_DEBUG
 	select STACKDEPOT_ALWAYS_INIT if STACKTRACE_SUPPORT
@@ -71,10 +84,14 @@ config SLUB_DEBUG_ON
 	  "slab_debug=-".
 
 config SLUB_RCU_DEBUG
+# 把 SLAB_TYPESAFE_BY_RCU 对象的复用延后得近似 kfree_rcu，使 KASAN 能观察
+# grace period 内 UAF；这会改变某类“对象在宽限期内被复用”的 bug 时序。
 	bool "Enable UAF detection in TYPESAFE_BY_RCU caches (for KASAN)"
 	depends on SLUB_DEBUG
 	# SLUB_RCU_DEBUG should build fine without KASAN, but is currently useless
 	# without KASAN, so mark it as a dependency of KASAN for now.
+	# 该代码理论上无需 KASAN 也能编译，但当前只有 KASAN 消费其检测效果，所以
+	# 暂把 KASAN 作为依赖；这是用途限制而非编译上的永久约束。
 	depends on KASAN
 	default KASAN_GENERIC || KASAN_SW_TAGS
 	help
@@ -103,6 +120,8 @@ config SLUB_RCU_DEBUG
 	  If unsure, say N.
 
 config PAGE_OWNER
+# 记录每页最后分配调用栈，帮助定位裸 alloc_pages 泄漏；编译后仍需 page_owner=on
+# 才分配/维护主要数据，运行开销和内存占用较高。
 	bool "Track page owner"
 	depends on DEBUG_KERNEL && STACKTRACE_SUPPORT
 	select DEBUG_FS
@@ -120,6 +139,8 @@ config PAGE_OWNER
 	  If unsure, say N.
 
 config PAGE_TABLE_CHECK
+# 在用户页表项安装/移除时同步验证匿名页重复可写映射及匿名/文件页混用；选择
+# PAGE_EXTENSION 保存状态，并要求 exclusive System RAM 边界可靠。
 	bool "Check for invalid mappings in user page tables"
 	depends on ARCH_SUPPORTS_PAGE_TABLE_CHECK
 	depends on EXCLUSIVE_SYSTEM_RAM
@@ -134,6 +155,7 @@ config PAGE_TABLE_CHECK
 	  If unsure say "n".
 
 config PAGE_TABLE_CHECK_ENFORCED
+# 强制页表检查默认开启，阻止仅因忘记 page_table_check=on 而漏测；仍依赖上项。
 	bool "Enforce the page table checking by default"
 	depends on PAGE_TABLE_CHECK
 	help
@@ -145,6 +167,8 @@ config PAGE_TABLE_CHECK_ENFORCED
 	  If unsure say "n".
 
 config PAGE_POISONING
+# free_pages 后写软件 poison，alloc_pages 前核对，既暴露 UAF 写入也降低旧数据
+# 泄漏；它不同于硬件 HWPoison，若只需清零可用 init_on_free=1。
 	bool "Poison pages after freeing"
 	help
 	  Fill the pages with poison patterns after free_pages() and verify
@@ -163,6 +187,8 @@ config PAGE_POISONING
 	  If unsure, say N
 
 config DEBUG_PAGE_REF
+# 为 page 引用增减加入 tracepoint，诊断迁移因引用不匹配失败；只有启用 tracepoint
+# 时才有主要运行开销，但会增加约 30KB 代码。
 	bool "Enable tracepoint to track down page reference manipulation"
 	depends on DEBUG_KERNEL
 	depends on TRACEPOINTS
@@ -175,15 +201,19 @@ config DEBUG_PAGE_REF
 	  nil until the tracepoints are actually enabled.
 
 config DEBUG_RODATA_TEST
+# 启动时验证 rodata 确实转为只读，仅在严格 W^X 基础能力存在时有意义。
 	bool "Testcase for the marking rodata read-only"
 	depends on STRICT_KERNEL_RWX
 	help
 	  This option enables a testcase for the setting rodata read-only.
 
 config ARCH_HAS_DEBUG_WX
+# 架构声明能遍历并判定内核映射的 W/X 属性。
 	bool
 
 config DEBUG_WX
+# 启动后用 PTDUMP 检查残留 W+X 映射并告警；这是一次性防护审计，告警表示
+# 利用面扩大，不等同于已经存在可直接利用漏洞。
 	bool "Warn on W+X mappings at boot"
 	depends on ARCH_HAS_DEBUG_WX
 	depends on ARCH_HAS_PTDUMP
@@ -214,12 +244,15 @@ config DEBUG_WX
 	  If in doubt, say "Y".
 
 config ARCH_HAS_PTDUMP
+# 架构实现页表布局遍历/打印后选择此能力。
 	bool
 
 config PTDUMP
+# 通用页表转储核心，由 DEBUG_WX 或用户可见 debugfs 前端选择。
 	bool
 
 config PTDUMP_DEBUGFS
+# 把内核页表布局暴露给 debugfs，适合架构开发；生产系统会增加敏感布局可见性。
 	bool "Export kernel pagetable layout to userspace via debugfs"
 	depends on DEBUG_KERNEL
 	depends on DEBUG_FS
@@ -235,9 +268,12 @@ config PTDUMP_DEBUGFS
 	  If in doubt, say N.
 
 config HAVE_DEBUG_KMEMLEAK
+# 架构声明 kmemleak 扫描所需地址/内存模型支持。
 	bool
 
 config DEBUG_KMEMLEAK
+# 类似保守 GC 地跟踪分配并扫描可达指针，但只报告孤儿对象、不自动释放；选择
+# debugfs、符号、CRC、栈仓库等报告基础，所有分配路径会承担记录开销。
 	bool "Kernel memory leak detector"
 	depends on DEBUG_KERNEL && HAVE_DEBUG_KMEMLEAK
 	select DEBUG_FS
@@ -263,6 +299,8 @@ config DEBUG_KMEMLEAK
 	  mounted (usually at /sys/kernel/debug).
 
 config DEBUG_KMEMLEAK_MEM_POOL_SIZE
+# kmemleak 完成 slab 初始化前用静态元数据池记录早期分配，之后该池作为 slab
+# 失败时的应急储备；过小会丢记录并制造假阳性，范围 200..1,000,000。
 	int "Kmemleak memory pool size"
 	depends on DEBUG_KMEMLEAK
 	range 200 1000000
@@ -276,6 +314,7 @@ config DEBUG_KMEMLEAK_MEM_POOL_SIZE
 	  if slab allocations fail.
 
 config DEBUG_KMEMLEAK_DEFAULT_OFF
+# 编译检测器但默认不启动，需 kmemleak=on；适合保留诊断能力而控制普通启动开销。
 	bool "Default kmemleak to off"
 	depends on DEBUG_KMEMLEAK
 	help
@@ -283,6 +322,8 @@ config DEBUG_KMEMLEAK_DEFAULT_OFF
 	  on the command line via kmemleak=on.
 
 config DEBUG_KMEMLEAK_AUTO_SCAN
+# 启动自动扫描线程并周期报告；扫描可能耗 CPU/阻塞用户任务，关闭后仍可手工
+# 触发，但不会自动发现和报告新泄漏。
 	bool "Enable kmemleak auto scan thread on boot up"
 	default y
 	depends on DEBUG_KMEMLEAK
@@ -298,6 +339,8 @@ config DEBUG_KMEMLEAK_AUTO_SCAN
 	  If unsure, say Y.
 
 config DEBUG_KMEMLEAK_VERBOSE
+# 自动扫描发现新孤儿对象时把回溯、十六进制内容和地址写入 dmesg；依赖自动
+# 扫描，并可用 sysfs 模块参数动态切换，注意日志量和地址信息暴露。
 	bool "Default kmemleak to verbose mode"
 	depends on DEBUG_KMEMLEAK_AUTO_SCAN
 	help
@@ -309,6 +352,8 @@ config DEBUG_KMEMLEAK_VERBOSE
 	  If unsure, say N.
 
 config PER_VMA_LOCK_STATS
+# 统计 per-VMA fault 快路径的成功、重试和失败并导出 /proc/vmstat，用于判断锁
+# 粒度收益和退化场景；每次 fault 都增加计数，故有小幅热路径成本。
 	bool "Statistics for per-vma locks"
 	depends on PER_VMA_LOCK
 	help

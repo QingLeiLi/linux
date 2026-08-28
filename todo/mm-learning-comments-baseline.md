@@ -8,8 +8,8 @@
 
 |序|状态|文件|code|中文|density|gap|
 |-:|:--:|---|-:|-:|-:|-:|
-|1|~|mm/gup_test.h|32|0|0.000|32|
-|2||mm/page_reporting.h|33|0|0.000|33|
+|1|x|mm/gup_test.h|32|0|0.000|32|
+|2|x|mm/page_reporting.h|33|0|0.000|33|
 |3||mm/rodata_test.c|33|0|0.000|33|
 |4||mm/damon/sysfs-common.h|38|0|0.000|38|
 |5||mm/kasan/report_hw_tags.c|38|0|0.000|38|

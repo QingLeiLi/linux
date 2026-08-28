@@ -2,7 +2,13 @@
 
 menu "Data Access Monitoring"
 
+# DAMON 配置层把“监控框架、地址空间操作集、用户接口、内核策略模块”分开。
+# depends on 保证下层能力先存在，default DAMON 让常用组件随框架默认开启但仍可
+# 单独裁剪；最终符号由 mm/damon/Makefile 映射到 core/ops/sysfs/module 对象。
+
 config DAMON
+# DAMON 核心把地址范围聚合成 region，周期性采样访问并调整 region 边界，向上层
+# 提供低开销访问频率信息；核心本身不限定虚拟/物理地址，也不直接执行回收策略。
 	bool "DAMON: Data Access Monitoring Framework"
 	help
 	  This builds a framework that allows kernel subsystems to monitor
@@ -13,6 +19,8 @@ config DAMON
 	  more information.
 
 config DAMON_DEBUG_SANITY
+# 在 DAMON 状态转换和数据结构上增加开发期一致性检查，可更早暴露框架 bug，
+# 但会给监控热路径增加开销，因此只建议测试构建启用。
 	bool "Check sanity of DAMON code"
 	depends on DAMON
 	help
@@ -24,6 +32,8 @@ config DAMON_DEBUG_SANITY
 	  If unsure, say N.
 
 config DAMON_KUNIT_TEST
+# 构建 core 的 KUnit 套件；要求 KUnit 内建（=y），避免测试与被测内建代码的
+# 链接/初始化时序被模块边界割裂，KUNIT_ALL_TESTS 可统一选择。
 	bool "Test for damon" if !KUNIT_ALL_TESTS
 	depends on DAMON && KUNIT=y
 	default KUNIT_ALL_TESTS
@@ -36,6 +46,8 @@ config DAMON_KUNIT_TEST
 	  If unsure, say N.
 
 config DAMON_VADDR
+# 提供进程虚拟地址空间操作集，把访问检测落到页表 young/idle 信息；依赖 MMU，
+# 并选择 PAGE_IDLE_FLAG 作为不反复扰动页表的访问状态辅助。
 	bool "Data access monitoring operations for virtual address spaces"
 	depends on DAMON && MMU
 	select PAGE_IDLE_FLAG
@@ -45,6 +57,8 @@ config DAMON_VADDR
 	  that work for virtual address spaces.
 
 config DAMON_PADDR
+# 提供系统物理地址空间操作集，供主动回收、LRU 排序和统计模块观察物理页；
+# 同样依赖 MMU 与 PAGE_IDLE_FLAG，但不绑定某个进程的 VMA 生命周期。
 	bool "Data access monitoring operations for the physical address space"
 	depends on DAMON && MMU
 	select PAGE_IDLE_FLAG
@@ -54,6 +68,7 @@ config DAMON_PADDR
 	  that works for the physical address space.
 
 config DAMON_VADDR_KUNIT_TEST
+# 只验证虚拟地址操作集的 region/页表行为，前提是 DAMON_VADDR 与内建 KUnit。
 	bool "Test for DAMON operations" if !KUNIT_ALL_TESTS
 	depends on DAMON_VADDR && KUNIT=y
 	default KUNIT_ALL_TESTS
@@ -66,6 +81,8 @@ config DAMON_VADDR_KUNIT_TEST
 	  If unsure, say N.
 
 config DAMON_SYSFS
+# 构建用户态控制面：用户通过 sysfs 创建 context/target/scheme 并提交配置；
+# 它只负责对象编排，实际采样由所选 DAMON ops 执行。
 	bool "DAMON sysfs interface"
 	depends on DAMON && SYSFS
 	default DAMON
@@ -74,6 +91,7 @@ config DAMON_SYSFS
 	  the interface for arbitrary data access monitoring.
 
 config DAMON_SYSFS_KUNIT_TEST
+# 验证 sysfs 对象层级、输入解析和提交/回滚语义，不替代 core/ops 的独立测试。
 	bool "Test for damon sysfs interface" if !KUNIT_ALL_TESTS
 	depends on DAMON_SYSFS && KUNIT=y
 	default KUNIT_ALL_TESTS
@@ -86,6 +104,8 @@ config DAMON_SYSFS_KUNIT_TEST
 	  If unsure, say N.
 
 config DAMON_RECLAIM
+# 物理地址监控之上的主动回收模块：识别长期未访问页，在轻度压力下先于传统
+# 全局扫描回收；重压仍由 vmscan 等常规回收器承担完整保障。
 	bool "Build DAMON-based reclaim (DAMON_RECLAIM)"
 	depends on DAMON_PADDR
 	help
@@ -98,6 +118,8 @@ config DAMON_RECLAIM
 	  scanning-based reclamation is used for heavy pressure.
 
 config DAMON_LRU_SORT
+# 根据 DAMON 访问热度提升热页、降低冷页在 LRU 中的位置，使后续内存压力优先
+# 回收冷页；它改变回收候选顺序，不直接保证页会被回收。
 	bool "Build DAMON-based LRU-lists sorting (DAMON_LRU_SORT)"
 	depends on DAMON_PADDR
 	help
@@ -106,6 +128,8 @@ config DAMON_LRU_SORT
 	  pages reclaimed first under memory pressure.
 
 config DAMON_STAT
+# 运行物理地址监控并把结果聚合为简单统计指标，供无需完整 sysfs region 数据的
+# 观测场景使用；实现复用 modules-common 的参数与 context 构造协议。
 	bool "Build data access monitoring stat (DAMON_STAT)"
 	depends on DAMON_PADDR
 	help
@@ -114,6 +138,8 @@ config DAMON_STAT
 	  metrics.
 
 config DAMON_STAT_ENABLED_DEFAULT
+# 只决定 DAMON_STAT 模块初始化后的 enabled 默认值；启动参数或运行期模块参数
+# 仍可关闭，因而不会改变 DAMON_STAT 是否被编译。
 	bool "Enable DAMON_STAT by default"
 	depends on DAMON_STAT
 	default DAMON_STAT

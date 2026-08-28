@@ -29,7 +29,7 @@
 
 - [x] `kernel/sched/fair.c`
 - [x] `kernel/sched/rt.c`
-- [ ] `kernel/sched/deadline.c`
+- [x] `kernel/sched/deadline.c`
 - [x] `kernel/sched/stop_task.c`
 - [x] `kernel/sched/core_sched.c`
 - [x] `kernel/sched/autogroup.h`
@@ -45,7 +45,7 @@
 
 ### PELT、负载、统计与 CPU 时间
 
-- [ ] `kernel/sched/sched-pelt.h`
+- [x] `kernel/sched/sched-pelt.h`
 - [x] `kernel/sched/pelt.h`
 - [x] `kernel/sched/pelt.c`
 - [x] `kernel/sched/loadavg.c`
