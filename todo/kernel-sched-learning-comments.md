@@ -72,7 +72,7 @@
 - [x] `kernel/sched/ext/cid.c`
 - [x] `kernel/sched/ext/idle.h`
 - [x] `kernel/sched/ext/idle.c`
-- [ ] `kernel/sched/ext/ext.c`
+- [x] `kernel/sched/ext/ext.c`
 
 ## 明确排除
 
@@ -84,4 +84,4 @@
 
 ## 当前处理文件
 
-- `kernel/sched/fair.c`（全文件已按第 17 章闭环：函数契约、复杂路径、英文注释邻接翻译与密度检查均已完成）
+- 无（`kernel/sched/ext/ext.c` 已按第 17 章完成全文件验收）
