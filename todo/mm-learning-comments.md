@@ -12,7 +12,7 @@
 
 ## 进度
 
-- [ ] 下一文件：`mm/rodata_test.c`
+- [ ] 下一文件：`mm/vma_internal.h`
 
 ## 固定顺序
 
@@ -35,6 +35,14 @@
 - [x] `mm/kfence/Makefile`：仅新增 4 行注释；context analysis、核心对象和测试栈约束已覆盖，GNU Make 解析通过。
 - [x] `mm/kmsan/Makefile`：仅新增 10 行注释；运行时递归防护、对象 flags 和测试反向插桩已覆盖，GNU Make 解析通过。
 - [x] `mm/page_reporting.h`：33/56/1.697/8；仅新增 82 行注释；第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/rodata_test.c`：33/29/0.879/8；仅新增 46 行注释；启动期 rodata 内容、写保护与页边界四阶段自检已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/damon/sysfs-common.h`：38/92/2.421/5；仅新增 126 行注释；共享锁、两类 kobject 生命周期及 sysfs/core 转换接口已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/kasan/report_hw_tags.c`：38/54/1.421/8；仅新增 72 行注释；HW_TAGS 坏地址、slab 大小、metadata 行与标签输出契约已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/mm_slot.h`：40/49/1.225/8；仅新增 61 行注释；KSM/khugepaged 的哈希/扫描双索引、mm 引用与锁边界已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/debug_page_alloc.c`：40/53/1.325/5；仅新增 71 行注释；启动参数、static key 与 buddy guard page 设置/合并协议已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/pgalloc-track.h`：42/49/1.167/5；仅新增 57 行注释；四级页表分配、修改位累积与架构同步边界已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/hugetlb_cma.h`：44/84/1.909/6；仅新增 114 行注释；运行期 frozen folio、启动期 CMA bootmem、exclusive 策略及无 CMA 桩已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/shuffle.h`：44/70/1.591/6；仅新增 96 行注释；static key 门控、node/zone 洗牌、随机插入及关闭配置桩已覆盖，第 17 章验收、diff/checkpatch 通过。
 
 ## 待决
 
@@ -49,3 +57,5 @@
 - 构建元数据：`mm/Kconfig` 的配置值流向 `mm/Makefile`，再由 `source "mm/damon/Kconfig"` 和 `obj-$(CONFIG_DAMON) += damon/` 进入 DAMON；下一次从 `mm/damon/Kconfig` 继续，无需重扫本轮五文件。
 - 构建元数据第二批：`mm/damon/Kconfig`、`kasan/Makefile`、`kfence/Makefile`、`kmsan/Makefile` 已闭环；下一轮直接进入基线 `.c/.h`，无需重扫构建入口。
 - `page_reporting.h`：已读 `mm/page_reporting.c` 的 order 参数、request/notify、process、register/unregister，`mm/page_alloc.c` 的 free-list 摘除与释放通知调用点，以及 `include/linux/page_reporting.h` 的驱动契约；已核对 static key、RCU 设备生命周期、zone 锁下 PageReported 清理和异步批处理边界。关联实现目前缺少中文学习注释，后续建议分别处理 `mm/page_reporting.c` 与 `include/linux/page_reporting.h`，不在本轮扩展修改。
+- 本批五文件：`rodata_test.c` 已核对 `init/main.c::mark_readonly`、`mm/maccess.c::copy_to_kernel_nofault` 与 `include/linux/rodata_test.h`；`damon/sysfs-common.h` 已核对 `sysfs-common.c`、`sysfs-schemes.c` 对应实现和 `sysfs.c` 调用点；`kasan/report_hw_tags.c` 已核对 `report.c` 报告组装及 `kasan.h` 标签/粒度定义；`mm_slot.h` 已核对 `ksm.c`、`khugepaged.c` 注册退出与锁/引用配对；`debug_page_alloc.c` 已核对 `mm_init.c` static key 提交、`page_alloc.c` guard 拆分/合并及 `include/linux/mm.h` 热路径包装。关联实现的学习注释覆盖不一，本批只修改五个基线目标。
+- 本批三文件：`pgalloc-track.h` 已核对 `include/linux/{pgtable,pgalloc}.h` 的修改位/同步契约，以及 `vmalloc.c`、`memory.c` 的页表下降调用链；`hugetlb_cma.h` 已核对 `hugetlb_cma.c` 全部公开实现、`cma.c` frozen/early reservation helper 和 `hugetlb.c` 分配释放/启动路径；`shuffle.h` 已核对 `shuffle.c` 实现、`page_alloc.c` 高阶释放、`mm_init.c` 启动调用与 `memory_hotplug.c` 上线调用。关联实现不在本批修改范围。
