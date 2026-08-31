@@ -7,6 +7,13 @@
  *
  */
 
+/*
+ * 本文件把 KMSAN 元数据中的 origin 句柄还原为“未初始化值在哪里产生、经过哪些
+ * 内存写入传播、最终在哪里被使用”的诊断报告。调用链通常是编译器插桩或范围检查
+ * → kmsan_internal_check_memory() → kmsan_report()；这里只消费元数据并打印，
+ * 不改变被检查内存的 shadow/origin，也不接管 Stack Depot 记录的所有权。
+ */
+
 #include <linux/console.h>
 #include <linux/kmsan.h>
 #include <linux/moduleparam.h>
@@ -19,7 +26,15 @@
 static DEFINE_RAW_SPINLOCK(kmsan_report_lock);
 #define DESCR_SIZE 128
 /* Protected by kmsan_report_lock */
+/*
+ * report_local_descr[] 由 kmsan_report_lock 保护。它是所有 CPU 共用的临时格式化
+ * 缓冲区而不是某个 origin 的长期存储；锁同时防止两份报告互相穿插并覆盖该字符串。
+ */
 static char report_local_descr[DESCR_SIZE];
+/*
+ * panic_on_kmsan 是只读居多的全局策略：启动/模块参数写入，报告尾部读取；非零时
+ * 首份能够走到报告末尾的错误会触发 panic。导出符号允许其他内核代码查询该策略。
+ */
 int panic_on_kmsan __read_mostly;
 EXPORT_SYMBOL_GPL(panic_on_kmsan);
 
@@ -27,22 +42,44 @@ EXPORT_SYMBOL_GPL(panic_on_kmsan);
 #undef MODULE_PARAM_PREFIX
 #endif
 #define MODULE_PARAM_PREFIX "kmsan."
+/* 用户通过 kmsan.panic=<int> 选择“仅报告并污染内核”还是“报告后立即崩溃”。 */
 module_param_named(panic, panic_on_kmsan, int, 0);
 
 /*
  * Skip internal KMSAN frames.
  */
+/*
+ * 跳过报告栈开头连续的 KMSAN runtime 帧，让首行指向真正使用未初始化值的调用者。
+ *
+ * 业务背景：stack_trace_save()/Stack Depot 保存的是原始返回地址，若直接打印，报告
+ * 会被 __msan_* 与 kmsan_* 包装淹没。调用者是 kmsan_print_origin() 和
+ * kmsan_report()，返回值随后作为 stack_trace_print() 的起始下标。
+ * 入参：@stack_entries 是借用的返回地址数组，不可为 NULL；@num_entries 是数组中
+ * 有效项数，范围应为 0..调用者缓冲区容量，函数不取得数组 ownership。
+ * 出参/返回：返回从数组头部应跳过的项数；可能为 0，也可能等于 @num_entries，
+ * 不修改输入数组和任何全局状态。
+ * 注意事项：逐项用 %ps 符号化，可能依赖 kallsyms，但不分配内存；调用路径处于
+ * KMSAN runtime/原始自旋锁保护的报告阶段，必须保持不可睡眠且不得再次触发报告。
+ */
 static int get_stack_skipnr(const unsigned long stack_entries[],
 			    int num_entries)
 {
+	/* len 是本次符号字符串长度；skip 同时是扫描游标和最终跳过数量。 */
 	int len, skip;
+	/* 固定栈缓冲只保存足以识别函数名前缀的截断符号，不跨迭代存活。 */
 	char buf[64];
 
+	/* 阶段 1：从最内层开始，连续识别 runtime 前缀；遇到首个业务帧即停止。 */
 	for (skip = 0; skip < num_entries; ++skip) {
+		/* %ps 解析为符号名；scnprintf 保证 buf 终止并返回可搜索的实际长度。 */
 		len = scnprintf(buf, sizeof(buf), "%ps",
 				(void *)stack_entries[skip]);
 
 		/* Never show __msan_* or kmsan_* functions. */
+		/*
+		 * 永不显示 __msan_* 编译器回调或 kmsan_* runtime 函数；只有前缀匹配
+		 * 才跳过，避免把业务函数名中间偶然出现的同名片段误判为内部帧。
+		 */
 		if ((strnstr(buf, "__msan_", len) == buf) ||
 		    (strnstr(buf, "kmsan_", len) == buf))
 			continue;
@@ -51,9 +88,11 @@ static int get_stack_skipnr(const unsigned long stack_entries[],
 		 * No match for runtime functions -- @skip entries to skip to
 		 * get to first frame of interest.
 		 */
+		/* 当前项不是 runtime：@skip 已准确指向第一帧有诊断意义的调用者。 */
 		break;
 	}
 
+	/* 全部为内部帧时返回 num_entries，调用者会得到长度为零的打印区间。 */
 	return skip;
 }
 
@@ -65,41 +104,82 @@ static int get_stack_skipnr(const unsigned long stack_entries[],
  * The meaningful part of the description is copied to a global buffer to avoid
  * allocating memory.
  */
+/*
+ * Clang 当前为局部变量生成“----局部名@函数名”形式的描述；报告只保留局部名，
+ * 因为函数名会在紧随其后的创建栈中出现，重复展示反而容易让读者误认变量全名。
+ * 有意义的片段复制到全局固定缓冲区，从而避免在错误报告的脆弱上下文中分配内存。
+ */
+/*
+ * 把编译器局部变量描述规范化为适合日志展示的短名称。
+ *
+ * 业务背景：kmsan_print_origin() 识别 KMSAN_ALLOCA_MAGIC_ORIGIN 后，需要把 Clang
+ * 嵌入 origin 的描述转成人可读名字；本函数是格式化层，不验证 origin 本身。
+ * 入参：@descr 是借用的、NUL 结尾的编译器静态描述字符串，不可为 NULL；调用期间
+ * 只读，所有权不变。
+ * 出参/返回：返回借用的 report_local_descr 指针，其中删除所有 '-'，并在首个 '@'
+ * 处截断；结果最长 DESCR_SIZE-1 字节且已 NUL 结尾，下次报告会覆盖它。
+ * 注意事项：调用者必须持有 kmsan_report_lock；函数不睡眠、不分配，结果不可在解锁
+ * 后作为稳定对象保存。len、i 是输入字节范围，pos 是输出缓冲的下一写入位置。
+ */
 static char *pretty_descr(char *descr)
 {
 	int pos = 0, len = strlen(descr);
 
+	/* 单遍压缩前缀：'@' 结束局部名，'-' 只是 Clang 标记，不进入用户可见文本。 */
 	for (int i = 0; i < len; i++) {
 		if (descr[i] == '@')
 			break;
 		if (descr[i] == '-')
 			continue;
 		report_local_descr[pos] = descr[i];
+		/* 为末尾 NUL 保留一格；达到容量后保留当前已写字符并立即截断。 */
 		if (pos + 1 == DESCR_SIZE)
 			break;
 		pos++;
 	}
 	report_local_descr[pos] = 0;
+	/* 返回共享缓冲的借用指针，生命周期由下一次 pretty_descr() 调用界定。 */
 	return report_local_descr;
 }
 
+/*
+ * 沿一个 KMSAN origin 的 Stack Depot 链，逆向打印每次传播和最初创建位置。
+ *
+ * 业务背景：shadow 只回答“字节是否未初始化”，origin handle 才保存因果。它由
+ * kmsan_report() 在使用点栈之后调用，输出顺序是最近一次存储 → 更早 origin → 创建栈。
+ * 入参：@origin 为借用的 depot handle；0 表示没有可报告来源，非零值必须来自 KMSAN
+ * origin 编码。函数不增加或释放 Stack Depot 引用。
+ * 出参/返回：无直接返回值；向错误日志追加局部变量位置、传播栈或创建栈，任何元数据
+ * 缺失都退化为有限说明，不修改 shadow/origin。
+ * 注意事项：调用者通常已进入 KMSAN runtime 并持有 kmsan_report_lock，因此不可睡眠；
+ * Stack Depot 返回的 entries/chained_entries 都是借用内部数组，只能在记录有效期内读。
+ */
 void kmsan_print_origin(depot_stack_handle_t origin)
 {
+	/* 两组 entries 分别指向当前 origin 记录和链节点保存的“本次存储”调用栈。 */
 	unsigned long *entries = NULL, *chained_entries = NULL;
+	/* nr_entries/chained_nr_entries 是对应借用数组的元素数；skipnr 隐藏 runtime 前缀。 */
 	unsigned int nr_entries, chained_nr_entries, skipnr;
+	/* pc1/pc2 只在 alloca 特殊记录中保存编译器给出的最多两个创建位置。 */
 	void *pc1 = NULL, *pc2 = NULL;
+	/* head 是链节点的当前存储栈 handle；origin 随循环推进到前驱。 */
 	depot_stack_handle_t head;
+	/* magic 区分普通栈、alloca 描述和传播链；descr 是记录中借用的静态字符串。 */
 	unsigned long magic;
 	char *descr = NULL;
+	/* depth 编码在 handle 的 extra bits 中，用于说明链是否因上限而截断。 */
 	unsigned int depth;
 
+	/* 0 是“没有 origin”的哨兵；无 ownership 或输出需要处理。 */
 	if (!origin)
 		return;
 
+	/* 阶段 1：每轮解码当前记录；链节点令 origin 前移，终端记录则打印后退出。 */
 	while (true) {
 		nr_entries = stack_depot_fetch(origin, &entries);
 		depth = kmsan_depth_from_eb(stack_depot_get_extra_bits(origin));
 		magic = nr_entries ? entries[0] : 0;
+		/* alloca 特殊记录固定四项：magic、描述指针和两个可选程序计数器。 */
 		if ((nr_entries == 4) && (magic == KMSAN_ALLOCA_MAGIC_ORIGIN)) {
 			descr = (char *)entries[1];
 			pc1 = (void *)entries[2];
@@ -110,20 +190,32 @@ void kmsan_print_origin(depot_stack_handle_t origin)
 				pr_err(" %pSb\n", pc1);
 			if (pc2)
 				pr_err(" %pSb\n", pc2);
+			/* 局部变量记录已经是因果链根，无前驱可继续。 */
 			break;
 		}
+		/* 链记录固定三项：magic、本次存储栈 handle、较早的 origin handle。 */
 		if ((nr_entries == 3) && (magic == KMSAN_CHAIN_MAGIC_ORIGIN)) {
 			/*
 			 * Origin chains deeper than KMSAN_MAX_ORIGIN_DEPTH are
 			 * not stored, so the output may be incomplete.
 			 */
+			/*
+			 * origin 链超过 KMSAN_MAX_ORIGIN_DEPTH 后不会继续存储，因此输出可能
+			 * 不完整；达到上限时明确告知中间可能省略了零个或多个传播栈。
+			 */
 			if (depth == KMSAN_MAX_ORIGIN_DEPTH)
 				pr_err("<Zero or more stacks not recorded to save memory>\n\n");
 			head = entries[1];
+			/* 在打印当前存储栈前先把循环游标转到前驱，下一轮继续追根。 */
 			origin = entries[2];
 			pr_err("Uninit was stored to memory at:\n");
 			chained_nr_entries =
 				stack_depot_fetch(head, &chained_entries);
+			/*
+			 * Stack Depot 内存可能未被 KMSAN 标记为已初始化；先解除其 shadow，
+			 * 防止诊断代码读取栈数组时递归产生一份伪报告。checked=false 表示
+			 * 此内部维护操作不再检查目标地址。
+			 */
 			kmsan_internal_unpoison_memory(
 				chained_entries,
 				chained_nr_entries * sizeof(*chained_entries),
@@ -133,8 +225,10 @@ void kmsan_print_origin(depot_stack_handle_t origin)
 			stack_trace_print(chained_entries + skipnr,
 					  chained_nr_entries - skipnr, 0);
 			pr_err("\n");
+			/* 继续处理 entries[2]，直至普通创建栈或 alloca 根。 */
 			continue;
 		}
+		/* 普通记录是最终创建栈；空/失效 handle 只能报告“栈不可用”。 */
 		pr_err("Uninit was created at:\n");
 		if (nr_entries) {
 			skipnr = get_stack_skipnr(entries, nr_entries);
@@ -143,20 +237,47 @@ void kmsan_print_origin(depot_stack_handle_t origin)
 		} else {
 			pr_err("(stack is not available)\n");
 		}
+		/* 普通记录没有前驱，因果打印至此完成。 */
 		break;
 	}
 }
 
+/*
+ * 生成一份完整 KMSAN 使用点报告，并按全局策略决定继续运行或 panic。
+ *
+ * 业务背景：kmsan_internal_check_memory() 把连续且共享 origin 的坏字节合并后调用
+ * 本函数；编译器插桩的标量检查也可用 size=0 调用。它位于“发现 shadow 非零”与
+ * “把 origin 因果链呈现给开发者”之间，是诊断发布点而非检测或修复点。
+ * 入参：@origin 是借用的非零 Stack Depot handle；@address 是整次内存访问的可空
+ * 内核起始地址；@size 是访问字节数，0 表示无地址的标量使用；@off_first/@off_last
+ * 是相对 @address 的包含式坏字节偏移，仅 size>0 时有效；@user_addr 是可空、借用的
+ * 用户目标地址，只在 REASON_COPY_TO_USER 中展示；@reason 必须是 kmsan_bug_reason
+ * 的已命名值，描述普通使用、copy_to_user 泄漏或 USB 提交泄漏。
+ * 出参/返回：无直接返回值和输出参数；成功报告会打印使用栈、origin 链及访问范围，
+ * 添加 TAINT_BAD_PAGE；panic_on_kmsan 非零时不返回，否则恢复 uaccess/runtime 状态。
+ * 注意事项：禁用 KMSAN、已在 runtime、当前上下文 depth 非零或 origin=0 时静默返回。
+ * 报告阶段持 raw spinlock、不可睡眠；所有正常出口必须恢复 user_access_save() 状态并
+ * kmsan_leave_runtime()。输入 reason 非法或栈全是内部帧违反调用契约。
+ */
 void kmsan_report(depot_stack_handle_t origin, void *address, int size,
 		  int off_first, int off_last, const void __user *user_addr,
 		  enum kmsan_bug_reason reason)
 {
+	/* stack_entries 保存当前“使用点”栈；容量是 KMSAN 的固定诊断深度。 */
 	unsigned long stack_entries[KMSAN_STACK_DEPTH];
+	/* num_stack_entries 是实际帧数，skipnr 是应隐藏的 runtime 前缀长度。 */
 	int num_stack_entries, skipnr;
+	/* bug_type 指向只读字面量，由 reason 与 origin 的 UAF 位共同选择。 */
 	char *bug_type = NULL;
+	/* ua_flags 保存进入报告前的体系结构 uaccess/SMAP 状态，供末尾精确恢复。 */
 	unsigned long ua_flags;
+	/* is_uaf 来自 origin extra bits，区分未初始化与释放后继续使用。 */
 	bool is_uaf;
 
+	/*
+	 * 阶段 1：递归与有效性门禁。关闭 KMSAN 或已处于 runtime 时再报告会递归读取
+	 * shadow；depth 非零表示当前任务显式禁止检查；无 origin 则无法给出可信因果。
+	 */
 	if (!kmsan_enabled || kmsan_in_runtime())
 		return;
 	if (current->kmsan_ctx.depth)
@@ -164,37 +285,52 @@ void kmsan_report(depot_stack_handle_t origin, void *address, int size,
 	if (!origin)
 		return;
 
+	/*
+	 * 阶段 2：进入不插桩的 runtime，并暂时保存/关闭用户访问窗口。raw spinlock
+	 * 串行化整份多行日志和共享描述缓冲；从这里到 unlock 均不可睡眠。
+	 */
 	kmsan_enter_runtime();
 	ua_flags = user_access_save();
 	raw_spin_lock(&kmsan_report_lock);
 	pr_err("=====================================================\n");
 	is_uaf = kmsan_uaf_from_eb(stack_depot_get_extra_bits(origin));
+	/* reason 选择泄漏场景，is_uaf 再补充“来源对象已经释放”的维度。 */
 	switch (reason) {
 	case REASON_ANY:
+		/* 普通算术、比较或控制流使用：报告未初始化值或释放后使用。 */
 		bug_type = is_uaf ? "use-after-free" : "uninit-value";
 		break;
 	case REASON_COPY_TO_USER:
+		/* 拷往用户态会暴露内核数据，故使用 kernel-infoleak 分类。 */
 		bug_type = is_uaf ? "kernel-infoleak-after-free" :
 				    "kernel-infoleak";
 		break;
 	case REASON_SUBMIT_URB:
+		/* USB URB 把字节交给设备，单独标为 USB 信息泄漏。 */
 		bug_type = is_uaf ? "kernel-usb-infoleak-after-free" :
 				    "kernel-usb-infoleak";
 		break;
 	}
 
+	/* 阶段 3：捕获当前使用点栈，参数 1 先略过 stack_trace_save() 自身。 */
 	num_stack_entries =
 		stack_trace_save(stack_entries, KMSAN_STACK_DEPTH, 1);
 	skipnr = get_stack_skipnr(stack_entries, num_stack_entries);
 
+	/*
+	 * get_stack_skipnr() 再隐藏 KMSAN 包装；正常插桩调用链必须至少剩一帧，首个
+	 * 业务地址用于报告标题，其余完整打印以保留调用上下文。
+	 */
 	pr_err("BUG: KMSAN: %s in %pSb\n", bug_type,
 	       (void *)stack_entries[skipnr]);
 	stack_trace_print(stack_entries + skipnr, num_stack_entries - skipnr,
 			  0);
 	pr_err("\n");
 
+	/* 阶段 4：在使用点之后逆向打印 origin 的传播链和最终创建位置。 */
 	kmsan_print_origin(origin);
 
+	/* 阶段 5：有范围信息时给出坏字节的包含式偏移；单字节使用更紧凑文案。 */
 	if (size) {
 		pr_err("\n");
 		if (off_first == off_last)
@@ -204,6 +340,7 @@ void kmsan_report(depot_stack_handle_t origin, void *address, int size,
 			pr_err("Bytes %d-%d of %d are uninitialized\n",
 			       off_first, off_last, size);
 	}
+	/* address 描述内核访问范围；user_addr 只对 copy_to_user 泄漏有业务意义。 */
 	if (address)
 		pr_err("Memory access of size %d starts at %px\n", size,
 		       address);
@@ -212,10 +349,20 @@ void kmsan_report(depot_stack_handle_t origin, void *address, int size,
 	pr_err("\n");
 	dump_stack_print_info(KERN_ERR);
 	pr_err("=====================================================\n");
+	/*
+	 * 报告已经对外可见后把内核标为 TAINT_BAD_PAGE；LOCKDEP_NOW_UNRELIABLE
+	 * 表示检测到的内存错误可能使后续锁依赖诊断不再可信。
+	 */
 	add_taint(TAINT_BAD_PAGE, LOCKDEP_NOW_UNRELIABLE);
+	/* 多行报告与 report_local_descr 的共享临界区到此结束。 */
 	raw_spin_unlock(&kmsan_report_lock);
+	/* panic 路径是不返回的策略出口；此前已解锁，避免 panic 流程继承报告锁。 */
 	if (panic_on_kmsan)
 		panic("kmsan.panic set ...\n");
+	/*
+	 * 正常返回按进入的逆序恢复体系结构 uaccess 状态，再退出 KMSAN runtime；
+	 * 此后同一执行上下文的常规内存访问才重新参与 KMSAN 检查。
+	 */
 	user_access_restore(ua_flags);
 	kmsan_leave_runtime();
 }
