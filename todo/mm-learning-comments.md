@@ -12,7 +12,7 @@
 
 ## 进度
 
-- [x] 当前文件：无
+- [~] 当前文件：`mm/workingset.c`
 
 ## 固定顺序
 
@@ -126,6 +126,12 @@
 - [x] `mm/dmapool.c`：340/181/0.532/10；仅新增 237 行注释；18 个函数的四段式契约、结构字段、空闲栈、coherent backing、双锁 sysfs 发布、debug poison、快慢分配与 devres 生命周期已覆盖，第 17 章验收、diff/checkpatch 通过。
 - [x] `mm/memfd.c`：340/179/0.526/10；仅新增 233 行注释；16 个函数/系统调用的四段式契约、folio pin 候选退避、hugetlb 实例化、不可逆 seals、WRITE 发布回滚、mmap 与 noexec namespace 策略已覆盖，第 17 章验收、diff/checkpatch 通过。
 - [x] `mm/damon/lru_sort.c`：346/199/0.575/9；仅新增 253 行注释；17 个函数/回调的四段式契约、全部参数语义、热冷 scheme、quota goal/filter、临时 ctx 原子提交、启停与统计回调生命周期已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/memremap.c`：351/238/0.678/10；仅新增 318 行注释；14 个函数的四段式契约、ZONE_DEVICE 上线/拆除、XArray-RCU/percpu_ref 生命周期、五类设备页释放与失败逆序回滚已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/page_ext.c`：352/252/0.716/9；仅新增 335 行注释；26 个函数/配置实现的四段式契约、客户端布局、FLATMEM/SPARSEMEM 分配、偏移指针编码、热插拔 invalid→RCU→free 与公开 get/put 生命周期已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/hugetlb_sysfs.c`：370/204/0.551/10；仅新增 261 行注释；23 个函数/配置实现的四段式契约、全局/节点 kobject 反查、持久池与 overcommit、demote 双锁/失败回源及 sysfs 树回滚已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/memfd_luo.c`：372/183/0.492/10；仅新增 228 行注释；12 个函数/回调的四段式契约、memfd-v2 packed ABI、folio pin/preserve/freeze、dirty+uptodate 数据不变量、page-cache/memcg/inode/LRU 恢复及分层失败清理已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/show_mem.c`：375/156/0.416/10；仅新增 184 行注释；9 个函数/配置实现的四段式契约、MemAvailable 保守估算、NUMA/cpuset/zone 过滤、全局/节点/zone 统计口径、buddy 锁内快照与非阻塞分配画像已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/damon/paddr.c`：382/219/0.573/10；仅新增 271 行注释；19 个函数的四段式契约、物理地址单位换算、young/idle 采样、probe/memcg 过滤、folio 去重、回收/LRU/NUMA 动作与操作表注册已覆盖，第 17 章验收、diff/checkpatch 通过。
 
 本轮五文件聚合验收：`kmsan/core.c`、`damon/reclaim.c`、`debug.c`、`pgtable-generic.c`、`page_isolation.c` 合计新增 772 行注释与空行、删除 0 行；新增非空行全部位于注释，原代码、预处理行及上游注释文本/顺序/缩进未改。密度门禁依次为 `291/116/0.399/9`、`292/125/0.428/9`、`297/94/0.316/10`、`299/139/0.465/9`、`307/127/0.414/10`，均通过；聚合 `git diff --check` 及 `checkpatch --strict --ignore LONG_LINE_COMMENT` 为 0 errors、0 warnings、0 checks。仓库无 `.config`，未执行目标编译。
 
@@ -183,6 +189,10 @@
 
 本轮第 17 章内容验收记录：按结构位置复核的函数/回调为 `9/9/5/8/6`，另核对 nofault 循环宏、KMSAN 启动账本结构、percpu 输出宏、KUnit case/suite 和 page-idle sysfs 属性实体；全部非豁免英文注释均有紧邻翻译与学习补充，vaddr 测试原英文把最终映射终点写作 305 的不一致已保留原文并以修正说明按代码/断言限定为 330。路径清单覆盖 nofault 的 -ERANGE/-EFAULT 与部分复制、KMSAN 三块分组/降阶回收、percpu 锁外扩容重试、DAMON fixture skip/部分更新销毁、page-idle PFN/folio 竞态复核及 PTE/PMD/MMU notifier/reclaim 补偿。复述与推理抽查选取 `copy_from_kernel_nofault()`、`kmsan_memblock_discard()`、`percpu_stats_show()`、`damon_do_test_apply_three_regions()`、`page_idle_bitmap_read()/write()`，均可由注释恢复入口约束、ownership、锁/睡眠边界、失败/退化路径、发布点与返回后的下一步。
 
+本轮五文件聚合验收：`memremap.c`、`page_ext.c`、`hugetlb_sysfs.c`、`memfd_luo.c`、`show_mem.c` 合计新增 1326 行注释、删除 0 行；新增非空行全部位于注释，原代码、预处理行及上游注释文本/顺序/缩进未改。密度门禁依次为 `351/238/0.678/10`、`352/252/0.716/9`、`370/204/0.551/10`、`372/183/0.492/10`、`375/156/0.416/10`，均通过；聚合 `git diff --check` 及 `checkpatch --strict --ignore LONG_LINE_COMMENT` 为 0 errors、0 warnings、0 checks。仓库无 `.config`，未执行目标编译。
+
+本轮第 17 章内容验收记录：按修改后完整文件的物理结构复核函数/回调/配置实现为 `14/26/23/12/9`，另逐项核对 dev_pagemap/XArray、page_ext ops/偏移编码、hstate kobject/属性表、memfd-v2 ABI/回调表、全局统计/迁移类型表和全部局部变量；所有非豁免英文注释均保留原文并有紧邻完整译注。路径清单覆盖 ZONE_DEVICE 上线与失败逆序拆除、page_ext 的 invalid→RCU→free 热拔发布、HugeTLB resize/demote 双锁及回源、memfd folio preserve→freeze→restore 的多层清理，以及 MemAvailable 估算→NUMA 过滤→buddy 锁内复制→锁外打印。复述与推理抽查选取 `devm_memremap_pages()`/`memunmap_pages()`、`page_ext_init()`/`page_ext_callback()`、`demote_store()`/`hugetlb_sysfs_add_hstate()`、`memfd_luo_preserve()`/`memfd_luo_retrieve()`、`si_mem_available()`/`show_free_areas()`/`__show_mem()`，均可由注释恢复入口约束、ownership、锁/RCU/IRQ、状态发布、失败或非阻塞退化、配置差异和返回后的下一步，结论均为通过。
+
 ## 待决
 
 - [-] `mm/damon/modules-common.h`：语义补注完成；统计宏为不可拆的 11 行续行，门禁 max_gap=11，未改宏凑数。
@@ -227,3 +237,4 @@
 - 本轮五文件：`shmem_quota.c` 已核对 `mm/shmem.c::shmem_enable_quotas()`、`fs/quota/dquot.c` 的 dqget/release/get-next 与 `include/linux/quota.h` 操作表契约；`damon/stat.c` 已核对 `mm/damon/core.c` 的 attrs/start/stop/call/system-RAM region、`paddr.c` 与 `include/linux/damon.h` 区域年龄语义；`kasan/quarantine.c` 已核对 `mm/kasan/common.c` 的 free/alloc 入口、`generic.c` 的 cache shrink/shutdown 以及 `kasan.h` metadata 布局；`sparse.c` 已核对 `mm/internal.h::sparse_init_one_section()`、`sparse-vmemmap.c` 后端、`include/linux/mmzone.h` section 布局和 `mm/mm_init.c` 启动调用；`kasan/report_generic.c` 已核对 `mm/kasan/report.c` 的报告组装与私有 `kasan.h` ABI。除 `mm/mm_init.c` 为部分覆盖外，上述关联读取区域均缺少本任务级系统学习注释，建议仍按各自基线或子系统主题后续补注；本轮未越界修改。
 - 本轮五文件：`kmsan/core.c` 已核对 `mm/kmsan/{kmsan.h,shadow.c,report.c,hooks.c}` 的 metadata/origin ABI、报告消费和 hook 调用（前三者充分，`hooks.c` 缺失）；`damon/reclaim.c` 已核对 `mm/damon/{modules-common.c,modules-common.h,core.c,stat.c}` 与 `include/linux/damon.h` 的 context 构造、commit/start/stop/call（共享 helper 与 `stat.c` 充分，core/公开头读取区域缺失）；`debug.c` 已核对 `include/linux/mmdebug.h`、`mm/{page_alloc,page_owner}.c` 和 `include/linux/mm.h` 的 dump 调用与 VMA flags（公开 `mm.h` 部分覆盖，其余读取区域缺失）；`pgtable-generic.c` 已核对 `include/linux/{pgtable,mm}.h`、`mm/{memory,huge_memory,khugepaged}.c` 的 PTE 映射配对、THP deposit/withdraw 和 RCU 延迟释放（`mm.h` 部分覆盖，其余读取区域缺失）；`page_isolation.c` 已核对 `include/linux/page-isolation.h`、`mm/{page_alloc,memory_hotplug,cma,compaction}.c` 的连续分配/下线调用链（读取区域缺失或部分覆盖）。缺失/部分覆盖区域建议仍按各自基线或主题顺序补注，本轮未越界修改。
 - 本轮返工五文件关联读取复用既有探查结论：`kmsan/hooks.c` 对照 `mm/kmsan/{kmsan.h,core.c,shadow.c,report.c}`（均已闭环）及 `include/linux/kmsan.h`（缺失），核对 runtime、metadata/origin 与报告 ABI；`gup_test.c` 对照 `mm/gup_test.h`（充分）、`mm/gup.c` 和 `tools/testing/selftests/mm/{gup_test.c,gup_longterm.c}`（源码学习注释缺失），核对 ioctl、get/pin 与长期会话；`dmapool.c` 对照 `mm/dmapool_test.c`（充分）、`include/linux/dmapool.h` 与 `drivers/base/core.c`（缺失或零散），核对 DMA 地址配对、设备列表/sysfs 和 devres；`memfd.c` 对照 `mm/gup.c`、`mm/shmem.c`、`mm/hugetlb.c`、PID namespace noexec 及 UAPI 定义（覆盖不一），核对 pin 排空、后端 file/seal 与策略；`damon/lru_sort.c` 对照 `mm/damon/{modules-common.c,modules-common.h,stat.c,reclaim.c}`（充分）、`core.c` 和 `include/linux/damon.h`（缺失），以及 `mm/damon/{Kconfig,Makefile}`（充分），核对 ctx/scheme commit、启停和 bool 生命周期。缺失/部分覆盖的关联源码建议仍按各自基线顺序补注，本轮未越界修改。
+- 本轮五文件：`memremap.c` 已核对 `include/linux/memremap.h`、`mm/sparse-vmemmap.c`、`mm/memory_hotplug.c`、`mm/swap.c` 及驱动调用点；`page_ext.c` 已核对 `include/linux/page_ext.h`、`page_owner.c`、`page_table_check.c` 与相关客户端声明；`hugetlb_sysfs.c` 已核对 `hugetlb_internal.h` 和 `hugetlb.c` 的池调整/demote 实现；`memfd_luo.c` 已核对 `include/linux/kho/abi/memfd.h`、`include/linux/liveupdate.h`、`kernel/liveupdate/kexec_handover.c` 资源接口及已闭环的 `memfd.c`；`show_mem.c` 已核对 `mm/internal.h` 的过滤位、`page_alloc.c`/`oom_kill.c` 调用、`swap_state.c::show_swap_cache_info()`、`lib/alloc_tag.c::alloc_tag_top_users()`、`fs/proc/meminfo.c` 和 DAMON 节点消费者。`hugetlb_internal.h`、`page_table_check.c`、`memfd.c` 在所需契约上充分，其余关联读取区域缺失或部分覆盖，建议仍按各自基线/主题顺序补注；本轮未越界修改。
