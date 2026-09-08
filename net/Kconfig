@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Network configuration
+# 网络子系统的顶层 Kconfig：NET 是总闸门；其内部先声明跨协议共享的隐藏能力位，再通过 source
+# 展开各协议族菜单。bool 只能内建，tristate 可取 y/m/n；无 prompt 的符号通常只供其他配置 select。
 #
 
 menuconfig NET
@@ -23,15 +25,23 @@ menuconfig NET
 	  For a general introduction to Linux networking, it is highly
 	  recommended to read the NET-HOWTO, available from
 	  <http://www.tldp.org/docs.html#howto>.
+	  除非明确构建完全不需要网络的极简内核，否则应选 Y：即使独立主机也常有程序依赖本机
+	  socket/loopback。升级内核时网络用户态工具也可能需要同步升级，版本要求见
+	  Documentation/Changes；通用入门资料可参考 Linux 网络 HOWTO。select 表示开启 NET 会强制
+	  带入 netlink 属性解析、通用网络工具和 BPF 基础能力，而不要求用户逐项选择。
 
 if NET
 
+# 这是供旧式子系统选择的隐藏请求位：自身不生成用户界面，只表示某调用方仍需 compat netlink 消息。
 config WANT_COMPAT_NETLINK_MESSAGES
 	bool
 	help
 	  This option can be selected by other options that need compat
 	  netlink messages.
+	  需要兼容 netlink 消息的其他配置可 select 此项；普通用户不应直接控制它。
 
+# COMPAT 内核且 WEXT 或上述请求位存在时自动启用。发送方把 compat 版本 skb 放入主 skb 的
+# frag_list，netlink 再按接收任务是否为 compat ABI 选择消息；新接口必须设计成 ABI 无关，不能沿用此机制。
 config COMPAT_NETLINK_MESSAGES
 	def_bool y
 	depends on COMPAT
@@ -45,7 +55,12 @@ config COMPAT_NETLINK_MESSAGES
 
 	  Newly written code should NEVER need this option but do
 	  compat-independent messages instead!
+	  此能力可按目标任务是兼容进程还是本机进程发送不同 netlink 消息。发送前需把兼容 skb 放到
+	  skb_shinfo(skb)->frag_list，netlink 层负责最终分派。新代码绝不应依赖它，而应使用与 ABI
+	  位宽无关的消息布局。
 
+# 以下无 prompt 的 bool 是网络核心内部能力标签：入口/出口挂点分别供 tc、BPF 等选择；
+# NET_XGRESS 一次 select 两者，NET_REDIRECT 标记重定向支持，均不是面向最终用户的独立功能。
 config NET_INGRESS
 	bool
 
@@ -60,27 +75,34 @@ config NET_XGRESS
 config NET_REDIRECT
 	bool
 
+# 这两个 skb 能力位由实际使用者选择：SKB_DECRYPTED 增加“报文已解密”的元数据语义，
+# SKB_EXTENSIONS 启用可选扩展区。保持隐藏可避免没有消费者时仍扩大热路径对象或代码。
 config SKB_DECRYPTED
 	bool
 
 config SKB_EXTENSIONS
 	bool
 
+# 网络设备内存接收依赖 dma-buf 与 page_pool；依赖满足时默认开启并带入通用分配器。
 config NET_DEVMEM
 	def_bool y
 	select GENERIC_ALLOCATOR
 	depends on DMA_SHARED_BUFFER
 	depends on PAGE_POOL
 
+# NET_SHAPER 是整形基础设施的隐藏总开关，具体消费者负责选择它。
 config NET_SHAPER
 	bool
 
+# 需要 CRC32C 的网络协议选择此隐藏包装位，它再 select 通用 CRC32 实现，集中表达构建依赖。
 config NET_CRC32C
 	bool
 	select CRC32
 
 menu "Networking options"
 
+# 先展开直接建立 socket/安全变换或数据通道的协议菜单；source 是文本级包含，子文件中的
+# depends on 仍决定选项是否可见，并不意味着列在这里就一定编译。
 source "net/packet/Kconfig"
 source "net/psp/Kconfig"
 source "net/unix/Kconfig"
@@ -91,6 +113,7 @@ source "net/smc/Kconfig"
 source "drivers/dibs/Kconfig"
 source "net/xdp/Kconfig"
 
+# TLS/RPC/NVMe-TCP 的握手 upcall 公共层只在至少一个消费者存在时可用，并默认随消费者内建。
 config NET_HANDSHAKE
 	bool
 	depends on SUNRPC || NVME_TARGET_TCP || NVME_TCP
@@ -110,6 +133,9 @@ config NET_HANDSHAKE_KUNIT_TEST
 
 	  For more information on KUnit and unit tests in general, refer
 	  to the KUnit documentation in Documentation/dev-tools/kunit/.
+	  该项构建握手 upcall 的 KUnit 测试。测试通常在启动时运行，并以 TAP 格式写入调试日志；
+	  它面向使用 KUnit harness 的内核开发者，不应放入生产内核。使用方法见
+	  Documentation/dev-tools/kunit/；KUNIT_ALL_TESTS 可统一决定默认值，单独选择时可编成模块。
 
 config INET
 	bool "TCP/IP networking"
@@ -132,22 +158,32 @@ config INET
 	  <file:Documentation/networking/ip-sysctl.rst>.
 
 	  Short answer: say Y.
+	  这是互联网和大多数局域网使用的 TCP/IP 协议族，通常应选 Y；许多程序即使在未联网主机上
+	  也通过 loopback 使用 TCP/IP。若同时启用 procfs 与 sysctl，可经 /proc/sys/net/ipv4/*
+	  调整协议行为，参数见 Documentation/networking/ip-sysctl.rst。旧帮助给出的体积数字和
+	  HOWTO 链接仅作历史参考，实际大小随版本和配置变化；简短建议仍是 Y。
 
 if INET
+# 只有 IPv4 核心存在时才展开 IPv4、IPv6、NetLabel 与 MPTCP 菜单；这里体现当前内核中 IPv6
+# 对 INET 公共基础的构建依赖，而不是说 IPv6 地址或报文属于 IPv4。
 source "net/ipv4/Kconfig"
 source "net/ipv6/Kconfig"
 source "net/netlabel/Kconfig"
 source "net/mptcp/Kconfig"
 
 endif # if INET
+# 结束 INET 条件块；后续安全标记、时间戳和 Netfilter 仍可作为 NET 公共功能独立配置。
 
+# 安全标记为 skb 携带独立于 nfmark 的安全上下文，供 LSM/Netfilter 策略匹配；没有此需求选 N。
 config NETWORK_SECMARK
 	bool "Security Marking"
 	help
 	  This enables security marking of network packets, similar
 	  to nfmark, but designated for security purposes.
 	  If you are unsure how to answer this question, answer N.
+	  开启后可给网络包附加类似 nfmark、但专用于安全策略的标记；不确定时选 N。
 
+# NET_PTP_CLASSIFY 是隐藏基础能力；PHY 时间戳选项通过 select 强制带入报文 PTP 分类逻辑。
 config NET_PTP_CLASSIFY
 	def_bool n
 
@@ -161,6 +197,8 @@ config NETWORK_PHY_TIMESTAMPING
 	  and receive paths.
 
 	  If you are unsure how to answer this question, answer N.
+	  允许具备硬件时间戳能力的 PHY 或其他监听 MII 总线的设备给收发报文打时间戳；分类与回调会
+	  增加收发热路径开销，没有 PHY 硬件时间戳需求时选 N。
 
 menuconfig NETFILTER
 	bool "Network packet filtering framework (Netfilter)"
@@ -214,9 +252,17 @@ menuconfig NETFILTER
 	  proxying, and portforwarding mechanisms. Please see
 	  <file:Documentation/Changes> under "iptables" for the location of
 	  these packages.
+	  Netfilter 是经过本机的网络包过滤与改写框架。典型用途包括：按类型/源/目的拒绝单包的防火墙；
+	  为没有全球地址的内网主机执行 masquerading/NAT 及端口转发；把外连透明转交本地代理；以及
+	  让桥接的 IP/ARP 流量进入过滤路径。它属于包过滤器，不等同于理解应用层协议、通常更严格但
+	  部署更侵入的代理防火墙；两者可以组合。历史 ipmasqadm/ipchains 等功能已由 Netfilter 模块和
+	  用户态工具取代，工具要求见 Documentation/Changes 的 iptables 条目。需要防火墙、NAT、透明
+	  代理或桥接过滤时选 Y，否则可关闭以缩小内核。
 
 if NETFILTER
 
+# 此开关只控制配置界面的专家粒度：Y 显示全部 Netfilter 模块；N 隐藏少见项，并让常用基础项
+# 默认取 M。它不绕过各模块自己的依赖，也不直接决定每个模块一定被编译。
 config NETFILTER_ADVANCED
 	bool "Advanced netfilter configuration"
 	depends on NETFILTER
@@ -227,7 +273,11 @@ config NETFILTER_ADVANCED
 	  basic ones needed by most people will default to 'M'.
 
 	  If unsure, say Y.
+	  选择 Y 可逐项配置全部 Netfilter 模块；选择 N 会隐藏非常用模块，并把多数用户所需的基础模块
+	  默认设为 M。不确定时选 Y，以免因隐藏选项而难以理解实际配置。
 
+# bridge-nf 把桥接的 ARP/IP 包挂入 arptables/iptables 所见路径。它依赖桥、INET、Netfilter
+# 专家菜单，并选择 bridge family 与 skb 扩展元数据；是否启用它不影响 ebtables 自身的开关。
 config BRIDGE_NETFILTER
 	tristate "Bridged IP/ARP packets filtering"
 	depends on BRIDGE
@@ -243,14 +293,21 @@ config BRIDGE_NETFILTER
 	  ebtables.
 
 	  If unsure, say N.
+	  开启后 arptables 可观察桥接 ARP，iptables 可观察桥接 IP，适合桥接防火墙；它既不会自动
+	  开启也不会关闭 ebtables。不确定时选 N，避免改变桥转发路径并增加额外处理。
 
+# 在 NETFILTER 条件内继续展开通用、IPv4、IPv6 与桥四个 hook/表达式实现菜单；子菜单仍可用
+# 更细的协议依赖裁剪。endif 结束整个 Netfilter 专属配置域。
 source "net/netfilter/Kconfig"
 source "net/ipv4/netfilter/Kconfig"
 source "net/ipv6/netfilter/Kconfig"
 source "net/bridge/netfilter/Kconfig"
 
 endif # if NETFILTER
+# 结束 Netfilter 专属条件块，随后回到通用 Networking options 菜单继续装配其他协议。
 
+# 下列 source 展开彼此相对独立的传输协议、二层协议、队列调度与虚拟交换/设备控制菜单。
+# 把声明集中在顶层只是形成统一“Networking options”界面；每个子文件负责自己的依赖与默认值。
 source "net/sctp/Kconfig"
 source "net/rds/Kconfig"
 source "net/tipc/Kconfig"
@@ -282,6 +339,8 @@ source "net/l3mdev/Kconfig"
 source "net/qrtr/Kconfig"
 source "net/ncsi/Kconfig"
 
+# net_device 引用计数默认采用 per-CPU 累加以降低 SMP 热点；强制 N 改用集中计数会损失性能，
+# 但更容易立即观察下溢，适合调试 get/put 不配对。单处理器上没有 per-CPU 扩展的收益，故依赖 SMP。
 config PCPU_DEV_REFCNT
 	bool "Use percpu variables to maintain network device refcount"
 	depends on SMP
@@ -289,7 +348,11 @@ config PCPU_DEV_REFCNT
 	help
 	  network device refcount are using per cpu variables if this option is set.
 	  This can be forced to N to detect underflows (with a performance drop).
+	  开启后网络设备引用计数使用每 CPU 变量；调试引用下溢时可强制设为 N，代价是共享计数带来的
+	  性能下降。
 
+# skb_shared_info 尾部可记录的 page fragment 上限。更大数组能让 BIG TCP/GRO 合并更多片段，
+# 但每个小包及 build_skb() 驱动也要承担更多内存，并可能触发旧驱动对 17 片段的错误假设。
 config MAX_SKB_FRAGS
 	int "Maximum number of fragments per skb_shared_info"
 	range 17 45
@@ -301,7 +364,10 @@ config MAX_SKB_FRAGS
 	  This also increases memory overhead of small packets,
 	  and in drivers using build_skb().
 	  If unsure, say 17.
+	  增加每个 skb_shared_info 的片段数可提高 GRO、尤其 BIG TCP 的效率，但可能暴露旧驱动缺陷，
+	  也会增加小包和 build_skb() 驱动的内存开销。有效范围 17～45，不确定时保留 17。
 
+# RPS 在驱动收包后用软件把协议处理分散到其他 CPU；需要 SMP，并通过 SYSFS 暴露队列 CPU mask。
 config RPS
 	bool "Receive packet steering"
 	depends on SMP && SYSFS
@@ -309,7 +375,10 @@ config RPS
 	help
 	  Software receive side packet steering (RPS) distributes the
 	  load of received packet processing across multiple CPUs.
+	  软件接收侧导流把收到报文的后续处理负载分散到多个 CPU，适用于硬件队列不足或需按流调度的场景。
 
+# RFS 在 RPS 的按流 CPU 选择之上，让支持 flow filter 的多队列网卡把规则下推硬件；CPU_RMAP
+# 提供反向队列映射。只有驱动显式实现相应 ndo 回调时，开启该项才产生硬件加速。
 config RFS_ACCEL
 	bool "Hardware acceleration of RFS"
 	depends on RPS
@@ -318,19 +387,25 @@ config RFS_ACCEL
 	help
 	  Allowing drivers for multiqueue hardware with flow filter tables to
 	  accelerate RFS.
+	  允许具备流过滤表的多队列网卡驱动加速 RFS，把软件选定的流—CPU/队列关系编程到硬件。
 
+# socket 接收队列映射是 XPS/RFS 等消费者选择的隐藏字段能力；单独打开没有用户可见行为。
 config SOCK_RX_QUEUE_MAPPING
 	bool
 
+# XPS 在 SMP 上按 CPU/接收队列选择发送队列，并要求 socket 保存接收队列映射以维持双向流局部性。
 config XPS
 	bool
 	depends on SMP
 	select SOCK_RX_QUEUE_MAPPING
 	default y
 
+# HWBM 是硬件 buffer manager 驱动使用的隐藏能力标签，由具体平台选择。
 config HWBM
 	bool
 
+# 这两个 cgroup 控制器都需 socket 携带 cgroup 元数据：NET_PRIO 按接口赋优先级，NET_CLASSID
+# 给 socket 标通用 classid，供 cls_cgroup 与 Netfilter 匹配。select 会带入共享 SOCK_CGROUP_DATA 布局。
 config CGROUP_NET_PRIO
 	bool "Network priority cgroup"
 	depends on CGROUPS
@@ -338,6 +413,7 @@ config CGROUP_NET_PRIO
 	help
 	  Cgroup subsystem for use in assigning processes to network priorities on
 	  a per-interface basis.
+	  该 cgroup 子系统按网络接口为进程流量分配网络优先级。
 
 config CGROUP_NET_CLASSID
 	bool "Network classid cgroup"
@@ -346,11 +422,16 @@ config CGROUP_NET_CLASSID
 	help
 	  Cgroup subsystem for use as general purpose socket classid marker that is
 	  being used in cls_cgroup and for netfilter matching.
+	  该 cgroup 子系统给 socket 设置通用 classid 标记，供 cls_cgroup 分类器和 Netfilter 规则匹配。
 
+# busy poll 允许进程在 socket 接收路径短时间轮询网卡以换取更低延迟。PREEMPT_RT 与 netconsole
+# 同时存在时默认关闭，避免实时/控制台约束与忙轮询热路径组合；该隐藏项仍可被依赖关系引用。
 config NET_RX_BUSY_POLL
 	bool
 	default y if !PREEMPT_RT || (PREEMPT_RT && !NETCONSOLE)
 
+# Byte Queue Limits 用动态队列上限约束驱动排队字节数，减轻 bufferbloat；SYSFS 提供观测/调节，
+# DQL 是其通用动态队列算法。默认 Y，但只有使用 BQL API 的驱动获得效果。
 config BQL
 	bool
 	prompt "Enable Byte Queue Limits"
@@ -358,6 +439,8 @@ config BQL
 	select DQL
 	default y
 
+# BPF stream parser 把 TCP 字节流按消息切分后交给 sockmap BPF；它依赖 INET、BPF syscall 与
+# cgroup BPF，并选择通用 stream parser 和 socket L7 消息框架。
 config BPF_STREAM_PARSER
 	bool "enable BPF STREAM_PARSER"
 	depends on INET
@@ -368,7 +451,10 @@ config BPF_STREAM_PARSER
 	help
 	  Enabling this allows a TCP stream parser to be used with
 	  BPF_MAP_TYPE_SOCKMAP.
+	  开启后，BPF_MAP_TYPE_SOCKMAP 可借助 TCP stream parser 识别应用层消息边界，再由 BPF 程序处理。
 
+# 当某 CPU 的接收 backlog 达上限必须丢包时，flow limit 优先惩罚明显高于平均负载的少数流，
+# 为其他活跃流保留容量；它建立在 RPS 的流哈希/CPU 分发信息之上。
 config NET_FLOW_LIMIT
 	bool "Net flow limit"
 	depends on RPS
@@ -380,9 +466,13 @@ config NET_FLOW_LIMIT
 	  maintain capacity for the other flows. This feature provides servers
 	  with many clients some protection against DoS by a single (spoofed)
 	  flow that greatly exceeds average workload.
+	  接收处理 CPU 的 backlog 达到 netdev_max_backlog 后本就必须丢包；若少数流贡献绝大多数负载，
+	  此机制会更早丢弃这些流，为其他流保留容量，从而降低单个真实或伪造源流造成 DoS 的影响。
 
 menu "Network testing"
 
+# pktgen 是主动发包压测器，会按配置速率从指定接口注入报文；需要 IPv4/INET 与 procfs 控制面。
+# 它能显著占用链路和 CPU，因此只应在隔离测试环境使用；选 M 时模块名为 pktgen。
 config NET_PKTGEN
 	tristate "Packet Generator (USE WITH CAUTION)"
 	depends on INET && PROC_FS
@@ -397,7 +487,11 @@ config NET_PKTGEN
 
 	  To compile this code as a module, choose M here: the
 	  module will be called pktgen.
+	  该模块按可配置速率从指定接口发送预配置报文，用于网卡压力测试和性能分析；不了解其影响时
+	  应选 N。操作文档见 Documentation/networking/pktgen.rst；选 M 生成 pktgen 模块。
 
+# legacy drop monitor 通过 netlink 广播网络栈丢包事件，服务旧 dropwatch 等工具；它依赖 INET
+# 和 tracepoint，但与基于 perf 的新丢包监控无关。没有旧用户态兼容需求时应选 N。
 config NET_DROP_MONITOR
 	tristate "Legacy network packet drop alerting service"
 	depends on INET && TRACEPOINTS
@@ -408,10 +502,14 @@ config NET_DROP_MONITOR
 	  process. This feature is NOT related to "perf" based drop monitoring.
 	  Say N here unless you need to support older userspace tools like
 	  "dropwatch".
+	  当网络栈丢弃报文时，此旧式服务通过 netlink 向所有监听进程广播告警；它不属于 perf 丢包
+	  监控。除非必须支持 dropwatch 等旧工具，否则选 N。
 
 endmenu # Network testing
+# 结束“网络测试”子菜单；测试项与下面的生产协议配置在界面上保持隔离。
 
 endmenu # Networking options
+# 结束通用“网络选项”菜单，但仍处于 NET 总条件内，所以下面的协议菜单依旧受 NET 控制。
 
 source "net/can/Kconfig"
 source "net/bluetooth/Kconfig"
@@ -420,9 +518,12 @@ source "net/kcm/Kconfig"
 source "net/strparser/Kconfig"
 source "net/mctp/Kconfig"
 
+# FIB_RULES 是策略路由等实现选择的隐藏能力位；在通用网络选项菜单结束后，CAN、Bluetooth、
+# RxRPC、KCM、流解析和 MCTP 仍处于 NET 总闸门内，但各自形成独立菜单。
 config FIB_RULES
 	bool
 
+# 无线总菜单在非 s390 平台默认开启；它只让 cfg80211/mac80211 选项可见，具体协议/驱动仍需另选。
 menuconfig WIRELESS
 	bool "Wireless"
 	depends on !S390
@@ -434,7 +535,10 @@ source "net/wireless/Kconfig"
 source "net/mac80211/Kconfig"
 
 endif # WIRELESS
+# 结束无线条件块；RFKill 等后续菜单可供无线之外的设备复用，故有意放在块外。
 
+# 这些 source 展开 RFKill、9P、Ceph、NFC、packet sample 与 IFE；它们不依赖 WIRELESS 条件块，
+# 因而 RFKill 等能力也可被非 802.11 驱动复用。
 source "net/rfkill/Kconfig"
 source "net/9p/Kconfig"
 source "net/ceph/Kconfig"
@@ -442,6 +546,7 @@ source "net/nfc/Kconfig"
 source "net/psample/Kconfig"
 source "net/ife/Kconfig"
 
+# 轻量隧道把封装状态挂在 FIB route/nexthop 上，不创建独立 net_device，适合 MPLS 等按路由动作。
 config LWTUNNEL
 	bool "Network light weight tunnels"
 	help
@@ -449,7 +554,10 @@ config LWTUNNEL
 	  tunnels like mpls. There is no netdevice associated with a light
 	  weight tunnel endpoint. Tunnel encapsulation parameters are stored
 	  with light weight tunnel state associated with fib routes.
+	  轻量隧道为 MPLS 等封装提供基础设施：端点没有对应 net_device，封装参数保存在与 FIB 路由
+	  关联的 lwtunnel state 中，因此生命周期随路由状态而不是虚拟网卡管理。
 
+# 在路由查找得到 nexthop 后执行 BPF 动作；必须同时有 lwtunnel 和 INET，lwtunnel 内建时默认开启。
 config LWTUNNEL_BPF
 	bool "Execute BPF program as route nexthop action"
 	depends on LWTUNNEL && INET
@@ -457,7 +565,10 @@ config LWTUNNEL_BPF
 	help
 	  Allows to run BPF programs as a nexthop action following a route
 	  lookup for incoming and outgoing packets.
+	  允许入站或出站报文完成路由查找后，把 BPF 程序作为下一跳动作执行。
 
+# 下列无 prompt 的 bool 是可复用核心组件能力：目的缓存、GRO cell、socket 发包验证和 802.1Q
+# helper 均由真实消费者 select；默认 n 可避免没有调用者时把死代码带入构建。
 config DST_CACHE
 	bool
 	default n
@@ -472,10 +583,13 @@ config SOCK_VALIDATE_XMIT
 config NET_IEEE8021Q_HELPERS
 	bool
 
+# 网络自测随 PHYLIB 的 y/m 形态默认启用，并要求 INET；def_tristate 会让测试与依赖保持可链接的三态。
 config NET_SELFTESTS
 	def_tristate PHYLIB
 	depends on PHYLIB && INET
 
+# NET_SOCK_MSG 为普通 TCP socket 或 TLS 等 ULP 提供由 BPF 处理 L7 数据的共享框架，是
+# BPF_STREAM_PARSER 等功能的隐藏依赖，单独默认关闭。
 config NET_SOCK_MSG
 	bool
 	default n
@@ -483,7 +597,10 @@ config NET_SOCK_MSG
 	  The NET_SOCK_MSG provides a framework for plain sockets (e.g. TCP) or
 	  ULPs (upper layer modules, e.g. TLS) to process L7 application data
 	  with the help of BPF programs.
+	  NET_SOCK_MSG 允许普通 socket（如 TCP）或上层模块 ULP（如 TLS）借助 BPF 程序处理七层应用数据。
 
+# NET_DEVLINK 与 PAGE_POOL 都是由驱动/子系统选择的隐藏公共能力。前者提供设备管理控制面，
+# 后者为接收路径提供可回收 page 池；不应把隐藏默认 n 误解为功能已废弃。
 config NET_DEVLINK
 	bool
 	default n
@@ -503,7 +620,11 @@ config PAGE_POOL_STATS
 	  the driver using the page pool supports exporting this data.
 
 	  If unsure, say N.
+	  开启后统计 page_pool 的页面分配与回收，但会增加热路径 CPU 成本及统计存储内存；只有使用
+	  page_pool 且实现导出的驱动才能提供这些数据。不确定时选 N。
 
+# 通用 failover 让半虚拟网卡注册主 netdev 与事件操作表，并把同 MAC 的 PCI VF 作为低延迟
+# 加速数据面；VF 拔除或虚机迁移时退回半虚拟路径，因此可同时获得直通性能与迁移能力。
 config FAILOVER
 	tristate "Generic failover module"
 	help
@@ -516,7 +637,12 @@ config FAILOVER
 	  VF as an accelerated low latency datapath. It also allows live
 	  migration of VMs with direct attached VFs by failing over to the
 	  paravirtual datapath when the VF is unplugged.
+	  该模块为半虚拟驱动提供统一接口，用于注册 failover netdev 与事件回调；同 MAC 的从属 PCI
+	  以太网设备发生注册、注销、链路或改名事件时调用这些回调。VF 可作为低延迟加速路径，拔除
+	  VF 时切回半虚拟路径，从而支持带直通 VF 的虚机在线迁移。
 
+# generic netlink 版 ethtool 控制面比传统 ioctl 更易扩展，并支持通知等新能力；DIMLIB 是其
+# 动态中断合并等实现依赖。默认 Y 不代表必须安装用户态 ethtool，但决定内核是否接受该接口。
 config ETHTOOL_NETLINK
 	bool "Netlink interface for ethtool"
 	select DIMLIB
@@ -525,7 +651,10 @@ config ETHTOOL_NETLINK
 	  An alternative userspace interface for ethtool based on generic
 	  netlink. It provides better extensibility and some new features,
 	  e.g. notification messages.
+	  这是基于 generic netlink 的 ethtool 替代用户接口，扩展性更好，并提供通知消息等新功能。
 
+# 两项 KUnit 配置只增加测试对象：前者验证 net_device 地址列表，后者覆盖 sk_buff 等网络核心设施。
+# KUNIT_ALL_TESTS 统一提供默认值；生产配置或不确定时应选 N。
 config NETDEV_ADDR_LIST_TEST
 	tristate "Unit tests for device address list"
 	default KUNIT_ALL_TESTS
@@ -539,5 +668,7 @@ config NET_TEST
 	  KUnit tests covering core networking infra, such as sk_buff.
 
 	  If unsure, say N.
+	  运行覆盖 sk_buff 等网络核心基础设施的 KUnit 测试；不确定时选 N。
 
 endif   # if NET
+# 该 endif 与开头的 if NET 配对：NET=n 时本文件中所有协议、网络测试和公共能力均不进入配置域。

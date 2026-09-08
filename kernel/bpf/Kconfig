@@ -1,6 +1,31 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+#
+# kernel/bpf 配置学习导读
+#
+# 本文件把 BPF 分成三层能力：隐藏的基础/架构能力位（BPF、HAVE_*、ARCH_WANT_*），
+# 用户可选的系统调用与执行后端（BPF_SYSCALL、BPF_JIT 及其策略），以及依赖这些
+# 基础设施的上层功能（preload、BPF_LSM）。典型构建关系是：
+#
+#   体系结构选择 HAVE_EBPF_JIT
+#          ↓
+#   用户选择 BPF_SYSCALL → 自动选择 BPF 和所需的 RCU/网络基础设施
+#          ↓
+#   可选 BPF_JIT → EXECMEM 提供可执行内存 → 架构 JIT 生成本机指令
+#          ↓
+#   tracing/LSM、map、link 与各种程序类型通过 bpf() FD ABI 对外工作
+#
+# Kconfig 的 select 是由当前选项强制打开目标能力，不会替目标检查 depends on；因此
+# 每个 select 都必须只指向在当前依赖条件下安全可用的底层设施。这里的隐藏 bool 没有
+# prompt，普通用户不能直接选择，只能由其他配置或体系结构 select。配置决定代码是否
+# 编入内核，sysctl 则只在已编入的能力范围内控制运行期策略，二者不能互相替代。
+#
+
 # BPF interpreter that, for example, classic socket filters depend on.
+# BPF 解释器是经典 socket filter 等调用者依赖的基础执行能力。
+#
+# BPF 是无用户提示的内部总开关。上层通过 select BPF 启用它；关闭时解释器和共享核心
+# 不进入构建。SHA-256 库用于 BPF 核心计算程序 tag 等稳定摘要，因此随基础能力一并选择。
 config BPF
 	bool
 	select CRYPTO_LIB_SHA256
@@ -8,22 +33,41 @@ config BPF
 # Used by archs to tell that they support BPF JIT compiler plus which
 # flavour. Only one of the two can be selected for a specific arch since
 # eBPF JIT supersedes the cBPF JIT.
+# 体系结构用下面两个隐藏能力位声明支持哪一种 BPF JIT。对同一体系结构只能选择一种：
+# eBPF JIT 能承接现代指令格式，并取代只面向经典 BPF 的旧 JIT。它们只陈述编译器后端
+# 是否存在，不代表运行时已经启用 JIT；真正的用户开关是后面的 BPF_JIT。
 
 # Classic BPF JIT (cBPF)
+# HAVE_CBPF_JIT 表示体系结构提供经典 BPF 本机码生成器；只能由体系结构 Kconfig 选择。
 config HAVE_CBPF_JIT
 	bool
 
 # Extended BPF JIT (eBPF)
+# HAVE_EBPF_JIT 表示体系结构提供 eBPF 本机码生成器；现代 BPF syscall/JIT 组合使用该能力。
 config HAVE_EBPF_JIT
 	bool
 
 # Used by archs to tell that they want the BPF JIT compiler enabled by
 # default for kernels that were compiled with BPF JIT support.
+# 体系结构用该隐藏策略位请求：只要内核编入了 JIT 支持，启动时就默认启用它。
+# 它不自行选择 BPF_JIT，也不保证存在 JIT 后端，只参与 BPF_JIT_DEFAULT_ON 的默认值计算。
 config ARCH_WANT_DEFAULT_BPF_JIT
 	bool
 
 menu "BPF subsystem"
 
+# BPF 子系统菜单集中展示可由内核配置者选择的 syscall、JIT、安全默认值和上层功能。
+# 菜单本身不产生代码；各条目的 depends on 决定它是否可见、select 决定启用后的构建闭包。
+
+#
+# BPF_SYSCALL - 建立现代 BPF 的用户空间控制面。
+#
+# 打开后，bpf() 系统调用可创建/装载程序与 map，并把内核对象包装成文件描述符；关闭后
+# 不存在这套 FD ABI，即使网络子系统因经典过滤器选择了基础 BPF，也不能靠 bpf() 管理
+# eBPF 对象。IRQ_WORK 支撑延后工作，Tasks RCU/Tasks Trace RCU 支撑程序、trampoline 等
+# 跨任务执行路径的安全更新，BINARY_PRINTF 支撑格式化 helper。NET=y 时才连带选择消息
+# 重定向、通用 ingress/egress 和 page-pool 设施，避免纯计算构建无条件拉入网络代码。
+# 默认 n 表示通用内核不会仅因进入此菜单就暴露系统调用；发行版或用户必须明确选择。
 config BPF_SYSCALL
 	bool "Enable bpf() system call"
 	select BPF
@@ -39,6 +83,15 @@ config BPF_SYSCALL
 	  Enable the bpf() system call that allows to manipulate BPF programs
 	  and maps via file descriptors.
 
+# 启用 bpf() 系统调用后，用户空间通过文件描述符操纵 BPF 程序和 map。FD 持有内核对象
+# 引用，关闭 FD、pin 到 bpffs 或被其他对象引用会共同决定其最终生命周期。
+
+#
+# BPF_JIT - 允许把 BPF 字节码编译为体系结构本机指令。
+#
+# 该选项要求基础 BPF 已启用，并且体系结构至少声明一种 JIT 后端。select EXECMEM 引入
+# 分配、写入后封闭并执行本机代码所需的可执行内存设施。编入 JIT 不等于每次装载都必然
+# 使用它：运行期 sysctl、程序类型、架构后端和加固策略仍可决定解释执行或 JIT 编译。
 config BPF_JIT
 	bool "Enable BPF Just In Time compiler"
 	depends on BPF
@@ -55,6 +108,16 @@ config BPF_JIT
 	  /proc/sys/net/core/bpf_jit_harden   (optional)
 	  /proc/sys/net/core/bpf_jit_kallsyms (optional)
 
+# BPF 程序通常可由解释器执行；启用本选项后，装载阶段可生成本机代码，换取更高执行速度，
+# 代价是增加架构后端和可执行内存攻击面。管理员通过上述 sysctl 控制启用、常量盲化加固
+# 和符号暴露；这些节点只调节已经编入的功能，不能在 CONFIG_BPF_JIT=n 时凭空增加后端。
+
+#
+# BPF_JIT_ALWAYS_ON - 将 eBPF JIT 变为不可撤销的唯一执行后端。
+#
+# 它同时要求 bpf() ABI、eBPF 架构 JIT 和总 JIT 开关，因而不会在只有 cBPF JIT 的平台
+# 出现。启用后编译期移除 BPF 解释器，并把运行期 bpf_jit_enable 固定为 1；这牺牲关闭
+# JIT 的诊断/回退能力，以避免解释器间接执行字节码可能形成的推测执行攻击面。
 config BPF_JIT_ALWAYS_ON
 	bool "Permanently enable BPF JIT and remove BPF interpreter"
 	depends on BPF_SYSCALL && HAVE_EBPF_JIT && BPF_JIT
@@ -66,10 +129,25 @@ config BPF_JIT_ALWAYS_ON
 	  is permanently set to 1 and setting any other value than that will
 	  return failure.
 
+# 本选项永久启用 JIT 并移除解释器，以避免解释器对 BPF 指令进行推测执行。启用后
+# bpf_jit_enable 永远为 1，向该 sysctl 写入其他值会失败；管理员不能在运行期退回解释器。
+
+#
+# BPF_JIT_DEFAULT_ON - 计算 JIT 的启动默认策略。
+#
+# def_bool 没有用户 prompt：体系结构请求默认启用或选择 ALWAYS_ON 时自动为 y，但仍受
+# HAVE_EBPF_JIT && BPF_JIT 限制。它只决定可变策略的初始值；除 ALWAYS_ON 外，管理员
+# 仍可通过 sysctl 调整运行时状态。
 config BPF_JIT_DEFAULT_ON
 	def_bool ARCH_WANT_DEFAULT_BPF_JIT || BPF_JIT_ALWAYS_ON
 	depends on HAVE_EBPF_JIT && BPF_JIT
 
+#
+# BPF_UNPRIV_DEFAULT_OFF - 选择非特权 bpf() 的安全启动默认值。
+#
+# 只有存在 BPF_SYSCALL 时该策略才有意义。默认 y 把 unprivileged_bpf_disabled 初始化为
+# 2：启动时禁用，但管理员仍可改为 0；写 1 则进入永久禁用状态，之后不能恢复为 0。
+# 这不会限制具备相应 capability 的特权调用者，也不等同于完全移除 bpf() 系统调用。
 config BPF_UNPRIV_DEFAULT_OFF
 	bool "Disable unprivileged BPF by default"
 	default y
@@ -87,8 +165,20 @@ config BPF_UNPRIV_DEFAULT_OFF
 
 	  If you are unsure how to answer this question, answer Y.
 
+# 默认关闭非特权 BPF 可降低未缓解硬件上利用推测执行侧信道的风险。状态 2 允许管理员
+# 稍后重新启用，状态 1 是不可逆的运行期封锁；不确定时选择 Y 是上游给出的安全建议。
+
+# preload 子菜单在同一 BPF 菜单中追加启动期预装机制；其具体依赖和用户模式驱动生命周期
+# 由 kernel/bpf/preload/Kconfig 定义，source 只是文本包含，不自动打开任何选项。
 source "kernel/bpf/preload/Kconfig"
 
+#
+# BPF_LSM - 允许 BPF 程序挂接 Linux Security Module hook。
+#
+# BPF_EVENTS 提供 tracing 附着基础，BPF_SYSCALL 提供程序/link 控制面，SECURITY 提供 LSM
+# 框架，BPF_JIT 则是该程序类型要求的执行后端；任一依赖关闭时条目不可选。成功启用只把
+# 插桩能力编入内核，具体策略仍须装载并附着 BPF LSM 程序，而且系统 LSM 顺序/策略继续
+# 决定这些 hook 是否参与最终访问控制。
 config BPF_LSM
 	bool "Enable BPF LSM Instrumentation"
 	depends on BPF_EVENTS
@@ -101,4 +191,8 @@ config BPF_LSM
 
 	  If you are unsure how to answer this question, answer N.
 
+# 该功能让 BPF 程序参与安全 hook，以实现动态强制访问控制或审计策略。它扩大了可编程
+# 安全面且需要配套策略，因此上游建议不确定时选 N；关闭时传统 LSM 行为不受影响。
+
 endmenu # "BPF subsystem"
+# 结束“BPF subsystem”菜单；以上隐藏架构能力仍位于菜单外，可供体系结构无条件声明。

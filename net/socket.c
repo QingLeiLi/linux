@@ -66,7 +66,17 @@
  *
  *	Based upon Swansea University Computer Society NET3.039
  */
+/*
+ * 这是 BSD socket 模型在 Linux 中的顶层接口，版本历史源自 1995 年的 NET3.039 实现。作者与修订
+ * 记录展示了本层职责如何形成：修正 NOTSOCK/BADF、shutdown、用户区校验与 datagram 重连；把
+ * 地址复制和通用检查上移到协议层之前；允许零长度发送并加入异步 I/O；socket 数量曾可配置、
+ * 动态分配，最终改为嵌入 inode；随后公开内核 socket 分配/释放、加入 sendmsg/recvmsg 和符号导出、
+ * 兼容 NET=n、系统调用锁、copy_from_user、send 到 sendto 的复用，以及协议无关的 listen backlog
+ * 校验。本轮在保留前述 TCP Echo 导读的基础上扩展到全文件，覆盖 sockfs、时间戳、ioctl、全部
+ * socket 系统调用、compat ABI、协议族注册和内核 socket API。
+ */
 
+/* 第一组头文件连接 BPF/ethtool、VFS/MM、socket ABI、中断/RCU、net_device 与 proc/seq 基础设施。 */
 #include <linux/bpf-cgroup.h>
 #include <linux/ethtool.h>
 #include <linux/mm.h>
@@ -80,6 +90,8 @@
 #include <linux/netdevice.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+
+/* 第二组提供锁、bridge/VLAN/PTP、初始化、poll、模块、高端内存、伪文件系统与 LSM 接口。 */
 #include <linux/mutex.h>
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
@@ -92,6 +104,8 @@
 #include <linux/mount.h>
 #include <linux/pseudo_fs.h>
 #include <linux/security.h>
+
+/* 第三组负责 iterator/系统调用 ABI、compat、模块自动加载、审计、命名空间、分配和 xattr。 */
 #include <linux/uio.h>
 #include <linux/syscalls.h>
 #include <linux/compat.h>
@@ -102,10 +116,13 @@
 #include <linux/magic.h>
 #include <linux/slab.h>
 #include <linux/xattr.h>
+
+/* nospec 与间接调用包装保护分派边界，io_uring/net.h 把 socket file 接到异步命令入口。 */
 #include <linux/nospec.h>
 #include <linux/indirect_call_wrapper.h>
 #include <linux/io_uring/net.h>
 
+/* uaccess/unistd 提供用户复制与 syscall 编号；net 头文件补 compat、无线 ioctl 与 cgroup 分类。 */
 #include <linux/uaccess.h>
 #include <asm/unistd.h>
 
@@ -113,6 +130,7 @@
 #include <net/wext.h>
 #include <net/cls_cgroup.h>
 
+/* sock.h 是通用协议 socket 底座，netfilter.h 提供包过滤初始化与相关接口。 */
 #include <net/sock.h>
 #include <linux/netfilter.h>
 
@@ -121,6 +139,8 @@
 #include <linux/route.h>
 #include <linux/termios.h>
 #include <linux/sockios.h>
+
+/* 最后一组覆盖 busy poll、错误队列/时间戳、PTP 设备时钟与 socket tracepoint。 */
 #include <net/busy_poll.h>
 #include <linux/errqueue.h>
 #include <linux/ptp_clock_kernel.h>
@@ -129,10 +149,15 @@
 #include "core/dev.h"
 
 #ifdef CONFIG_NET_RX_BUSY_POLL
+/* 两个只读居多的全局微秒预算分别控制 recv 路径和 poll/select 的默认 busy-loop 时长。 */
 unsigned int sysctl_net_busy_read __read_mostly;
 unsigned int sysctl_net_busy_poll __read_mostly;
 #endif
 
+/*
+ * VFS socket_file_ops 在定义前需要这些静态声明。read/write/splice 通过 msghdr/iterator 转入协议，
+ * mmap/poll/ioctl/fasync/close 则直接分派 socket->ops 或维护 file/socket 状态；声明本身不持有对象。
+ */
 static ssize_t sock_read_iter(struct kiocb *iocb, struct iov_iter *to);
 static ssize_t sock_write_iter(struct kiocb *iocb, struct iov_iter *from);
 static int sock_mmap(struct file *file, struct vm_area_struct *vma);
@@ -152,8 +177,19 @@ static ssize_t sock_splice_read(struct file *file, loff_t *ppos,
 static void sock_splice_eof(struct file *file);
 
 #ifdef CONFIG_PROC_FS
+/*
+ * sock_show_fdinfo() - 让协议向 /proc/<pid>/fdinfo 输出 socket 专属信息
+ *
+ * 业务背景：seq_file 遍历一个 socket file 时由 VFS 回调此包装；公共层先恢复 socket，再按协议
+ * 是否实现 show_fdinfo 决定输出，避免每个协议重复 file 类型转换。
+ * 入参：@m 是本次输出 seq_file；@f 是调用期间持有引用的 socket file，private_data 借用 socket。
+ * 出参/返回：无直接返回值；协议回调可向 m 追加文本，没有回调则不产生输出。
+ * 注意事项：READ_ONCE 取得一致 ops 指针；file 引用与 socket 的模块引用保证同步回调期间有效，
+ * 本函数不保存指针。CONFIG_PROC_FS=n 时同名宏为 NULL，不生成函数。
+ */
 static void sock_show_fdinfo(struct seq_file *m, struct file *f)
 {
+	/* 两个局部指针均为借用：sock 由 file 固定，ops 的 owner 引用由 socket 生命周期固定。 */
 	struct socket *sock = f->private_data;
 	const struct proto_ops *ops = READ_ONCE(sock->ops);
 
@@ -161,6 +197,7 @@ static void sock_show_fdinfo(struct seq_file *m, struct file *f)
 		ops->show_fdinfo(m, sock);
 }
 #else
+/* 无 procfs 时操作表填 NULL，VFS 不会尝试输出 fdinfo，避免保留不可达代码。 */
 #define sock_show_fdinfo NULL
 #endif
 
@@ -168,7 +205,15 @@ static void sock_show_fdinfo(struct seq_file *m, struct file *f)
  *	Socket files have a set of 'special' operations as well as the generic file ones. These don't appear
  *	in the operation structures but are done directly via the socketcall() multiplexor.
  */
+/*
+ * socket file 除通用 file 操作外还有由旧 socketcall() 多路系统调用直接处理的专用动作，因此并非
+ * 每个 socket ABI 都出现在此表。该常驻表是 file 类型判据：sock_from_file() 以地址相等确认 socket。
+ */
 
+/*
+ * socket_file_ops 把 read/write/poll/ioctl/mmap/close/fasync/splice/io_uring/fdinfo 映射到本文件
+ * 包装；THIS_MODULE 固定本实现，file->private_data 在 sock_alloc_file() 发布前已指向 socket。
+ */
 static const struct file_operations socket_file_ops = {
 	.owner =	THIS_MODULE,
 	.read_iter =	sock_read_iter,
@@ -188,6 +233,10 @@ static const struct file_operations socket_file_ops = {
 	.show_fdinfo =	sock_show_fdinfo,
 };
 
+/*
+ * 地址族编号到日志名称的稀疏常驻表；下标与 PF_* ABI 号一致，指定初始化器避免枚举增删造成错位。
+ * 字符串只用于协议族注册/注销诊断，不决定实际分派，也不拥有 net_proto_family 对象。
+ */
 static const char * const pf_family_names[] = {
 	[PF_UNSPEC]	= "PF_UNSPEC",
 	[PF_UNIX]	= "PF_UNIX/PF_LOCAL",
@@ -240,7 +289,12 @@ static const char * const pf_family_names[] = {
 /*
  *	The protocol list. Each protocol is registered in here.
  */
+/* 每个地址族实现都注册到此表；数组负责索引和发布，不接管协议操作表内存。 */
 
+/*
+ * writer 用 net_family_lock 串行同一 family 的注册/注销；reader 在 RCU 临界区查表，再取得 owner
+ * 模块引用后才离开 RCU。__read_mostly 降低热读缓存干扰，__rcu 要求使用相应访问原语。
+ */
 static DEFINE_SPINLOCK(net_family_lock);
 static const struct net_proto_family __rcu *net_families[NPROTO] __read_mostly;
 
@@ -249,6 +303,7 @@ static const struct net_proto_family __rcu *net_families[NPROTO] __read_mostly;
  * Move socket addresses back and forth across the kernel/user
  * divide and look after the messy bits.
  */
+/* 以下辅助函数跨越 user/kernel 地址边界，集中执行长度上限、fault 与审计，协议回调只接收内核地址。 */
 
 /**
  *	move_addr_to_kernel	-	copy a socket address into kernel space
@@ -260,15 +315,25 @@ static const struct net_proto_family __rcu *net_families[NPROTO] __read_mostly;
  *	too long an error code of -EINVAL is returned. If the copy gives
  *	invalid addresses -EFAULT is returned. On a success 0 is returned.
  */
+/*
+ * 将 socket 地址从用户空间复制到内核：@uaddr 是只读用户指针，@ulen 是字节数且必须位于
+ * 0..sizeof(sockaddr_storage)，@kaddr 是调用者拥有的输出缓存。长度非法返回 -EINVAL，用户内存
+ * 不可读返回 -EFAULT，审计拒绝/失败返回 audit_sockaddr() 的负 errno，成功返回 0。零长度成功且
+ * 不访问两个地址对象；函数可因用户缺页而睡眠，返回后协议只能借用 kaddr，ownership 不转移。
+ */
 
 int move_addr_to_kernel(void __user *uaddr, int ulen, struct sockaddr_storage *kaddr)
 {
+	/* 先验证长度，保证随后 copy_from_user 永不越过固定输出对象。 */
 	if (ulen < 0 || ulen > sizeof(struct sockaddr_storage))
 		return -EINVAL;
+	/* 某些无地址调用合法传 0；不要无意义地触碰可能为空的用户指针。 */
 	if (ulen == 0)
 		return 0;
+	/* copy_from_user 返回未复制字节数，本层统一转换为 socket ABI 的 -EFAULT。 */
 	if (copy_from_user(kaddr, uaddr, ulen))
 		return -EFAULT;
+	/* 审计在协议消费前观察稳定内核副本；其错误直接阻止后续 bind/connect/send。 */
 	return audit_sockaddr(ulen, kaddr);
 }
 
@@ -288,14 +353,29 @@ int move_addr_to_kernel(void __user *uaddr, int ulen, struct sockaddr_storage *k
  *	length of the data is written over the length limit the user
  *	specified. Zero is returned for a success.
  */
+/*
+ * move_addr_to_user() - 按用户容量返回真实 socket 地址及实际长度
+ *
+ * 业务背景：accept/getname/recvfrom 先让协议填内核 sockaddr，再由本函数遵守 value-result 长度 ABI
+ * 复制给用户，避免协议直接访问可变用户指针。
+ * 入参：@kaddr 是已初始化的内核地址借用指针；@klen 是真实字节数且不得超过 storage；@uaddr 是
+ * 用户输出缓存；@ulen 是输入输出 int 指针，进入值为容量，成功时改写为未截断真实长度。
+ * 出参/返回：成功 0；用户容量为负返回 -EINVAL；地址或长度不可访问返回 -EFAULT；审计复制准备
+ * 失败返回 -ENOMEM。地址最多复制 min(容量, klen)，但长度槽始终报告 klen。
+ * 注意事项：会访问用户页并可睡眠；scoped_user_rw_access_size 配对打开/关闭 unsafe uaccess 区域，
+ * kaddr/用户缓存 ownership 均不改变。
+ */
 
 static int move_addr_to_user(struct sockaddr_storage *kaddr, int klen,
 			     void __user *uaddr, int __user *ulen)
 {
+	/* len 保存用户提供容量，并在截断后成为本次实际复制字节数。 */
 	int len;
 
+	/* 协议若报告超过公共容器的长度属于内核错误，不应以普通用户 errno 掩盖。 */
 	BUG_ON(klen > sizeof(struct sockaddr_storage));
 
+	/* 单个受控 uaccess 作用域先读容量、计算截断长度，再把真实长度写回，任一步 fault 都统一跳转。 */
 	scoped_user_rw_access_size(ulen, 4, efault_end) {
 		unsafe_get_user(len, ulen, efault_end);
 
@@ -305,11 +385,13 @@ static int move_addr_to_user(struct sockaddr_storage *kaddr, int klen,
 		 *      "fromlen shall refer to the value before truncation.."
 		 *                      1003.1g
 		 */
+		/* POSIX 要求 fromlen 报告截断前真实长度，因此写回 klen，而不是将要复制的 len。 */
 		if (len >= 0)
 			unsafe_put_user(klen, ulen, efault_end);
 	}
 
 	if (len) {
+		/* 负容量此前没有写回长度；此处优先按 ABI 报 -EINVAL。 */
 		if (len < 0)
 			return -EINVAL;
 		if (audit_sockaddr(klen, kaddr))
@@ -317,29 +399,53 @@ static int move_addr_to_user(struct sockaddr_storage *kaddr, int klen,
 		if (copy_to_user(uaddr, kaddr, len))
 			return -EFAULT;
 	}
+	/* len==0 仍已成功把真实长度写回；只是用户明确不给地址数据空间。 */
 	return 0;
 
 efault_end:
+	/* 长度指针读或写 fault 时，调用者不能依赖任何部分用户输出。 */
 	return -EFAULT;
 }
 
+/* 启动期创建的 sockfs_inode SLAB；发布后只读，实例由 VFS alloc/free_inode 回调成对管理。 */
 static struct kmem_cache *sock_inode_cachep __ro_after_init;
 
+/* user.* xattr 值的共享对象缓存；链表节点归各 sockfs_inode，缓存本身与 sockfs 同寿命。 */
 static struct simple_xattr_cache sockfs_xa_cache;
 
+/*
+ * 一个 sockfs inode 的完整宿主：xattrs/limits 管 user.* 扩展属性配额，匿名 struct socket_alloc
+ * 同时内嵌 struct socket 与 vfs_inode，使 file、inode、socket 共享一次分配和一致生命周期。
+ */
 struct sockfs_inode {
 	struct list_head xattrs;
 	struct simple_xattr_limits xattr_limits;
 	struct socket_alloc;
 };
 
+/*
+ * SOCKFS_I() - 从内嵌 VFS inode 恢复 sockfs 宿主对象
+ * 业务背景：VFS 回调只传 inode，本层需访问同次分配中的 socket/xattr；container_of 不做查找。
+ * 入参：@inode 是有效 sockfs inode 的借用指针，不可为空且不能来自其他文件系统。
+ * 出参/返回：返回同一对象的借用 sockfs_inode 指针，不增加引用、无失败类别。
+ * 注意事项：调用者原有 inode 引用/锁继续决定生命周期；函数不加锁、不睡眠。
+ */
 static struct sockfs_inode *SOCKFS_I(struct inode *inode)
 {
 	return container_of(inode, struct sockfs_inode, vfs_inode);
 }
 
+/*
+ * sock_alloc_inode() - 为 sockfs 分配并初始化 inode/socket 联合对象
+ * 业务背景：new_inode_pseudo() 经 super_operations 调用它，构造尚未发布的空 socket 容器。
+ * 入参：@sb 是 sockfs superblock 的借用指针，供分配记账，不转移引用。
+ * 出参/返回：成功返回内嵌 inode，分配失败返回 NULL；VFS 最终经 sock_free_inode() 归还对象。
+ * 注意事项：GFP_KERNEL 可睡眠；返回时 xattr 链、等待队列和 socket 空状态完整，但协议 ops/sk/file
+ * 仍为空，必须由后续 __sock_create()/sock_alloc_file() 分阶段发布。
+ */
 static struct inode *sock_alloc_inode(struct super_block *sb)
 {
+	/* si 是本函数新取得的唯一对象；返回 inode 后所有权转给 VFS。 */
 	struct sockfs_inode *si;
 
 	si = alloc_inode_sb(sb, sock_inode_cachep, GFP_KERNEL);
@@ -348,10 +454,12 @@ static struct inode *sock_alloc_inode(struct super_block *sb)
 	INIT_LIST_HEAD_RCU(&si->xattrs);
 	simple_xattr_limits_init(&si->xattr_limits);
 
+	/* 阶段 2：异步通知等待队列先就绪，协议稍后即可安全挂接 wait/fasync 用户。 */
 	init_waitqueue_head(&si->socket.wq.wait);
 	si->socket.wq.fasync_list = NULL;
 	si->socket.wq.flags = 0;
 
+	/* 阶段 3：建立未连接、无协议、无 file 的明确初态，失败释放路径可据 NULL 判定资源层次。 */
 	si->socket.state = SS_UNCONNECTED;
 	si->socket.flags = 0;
 	si->socket.ops = NULL;
@@ -361,6 +469,13 @@ static struct inode *sock_alloc_inode(struct super_block *sb)
 	return &si->vfs_inode;
 }
 
+/*
+ * sock_evict_inode() - 在 inode 逐出时释放其动态 xattr 并清理 VFS inode 状态
+ * 业务背景：最后引用消失后 VFS 先 evict 内容、后调用 free_inode 归还承载内存。
+ * 入参：@inode 是仍有效且已不可被新查找获得的 sockfs inode，ownership 仍归 VFS。
+ * 出参/返回：无；释放全部 simple_xattr 值并 clear_inode，不释放 si 本体。
+ * 注意事项：与 user xattr 操作的同步由 VFS inode 生命周期/锁保证；可释放内存并可能进入回收路径。
+ */
 static void sock_evict_inode(struct inode *inode)
 {
 	struct sockfs_inode *si = SOCKFS_I(inode);
@@ -369,6 +484,13 @@ static void sock_evict_inode(struct inode *inode)
 	clear_inode(inode);
 }
 
+/*
+ * sock_free_inode() - 把已逐出的 sockfs_inode 本体归还专用 SLAB
+ * 业务背景：这是 sock_alloc_inode() 的最终释放端，执行时 socket、xattr 与 VFS 内容均已解除。
+ * 入参：@inode 是最后一次借用，必须来自 sock_inode_cachep 且已完成 evict。
+ * 出参/返回：无；调用后 inode/si 内存失效。
+ * 注意事项：不得在此重复释放协议 sock 或 xattr；这些更早由 close/evict 路径负责。
+ */
 static void sock_free_inode(struct inode *inode)
 {
 	struct sockfs_inode *si = SOCKFS_I(inode);
@@ -376,6 +498,13 @@ static void sock_free_inode(struct inode *inode)
 	kmem_cache_free(sock_inode_cachep, si);
 }
 
+/*
+ * init_once() - 为每个新 SLAB 对象执行可复用的 VFS inode 一次性构造
+ * 业务背景：kmem_cache_create() 注册该 ctor，分配对象时先建立 inode 内部锁/链表基础状态。
+ * 入参：@foo 是缓存提供的未类型化 sockfs_inode 存储，不可为空，ownership 留在 SLAB。
+ * 出参/返回：无；只初始化 vfs_inode，socket/xattr 的每次分配状态由 sock_alloc_inode() 重置。
+ * 注意事项：ctor 上下文不能依赖已存在的 socket 协议状态，也不能保存外部引用。
+ */
 static void init_once(void *foo)
 {
 	struct sockfs_inode *si = (struct sockfs_inode *)foo;
