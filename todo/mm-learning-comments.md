@@ -12,7 +12,7 @@
 
 ## 进度
 
-- [~] 当前文件：`mm/workingset.c`
+- [~] 当前文件：`mm/execmem.c`
 
 ## 固定顺序
 
@@ -132,6 +132,25 @@
 - [x] `mm/memfd_luo.c`：372/183/0.492/10；仅新增 228 行注释；12 个函数/回调的四段式契约、memfd-v2 packed ABI、folio pin/preserve/freeze、dirty+uptodate 数据不变量、page-cache/memcg/inode/LRU 恢复及分层失败清理已覆盖，第 17 章验收、diff/checkpatch 通过。
 - [x] `mm/show_mem.c`：375/156/0.416/10；仅新增 184 行注释；9 个函数/配置实现的四段式契约、MemAvailable 保守估算、NUMA/cpuset/zone 过滤、全局/节点/zone 统计口径、buddy 锁内快照与非阻塞分配画像已覆盖，第 17 章验收、diff/checkpatch 通过。
 - [x] `mm/damon/paddr.c`：382/219/0.573/10；仅新增 271 行注释；19 个函数的四段式契约、物理地址单位换算、young/idle 采样、probe/memcg 过滤、folio 去重、回收/LRU/NUMA 动作与操作表注册已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/workingset.c`：382/258/0.675/10；相对筛选基线仅新增 337 行注释；14 个具名函数及 CONFIG_LRU_GEN 双实现的四段式契约、shadow 位域/时间戳精度、传统 LRU 与 MGLRU refault、memcg/RCU 生命周期、纯 shadow XArray 节点 shrinker 锁序及初始化回滚已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/numa_emulation.c`：384/172/0.448/10；仅新增 222 行注释；13 个函数及两套 CPU-map 配置实现的四段式契约、候选 meminfo 构造与提交、洞/DMA32 尾段、固定/均分/交错切分、PXM/距离表重建和 CPU 热插拔映射已覆盖，第 17 章验收、diff/checkpatch 通过。
+- [x] `mm/kasan/init.c`：385/173/0.449/10；仅新增 230 行注释；24 个条件编译后函数实现的四段式契约、early/zero shadow 共享页表、slab 前后分配、逐级建表与拆表、静态表身份保护、热插拔回滚及低层 errno 不传播边界已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
+- [x] `mm/kasan/common.c`：398/221/0.555/10；仅新增 304 行注释；36 个函数的四段式契约、page/slab/kmalloc/mempool/vmalloc poison 生命周期、tag 选择、track 快照、quarantine ownership、KFENCE/RCU/抽样分支与 KASAN 深度下溢计数已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
+- [x] `mm/kasan/generic.c`：404/188/0.465/10；仅新增 264 行注释；Generic shadow 编码与固定/变长访问检查、编译器 `__asan_*` ABI、alloca/global redzone、cache metadata 布局回退、quarantine cache 清理和 alloc/free/aux track 生命周期已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
+- [x] `mm/kasan/shadow.c`：410/156/0.380/10；仅新增 220 行注释；26 个函数和 vmalloc 批次上下文的四段式契约、mem* 编译器 ABI、shadow 毒码/tag、hotplug notifier、vmalloc 并发建表与延迟拆表、跨 CPU 发布屏障及模块 shadow 回收已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
+- [x] `mm/vma.h`：416/170/0.409/10；仅新增 218 行注释；VMA 准备/munmap/merge/unmap 描述符、Maple Tree 游标包装、split/merge 只准备不提交属性、文件/anon_vma ownership、页表释放边界、MMU/64 位配置桩与 MDWE W^X 判定已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
+- [x] `mm/mempool.c`：436/130/0.298/10；仅新增 190 行注释；预留元素 ownership、curr_nr/min_nr 锁内不变量、SLUB/KASAN poison、零最小池、resize 并发发布、alloc/free 屏障、waitqueue 保底分配及 slab/kmalloc/page 后端配对已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
+- [x] `mm/readahead.c`：440/115/0.261/10；仅新增 149 行注释；同步/异步窗口推断、BDI 上限、large-folio order 对齐与回退、page cache folio 锁/引用交接、invalidate_lock+NOFS、aops 领取/清理边界、PSI、系统调用校验和窗口双向扩展已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
+
+本轮十文件进度（5/10）：`vma.h` 已按修改后完整文件顺序复读；全部结构/字段组、枚举、宏、声明与内联实现，以及非豁免英文注释均有紧邻中文学习说明。相对基线新增 218 行、删除 0 行；密度 `416/170/0.409/10`，`git diff --check` 与 `checkpatch --strict --ignore LONG_LINE_COMMENT` 为 0 errors、0 warnings、0 checks。仓库无 `.config`，未执行目标编译。
+
+本轮十文件进度（6/10）：`mempool.c` 已按修改后完整文件顺序完成第 17 章强制验收；33 个函数/配置桩、故障注入状态、全部非豁免英文注释、普通分配→预留池→等待重试、归还回填/底层释放、resize 竞态和屏障协议均已复读。相对基线新增 190 行、删除 0 行；密度 `436/130/0.298/10`，diff/checkpatch 为 0 errors、0 warnings、0 checks。仓库无 `.config`，未执行目标编译。
+
+本轮十文件进度（7/10）：`readahead.c` 已按修改后完整文件顺序完成第 17 章强制验收；17 个函数/系统调用、窗口状态、全部非豁免英文注释、同步/异步触发、large-folio 对齐降级、folio 发布/领取/移除、EOF/拥塞/冲突和部分扩展均已复读。相对基线新增 149 行、删除 0 行；密度 `440/115/0.261/10`，diff/checkpatch 为 0 errors、0 warnings、0 checks。仓库无 `.config`，未执行目标编译。
+
+本轮十文件进度（1/10）：`workingset.c` 已按修改后完整文件顺序完成第 17 章强制验收；函数/实体、全部非豁免英文注释、传统与 MGLRU 快慢路径、shadow 发布与回收、RCU/引用/锁序及失败出口均已复读。相对基线新增 337 行、删除 0 行，新增非空行仅为注释；密度 `382/258/0.675/10`，`git diff --check` 与 `checkpatch --strict --ignore LONG_LINE_COMMENT` 均为 0 errors、0 warnings、0 checks。仓库无 `.config`，未执行目标编译。
+
+本轮十文件进度（2/10）：`numa_emulation.c` 已按修改后完整文件顺序完成第 17 章强制验收；全部函数、全局映射、命令行三种模式、成功提交/失败回退、物理洞与尾段、距离矩阵及两套 CPU mask 配置实现均已复读，所有非豁免英文注释均有紧邻完整译注。相对基线新增 222 行、删除 0 行，新增非空行仅为注释；密度 `384/172/0.448/10`，diff/checkpatch 为 0 errors、0 warnings、0 checks。仓库无 `.config`，未执行目标编译。
 
 本轮五文件聚合验收：`kmsan/core.c`、`damon/reclaim.c`、`debug.c`、`pgtable-generic.c`、`page_isolation.c` 合计新增 772 行注释与空行、删除 0 行；新增非空行全部位于注释，原代码、预处理行及上游注释文本/顺序/缩进未改。密度门禁依次为 `291/116/0.399/9`、`292/125/0.428/9`、`297/94/0.316/10`、`299/139/0.465/9`、`307/127/0.414/10`，均通过；聚合 `git diff --check` 及 `checkpatch --strict --ignore LONG_LINE_COMMENT` 为 0 errors、0 warnings、0 checks。仓库无 `.config`，未执行目标编译。
 
