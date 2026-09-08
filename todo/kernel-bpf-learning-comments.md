@@ -40,12 +40,12 @@
 - [x] `kernel/bpf/cnum.c`
 - [x] `kernel/bpf/range_tree.h`
 - [x] `kernel/bpf/range_tree.c`
-- [~] `kernel/bpf/cfg.c`
-- [ ] `kernel/bpf/states.c`
-- [ ] `kernel/bpf/liveness.c`
-- [ ] `kernel/bpf/backtrack.c`
-- [ ] `kernel/bpf/const_fold.c`
-- [ ] `kernel/bpf/fixups.c`
+- [x] `kernel/bpf/cfg.c`
+- [x] `kernel/bpf/states.c`
+- [x] `kernel/bpf/liveness.c`
+- [x] `kernel/bpf/backtrack.c`
+- [x] `kernel/bpf/const_fold.c`
+- [~] `kernel/bpf/fixups.c`
 - [ ] `kernel/bpf/disasm.h`
 - [ ] `kernel/bpf/disasm.c`
 - [ ] `kernel/bpf/log.c`
@@ -313,6 +313,148 @@
 
 ### `kernel/bpf/cfg.c`
 
-- 状态：首次建图中。
-- 目标：解释验证器子程序 CFG 的基本块切分、边建立、DFS/拓扑/支配关系、不可达与环路拒绝、
-  exception callback 约束及所有临时图对象的分配回滚。
+- 状态：全文件完成；已按方法论第 17 章完成强制验收。
+- 文件职责与函数清单：完整复读最终 1211 行。20 个函数定义 20/20 均有紧邻专属契约；覆盖三类
+  子程序副作用标记与调用图合并、DFS 边推进、调用/普通跳转/gotox/隐藏退出分派、跳转表分配/读取/
+  排序/合并/边界验证、整图结构检查、逐子程序后序和 Tarjan 强连通分量。两个枚举的 DFS 颜色、
+  边进度和驱动返回态逐项说明；宏、柔性数组、错误指针、显式栈及重要局部变量均已登记。
+- 英文注释与路径验收：SPDX/版权和论文题名豁免；非递归 DFS 伪代码、callee 属性稳定条件、map
+  查询保证、gotox 表筛选限制、异常退出、回调/迭代器收敛、后序切片、Tarjan 不变量与递归伪代码等
+  英文说明均逐字保留并有紧邻中文翻译与机制补充。仅凭注释可复述主入口/异常入口 DFS、树边/回边/
+  交叉边分类、ldimm64 第二槽禁跳、跳转表发布、后序“后继先于前驱”以及 SCC 根的判定与弹栈。
+- 并发/生命周期与抽查：验证线程独占 env，本文件无锁/RCU；局部 DFS/后序/Tarjan 工作数组由当前
+  函数持有并在失败或完成时释放，jt/postorder/scc_info 成功后转交 env 统一销毁。抽查
+  `visit_insn()` 可按指令类别恢复全部后继和检查点副作用；抽查 `bpf_check_cfg()` 可恢复两根 DFS、
+  不可达与 ldimm64 检查及统一回滚；抽查 `bpf_compute_scc()` 可用 pre/low/活动栈推导多顶点、自环和
+  隐式回调循环编号，且能指出 scc_info 分配失败后 aux.scc 非事务性写入由整体验证失败兜底。
+- 关联读取：`include/linux/bpf_verifier.h` 中 `bpf_verifier_env.cfg`、`bpf_subprog_info`、
+  `bpf_insn_aux_data.jt/scc` 及 `bpf_iarray`（确认字段 ownership 与消费者，现有学习注释部分覆盖）；
+  `kernel/bpf/verifier.c` 中 CFG 三入口调用和环境清理（确认调用顺序与最终释放，学习注释缺失，已列入
+  后序）；`kernel/bpf/liveness.c` 的 `bpf_insn_successors()`（确认后继表的借用/复用语义，学习注释缺失，
+  紧接后序）；`kernel/bpf/bpf_insn_array.c` 的 `insn_array_lookup_elem()`/init（确认 array map 槽位与
+  xlated_off 稳定条件，学习注释缺失，已列入后序）。目录外头文件建议另立任务补足公开数据结构契约。
+- 修改安全：本轮新增 98 行、删除 0 行，原代码和原注释零改动；密度门禁
+  `code=559, comments=563, chinese=254, density=0.454, max_gap=10` 通过；`git diff --check` 通过，
+  增量 checkpatch 为 0 errors/52 个中文 UTF-8 视觉行宽 warnings。宿主 GNU Make 3.81 低于源码要求
+  4.0，且工作树无可用 `.config`，未执行目标对象构建；纯注释追加不改变预处理结果。
+
+### `kernel/bpf/states.c`
+
+- 状态：全文件完成；已按方法论第 17 章完成强制验收。
+- 文件职责与函数清单：完整复读最终 2090 行。37 个函数定义 37/37 及 2 个内部前置声明均有紧邻
+  专属契约；覆盖状态父链和延迟释放、SCC callchain/visit/backedge、ID 重命名、死值清洗、寄存器/
+  栈/出栈参数/引用安全包含、精度固定点、循环候选和状态缓存主入口。`exact_level` 三种模式、静态
+  `unbound_reg`、ID scratch、各类栈槽和关键统计字段均已登记。
+- 英文注释与路径验收：SPDX/版权豁免；父状态容器、SCC 进入/退出、ID 映射、标量链接、死半槽、
+  类型严格性、包指针 range、栈包含、迭代器 depth、推测状态、精度传播以及主入口各启发式说明均
+  原样保留并有紧邻中文翻译与机制补充。仅凭注释可复述“清死值→扫描缓存→区分未完成循环与已
+  完成安全状态→回灌精度/SCC 回边→淘汰低收益状态→保存新检查点”的完整主线。
+- 并发/生命周期与抽查：验证线程独占 env，无运行期锁/RCU；explored/free 节点以 branches 和未完成
+  SCC 标记延迟释放，visit 按 callchain 隔离 parent 链寿命，backedge 登记后转移 ownership，固定点
+  完成或 free_states() 统一释放。抽查 `regsafe()` 可按标量、内存/包/栈/arena/insn 指针恢复安全
+  包含方向和 ID 约束；抽查 `stacksafe()` 可恢复 POISON 归一化、半槽合成和特殊资源槽比较；抽查
+  `bpf_is_state_visited()` 可恢复普通死循环、iterator/may_goto/callback 收敛及缓存发布/回滚；抽查
+  `propagate_backedges()` 可恢复 64 轮上限和保守精度退化。审计还记录当前 `scc_visit_lookup()` 在
+  NULL 检查前形成 `info->visits` 成员地址的源码前提，未在注释任务中擅改代码。
+- 关联读取：`include/linux/bpf_verifier.h` 的 ID/SCC/环境字段（确认容量、柔性数组和所有权）；
+  `kernel/bpf/verifier.c` 的 prune-point 调用、路径退出、`bpf_free_backedges()` 与 `free_states()`（确认
+  发布和最终回收）；`kernel/bpf/liveness.c` 的 live-stack 查询（确认跨帧查询输入，紧接后序）；
+  `kernel/bpf/backtrack.c` 的 `bpf_mark_chain_precision()`（确认当前状态精度可延后、parent 才是持久
+  传播目标，紧接后序）。目录外头文件仍建议另立任务补足公开结构契约。
+- 修改安全：最终新增 491 行、删除 0 行，原代码和原英文注释零改动；密度门禁
+  `code=910, comments=1034, chinese=387, density=0.425, max_gap=10` 通过；`git diff --check` 通过，
+  增量 checkpatch 为 0 errors/202 个中文 UTF-8 视觉行宽 warnings。宿主 GNU Make 3.81 低于源码要求
+  4.0，且工作树无可用 `.config`，未执行目标对象构建；纯注释追加不改变预处理结果。
+
+### `kernel/bpf/liveness.c`
+
+- 状态：全文件完成；已按方法论第 17 章完成强制验收。
+- 文件职责与函数清单：完整复读最终 3083 行。63 个函数定义 63/63 均有紧邻专属契约；覆盖函数实例
+  建模、逐帧活跃栈位图、指令后继/固定点、跨子程序参数反向追踪、实例合并，以及逐指令活跃寄存器
+  发布。`per_frame_masks`、`func_instance`、`live_stack_query`、`bpf_liveness`、`arg_track` 联合体及其
+  状态枚举、`subprog_at_info`、`insn_live_regs`、容量宏和关键工作数组均已登记。
+- 英文注释与路径验收：SPDX/版权豁免；实例散列、相对指令号、栈位读写、后继枚举、参数偏移集合、
+  spill/fill、回调子程序、固定点和活跃寄存器等英文说明均逐字保留并有紧邻中文翻译与机制补充。
+  仅凭注释可复述“建立调用实例→反向传播栈需求→计算子程序参数摘要→合并等价实例→正向发布栈
+  活跃区间→反向发布寄存器活跃集”的主线；并注明上游旧英文中的 `live_regs` 在当前结构实际对应
+  `live_regs_before`，避免照抄过时字段名。
+- 并发/生命周期与抽查：验证线程独占 env，无运行期锁/RCU；临时状态、参数追踪数组和偏移集合由
+  当前分析持有并沿错误路径释放，成功实例挂入 `env->liveness`，最终由 `bpf_stack_liveness_free()`
+  统一回收，查询对象只借用位图。初学者抽查 `arg_track_xfer()` 可按 load/store/ALU/call 恢复“本条
+  指令怎样把出口需求搬回入口”；开发者抽查可推导不精确状态的保守合并、重叠 spill 清除和偏移溢出
+  退化。抽查 `compute_subprog_args()` 可复述参数摘要固定点，并推导递归调用实例、回调入口及失败回滚；
+  抽查 `analyze_subprog()` 可复述后序遍历和逐帧位图传播，并推导等价实例合并的单调性；另抽查
+  `bpf_compute_live_registers()` 可恢复反向数据流、调用 clobber 与 `live_regs_before` 的发布边界。
+- 关联读取：`kernel/bpf/states.c` 的 `__clean_func_state()`/`clean_verifier_state()`（确认栈位查询和
+  `live_regs_before` 消费者，现有学习注释充分）；`kernel/bpf/cfg.c` 的 `bpf_insn_successors()` 相关
+  gotox/后序语义（现有学习注释充分）；`kernel/bpf/verifier.c` 的 CFG→活跃性→`do_check` 调用顺序、
+  helper/kfunc 栈访问和清理路径（契约已核对，学习注释缺失，已列入后序）；
+  `include/linux/bpf_verifier.h` 的活跃寄存器、调用栈和 CFG 字段（部分覆盖，目录外建议另立任务补足）。
+- 修改安全：最终新增 787 行、删除 0 行，原代码和原英文注释零改动；密度门禁
+  `code=1736, comments=1124, chinese=632, density=0.364, max_gap=10` 通过；`git diff --check` 通过，
+  增量 checkpatch 为 0 errors/325 个中文 UTF-8 视觉行宽 warnings。全文件 checkpatch 的 3 errors/
+  1 warning 分别来自原有同一行 `case` 语句和 `kvzalloc(sizeof(*f))`，均可在 HEAD 原文定位。本机
+  GNU Make 3.81 低于源码要求 4.0，且无 `.config`，目标对象构建不可用；纯注释追加不改变编译结果。
+
+### `kernel/bpf/backtrack.c`
+
+- 状态：全文件完成；已按方法论第 17 章完成强制验收。
+- 文件职责与函数清单：完整复读最终 1148 行。26 个函数定义 26/26 均有紧邻专属契约；覆盖跳转历史
+  追加/合并、真实前驱恢复、逐帧寄存器/普通栈/出栈参数位图、日志格式化、单指令反向传递、全标精确
+  兜底及 parent 状态链主循环。`verbose` 宏、`backtrack_state` 三类位图的本文件用法、history 字段、
+  指令解码字段、槽号/帧号和临时 bitmap 均已登记。
+- 英文注释与路径验收：SPDX/版权豁免；跳转历史循环边界、逐指令回溯、标量精度算法、跨帧示例、
+  当前状态无需 precise 的长篇论证、状态剪枝路径无关性及保守兜底说明均逐字保留并有紧邻中文翻译与
+  机制补充。仅凭注释可复述“精度使用点置需求→沿真实历史逆行→在 MOV/ALU/load/store/call/exit
+  转移位图→跨 parent 提交 precise→定义点清空或全标兜底”的完整主线；旧注释所称 spi 入参在当前
+  接口实际由调用者预置 `env->bt`，已在入口契约澄清。
+- 并发/生命周期与抽查：验证线程独占 env，无运行期锁/RCU；`jmp_history` 由 state 持有，krealloc
+  失败保留旧指针，`hist` 只借用；`env->bt` 是不分配内存的可复用工作区，成功时需求清空，未支持
+  指令走全标精确并 reset，致命一致性错误交由验证失败清理。初学者抽查 `backtrack_insn()` 可按
+  指令类型复述出口需求怎样变成入口需求；开发者抽查可推导 linked_regs 两次同步、栈比较 flags、
+  静态/全局子程序与同步回调的不同帧语义。抽查 `bpf_mark_chain_precision()` 可复述双层“状态链×真实
+  指令路径”循环，并推导当前短命状态不置 precise、父检查点固定点和全局入口边界；抽查
+  `bpf_mark_all_scalars_precise()` 可说明为何跳过当前状态、覆盖全部父帧且只处理标量/spill。
+- 关联读取：`include/linux/bpf_verifier.h` 的 `backtrack_state`、三类置位/查询助手和公开原型（确认
+  位宽、帧容量与 env 内嵌 ownership，学习注释缺失，目录外建议另立任务）；`kernel/bpf/verifier.c` 的
+  `bpf_bt_sync_linked_regs()`、精度触发点、栈访问/条件分支 history 生产者（确认等价寄存器和 flags
+  语义，学习注释缺失，已列入后序）；`kernel/bpf/states.c` 的 `propagate_precision()`（确认批量预置
+  env->bt 及 changed 消费，现有学习注释充分）。
+- 修改安全：最终新增 164 行、删除 0 行，原代码和原英文注释零改动；密度门禁
+  `code=583, comments=491, chinese=138, density=0.237, max_gap=10` 通过；`git diff --check` 通过，
+  增量 checkpatch 为 0 errors/114 个中文 UTF-8 视觉行宽 warnings。全文件 checkpatch 的 1 error/
+  2 warnings 来自 HEAD 原有续行空格缩进、return 后 else 和字符串换行前空格。本机 GNU Make 3.81
+  低于源码要求 4.0，且无 `.config`，目标对象构建不可用；纯注释追加不改变编译结果。
+
+### `kernel/bpf/const_fold.c`
+
+- 状态：全文件完成；已按方法论第 17 章完成强制验收。
+- 文件职责与函数清单：完整复读最终 503 行。10 个函数定义 10/10 均有紧邻专属契约；覆盖常量格
+  判定、单指令传递、后继汇合、逆后序固定点、条件求值和死分支改写。`const_arg_state` 六个枚举项、
+  `const_arg_info` 三字段、三类 aux 掩码、二维工作矩阵、入口/出口快照及 CFG 后继均已登记。
+- 英文注释与路径验收：SPDX/版权豁免；文件级前向分析说明、枚举逐项语义、transfer/join、清零初态、
+  子程序入口、32 位发布限制、分支改写目的及 JMP32 两段有序映射均逐字保留并有紧邻中文翻译与机制
+  补充。仅凭注释可复述“入口设 UNKNOWN→逆后序传递/汇合到固定点→发布 R0-R9 常量/逻辑指针→
+  恒真/恒假分支改写→CFG 后序重算”的主线。
+- 并发/生命周期与抽查：验证线程独占 env；只读 map 必须同时满足程序侧只读、冻结且无活动写者，
+  才由 direct-read 借用稳定 value 内容，无额外锁/RCU。`ci_in` 由计算入口分配并在发布按值副本后释放；
+  prune 改写程序指令并在有变化时先释放旧 postorder，重算失败由整体验证失败清理且不局部回滚。
+  初学者抽查 `const_reg_xfer()` 可按 MOV/ADD/SUB/AND/LD/LDX/call/atomic 复述定义和 clobber；开发者
+  抽查可推导 map-value 直接读取的不可变前提、ALU32 零扩展及 UNKNOWN 保守性。抽查
+  `bpf_compute_const_regs()` 可复述逆后序固定点，并推导格的单调收敛及多子程序入口；抽查
+  `bpf_prune_dead_branches()` 可复述恒真/恒假 offset，推导 may_goto 豁免、JMP32 有符号归一化和 CFG
+  ownership 更新。
+- 关联读取：`kernel/bpf/verifier.c` 的 `bpf_map_is_rdonly()`/`bpf_map_direct_read()`、helper/kfunc 栈
+  大小消费者、`do_check` 常量一致性断言和顶层 pass 顺序（确认冻结/无并发写前提及 aux 消费，学习
+  注释缺失，已列入后序）；`kernel/bpf/liveness.c` 的回调函数指针消费者（现有学习注释充分）；
+  `kernel/bpf/cfg.c` 的后继/后序生产者（现有学习注释充分）；`include/linux/bpf_verifier.h` 的三个
+  mask 与十项 vals 契约（英文契约充分但中文缺失，目录外建议另立任务）。
+- 修改安全：最终新增 99 行、删除 0 行，原代码和原英文注释零改动；密度门禁
+  `code=337, comments=135, chinese=87, density=0.258, max_gap=10` 通过；`git diff --check` 通过，
+  增量 checkpatch 为 0 errors/49 个中文 UTF-8 视觉行宽 warnings。全文件 checkpatch 的 4 errors 均
+  来自 HEAD 原有 switch 同行语句。本机 GNU Make 3.81 低于源码要求 4.0，且无 `.config`，目标对象
+  构建不可用；纯注释部分不改变编译结果，分支改写代码保持原样。
+
+### `kernel/bpf/fixups.c`
+
+- 状态：首次建图中；当前仅切换唯一目标，尚未声称完成。

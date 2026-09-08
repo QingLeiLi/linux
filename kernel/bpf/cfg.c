@@ -237,6 +237,7 @@ static int visit_func_call_insn(int t, struct bpf_insn *insns,
 	int ret, insn_sz;
 	int w;
 
+	/* 先建调用返回后的顺序边；若压入该后继，本轮立即交还外层 DFS。 */
 	insn_sz = bpf_is_ldimm64(&insns[t]) ? 2 : 1;
 	ret = push_insn(t, t + insn_sz, FALLTHROUGH, env);
 	if (ret)
@@ -385,15 +386,18 @@ static struct bpf_iarray *jt_from_map(struct bpf_map *map)
 	int err;
 	int n;
 
+	/* 阶段 1：按 map 最大槽数取得本函数独占的输出对象。 */
 	jt = bpf_iarray_realloc(NULL, map->max_entries);
 	if (!jt)
 		return ERR_PTR(-ENOMEM);
 
+	/* 阶段 2：读取并去重；错误或空表都不能形成 gotox 的合法后继集合。 */
 	n = bpf_copy_insn_array_uniq(map, 0, map->max_entries - 1, jt->items);
 	if (n < 0) {
 		err = n;
 		goto err_free;
 	}
+	/* 复制成功但没有目标同样违反 gotox 契约；非空时才收缩逻辑计数并交付。 */
 	if (n == 0) {
 		err = -EINVAL;
 		goto err_free;
@@ -402,6 +406,7 @@ static struct bpf_iarray *jt_from_map(struct bpf_map *map)
 	return jt;
 
 err_free:
+	/* 失败时 jt 尚未发布，仍由本函数释放，并把具体 errno 编码进错误指针。 */
 	kvfree(jt);
 	return ERR_PTR(err);
 }
@@ -459,9 +464,11 @@ static struct bpf_iarray *jt_from_subprog(struct bpf_verifier_env *env,
 			memcpy(jt->items + old_cnt, jt_cur->items, jt_cur->cnt << 2);
 		}
 
+		/* 当前 map 的临时表无论是否被选中都已复制完，可在进入下一轮前释放。 */
 		kvfree(jt_cur);
 	}
 
+	/* 阶段 3：没有任何候选属于子程序时拒绝；否则对跨 map 重复目标再去重。 */
 	if (!jt) {
 		verbose(env, "no jump tables found for subprog starting at %u\n", subprog_start);
 		return ERR_PTR(-EINVAL);
@@ -486,6 +493,7 @@ create_jt(int t, struct bpf_verifier_env *env)
 	struct bpf_iarray *jt;
 	int i;
 
+	/* 先用包含 t 的 subprog 及其哨兵后一项取得精确的左闭右开边界。 */
 	subprog = bpf_find_containing_subprog(env, t);
 	subprog_start = subprog->start;
 	subprog_end = (subprog + 1)->start;
@@ -526,6 +534,7 @@ static int visit_gotox_insn(int t, struct bpf_verifier_env *env)
 	struct bpf_iarray *jt;
 	int i, w;
 
+	/* 阶段 1：首次访问才构表；写入 aux 是所有权发布点，后续访问只借用缓存。 */
 	jt = env->insn_aux_data[t].jt;
 	if (!jt) {
 		jt = create_jt(t, env);
@@ -535,6 +544,7 @@ static int visit_gotox_insn(int t, struct bpf_verifier_env *env)
 		env->insn_aux_data[t].jt = jt;
 	}
 
+	/* 阶段 2：逐个目标验证、标记并把尚未发现者加入显式 DFS 栈。 */
 	mark_prune_point(env, t);
 	for (i = 0; i < jt->cnt; i++) {
 		w = jt->items[i];
@@ -581,13 +591,16 @@ static int visit_abnormal_return_insn(struct bpf_verifier_env *env, int t)
 	struct bpf_subprog_info *subprog;
 	struct bpf_iarray *jt;
 
+	/* 已有缓存表示隐藏出口已经建立，直接保持幂等。 */
 	if (env->insn_aux_data[t].jt)
 		return 0;
 
+	/* 分配完成前不改变 env；失败可直接返回，不需要额外回滚。 */
 	jt = bpf_iarray_realloc(NULL, 2);
 	if (!jt)
 		return -ENOMEM;
 
+	/* 填完两个后继后一次性发布指针，避免消费者看见半初始化表。 */
 	subprog = bpf_find_containing_subprog(env, t);
 	jt->items[0] = t + 1;
 	jt->items[1] = subprog->exit_idx;
@@ -622,6 +635,7 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 
 	/* All non-branch instructions have a single fall-through edge. */
 	/* 中文：非跳转指令通常只有顺序后继；ld_abs/ld_ind 还附带隐藏失败出口。 */
+	/* 此阶段先识别隐藏退出，再把完整指令宽度后的地址作为普通后继。 */
 	if (BPF_CLASS(insn->code) != BPF_JMP &&
 	    BPF_CLASS(insn->code) != BPF_JMP32) {
 		if (BPF_CLASS(insn->code) == BPF_LD &&
@@ -631,6 +645,7 @@ static int visit_insn(int t, struct bpf_verifier_env *env)
 			if (ret)
 				return ret;
 		}
+		/* ldimm64 跨两个槽，普通指令跨一个槽；宽度决定唯一的顺序目标。 */
 		insn_sz = bpf_is_ldimm64(insn) ? 2 : 1;
 		return push_insn(t, t + insn_sz, FALLTHROUGH, env);
 	}
@@ -785,6 +800,7 @@ int bpf_check_cfg(struct bpf_verifier_env *env)
 	int *insn_stack, *insn_state;
 	int ex_insn_beg, i, ret = 0;
 
+	/* 阶段 1：颜色和显式栈都挂入 env，第二项失败时先撤销第一项。 */
 	insn_state = env->cfg.insn_state = kvzalloc_objs(int, insn_cnt,
 							 GFP_KERNEL_ACCOUNT);
 	if (!insn_state)
@@ -797,6 +813,7 @@ int bpf_check_cfg(struct bpf_verifier_env *env)
 		return -ENOMEM;
 	}
 
+	/* 阶段 2：确定可选的第二根，再初始化主入口；两棵 DFS 树共享颜色数组。 */
 	ex_insn_beg = env->exception_callback_subprog
 		      ? env->subprog_info[env->exception_callback_subprog].start
 		      : 0;
@@ -812,6 +829,7 @@ walk_cfg:
 		int t = insn_stack[env->cfg.cur_stack - 1];
 
 		ret = visit_insn(t, env);
+		/* 三态返回把“弹栈、继续下钻、失败回滚”明确交给唯一的外层驱动。 */
 		switch (ret) {
 		case DONE_EXPLORING:
 			/* 顶点所有边已推进，染黑并弹出显式 DFS 栈。 */
@@ -830,6 +848,7 @@ walk_cfg:
 		}
 	}
 
+	/* 阶段 3：主树或异常树结束后检查栈不变量，并按需启动尚未访问的第二根。 */
 	if (env->cfg.cur_stack < 0) {
 		verifier_bug(env, "pop stack internal bug");
 		ret = -EFAULT;
@@ -882,12 +901,30 @@ err_free:
  * [env->subprog_info[i].postorder_start, env->subprog_info[i+1].postorder_start)
  * with indices of 'i' instructions in postorder.
  */
+/*
+ * 中文：对每个子程序 i，把该子程序的指令按 DFS 后序写入 insn_postorder；
+ * postorder_start[i] 到 postorder_start[i+1] 的左闭右开区间就是 i 的切片。
+ *
+ * 业务背景：后续反向数据流需要保证“后继先于前驱”被处理，本函数在 CFG 已经
+ * 合法且后继表完整之后，为每个子程序生成这种稳定遍历顺序。
+ * 入参：env 是本次验证环境，借用其中的程序、子程序边界和指令后继表；函数
+ * 不取得 env 的所有权，要求所有 CFG 目标均已由 bpf_check_cfg() 验证在范围内。
+ * 出参/返回：成功返回 0，把新分配的 postorder 发布到 env->cfg.insn_postorder，
+ * 并写入各子程序边界及 cur_postorder；任一工作数组分配失败返回 -ENOMEM，
+ * env 中原有 CFG 持久字段不变。
+ * 注意事项：三个临时数组仅在本函数内持有并可睡眠分配，所有出口均释放 stack
+ * 和 state；postorder 成功后转交 env 的统一清理路径。验证过程串行，不需加锁。
+ */
 int bpf_compute_postorder(struct bpf_verifier_env *env)
 {
 	u32 cur_postorder, i, top, stack_sz, s;
 	int *stack = NULL, *postorder = NULL, *state = NULL;
 	struct bpf_iarray *succ;
 
+	/*
+	 * 阶段 1：按最大指令数准备结果、颜色和显式 DFS 栈。任一失败时结果尚未
+	 * 发布，三个局部指针仍归本函数，可在同一分支完整回滚。
+	 */
 	postorder = kvzalloc_objs(int, env->prog->len, GFP_KERNEL_ACCOUNT);
 	state = kvzalloc_objs(int, env->prog->len, GFP_KERNEL_ACCOUNT);
 	stack = kvzalloc_objs(int, env->prog->len, GFP_KERNEL_ACCOUNT);
@@ -897,12 +934,17 @@ int bpf_compute_postorder(struct bpf_verifier_env *env)
 		kvfree(stack);
 		return -ENOMEM;
 	}
+	/*
+	 * 阶段 2：逐个子程序独立设根。state 跨子程序保留，合法 CFG 不允许普通
+	 * 控制流跨越子程序；每个顶点第二次到达栈顶时，其后继均已处理，才写后序。
+	 */
 	cur_postorder = 0;
 	for (i = 0; i < env->subprog_cnt; i++) {
 		env->subprog_info[i].postorder_start = cur_postorder;
 		stack[0] = env->subprog_info[i].start;
 		stack_sz = 1;
 		do {
+			/* 首次见 top 时压入未见后继；再次见到时输出 top 并弹栈。 */
 			top = stack[stack_sz - 1];
 			state[top] |= DISCOVERED;
 			if (state[top] & EXPLORED) {
@@ -910,6 +952,7 @@ int bpf_compute_postorder(struct bpf_verifier_env *env)
 				stack_sz--;
 				continue;
 			}
+			/* 后继只在全局未见时压栈；已发现项会由其现有 DFS 路径负责完成。 */
 			succ = bpf_insn_successors(env, top);
 			for (s = 0; s < succ->cnt; ++s) {
 				if (!state[succ->items[s]]) {
@@ -920,6 +963,10 @@ int bpf_compute_postorder(struct bpf_verifier_env *env)
 			state[top] |= EXPLORED;
 		} while (stack_sz);
 	}
+	/*
+	 * 阶段 3：哨兵子程序项保存最后一个切片的右边界；至此结果完整，随后把
+	 * postorder 所有权转交 env，再释放只服务于构造过程的栈和颜色数组。
+	 */
 	env->subprog_info[i].postorder_start = cur_postorder;
 	env->cfg.insn_postorder = postorder;
 	env->cfg.cur_postorder = cur_postorder;
@@ -935,6 +982,21 @@ int bpf_compute_postorder(struct bpf_verifier_env *env)
  * assign it SCC number of zero.
  * Uses a non-recursive adaptation of Tarjan's algorithm for SCC computation.
  */
+/*
+ * 中文：在 CFG 上计算强连通分量，并把编号写入每条指令的 aux.scc。只有一个
+ * 顶点、没有自环且不调用回调的分量保持编号 0；其余分量代表显式或隐式循环。
+ * 实现采用 Tarjan 算法的非递归改写，避免验证大程序时消耗内核调用栈。
+ *
+ * 业务背景：验证器需要知道哪些指令处在同一循环中，才能限定状态传播与收敛；
+ * 本函数在 CFG 后继表建立后运行，并为后续分析分配按 SCC 编号索引的元数据。
+ * 入参：env 是验证环境的借用指针；prog、insn_aux_data 和所有 successor 表必须
+ * 已完整且在本函数期间稳定。
+ * 出参/返回：成功返回 0，更新非平凡分量的 aux[*].scc，并发布 scc_info/scc_cnt；
+ * 分配四个工作数组或 scc_info 失败返回 -ENOMEM。scc_info 失败前已经写入的
+ * aux.scc 不回滚，但验证流程会整体失败并统一销毁 env，调用者不得继续分析。
+ * 注意事项：工作数组由本函数持有并在 exit 统一释放；GFP_KERNEL_ACCOUNT 可
+ * 睡眠。验证线程独占 env，无锁；NOT_ON_STACK 必须大于所有有效 preorder 值。
+ */
 int bpf_compute_scc(struct bpf_verifier_env *env)
 {
 	const u32 NOT_ON_STACK = U32_MAX;
@@ -946,9 +1008,11 @@ int bpf_compute_scc(struct bpf_verifier_env *env)
 	u32 i, j, t, w;
 	u32 next_preorder_num;
 	u32 next_scc_id;
+	/* assign_scc 是当前根是否代表真实循环；succ 是借用的只读后继集合。 */
 	bool assign_scc;
 	struct bpf_iarray *succ;
 
+	/* preorder 和 SCC 编号从 1 开始，使清零分配出的 0 同时表达“未访问/非循环”。 */
 	next_preorder_num = 1;
 	next_scc_id = 1;
 	/*
@@ -957,6 +1021,13 @@ int bpf_compute_scc(struct bpf_verifier_env *env)
 	 * - 'low[t] == n' => smallest preorder number of the vertex reachable from 't' is 'n';
 	 * - 'dfs' DFS traversal stack, used to emulate explicit recursion.
 	 */
+	/*
+	 * 中文变量地图：stack 保存尚未归入最终分量的活动顶点；pre 是首次发现次序；
+	 * low 是从该顶点可达且仍在活动栈上的最小次序；dfs 保存显式递归帧。
+	 * pre==0 表示未访问，low==NOT_ON_STACK 表示已经弹出。两个 next_* 分别产生
+	 * 从 1 开始的访问序号和分量编号，0 因而可保留给非循环单点。
+	 */
+	/* 阶段 1：一次取得四个等长工作区；部分成功也统一走 exit 逆序释放。 */
 	stack = kvcalloc(insn_cnt, sizeof(int), GFP_KERNEL_ACCOUNT);
 	pre = kvcalloc(insn_cnt, sizeof(int), GFP_KERNEL_ACCOUNT);
 	low = kvcalloc(insn_cnt, sizeof(int), GFP_KERNEL_ACCOUNT);
@@ -1038,6 +1109,19 @@ int bpf_compute_scc(struct bpf_verifier_env *env)
 	 *
 	 * Below implementation replaces explicit recursion with array 'dfs'.
 	 */
+	/*
+	 * 中文算法说明：文献 [1] 给出经典 Tarjan DFS，[2] 给出这里采用的等价简化。
+	 * 活动栈保持如下不变量：若较晚发现的 u 能到达较早发现且仍活动的 v，u 在 v
+	 * 弹出前也必须留在栈中。因此 low[v] 小于 pre[v] 表示 v 能回到更早祖先；
+	 * 两者相等则 v 是一个强连通分量的根，可以连续弹出直到 v。
+	 *
+	 * 伪代码中每个新顶点先设置 pre/low 并压入 stack，再递归访问所有后继。
+	 * 对未访问后继先递归；随后总用后继 low 收紧当前 low。已弹出的后继把 low
+	 * 置为 NOT_ON_STACK，故 min 自动无效，这让“树边返回”和“栈内边”能共用
+	 * 一条更新语句。最后从 stack 弹出分量成员、写相同 scc 编号并递增编号。
+	 * 当前实现用 dfs 数组和 dfs_continue 标签模拟递归调用/返回，语义与之相同。
+	 */
+	/* 阶段 2：从每个尚未访问的顶点启动一棵 DFS 树，覆盖所有 CFG 分量。 */
 	for (i = 0; i < insn_cnt; i++) {
 		if (pre[i])
 			continue;
@@ -1045,6 +1129,7 @@ int bpf_compute_scc(struct bpf_verifier_env *env)
 		dfs_sz = 1;
 		dfs[0] = i;
 dfs_continue:
+		/* dfs 顶部是当前递归帧；首次进入时分配序号并加入活动分量栈。 */
 		while (dfs_sz) {
 			w = dfs[dfs_sz - 1];
 			if (pre[w] == 0) {
@@ -1054,6 +1139,7 @@ dfs_continue:
 				stack[stack_sz++] = w;
 			}
 			/* Visit 'w' successors */
+			/* 中文：逐个访问 w 的后继；遇到新顶点便压入 dfs 并立即下钻。 */
 			succ = bpf_insn_successors(env, w);
 			for (j = 0; j < succ->cnt; ++j) {
 				if (pre[succ->items[j]]) {
@@ -1067,6 +1153,7 @@ dfs_continue:
 			 * Preserve the invariant: if some vertex above in the stack
 			 * is reachable from 'w', keep 'w' on the stack.
 			 */
+			/* 中文：若 w 能回到更早活动顶点，它还不是分量根，只弹出 DFS 帧。 */
 			if (low[w] < pre[w]) {
 				dfs_sz--;
 				goto dfs_continue;
@@ -1075,6 +1162,10 @@ dfs_continue:
 			 * Assign SCC number only if component has two or more elements,
 			 * or if component has a self reference, or if instruction is a
 			 * callback calling function (implicit loop).
+			 */
+			/*
+			 * 中文：仅多顶点、自环或回调调用点构成需要跟踪的循环分量；普通单点
+			 * 保持 scc=0。回调虽没有显式 CFG 回边，验证模型会反复返回调用点。
 			 */
 			assign_scc = stack[stack_sz - 1] != w;	/* two or more elements? */
 			for (j = 0; j < succ->cnt; ++j) {	/* self reference? */
@@ -1086,6 +1177,7 @@ dfs_continue:
 			if (bpf_calls_callback(env, w)) /* implicit loop? */
 				assign_scc = true;
 			/* Pop component elements from stack */
+			/* 中文：从活动栈连续摘出直到根 w；成员共享编号，之后不再参与 low 收紧。 */
 			do {
 				t = stack[--stack_sz];
 				low[t] = NOT_ON_STACK;
@@ -1094,9 +1186,14 @@ dfs_continue:
 			} while (t != w);
 			if (assign_scc)
 				next_scc_id++;
+			/* 当前显式递归帧已完成；父帧将用更新后的 low 值继续扫描。 */
 			dfs_sz--;
 		}
 	}
+	/*
+	 * 阶段 3：编号确定后分配消费者元数据并发布计数。编号 0 也占一个槽；若此处
+	 * 失败，保留 aux 写入但返回错误，调用者必须放弃整个验证环境。
+	 */
 	env->scc_info = kvzalloc_objs(*env->scc_info, next_scc_id,
 				      GFP_KERNEL_ACCOUNT);
 	if (!env->scc_info) {
@@ -1105,6 +1202,7 @@ dfs_continue:
 	}
 	env->scc_cnt = next_scc_id;
 exit:
+	/* 成功和任意分配失败均在此释放本函数持有的四个临时数组。 */
 	kvfree(stack);
 	kvfree(pre);
 	kvfree(low);
