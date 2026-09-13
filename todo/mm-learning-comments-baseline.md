@@ -128,11 +128,11 @@
 |118|x|mm/list_lru.c|548|207|0.378|10|
 |119|x|mm/kmsan/kmsan_test.c|556|297|0.534|10|
 |120|x|mm/mlock.c|564|229|0.406|10|
-|121||mm/memory-tiers.c|602|0|0.000|602|
-|122||mm/hmm.c|603|0|0.000|603|
-|123||mm/kfence/kfence_test.c|610|0|0.000|610|
-|124||mm/sparse-vmemmap.c|616|0|0.000|616|
-|125||mm/mmu_notifier.c|648|0|0.000|648|
+|121|x|mm/memory-tiers.c|602|187|0.311|10|
+|122|x|mm/hmm.c|603|139|0.231|10|
+|123|x|mm/kfence/kfence_test.c|612|198|0.324|10|
+|124|x|mm/sparse-vmemmap.c|616|142|0.231|10|
+|125|x|mm/mmu_notifier.c|648|154|0.238|10|
 |126||mm/swap_state.c|649|0|0.000|649|
 |127||mm/pagewalk.c|661|0|0.000|661|
 |128||mm/swap.c|682|0|0.000|682|

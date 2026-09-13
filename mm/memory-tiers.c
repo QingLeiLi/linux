@@ -215,27 +215,33 @@ static void memory_tier_device_release(struct device *dev)
 static ssize_t nodelist_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
 {
+	/* attr 是 DEVICE_ATTR_RO 自动传入的描述符，本属性不需读取它。 */
 	int ret;
 	nodemask_t nmask;
 
 	mutex_lock(&memory_tier_lock);
+	/* 锁覆盖从 device→tier 转换到 mask 格式化的整个快照，避免节点列表半更新。 */
 	nmask = get_memtier_nodemask(to_memory_tier(dev));
 	ret = sysfs_emit(buf, "%*pbl\n", nodemask_pr_args(&nmask));
+	/* emit 完成时 mask 仍是栈上按值快照；解锁后不再访问 tier 成员链。 */
 	mutex_unlock(&memory_tier_lock);
 	return ret;
 }
 static DEVICE_ATTR_RO(nodelist);
 
+/* 属性数组以 NULL 终止；device core 借用这些静态对象直到 bus 注销。 */
 static struct attribute *memtier_dev_attrs[] = {
 	&dev_attr_nodelist.attr,
 	NULL
 };
 
 static const struct attribute_group memtier_dev_group = {
+	/* 一个 group 使 nodelist 随 tier device 原子发布与撤销。 */
 	.attrs = memtier_dev_attrs,
 };
 
 static const struct attribute_group *memtier_dev_groups[] = {
+	/* groups 数组同样以 NULL 终止，供 device_register() 遍历。 */
 	&memtier_dev_group,
 	NULL
 };
@@ -249,6 +255,7 @@ static const struct attribute_group *memtier_dev_groups[] = {
  */
 static struct memory_tier *find_create_memory_tier(struct memory_dev_type *memtype)
 {
+	/* 局部 adistance 会先向下取整；同一 chunk 的 type 必须共享一个 sysfs tier。 */
 	int ret;
 	bool found_slot = false;
 	struct memory_tier *memtier, *new_memtier;
@@ -264,6 +271,7 @@ static struct memory_tier *find_create_memory_tier(struct memory_dev_type *memty
 	 */
 	/* 原注释译注：memtype 已属于某 tier 时直接返回；找不到同距离层即报内部错误。 */
 	if (!list_empty(&memtype->tier_sibling)) {
+		/* 已链接对象不得重复 list_add；此分支也校验其 tier 没有被意外销毁。 */
 		list_for_each_entry(memtier, &memory_tiers, list) {
 			if (adistance == memtier->adistance_start)
 				return memtier;
@@ -273,6 +281,7 @@ static struct memory_tier *find_create_memory_tier(struct memory_dev_type *memty
 	}
 
 	list_for_each_entry(memtier, &memory_tiers, list) {
+		/* 有序链保证第一个更大的起点就是新 tier 的插入位置。 */
 		if (adistance == memtier->adistance_start) {
 			goto link_memtype;
 		} else if (adistance < memtier->adistance_start) {
@@ -287,6 +296,7 @@ static struct memory_tier *find_create_memory_tier(struct memory_dev_type *memty
 		return ERR_PTR(-ENOMEM);
 
 	new_memtier->adistance_start = adistance;
+	/* 两条链都先自环初始化，错误退出时仅需撤全局 list 节点。 */
 	INIT_LIST_HEAD(&new_memtier->list);
 	INIT_LIST_HEAD(&new_memtier->memory_types);
 	if (found_slot)
@@ -325,6 +335,7 @@ static struct memory_tier *__node_get_memory_tier(int node)
 	pg_data_t *pgdat;
 
 	pgdat = NODE_DATA(node);
+	/* NULL pgdat 表示无效或尚未建立的 nid，调用者把它当无 tier。 */
 	if (!pgdat)
 		return NULL;
 	/*
@@ -363,6 +374,7 @@ bool node_is_toptier(int node)
 		goto out;
 	}
 	if (memtier->adistance_start <= top_tier_adistance)
+		/* 小距离代表更快层；边界值仍属于可提升终点。 */
 		toptier = true;
 	else
 		toptier = false;
@@ -452,6 +464,7 @@ int next_demotion_node(int node, const nodemask_t *allowed_mask)
 	 */
 	/* 原注释译注：多个首选目标随机选择，避免共享轮转游标的 cache ping-pong。 */
 	if (!nodes_empty(mask))
+		/* 随机选择只在 RCU 读取后的本地 mask 上操作，不写共享 preferred。 */
 		return node_random(&mask);
 
 	/*
@@ -460,15 +473,18 @@ int next_demotion_node(int node, const nodemask_t *allowed_mask)
 	 * closest demotion target.
 	 */
 	nodes_complement(mask, *allowed_mask);
+	/* find_next_best_node 把补集当“已使用”集合，因而只会从 allowed 中选择。 */
 	return find_next_best_node(node, &mask);
 }
 
 static void disable_all_demotion_targets(void)
 {
+	/* 写侧先清 preferred 与 fallback，再以 grace period 切断旧图和新图的混合观察。 */
 	struct memory_tier *memtier;
 	int node;
 
 	for_each_node_state(node, N_MEMORY) {
+		/* node_demotion 数组按 nid 固定索引，节点无 memory 时无需写入。 */
 		node_demotion[node].preferred = NODE_MASK_NONE;
 		/*
 		 * We are holding memory_tier_lock, it is safe
@@ -489,6 +505,7 @@ static void disable_all_demotion_targets(void)
 
 static void dump_demotion_targets(void)
 {
+	/* 仅作锁内诊断：复制 mask 后立即打印，不把 RCU 借用指针传给 printk。 */
 	int node;
 
 	for_each_node_state(node, N_MEMORY) {
@@ -496,9 +513,11 @@ static void dump_demotion_targets(void)
 		nodemask_t preferred = node_demotion[node].preferred;
 
 		if (!memtier)
+			/* 尚未分级的节点在调试输出中跳过，不能解引用其 lower_tier_mask。 */
 			continue;
 
 		if (nodes_empty(preferred))
+			/* 空首选集并非错误：末层或未找到下一层时都合法。 */
 			pr_info("Demotion targets for Node %d: null\n", node);
 		else
 			pr_info("Demotion targets for Node %d: preferred: %*pbl, fallback: %*pbl\n",
@@ -521,6 +540,7 @@ static void dump_demotion_targets(void)
  */
 static void establish_demotion_targets(void)
 {
+	/* target/best_distance 只服务当前源节点；每轮必须重新初始化而不能继承前一节点。 */
 	struct memory_tier *memtier;
 	struct demotion_nodes *nd;
 	int target = NUMA_NO_NODE, node;
@@ -530,12 +550,14 @@ static void establish_demotion_targets(void)
 	lockdep_assert_held_once(&memory_tier_lock);
 
 	if (!node_demotion)
+		/* kzalloc 失败时全局降级功能退化关闭，不能触碰 NULL 数组。 */
 		return;
 
 	disable_all_demotion_targets();
 
 	/* 阶段 1：每个非末层节点从紧邻低 tier 选择全部同最短距离的 preferred target。 */
 	for_each_node_state(node, N_MEMORY) {
+		/* 末层没有更慢 tier；其 preferred 维持 disable 阶段写入的空集。 */
 		best_distance = -1;
 		nd = &node_demotion[node];
 
@@ -563,11 +585,13 @@ static void establish_demotion_targets(void)
 		 */
 		/* 重复搜索直到距离变差，避免只随机保留第一个同距候选。 */
 		do {
+			/* find_next_best_node 会把已考察节点写入 tier_nodes 这个 skip 掩码。 */
 			target = find_next_best_node(node, &tier_nodes);
 			if (target == NUMA_NO_NODE)
 				break;
 
 			distance = node_distance(node, target);
+			/* 第一个候选建立 best_distance；后续更远候选终止该 tier 的收集。 */
 			if (distance == best_distance || best_distance == -1) {
 				best_distance = distance;
 				node_set(target, nd->preferred);
@@ -586,8 +610,10 @@ static void establish_demotion_targets(void)
 	 */
 	/* 阶段 2：反向找到第一个含 CPU 的 tier，其抽象距离上界定义 top tier。 */
 	list_for_each_entry_reverse(memtier, &memory_tiers, list) {
+		/* 反向扫描使最近的含 CPU 层覆盖更慢层，符合不可继续提升的边界。 */
 		tier_nodes = get_memtier_nodemask(memtier);
 		if (nodes_and(tier_nodes, node_states[N_CPU], tier_nodes)) {
+			/* nodes_and 同时返回是否非空并把交集写回局部 mask。 */
 			/*
 			 * abstract distance below the max value of this memtier
 			 * is considered toptier.
@@ -614,6 +640,7 @@ static void establish_demotion_targets(void)
 		tier_nodes = get_memtier_nodemask(memtier);
 		nodes_andnot(lower_tier, lower_tier, tier_nodes);
 		memtier->lower_tier_mask = lower_tier;
+		/* 按值复制使每层拥有稳定 fallback 快照，读侧无需持有列表锁。 */
 	}
 
 	dump_demotion_targets();
@@ -626,7 +653,9 @@ static inline void establish_demotion_targets(void) {}
 /* 将 node 映射到 type；同 type 首次映射取得一份 kref，后续仅增加 map_count。 */
 static inline void __init_node_memory_type(int node, struct memory_dev_type *memtype)
 {
+	/* 同 node 的多个 device 只能共享一个 type；不同 type 不能悄悄替换既有归属。 */
 	if (!node_memory_types[node].memtype)
+		/* 首次关联只写指针，不立即取引用；下面 map_count 0→1 才取得那一份。 */
 		node_memory_types[node].memtype = memtype;
 	/*
 	 * for each device getting added in the same NUMA node
@@ -645,6 +674,7 @@ static inline void __init_node_memory_type(int node, struct memory_dev_type *mem
 /* 在 memory_tier_lock 下为 online memory node 获取 type、加入 tier，再 RCU 发布 pgdat->memtier。 */
 static struct memory_tier *set_node_memory_tier(int node)
 {
+	/* pgdat 只在 N_MEMORY 节点有效；失败时绝不能发布半初始化 tier 指针。 */
 	struct memory_tier *memtier;
 	struct memory_dev_type *memtype = default_dram_type;
 	int adist = MEMTIER_ADISTANCE_DRAM;
@@ -654,6 +684,7 @@ static struct memory_tier *set_node_memory_tier(int node)
 	lockdep_assert_held_once(&memory_tier_lock);
 
 	if (!node_state(node, N_MEMORY))
+		/* 没有 memory 的 node 不可加入 tier，避免为 CPU-only node 建立无效 sysfs 对象。 */
 		return ERR_PTR(-EINVAL);
 
 	/* 距离算法失败时使用默认 DRAM type；成功建 tier 后才能发布给 RCU 读者。 */
@@ -669,6 +700,7 @@ static struct memory_tier *set_node_memory_tier(int node)
 	__init_node_memory_type(node, memtype);
 
 	memtype = node_memory_types[node].memtype;
+	/* type 已稳定后才把 nid 加入 nodes；find_create 失败时不会发布 pgdat 指针。 */
 	node_set(node, memtype->nodes);
 	memtier = find_create_memory_tier(memtype);
 	if (!IS_ERR(memtier))
@@ -686,12 +718,14 @@ static void destroy_memory_tier(struct memory_tier *memtier)
 /* 节点下线时先 RCU 发布 NULL、等待旧 reader，再拆 type/tier 链并按需销毁空 tier。 */
 static bool clear_node_memory_tier(int node)
 {
+	/* 返回值告诉热插拔调用者是否确实改变图，从而避免无谓重建。 */
 	bool cleared = false;
 	pg_data_t *pgdat;
 	struct memory_tier *memtier;
 
 	pgdat = NODE_DATA(node);
 	if (!pgdat)
+		/* 热插拔通知可能面对尚未分配 pgdat 的 nid，此处无状态可清。 */
 		return false;
 
 	/*
@@ -705,11 +739,13 @@ static bool clear_node_memory_tier(int node)
 	/* 原注释译注：等 RCU 读段完成后再拆 nodes/type 链，因此普通 device release 可 kfree。 */
 	memtier = __node_get_memory_tier(node);
 	if (memtier) {
+		/* 在撤销 pgdat 发布前，memtype/tier 链仍完整，旧 RCU 读者可安全遍历。 */
 		struct memory_dev_type *memtype;
 
 		rcu_assign_pointer(pgdat->memtier, NULL);
 		synchronize_rcu();
 		memtype = node_memory_types[node].memtype;
+		/* RCU grace period 后没有读者再沿 memtier 访问 type 的 nodes mask。 */
 		node_clear(node, memtype->nodes);
 		if (nodes_empty(memtype->nodes)) {
 			list_del_init(&memtype->tier_sibling);
@@ -733,9 +769,11 @@ static void release_memtype(struct kref *kref)
 /* 分配未关联 node 的 type；调用者取得初始 kref，后续由 put_memory_type() 配对。 */
 struct memory_dev_type *alloc_memory_type(int adistance)
 {
+	/* 返回 ERR_PTR 保持与调用方的错误传播 ABI 一致，不能返回 NULL 混淆失败类别。 */
 	struct memory_dev_type *memtype;
 
 	memtype = kmalloc_obj(*memtype);
+	/* 对象尚未进任何 list，分配失败无需 rollback；成功后初始化全部可见字段。 */
 	if (!memtype)
 		return ERR_PTR(-ENOMEM);
 
@@ -767,6 +805,7 @@ EXPORT_SYMBOL_GPL(init_node_memory_type);
 /* 公共反向操作：减少 map_count，归零时断开 node 的 type 并归还首个映射持有的 kref。 */
 void clear_node_memory_type(int node, struct memory_dev_type *memtype)
 {
+	/* NULL 是驱动撤销时的“无指定 type”语义，仍只允许减少当前节点的计数。 */
 	mutex_lock(&memory_tier_lock);
 	if (node_memory_types[node].memtype == memtype || !memtype)
 		node_memory_types[node].map_count--;
@@ -787,9 +826,11 @@ EXPORT_SYMBOL_GPL(clear_node_memory_type);
 /* 在调用者给定 type 链中复用同距离对象或分配并插入新对象；返回者借用/持有原有 kref 规则不变。 */
 struct memory_dev_type *mt_find_alloc_memory_type(int adist, struct list_head *memory_types)
 {
+	/* 此 list 是调用者拥有的缓存；复用命中不额外 kref，生命周期仍由其最终 put 管理。 */
 	struct memory_dev_type *mtype;
 
 	list_for_each_entry(mtype, memory_types, list)
+		/* adistance 相等是 type 可共享的唯一键，避免同层生成重复对象。 */
 		if (mtype->adistance == adist)
 			return mtype;
 
@@ -806,6 +847,7 @@ EXPORT_SYMBOL_GPL(mt_find_alloc_memory_type);
 /* 清空临时 type 链并逐项 put；safe 遍历允许当前节点删除。 */
 void mt_put_memory_types(struct list_head *memory_types)
 {
+	/* 先脱离私有 list，再 put，避免 release 回调或错误处理看见悬挂链节点。 */
 	struct memory_dev_type *mtype, *mtn;
 
 	list_for_each_entry_safe(mtype, mtn, memory_types, list) {
@@ -823,14 +865,17 @@ EXPORT_SYMBOL_GPL(mt_put_memory_types);
 /* 原注释译注：late_initcall 在固件/设备及距离算法就绪后，为带/不带 CPU 的 memory node 初始化 tier。 */
 static int __init memory_tier_late_init(void)
 {
+	/* get_online_mems 阻止内存热插拔改变 N_MEMORY 遍历集合；guard 自动在所有出口释放 mutex。 */
 	int nid;
 	struct memory_tier *memtier;
 
 	get_online_mems();
+	/* 先冻结 online-memory 集合，再获取 tier mutex；顺序与热插拔路径一致。 */
 	guard(mutex)(&memory_tier_lock);
 
 	/* Assign each uninitialized N_MEMORY node to a memory tier. */
 	for_each_node_state(nid, N_MEMORY) {
+		/* 已由驱动分级的节点不可覆盖，否则会丢失其专属性能模型与 kref。 */
 		/*
 		 * Some device drivers may have initialized
 		 * memory tiers, potentially bringing memory nodes
@@ -844,6 +889,7 @@ static int __init memory_tier_late_init(void)
 		if (IS_ERR(memtier))
 			continue;
 	}
+	/* 单个节点失败不会阻止其余节点建图；最后统一用成功集合计算降级边。 */
 
 	establish_demotion_targets();
 	put_online_mems();
@@ -855,6 +901,7 @@ late_initcall(memory_tier_late_init);
 /* 把访问坐标作为诊断输出；coord/prefix 都是只读借用，不改变算法状态。 */
 static void dump_hmem_attrs(struct access_coordinate *coord, const char *prefix)
 {
+	/* 诊断仅在调用者已稳定 coord 时读取四个无符号字段；不承担同步责任。 */
 	pr_info(
 "%sread_latency: %u, write_latency: %u, read_bandwidth: %u, write_bandwidth: %u\n",
 		prefix, coord->read_latency, coord->write_latency,
@@ -865,20 +912,25 @@ static void dump_hmem_attrs(struct access_coordinate *coord, const char *prefix)
 int mt_set_default_dram_perf(int nid, struct access_coordinate *perf,
 			     const char *source)
 {
+	/* perf/source 为调用者借用数据；仅首个有效样本复制坐标并复制 source 字符串。 */
 	guard(mutex)(&default_dram_perf_lock);
 	if (default_dram_perf_error)
+		/* 一旦发现不一致即锁存错误，避免后续节点在不可信基线上得到不同结果。 */
 		return -EIO;
 
 	if (perf->read_latency + perf->write_latency == 0 ||
 	    perf->read_bandwidth + perf->write_bandwidth == 0)
 		return -EINVAL;
+	/* 首样本必须同时有延迟与带宽，避免未来公式的零除和无意义性能等级。 */
 
 	if (default_dram_perf_ref_nid == NUMA_NO_NODE) {
+		/* 建立基线后后续节点只能验证，不能替换参考节点以免距离随热插拔漂移。 */
 		default_dram_perf = *perf;
 		default_dram_perf_ref_nid = nid;
 		default_dram_perf_ref_source = kstrdup(source, GFP_KERNEL);
 		return 0;
 	}
+	/* 参考值存在时，只比较性能不变式；任何一项越界都会锁存失败而非选择性接受。 */
 
 	/*
 	 * The performance of all default DRAM nodes is expected to be
@@ -895,11 +947,13 @@ int mt_set_default_dram_perf(int nid, struct access_coordinate *perf,
 	    default_dram_perf.read_bandwidth ||
 	    abs(perf->write_bandwidth - default_dram_perf.write_bandwidth) * 10 >
 	    default_dram_perf.write_bandwidth) {
+		/* 任一维度越界即输出双方坐标并永久锁存 error，避免混合基线产生非传递等级。 */
 		pr_info(
 "memory-tiers: the performance of DRAM node %d mismatches that of the reference\n"
 "DRAM node %d.\n", nid, default_dram_perf_ref_nid);
 		pr_info("  performance of reference DRAM node %d from %s:\n",
 			default_dram_perf_ref_nid, default_dram_perf_ref_source);
+		/* 先打印固定参考样本，再打印本次样本，诊断顺序与比较方向一致。 */
 		dump_hmem_attrs(&default_dram_perf, "    ");
 		pr_info("  performance of DRAM node %d from %s:\n", nid, source);
 		dump_hmem_attrs(perf, "    ");
@@ -908,6 +962,7 @@ int mt_set_default_dram_perf(int nid, struct access_coordinate *perf,
 		default_dram_perf_error = true;
 		return -EINVAL;
 	}
+	/* 全部坐标在容差内才允许后续设备用这一基线换算 adistance。 */
 
 	return 0;
 }
@@ -915,6 +970,7 @@ int mt_set_default_dram_perf(int nid, struct access_coordinate *perf,
 /* 把延迟正比、带宽反比的性能坐标换算为抽象距离；要求已建立有效默认 DRAM 基线。 */
 int mt_perf_to_adistance(struct access_coordinate *perf, int *adist)
 {
+	/* 乘除按整数进行；调用者接受这一抽象等级的截断，零和输入已在此前拒绝。 */
 	guard(mutex)(&default_dram_perf_lock);
 	if (default_dram_perf_error)
 		return -EIO;
@@ -922,8 +978,10 @@ int mt_perf_to_adistance(struct access_coordinate *perf, int *adist)
 	if (perf->read_latency + perf->write_latency == 0 ||
 	    perf->read_bandwidth + perf->write_bandwidth == 0)
 		return -EINVAL;
+	/* 分母均来自已验证的基线；该检查只防本次设备报告零总量。 */
 
 	if (default_dram_perf_ref_nid == NUMA_NO_NODE)
+		/* 未有基线时不能计算比例；返回 ENOENT 让调用者保留默认距离。 */
 		return -ENOENT;
 
 	/*
@@ -934,6 +992,7 @@ int mt_perf_to_adistance(struct access_coordinate *perf, int *adist)
 	 * the base.
 	 */
 	*adist = MEMTIER_ADISTANCE_DRAM *
+	/* 结果通过输出指针提交；此前所有失败路径都保证其值未被本函数改写。 */
 		(perf->read_latency + perf->write_latency) /
 		(default_dram_perf.read_latency + default_dram_perf.write_latency) *
 		(default_dram_perf.read_bandwidth + default_dram_perf.write_bandwidth) /
@@ -968,6 +1027,7 @@ EXPORT_SYMBOL_GPL(mt_perf_to_adistance);
 /* 原注释译注：注册距离算法 notifier；高优先级算法给出结果时返回 NOTIFY_STOP，否则继续链。 */
 int register_mt_adistance_algorithm(struct notifier_block *nb)
 {
+	/* blocking 链意味着回调允许睡眠；注册者负责 notifier_block 与模块生命周期。 */
 	return blocking_notifier_chain_register(&mt_adistance_algorithms, nb);
 }
 EXPORT_SYMBOL_GPL(register_mt_adistance_algorithm);
@@ -998,6 +1058,7 @@ EXPORT_SYMBOL_GPL(unregister_mt_adistance_algorithm);
 /* 原注释译注：调用算法链计算 node 距离；未停止时保留调用者提供的 adist 默认值。 */
 int mt_calc_adistance(int node, int *adist)
 {
+	/* adist 是输入输出指针：没有 NOTIFY_STOP 时保持调用者的 DRAM 默认值。 */
 	return blocking_notifier_call_chain(&mt_adistance_algorithms, node, adist);
 }
 EXPORT_SYMBOL_GPL(mt_calc_adistance);
@@ -1006,18 +1067,21 @@ EXPORT_SYMBOL_GPL(mt_calc_adistance);
 static int __meminit memtier_hotplug_callback(struct notifier_block *self,
 					      unsigned long action, void *_arg)
 {
+	/* self 未参与状态选择；node notifier 的 action 决定 _arg 可解释为 node_notify。 */
 	struct memory_tier *memtier;
 	struct node_notify *nn = _arg;
 
 	/* 两个 case 都在同一 mutex 内把 node/type/tier 关系和目标图作为一个写侧事务更新。 */
 	switch (action) {
 	case NODE_REMOVED_LAST_MEMORY:
+		/* 最后一段 memory 消失才撤 tier，仍有 memory 的设备变更由 type map 计数处理。 */
 		mutex_lock(&memory_tier_lock);
 		if (clear_node_memory_tier(nn->nid))
 			establish_demotion_targets();
 		mutex_unlock(&memory_tier_lock);
 		break;
 	case NODE_ADDED_FIRST_MEMORY:
+		/* 首段 memory 到来后先发布完整 tier，再一次性重建全局降级图。 */
 		mutex_lock(&memory_tier_lock);
 		memtier = set_node_memory_tier(nn->nid);
 		if (!IS_ERR(memtier))
@@ -1032,11 +1096,13 @@ static int __meminit memtier_hotplug_callback(struct notifier_block *self,
 /* 子系统初始化：注册虚拟 bus、分配默认 DRAM type/可选 demotion 数组，并挂接热插拔 notifier。 */
 static int __init memory_tier_init(void)
 {
+	/* 此 initcall 必须早于 late_initcall；默认 type 是所有未被驱动分类节点的回退锚点。 */
 	int ret;
 
 	/* bus 注册失败和默认 type 分配失败均是启动期不可恢复错误。 */
 	ret = subsys_virtual_register(&memory_tier_subsys, NULL);
 	if (ret)
+		/* bus 注册是后续 device_register 的前提，失败必须停止启动而非留下半个子系统。 */
 		panic("%s() failed to register memory tier subsystem\n", __func__);
 
 #ifdef CONFIG_NUMA_MIGRATION
@@ -1054,6 +1120,7 @@ static int __init memory_tier_init(void)
 						      &default_memory_types);
 	mutex_unlock(&memory_tier_lock);
 	if (IS_ERR(default_dram_type))
+		/* 默认 type 缺失会让每个未驱动节点初始化失败，故启动期直接 panic。 */
 		panic("%s() failed to allocate default DRAM tier\n", __func__);
 
 	/* Record nodes with memory and CPU to set default DRAM performance. */
@@ -1074,6 +1141,7 @@ bool numa_demotion_enabled = false;
 static ssize_t demotion_enabled_show(struct kobject *kobj,
 				     struct kobj_attribute *attr, char *buf)
 {
+	/* kobj/attr 只用于 sysfs 分派；读取 bool 不取得 tier 或 node 的引用。 */
 	return sysfs_emit(buf, "%s\n", str_true_false(numa_demotion_enabled));
 }
 
@@ -1082,6 +1150,7 @@ static ssize_t demotion_enabled_store(struct kobject *kobj,
 				      struct kobj_attribute *attr,
 				      const char *buf, size_t count)
 {
+	/* 成功必须返回完整 count；解析失败不改变策略并把 errno 直接交给 sysfs。 */
 	ssize_t ret;
 	bool before = numa_demotion_enabled;
 
@@ -1095,42 +1164,51 @@ static ssize_t demotion_enabled_store(struct kobject *kobj,
 	 */
 	/* 原注释译注：策略改变后旧 kswapd_failures 统计可能失效，开启时需重置。 */
 	if (before == false && numa_demotion_enabled == true) {
+		/* 只在关闭→开启边沿清理；重复写 true 不应扰动正在收敛的统计。 */
 		struct pglist_data *pgdat;
 
 		for_each_online_pgdat(pgdat)
 			kswapd_clear_hopeless(pgdat, KSWAPD_CLEAR_HOPELESS_OTHER);
 	}
+	/* 不论是否发生边沿，已解析的开关值现在就是 sysfs 写入的可观察结果。 */
 
 	return count;
 }
 
 static struct kobj_attribute numa_demotion_enabled_attr =
+	/* __ATTR_RW 绑定上述两个函数；权限默认由宏给出，写入走 store 的完整解析路径。 */
 	__ATTR_RW(demotion_enabled);
 
 static struct attribute *numa_attrs[] = {
+	/* numa 目录当前只导出一个策略开关，NULL 是 sysfs group 的结束哨兵。 */
 	&numa_demotion_enabled_attr.attr,
 	NULL,
 };
 
 static const struct attribute_group numa_attr_group = {
+	/* group 静态存活至内核退出，create_group 成功后可被 sysfs 并发读取。 */
 	.attrs = numa_attrs,
 };
 
 static int __init numa_init_sysfs(void)
 {
+	/* kobject 成功创建后 ownership 转给 kobject core；建组失败路径必须 put 配对。 */
 	int err;
 	struct kobject *numa_kobj;
 
 	numa_kobj = kobject_create_and_add("numa", mm_kobj);
+	/* 父 mm_kobj 已由 MM 子系统拥有；本函数只管理新建子对象的失败回收。 */
 	if (!numa_kobj) {
 		pr_err("failed to create numa kobject\n");
 		return -ENOMEM;
 	}
 	err = sysfs_create_group(numa_kobj, &numa_attr_group);
+	/* group 发布失败前属性尚不可见，delete_obj 仅撤销这个新对象。 */
 	if (err) {
 		pr_err("failed to register numa group\n");
 		goto delete_obj;
 	}
+	/* 成功后 sysfs core 持有 group 与 kobject；本初始化路径无需额外 put。 */
 	return 0;
 
 delete_obj:
