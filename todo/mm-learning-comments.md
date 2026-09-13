@@ -12,7 +12,7 @@
 
 ## 进度
 
-- [~] 当前文件：`mm/execmem.c`
+- [~] 当前文件：`mm/memory-tiers.c`
 
 ## 固定顺序
 
@@ -141,6 +141,18 @@
 - [x] `mm/vma.h`：416/170/0.409/10；仅新增 218 行注释；VMA 准备/munmap/merge/unmap 描述符、Maple Tree 游标包装、split/merge 只准备不提交属性、文件/anon_vma ownership、页表释放边界、MMU/64 位配置桩与 MDWE W^X 判定已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
 - [x] `mm/mempool.c`：436/130/0.298/10；仅新增 190 行注释；预留元素 ownership、curr_nr/min_nr 锁内不变量、SLUB/KASAN poison、零最小池、resize 并发发布、alloc/free 屏障、waitqueue 保底分配及 slab/kmalloc/page 后端配对已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
 - [x] `mm/readahead.c`：440/115/0.261/10；仅新增 149 行注释；同步/异步窗口推断、BDI 上限、large-folio order 对齐与回退、page cache folio 锁/引用交接、invalidate_lock+NOFS、aops 领取/清理边界、PSI、系统调用校验和窗口双向扩展已覆盖，第 17 章验收、diff/checkpatch 通过；无 `.config`，未编译目标对象。
+- [x] `mm/execmem.c`：442/152/0.344/10；仅新增 191 行注释；架构窗口发布、KASAN shadow、ROX cache 的 busy/free Maple Tree ownership、direct-map 与 W^X 配对、陷阱指令、延迟释放重试、默认范围继承及启动期校验/发布已覆盖；第 17 章强制验收、diff/check 通过。无 `.config`，未编译目标对象；checkpatch 仅报告原有 MA_STATE 声明空行风格警告，未改代码规避。
+- [x] `mm/kasan/kasan.h`：446/123/0.276/10；仅新增 145 行注释；Generic/SW/HW tag 配置分流、shadow granule/毒码 ABI、对象 metadata 与 stack ring 生命周期、报告对象分段填充、地址 tag 架构钩子、硬件 poison/unpoison、KUnit 开关及 ASAN/HWASAN 编译器插桩 ABI 已覆盖；第 17 章强制验收、diff/checkpatch 通过。无 `.config`，未编译目标对象。
+- [x] `mm/kasan/report.c`：455/134/0.295/10；仅新增 152 行注释；软件/硬件抑制、首错与 multi-shot、KUnit 归属、raw-spinlock 报告边界、对象/栈/vmalloc/page 归属、metadata 行定位、模式层补全、UACCESS 恢复、异步 fault 与 non-canonical 反解已覆盖；第 17 章强制验收、diff/check 通过。无 `.config`，未编译目标对象；checkpatch 仅报告上游既有 `%px` 诊断输出及条件风格警告，未改代码规避。
+- [x] `mm/truncate.c`：484/147/0.304/10；仅新增 157 行注释；XArray shadow/DAX exceptional 清理、folio 截断与拆分回退、两遍 page-cache 删除、final truncate 的 AS_EXITING 屏障、轻量/强制失效、写回与页表撤销、文件大小扩展零化、普通截断与 hole-punch 的 COW 边界已覆盖；第 17 章强制验收、diff/check 通过。无 `.config`，未编译目标对象；checkpatch 仅报告上游文件名、函数指针原型和单语句大括号风格警告，未改代码规避。
+- [x] `mm/slab.h`：514/124/0.241/10；仅新增 173 行注释；slab/page ABI overlay、freelist ABA 双字 CAS、cache 与 per-node/sheaf 所有权、kmalloc bucket 选择、启动状态机、对象索引与 KASAN tag、obj-ext sanitizer 访问期、memcg/RCU 钩子、large-kmalloc 编码、随机 freelist 及初始化/调试边界已覆盖；第 17 章强制验收、diff/check 通过。无 `.config`，未编译目标对象；checkpatch 仅报告既有宏对齐、typedef、data_race 说明及无参数名原型风格，未改代码规避。
+- [x] `mm/highmem.c`：521/156/0.299/10；仅新增 159 行注释；永久 PKMAP 的 count/PTE/page-address 三元状态、TLB/cache 回收发布、色彩槽与等待队列、highmem 引用配对、compound page 双区间零化、task-local fixmap 的迁移/抢占/调度保存恢复、架构 hook、fork 清理及 hash page-to-virtual 关联锁序已覆盖；第 17 章强制验收、diff/check 通过。无 `.config`，未编译目标对象；checkpatch 仅报告上游宏未用参数、waitqueue 说明与裸 unsigned 风格，未改代码规避。
+- [x] `mm/shrinker.c`：530/140/0.264/10；仅新增 142 行注释；memcg per-node unit COW 扩容与 RCU 发布、IDR/bitmap 位屏障、deferred 扫描债务领取/回填、cgroup reparent、NUMA 路由、shrink budget/batch/trace、memcg 与全局 RCU 遍历、注册引用发布、等待回调退出及 RCU 延迟销毁已覆盖；第 17 章强制验收、diff/check 通过。无 `.config`，未编译目标对象；checkpatch 仅报告既有 DEFINE_IDR 与 -ENOSYS 风格，未改代码规避。
+- [x] `mm/page_io.c`：534/267/0.500/9；仅新增 334 行注释；文件 swap extent 激活、zeromap 与 large-folio 边界、zswap/memcg 策略、文件/同步块/异步块三种 I/O 后端、bio/iocb/mempool ownership、folio writeback/uptodate/unlock 发布、PSI 与统计、RCU/cluster 锁协议已覆盖；第 17 章强制验收、diff/checkpatch 通过。无 `.config`，未编译目标对象。
+- [x] `mm/hugetlb_vmemmap.c`：538/166/0.309/10；仅新增 197 行注释；HVO 的 PMD 拆分、PTE head/tail 重映射、写屏障/TLB 发布、部分失败恢复、memblock/buddy 页 ownership、批量优化低内存重试、bootmem sparsemem 预初始化与跨 zone fallback 已覆盖；第 17 章强制验收、diff/checkpatch 通过。无 `.config`，未编译目标对象。
+- [x] `mm/list_lru.c`：548/207/0.378/10；仅新增 250 行注释；node/memcg 分桶、irq/irqsave 锁配对、RCU+XArray 查找、dying memcg 向父链退避、add/del 与 shrinker bit、walker 的全部 lru_status、reparent 的 LONG_MIN/RCU 延迟释放、按需分配与 init/destroy 生命周期已覆盖；第 17 章强制验收、diff/checkpatch 通过。无 `.config`，未编译目标对象。
+- [x] `mm/kmsan/kmsan_test.c`：556/297/0.534/10；仅新增 409 行注释；console tracepoint 报告快照、KUnit 预期匹配、分配/栈/参数传播、页与 vmap、UAF、per-CPU、memcpy/origin、stackdepot、反毒、nofault 复制与 suite 生命周期已覆盖；第 17 章强制验收、diff/checkpatch 通过。无 `.config`，未编译 KUnit 目标。
+- [x] `mm/mlock.c`：564/229/0.406/10；仅新增 291 行注释；folio LRU 批处理和低位操作 tag、mlock_count/unevictable 迁移、PTE/PMD walk、大 folio 范围约束、VMA split/merge 与 VM_IO 竞争门禁、RLIMIT 重叠核算、mlock/munlock/lockall ABI 及 SHM ucounts 生命周期已覆盖；第 17 章强制验收、diff/checkpatch 通过。无 `.config`，未编译目标对象；checkpatch 仅报告上游既有 3 warnings、12 checks，未改源码消音。
 
 本轮十文件进度（5/10）：`vma.h` 已按修改后完整文件顺序复读；全部结构/字段组、枚举、宏、声明与内联实现，以及非豁免英文注释均有紧邻中文学习说明。相对基线新增 218 行、删除 0 行；密度 `416/170/0.409/10`，`git diff --check` 与 `checkpatch --strict --ignore LONG_LINE_COMMENT` 为 0 errors、0 warnings、0 checks。仓库无 `.config`，未执行目标编译。
 
