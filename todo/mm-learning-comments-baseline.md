@@ -133,11 +133,11 @@
 |123|x|mm/kfence/kfence_test.c|612|198|0.324|10|
 |124|x|mm/sparse-vmemmap.c|616|142|0.231|10|
 |125|x|mm/mmu_notifier.c|648|154|0.238|10|
-|126||mm/swap_state.c|649|0|0.000|649|
-|127||mm/pagewalk.c|661|0|0.000|661|
-|128||mm/swap.c|682|0|0.000|682|
-|129||mm/damon/vaddr.c|715|0|0.000|715|
-|130||mm/mprotect.c|718|0|0.000|718|
+|126|x|mm/swap_state.c|649|297|0.458|10|
+|127|x|mm/pagewalk.c|661|234|0.354|10|
+|128|x|mm/swap.c|682|295|0.433|10|
+|129|x|mm/damon/vaddr.c|715|246|0.344|10|
+|130|x|mm/mprotect.c|718|320|0.446|10|
 |131||mm/hugetlb_cgroup.c|721|0|0.000|721|
 |132||mm/page_owner.c|727|0|0.000|727|
 |133||mm/cma.c|729|0|0.000|729|

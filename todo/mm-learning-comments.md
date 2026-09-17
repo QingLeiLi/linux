@@ -12,7 +12,7 @@
 
 ## 进度
 
-- [~] 当前文件：`mm/swap_state.c`
+- [~] 当前文件：`mm/hugetlb_cgroup.c`
 
 ## 固定顺序
 
@@ -230,6 +230,11 @@
 
 ## 本轮闭环
 
+- [x] `mm/mprotect.c`：718/320/0.446/10；仅新增中文学习注释与空行。已按第 17 章复核 mprotect/pkey_mprotect 的地址形状、增长方向、mmap 写锁、整段连续 VMA 覆盖、VM_MAY/W^X/LSM/架构及 vm_ops 裁决；VMA 额度、split/merge、写序列、页表保护、TLB gather 和统计收尾；普通 PTE、softleaf、userfaultfd marker、匿名 COW、共享 writenotify、NUMA 采样、THP/PUD/HugeTLB、二级 MMU notifier；以及 pkey 分配、硬件访问设置失败回滚和释放锁边界。注释说明每项设计原因、并发/所有权约束及省略后的错误；密度门禁、纯追加审计、diff check 与补丁模式 checkpatch（除 LONG_LINE_COMMENT）通过。关联读取为 `include/linux/pagewalk.h`、页表/TLB helper 和 VMA 修改契约；关联文件未在本轮修改。
+- [x] `mm/damon/vaddr.c`：715/246/0.344/10；仅新增中文学习注释与空行。已按第 17 章复核 PID→task→mm 引用链、VMA 最大空洞三段近似、RCU VMA 锁到 mmap 锁回退、PTE/THP/HugeTLB 的 mkold/young/idle/notifier 访问基线、同 folio 采样缓存、young filter、加权 NUMA 迁移的 LRU 隔离与目的链所有权、filter 统计、madvise/迁移/STAT 分派、评分及 VADDR/FVADDR 注册。注释说明了设计原因、并发/所有权边界和省略后的具体错误；密度门禁、纯追加审计、diff check 与补丁模式 checkpatch（除 LONG_LINE_COMMENT）通过。关联读取为 `include/linux/pagewalk.h`、DAMON core/ops-common 的 pagewalk 与操作表契约；关联文件未在本轮修改。
+- [x] `mm/swap.c`：682/295/0.433/10；仅新增 352 行中文学习注释与空行。已按第 17 章逐项补全函数的业务背景、入参、出参/返回与注意事项，并复核普通/设备/HugeTLB folio 引用归零与 memcg 解除计费、per-CPU LRU batch 的 local/IRQ 锁与额外引用交接、active/deactivate/lazyfree 状态迁移、LRU_GEN 原子 refs/RCU 最小序列、全 CPU drain 的代数/屏障/work 同步、缓存禁用 RCU 等待、encoded page 批量释放和 memcg reparent；密度门禁、diff check、纯追加审计与补丁模式 checkpatch（除 LONG_LINE_COMMENT）通过。关联读取为 `include/linux/swap.h` 的 swap/LRU ABI；该头未在本轮修改，学习注释覆盖留待其各自范围处理。
+- [x] `mm/pagewalk.c`：661/234/0.354/10；仅新增 274 行中文学习注释与空行。已按第 17 章复核多级 PGD--PTE 回调的 action 重试/剪枝、空洞深度与 install_pte 分配失败、HugeTLB VMA 锁下回调、mmap/VMA 锁模型及 debug/no-VMA 边界、按 mapping 区间树的 VMA 裁剪，以及 `folio_walk_start()` 的无锁初查、PTL 下复读、normal/zero folio 判定与 `folio_walk_end()` 归还协议；密度门禁与 diff check 通过。关联读取为 `include/linux/pagewalk.h` 的回调、action、锁和 folio-walk ABI；该公开头未在本轮修改，学习注释覆盖留待其各自范围处理。
+- [x] `mm/swap_state.c`：649/297/0.458/10；仅新增 345 行中文学习注释与空行。已按第 17 章复核 swap-cache 的 slot-to-folio 发布/摘除、每页引用与 shadow、cluster 锁下批量一致性、分配后二次验证和 memcg 失败逆序回滚、同步/异步换入、cluster/VMA 两类预读、PTE 临时映射与跨设备引用，以及 sysfs 开关发布/失败清理；密度门禁、diff check 与补丁模式 checkpatch（除 LONG_LINE_COMMENT 以外）通过。关联读取为 `mm/swapfile.c` 的 device 引用调用点、`mm/swap.h` 的公开声明与 `mm/swap_table.h` 的 cluster 编码；这些关联区域未在本轮修改，学习注释覆盖留待各自基线顺序处理。
 - [x] `mm/memory-tiers.c`：602/187/0.311/10；仅新增 78 行中文学习注释。已按第 17 章复核 tier/type/node 映射、RCU 发布与热插拔拆除、demotion preferred/fallback 重建、默认 DRAM 性能基线、notifier 算法链和 sysfs 开关/失败回收；密度门禁、diff check 与补丁模式 checkpatch 通过。关联读取为 `include/linux/memory-tiers.h` 的公开接口，以及 `mm/{numa_balancing,migrate,vmscan}.c` 的调用点搜索；这些关联区域未在本轮修改，学习注释覆盖待其各自基线顺序处理。
 - [x] `mm/hmm.c`：603/139/0.231/10；仅新增 152 行中文学习注释与空行。已按第 17 章复核 HMM range 的 interval-notifier 重试、hole/PTE/PMD/PUD/HugeTLB 页表 walk、fault 前锁释放、device-private owner 与 migration 语义、PFN sticky 位，以及 IOVA/DMA/P2P map/unmap 的发布与失败逆序路径；密度门禁、diff check 与补丁模式 checkpatch 通过。关联读取为 `include/linux/{hmm.h,hmm-dma.h}` 的 range/PFN/DMA ABI；本轮未修改关联头，学习注释覆盖留待其各自范围决策。
 - [x] `mm/kfence/kfence_test.c`：612/198/0.324/10；仅新增 218 行中文学习注释与空行。已按第 17 章复核 console tracepoint 的两行快照发布与锁内重检、采样分配的 policy/候选归还/让出、OOB/UAF/corruption/invalid-free 分类、对齐空洞、init-on-free、RCU 延迟回收、krealloc ownership 转移、bulk API 和 KUnit suite 的 probe 注销同步；密度门禁、diff check 与补丁模式 checkpatch 通过。关联读取为 `mm/kfence/{kfence.h,core.c}` 的错误类型、对象状态和报告 ABI；本轮未修改关联文件，学习注释覆盖仍按各自基线处理。
