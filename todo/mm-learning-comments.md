@@ -1,6 +1,6 @@
 # mm 学习注释进度
 
-规则：单文件按 `doc/linux-kernel-source-learning-methodology.md` 第 17 章闭环；只加注释；`[~]` 未闭环时不开始下一文件。恢复任务先读本文件和 `todo/mm-learning-comments-baseline.md`，目标未变更时复用探查结论。
+规则：单文件按 `doc/linux-kernel-source-learning-methodology.md` 第 17 章闭环；机械门禁同时启用 `--require-english-translation`；人工验收必须逐项保存函数使用场景、结构体字段释义和枚举解释三类清单；只加注释；`[~]` 未闭环时不开始下一文件。恢复任务先读本文件和 `todo/mm-learning-comments-baseline.md`，目标未变更时复用探查结论。
 
 ## 筛选
 
@@ -12,7 +12,7 @@
 
 ## 进度
 
-- [~] 当前文件：`mm/debug_vm_pgtable.c`
+- [~] 当前文件：`mm/nommu.c`
 
 ## 固定顺序
 

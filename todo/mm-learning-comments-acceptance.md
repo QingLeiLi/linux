@@ -3,6 +3,264 @@
 本文件保存 `doc/linux-kernel-source-learning-methodology.md` 第 17 章要求的逐文件内容验收证据。
 行号对应该文件完成本轮编辑后的工作区版本；后续改动使行号漂移时，必须重建对应文件记录。
 
+自 2026-09-20 的标准升级起，新闭环记录必须单列并逐项保存“函数使用场景清单、结构体字段清单、
+枚举清单”；缺少任一适用项不得标记完成。此前记录中的实体总述仍是旧标准证据，不自动证明已经
+满足三类新门禁；需要按新标准复审时必须补建清单，不能从原完成标记反推通过。
+
+## mm/debug_vm_pgtable.c
+
+### 函数、实体与结构验收
+
+已按物理顺序核对 47 个条件编译定义：PTE/PMD/PUD 的 basic、advanced、leaf、clear、populate、
+PROT_NONE、soft-dirty、swap/migration、THP/HugeTLB/huge-vmap 测试，以及 `get_random_vaddr()`、
+大页分配/释放、`destroy_args()`、`phys_align_check()`、`init_fixed_pfns()`、`init_args()` 和总入口。
+每个真实定义的专属中文函数头均位于声明正上方，覆盖业务位置、参数/借用关系、返回/副作用和
+锁/配置/失败约束；条件编译空桩逐项说明不适用原因与无副作用契约。`pgtable_debug_args` 的 owner、
+当前槽位、释放基址、真实页 PFN、纯编码 PFN、保护值及 softleaf 字段组均已说明。
+
+### 复杂函数只读复述抽查
+
+- `pte_advanced_tests()`：调用者先映射并锁住 PTE；函数依次验证写保护并取走、access-flags 把只读
+  clean 升为可写 dirty、young test-and-clear，三轮之间都把槽位恢复为 none，并用 cache flush 清理
+  arm64 测试页的架构私有标志。
+- `init_args()`：先把所有 owner 字段置成可回滚哨兵，再创建 mm/VMA 和逐级页表；固定 PFN 只用于
+  编码，真实测试页按 PUD→PMD→order-0 降级分配。核心对象失败统一交给 `destroy_args()` 逆序释放，
+  大页缺失只让相应测试跳过，不阻止纯值测试。
+- `debug_vm_pgtable()`：先遍历权限组合执行无锁纯值断言，再覆盖叶、PROT_NONE、soft-dirty、swap、
+  migration 和大页分类；修改真实槽位时依次持 PTE、PMD、PUD、顶层页表锁且不嵌套，最后统一销毁。
+
+### 英文、路径、并发与关联证据
+
+- 原英文说明均保留，并在其后邻接补充完整中文含义与测试原因；许可证、版权和作者元数据按豁免处理。
+- 成功、能力缺失跳过、核心分配失败回滚、大页分配降级、折叠页表和各配置空桩均已覆盖。
+- `Documentation/mm/arch_pgtable_helpers.rst`：核对各层 pure-value 与 modifying helper 的通用语义；
+  它是英文接口表，不属于源码学习注释目标，建议随 helper 变化同步复审。
+
+### 机械与追加式安全门禁
+
+- 密度：`code=937 comments=666 chinese=338 density=0.361 max_gap=10`，通过。
+- `git diff --check -- mm/debug_vm_pgtable.c`：通过。
+- 相对基线：新增 430 行、删除 0 行；可执行代码和原有英文注释未改。
+- checkpatch（忽略 UTF-8 `LONG_LINE_COMMENT`）：0 error、0 warning。
+- 工作区无 `.config`，未执行目标对象编译，不声称编译通过。
+
+## mm/migrate_device.c
+
+### 函数与实体清单
+
+下表声明行对应最终复读版本；所有真实定义均有紧邻声明的中文契约，条件编译空桩分别说明配置边界：
+
+|函数|声明行|17.2 结论|
+|---|---:|---|
+|`migrate_vma_collect_skip`|35|通过|
+|`migrate_vma_collect_hole`|59|通过|
+|`migrate_vma_split_folio`|120|通过|
+|`migrate_vma_collect_huge_pmd`|187|通过|
+|`migrate_vma_collect_pmd`|318|通过|
+|`migrate_vma_collect`|638|通过|
+|`migrate_vma_check_page`|679|通过|
+|`migrate_device_unmap`|724|通过|
+|`migrate_vma_unmap`|843|通过|
+|`migrate_vma_setup`|925|通过|
+|`migrate_vma_insert_huge_pmd_page`|998|通过|
+|`migrate_vma_split_unmapped_folio`|1138|通过|
+|`migrate_vma_nr_pages`|1194|通过|
+|`migrate_vma_insert_page`|1227|通过|
+|`__migrate_device_pages`|1387|通过|
+|`migrate_device_pages`|1564|通过|
+|`migrate_vma_pages`|1585|通过|
+|`__migrate_device_finalize`|1599|通过|
+|`migrate_device_finalize`|1673|通过|
+|`migrate_vma_finalize`|1697|通过|
+|`migrate_device_pfn_lock`|1712|通过|
+|`migrate_device_range`|1760|通过|
+|`migrate_device_pfns`|1808|通过|
+|`migrate_device_coherent_folio`|1853|通过|
+
+静态 `migrate_vma_walk_ops` 已在声明前说明生命周期、字段分派和 mmap 读锁契约；MIGRATE 数组槽、
+PFN/flags、页数、fault owner、notifier range、页表锁和 cleanup 局部变量均在有效阶段内覆盖。
+
+### 复杂函数只读复述抽查
+
+- `migrate_vma_collect_pmd()`：先把 THP/device-private PMD 交给整 folio 路径，普通页再在 PTE 锁下
+  过滤页类型与 pgmap owner。它为候选取得 folio 引用，只 trylock 规避迁移互锁；单映射快路直接把
+  PTE 替换成保留 write/young/dirty/soft-dirty/UFFD-WP 的 migration entry，并把 rmap 引用转换成事务引用。
+- `migrate_device_unmap()`：普通 folio 先隔离 LRU并放掉 collect 引用，剩余映射走 rmap unmap；仍被
+  映射或 refcount 超出已知来源的页判为 pinned。失败页在第二遍恢复 migration PTE、LRU、锁和引用，
+  成功页保持锁定，直到 pages/finalize 阶段完成。
+- `__migrate_device_pages()`：无目标即清 MIGRATE；空洞槽在 notifier 窗口内发布驱动目标；THP 粒度不
+  匹配时只允许有 VMA 的源大页拆成 base 页，反向合并不支持。实体页先筛目标 ZONE_DEVICE 类型，再由
+  `folio_migrate_mapping()` 转移 mapping/flags；逐槽失败只清对应 MIGRATE。
+- `__migrate_device_finalize()`：失败或无目标时选择 src，成功时选择 dst；普通最终 folio 先回 LRU，
+  `remove_migration_ptes()` 是 CPU 映射恢复/替换提交点，之后消费源和被采用/丢弃目标的临时锁与引用，
+  但保留 fault owner 的源锁。
+
+### 英文、并发、生命周期与关联证据
+
+- 所有非豁免英文注释已由新邻接门禁逐单元核对，`untranslated=[]`；原文零删除、零改写。
+- 已覆盖 mmap 读锁、PTE/PMD 锁、folio trylock 防互锁、MMU notifier、uptodate 发布屏障、rmap/LRU、
+  memcg、compound 拆分、userfaultfd 退让、pin 拒绝和 setup→pages→finalize 强制闭环。
+- `include/linux/migrate.h`：核对 MIGRATE_PFN 编码、选择 flags、`struct migrate_vma` 数组和 owner 契约；
+  现有学习注释缺失，建议后续补 flags、数组阶段约束和公开 API。
+- `mm/migrate.c`：核对 `folio_migrate_mapping()` 的 expected refcount 与 `remove_migration_ptes()` 的 rmap
+  恢复语义；现有学习注释缺失，建议随基线顺序处理相关函数。
+- `mm/huge_memory.c::set_pmd_migration_entry()`：核对 PMD invalidation、anon-exclusive、软件位保存及
+  rmap/ref 转换；现有学习注释缺失，建议后续覆盖 THP migration 成对路径。
+
+### 机械与追加式安全门禁
+
+- 新门禁：`code=978 comments=723 chinese=323 density=0.330 max_gap=10 untranslated=[]`，通过。
+- 相对基线新增 405 行、删除 0 行；目标文件可执行代码和原注释未改。
+- `git diff --check` 通过；checkpatch 忽略 UTF-8 `LONG_LINE_COMMENT` 后 0 error、0 warning。
+- 工作区无 `.config`，未执行目标对象编译，不声称编译通过。
+
+## mm/zswap.c
+
+### 函数、结构与状态验收
+
+按物理顺序复读 56 个条件编译定义（54 个唯一函数名）：开关/容量查询、swap tree 分片、压缩池创建与
+RCU/percpu_ref 退役、运行时换算法、memcg/NUMA list_lru、条目分配释放、每 CPU crypto 上下文、
+压缩/解压、swap-cache 回写、动态 shrinker、store/load/invalidate、swapon/swapoff、debugfs 双实现和
+setup/init。所有真实定义均在声明正上方具有中文契约，覆盖参数借用、返回值、资源 owner、可睡眠性、
+锁/RCU 条件和失败后的 folio/entry 状态；`crypto_acomp_ctx`、`zswap_pool`、`zswap_entry`、全局池链表、
+收缩游标、容量滞回与初始化状态均已说明。
+
+### 复杂函数只读复述抽查
+
+- `zswap_compressor_param_set()`：初始化前只保存算法名；运行时先在池锁下尝试取得同算法退役池，锁外
+  新建或 resurrect，再在池锁下把采用池发布到 RCU 链表头。成功 kill 旧 current 的身份引用，失败则
+  把候选放到尾部后 kill；既有 entry 的 pool 引用使旧池延寿到最后条目释放。
+- `zswap_compress()` / `zswap_decompress()`：同一 CPU 的 mutex 串行复用 request/buffer，异步 crypto
+  提交后同步等待。压缩无收益时只有允许 writeback 才按 PAGE_SIZE 原样保存；zsmalloc 使用 NOWAIT。
+  解压以 begin/end 稳定最多两段 SG，原样页走 memcpy，算法路径还校验输出恰为一页。
+- `zswap_writeback_entry()` / `shrink_memcg_cb()`：LRU 回调不能先摘除无独立引用的 entry，故先旋到
+  尾部、复制 swpentry 后放锁。回写建立并锁住同 slot 的 swap-cache folio，再以 xarray 指针相等验证
+  entry 尚存，成功才解压、删树、释放压缩副本并续接 swap writepage；已缓存页作为进入热区的停止信号。
+- `zswap_shrinker_count()` / `shrink_worker()`：count 先消费近期磁盘 swapin 作为过度回收反馈，再以
+  backing/stored 压缩比缩放候选。池满 worker 持锁推进带 iterator 引用的 memcg 游标，对在线组另取扫描
+  引用，并与 offline cleanup 协调，轮转回写到 accept threshold 或达到连续失败上限。
+- `zswap_store()` / `zswap_load()`：store 在 folio 锁保护下逐 base page 发布；entry 先入 xarray 后补
+  pool/objcg 引用和计费，最后入 LRU 才对 writeback 可见。任一子页失败会清除整个 folio 范围的新旧
+  条目，防止旧数据回写覆盖新 swapfile 内容。load 命中后解压并把 swapcache 设为权威脏副本，消费
+  zswap entry；`-ENOENT` 唯一保留 folio 锁并交回真实 swap 读路径。
+
+### 英文、调用链与关联证据
+
+- 所有非豁免英文注释均由邻接门禁逐单元核对，`untranslated=[]`；原英文与可执行代码零删除、零改写。
+- `mm/page_io.c`：核对 write path 在 `zswap_store()` 成功后终止设备写出，read path 只有 `-ENOENT`
+  才访问慢设备并记录 `zswap_folio_swapin()`；该文件已有中文学习注释。
+- `mm/swapfile.c`：核对 slot free 先逐项 `zswap_invalidate()`，swapon 在设备发布前建立 tree，失败和
+  swapoff 路径销毁 tree；已有中文但本轮未重新验收。
+- `mm/memcontrol.c`：核对 memcg offline 在 list_lru/objcg 重挂前推进 zswap 游标，以及祖先级
+  `memory.zswap.writeback` 策略；已有中文但本轮未重新验收。
+- `include/linux/zswap.h`：核对公开返回/空桩契约和 disk swapin 反馈字段；当前无中文学习注释，建议
+  后续按基线顺序独立处理，不能由本文件密度替代。
+
+### 机械与追加式安全门禁
+
+- 新门禁：`code=1096 comments=989 chinese=383 density=0.349 max_gap=10 untranslated=[]`，通过。
+- 相对基线新增 531 行、删除 0 行；目标文件可执行代码和原注释未改。
+- `git diff --check` 通过；仅检查补丁新增行的 checkpatch 在忽略 UTF-8 `LONG_LINE_COMMENT` 后为
+  0 error、0 warning。
+- 验收脚本 `py_compile` 与当时 4 个漏译回归用例通过；随后新增命名参数标签用例后总计 5 个；
+  工作区无 `.config`，未执行目标对象编译，
+  不声称编译通过。
+
+## mm/mremap.c
+
+### 函数、实体与状态验收
+
+已按物理顺序复读全部条件编译实现和空桩：页表层级取得/分配、rmap 锁、soft-dirty、PTE/PMD/PUD
+搬迁、范围对齐与进度游标、VMA 计账/统计、源端删除与失败回滚、原地缩放、显式目标搬迁、hugetlb、
+userfaultfd、多 VMA 纯搬迁、参数准备和 syscall 主状态机。每个函数定义均有紧邻声明的中文契约，覆盖
+输入范围、返回值、锁与 owner、可睡眠点、失败后的 VMA/页表/计账状态；`pagetable_move_control` 和
+`vma_remap_struct` 的阶段性字段在首次参与控制流处均有说明。
+
+### 复杂函数只读复述抽查
+
+- `move_ptes()` / `move_page_tables()`：顶层先尝试完整 PUD、PMD 或 huge leaf 转接，不能整层搬时下钻
+  到 PTE；PTE 批处理在两端页表锁和必要的 rmap 锁下保留软脏、UFFD-WP 等软件状态。realign 只同步
+  向下扩展两个起点，`pmc_progress()` 再把内部游标钳回用户原始范围；分配失败返回短进度。
+- `copy_vma_and_data()`：目标 VMA 建立后搬页表，短搬迁或文件 `mremap` 回调失败即把已搬前缀反向
+  搬回；回滚强制取得 rmap 锁，并改写事务让上层删除目标而保留源端。
+- `unmap_source_vma()`：正常 move 已由调用者完成 commit 计账，删除源前临时清 `VM_ACCOUNT`，避免
+  `munmap` 二次撤账；若源 VMA 被切成左右残段，再借助复位后的 iterator 恢复两段标志。DONTUNMAP
+  失败回滚删的是目标，故不走该临时清位技巧。
+- `remap_move()`：FIXED 等长路径逐个处理相交 VMA，以首段实际目标为基准保留源 VMA 间隙；起点空洞、
+  UFFD 或不能证明服从 FIXED 的自定义地址选择器会在不安全的多段组合前拒绝。
+- `do_mremap()`：先规范化长度和参数，再以 killable mmap 写锁运行早期 map-count 门禁；按纯搬迁或
+  单 VMA resize 分派。shrink 可由内部释放锁，最终只按 `mmap_locked` 解锁，锁外再完成 mlock populate
+  与成功/失败对应的 UFFD 通知。
+
+### 英文、调用链与关联证据
+
+- 所有非豁免英文注释均由邻接门禁逐单元核对，`untranslated=[]`；命名参数标签如
+  `/* drop_lock= */` 只按精确结构豁免，普通行内英文仍由回归用例证明会失败。
+- `mm/internal.h`：核对 `struct pagetable_move_control` 与 `PAGETABLE_MOVE` 初始化关系；它是下一验收
+  文件，本记录不以当前调用点替代其独立内容审查。
+- `mm/vma_exec.c::relocate_vma_down()`：核对 exec 路径复用 `move_page_tables()`，短搬迁由即将销毁的
+  exec mm 生命周期收口；`mm/vma.c::copy_vma()` 核对 VMA merge 与 `need_rmap_locks` 输出。
+- `mm/userfaultfd.c`：核对 mremap prep/complete/fail 的引用生命周期与必须在 mmap 锁外完成的通知。
+
+### 机械与追加式安全门禁
+
+- 新门禁：`code=1120 comments=1199 chinese=381 density=0.340 max_gap=10 untranslated=[]`，通过。
+- 相对基线新增 517 行、删除 0 行；目标文件可执行代码和原注释未改。
+- `git diff --check` 通过；仅检查补丁新增行的 checkpatch 在忽略 UTF-8 `LONG_LINE_COMMENT` 后为
+  0 error、0 warning。
+- 验收脚本 5 个漏译/豁免回归用例通过；工作区无 `.config`，未执行目标对象编译，不声称编译通过。
+
+## mm/internal.h
+
+### 内联函数、结构与配置空桩验收
+
+已按物理顺序复读 100 个条件编译内联定义/空桩，并逐个确认声明正上方存在专属中文契约；覆盖页表
+搬迁控制块、GFP/分配标志、anon_vma 锁与引用、PTE/swap 批处理、回收与 fault 包装、buddy/compound
+页初始化、sparsemem、compaction/CMA、mlock/VMA 地址换算、启动调试、NUMA/node reclaim、memory
+failure、vmalloc、GUP/soft-dirty、shrinker debugfs、mmap action 和 MMU notifier。配置关闭空桩均明确
+返回哨兵、输出参数和无副作用边界，不以一段共享说明替代单函数契约。
+
+`pagetable_move_control`、`alloc_context`、`compact_control`、`capture_control`、
+`migration_target_control` 及 fallback/GUP/ALLOC 枚举与掩码均已说明字段阶段、owner、扫描方向和限制；
+连续声明区也按调用域分组说明，未把头文件原型误写成实现细节。
+
+### 复杂路径只读复述抽查
+
+- `folio_pte_batch_flags()`：先把扫描上限裁到 folio 尾部，以架构 batch hint 推进期望 PFN；比较时按
+  flags 清除可忽略位，真实 PTE 只读，write/young/dirty 只 OR 合并到调用者传入的首项副本。
+- buddy/compound helpers：`buddy_order()` 依赖 zone 锁或等价排他保证，unsafe 变体只提供单次读取；
+  `page_is_buddy()` 依次验证 guard/PageBuddy、order、zone 与零引用。compound head/tail 分别初始化
+  order、mapcount/pincount/deferred-list 和 tail 的 head/mapping/node/zone 编码。
+- `compact_control`：低端 `migrate_pfn` 与高端 `free_pfn` 相向扫描，隔离源/目标队列以 base page 计数；
+  direct/proactive/alloc_contig、skip hint、竞争和 pageblock 收尾字段决定可退让程度与进展保证。
+- `maybe_unlock_mmap_for_io()`：仅首次允许 retry 且非 NOWAIT 时先 pin 文件再释放 fault/mmap 锁，引用
+  由调用者在 IO/retry 后归还；已有 `fpin` 时不重复取引用或解锁。
+- `gup_must_unshare()`：只读 PIN 才需额外判断；匿名页要求 exclusive 并与 rmap 共享屏障配对，文件页
+  仅长期 pin 的私有可写映射需提前拆 COW，fast 路缺 VMA 时保守要求回退慢路。
+- mmap action/notifier wrappers：IO remap 先做架构 PFN 与解密 pgprot 规范化，再只准备 action；事务完成
+  或错误 unmap 前释放暂持 i_mmap 写锁。young wrappers 把 CPU 页表结果与二级 MMU notifier 结果合并。
+
+### 关联实现与脚本盲区证据
+
+- `mm/memory.c`、`mm/mprotect.c`、`mm/madvise.c`、`mm/vmscan.c`、`mm/rmap.c`：核对
+  `folio_pte_batch_flags()` 在 copy、保护、回收和 rmap 路径对 flags/首 PTE 副本的使用。
+- `mm/gup.c` 与 `include/linux/rmap.h`：核对 PTE/PMD/PUD、fast/slow GUP 调用点及 anon-exclusive 屏障。
+- `mm/page_alloc.c`、`mm/compaction.c`：核对 fallback 三态、双向扫描游标和 direct/CMA 初始化字段。
+- `mm/util.c`、`mm/memory.c`：核对 mmap action prepare/finish 中 PFN remap 与 i_mmap 锁的 owner 转移。
+- 原脚本只统计全文件中文密度与连续代码空窗，附近任意中文都能重置空窗，无法把某个英文注释块与
+  它自己的中文解释建立对应关系。现加入词法 comment-unit 提取与无代码间隔的邻接门禁，并以 5 个
+  回归用例覆盖漏译、正确邻接、代码隔断、元数据/预处理/literal 豁免和命名参数标签；它仍只证明
+  邻接存在，翻译完整性和函数归属继续由本节语义复读验收。
+
+### 机械与追加式安全门禁
+
+- 新门禁：`code=1146 comments=948 chinese=320 density=0.279 max_gap=10 untranslated=[]`，通过。
+- 相对基线新增 362 行、删除 0 行；目标文件可执行代码和原注释未改。
+- `git diff --check` 通过；仅检查补丁新增行的 checkpatch 在忽略 UTF-8 `LONG_LINE_COMMENT` 后为
+  0 error、0 warning。
+- 验收脚本 `py_compile` 与 5 个回归用例通过；工作区无 `.config`，未执行目标对象编译，
+  不声称编译通过。
+
 ## mm/cma.c
 
 ### 函数清单
