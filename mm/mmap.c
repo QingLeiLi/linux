@@ -90,6 +90,7 @@ const int mmap_rnd_compat_bits_max = CONFIG_ARCH_MMAP_RND_COMPAT_BITS_MAX;
 int mmap_rnd_compat_bits __read_mostly = CONFIG_ARCH_MMAP_RND_COMPAT_BITS;
 #endif
 
+/* 运行期只读式策略开关；启动/模块参数写入，may_expand_vm 读取以决定是否放宽 DATA 限额。 */
 static bool ignore_rlimit_data;
 /* 启动/模块参数：仅放宽 RLIMIT_DATA，仍保留地址空间和 overcommit 等其他门禁。 */
 core_param(ignore_rlimit_data, ignore_rlimit_data, bool, 0644);
@@ -143,6 +144,15 @@ static int check_brk_limits(unsigned long addr, unsigned long len)
 		? 0 : -EAGAIN;
 }
 
+/*
+ * brk() - 调整当前进程用户堆的可见末端。
+ * 【业务背景】系统调用入口在 malloc 扩缩传统堆时调用；它在 mmap 写锁内把字节级
+ * 请求转换成页级 VMA 变化，成功后用户态继续分配，失败则观察到未变的旧 brk。
+ * 【入参】brk 是已解标签的用户虚拟地址字节值，无对象 ownership 转移。
+ * 【出参/返回】ABI 总返回最终可见的 mm->brk，而非负 errno；成功可能拆除或扩建 VMA。
+ * 【注意事项】进程上下文可睡眠；写锁、RLIMIT、overcommit、userfaultfd 和锁页预取
+ * 分阶段处理，解锁前发布 mm->brk，失败必须恢复 origbrk。
+ */
 SYSCALL_DEFINE1(brk, unsigned long, brk)
 {
 	/* 用户堆边界事务：写锁内校验下限/rlimit，按增缩修改 VMA，失败返回并恢复原边界。 */
@@ -326,6 +336,13 @@ static inline u64 file_mmap_size_max(struct file *file, struct inode *inode)
 	return ULONG_MAX;
 }
 
+/*
+ * file_mmap_ok() - 验证文件映射页区间能否用该 inode 的偏移宽度表达。
+ * 【业务背景】do_mmap 在文件 mmap 回调前调用，避免把回绕或越界偏移交给驱动。
+ * 【入参】file/inode 为借用且不可空；pgoff 单位页，len 单位字节，均只读。
+ * 【出参/返回】可表达返回 true，否则 false；不加锁、不改状态、不转移引用。
+ * 【注意事项】调用者负责稳定 file/inode；maxsize=0 是驱动接受无符号偏移的哨兵。
+ */
 static inline bool file_mmap_ok(struct file *file, struct inode *inode,
 				unsigned long pgoff, unsigned long len)
 {
@@ -572,6 +589,7 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			break;
 
 		default:
+			/* 未知 MAP_TYPE 无法形成文件 VMA 协议，拒绝且不进入 seal/发布阶段。 */
 			return -EINVAL;
 		}
 
@@ -638,6 +656,7 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			pgoff = addr >> PAGE_SHIFT;
 			break;
 		default:
+			/* 匿名后端同样不消费未知类型；保持 mm 未变并返回参数错误。 */
 			return -EINVAL;
 		}
 	}
@@ -724,6 +743,14 @@ out_fput:
 	return retval;
 }
 
+/*
+ * mmap_pgoff() - 现代 mmap 系统调用的页偏移入口。
+ * 【业务背景】体系结构 syscall 分派到此，再由 ksys_mmap_pgoff 解析 fd/hugetlb 并进入
+ * vm_mmap_pgoff；用户态随后用返回地址访问新映射。
+ * 【入参】addr/len/prot/flags/fd 是用户 ABI 值，pgoff 单位页；本层不持有对象。
+ * 【出参/返回】成功为映射起址，失败为编码 errno；引用、锁和发布副作用由下层闭环。
+ * 【注意事项】进程上下文可睡眠；本包装不对字节 offset 再移位。
+ */
 SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
 		unsigned long, prot, unsigned long, flags,
 		unsigned long, fd, unsigned long, pgoff)
@@ -733,6 +760,12 @@ SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
 }
 
 #ifdef __ARCH_WANT_SYS_OLD_MMAP
+/*
+ * 旧 mmap ABI 的一次性用户参数快照，复制到内核栈后只读：addr 是地址 hint、len 是
+ * 字节长度、prot 是 PROT_* 权限、flags 是 MAP_* 策略、fd 是文件描述符、offset 是
+ * 字节偏移。六项均为 unsigned long ABI 宽度，生命周期仅覆盖 old_mmap 本次调用；
+ * 不承载引用，用户并发改写不会影响已经 copy_from_user 完成的快照。
+ */
 struct mmap_arg_struct {
 	/* 六字段是旧 ABI 的用户快照：五个 mmap 参数加字节 offset。 */
 	unsigned long addr;
@@ -743,6 +776,14 @@ struct mmap_arg_struct {
 	unsigned long offset;
 };
 
+/*
+ * old_mmap() - 兼容旧式“用户结构体 + 字节偏移”mmap ABI。
+ * 【业务背景】仅在 __ARCH_WANT_SYS_OLD_MMAP 配置中由旧用户 ABI 进入；复制参数后复用
+ * ksys_mmap_pgoff，成功后用户态获得与现代入口相同的映射。
+ * 【入参】arg 是可空性由 copy_from_user 校验的用户指针，内容复制后不再借用用户内存。
+ * 【出参/返回】复制失败 -EFAULT，offset 非页对齐 -EINVAL，否则地址或下层编码 errno。
+ * 【注意事项】可睡眠；offset 从字节转换为页，栈快照避免用户并发改写造成 TOCTOU。
+ */
 SYSCALL_DEFINE1(old_mmap, struct mmap_arg_struct __user *, arg)
 {
 	/* arg 仅为用户指针；先复制到栈，校验页对齐后把字节 offset 转为 pgoff。 */
@@ -763,6 +804,13 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_arg_struct __user *, arg)
  * existing mapping within it's guard gaps, for use as start_gap.
  */
 /* shadow stack 选址需额外保留一页起始 guard；普通 VMA 返回 0。 */
+/*
+ * stack_guard_placement() - 把 VMA 类型转换为选址器需要的起始 guard 字节数。
+ * 【业务背景】通用上下选址器构造 vm_unmapped_area_info 时调用，防止 shadow stack
+ * 紧贴既有映射；普通映射无需额外起始间隔。
+ * 【入参】vm_flags 是值传递的候选 VMA 标志；【返回】PAGE_SIZE 或 0，无副作用。
+ * 【注意事项】无需锁且不可睡眠；这里只表达选址约束，不建立 guard VMA。
+ */
 static inline unsigned long stack_guard_placement(vm_flags_t vm_flags)
 {
 	if (vm_flags & VM_SHADOW_STACK)
@@ -852,6 +900,13 @@ generic_get_unmapped_area(struct file *filp, unsigned long addr,
 
 #ifndef HAVE_ARCH_UNMAPPED_AREA
 /* 无体系结构覆盖时，arch 入口完整转发到底向上通用策略。 */
+/*
+ * arch_get_unmapped_area() - 缺省体系结构的 bottom-up 选址 ABI 桩。
+ * 【业务背景】__get_unmapped_area 经布局分派调用；无 arch 覆盖时复用 generic 实现。
+ * 【入参】filp 可空且借用，addr/len 为字节，pgoff 为页，flags/vm_flags 为策略位。
+ * 【出参/返回】候选地址或编码 errno，无引用变化；【注意事项】调用者稳定 mm 视图，
+ * 本配置桩不加锁，具体睡眠/边界规则与 generic_get_unmapped_area 相同。
+ */
 unsigned long
 arch_get_unmapped_area(struct file *filp, unsigned long addr,
 		       unsigned long len, unsigned long pgoff,
@@ -930,16 +985,31 @@ generic_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
 
 #ifndef HAVE_ARCH_UNMAPPED_AREA_TOPDOWN
 /* 无体系结构 top-down 覆盖时转发通用退化策略。 */
+/*
+ * arch_get_unmapped_area_topdown() - 缺省体系结构的 top-down 选址 ABI 桩。
+ * 【业务背景】MMF_TOPDOWN 布局由 mm_get_unmapped_area_vmflags 分派到此；未提供 arch
+ * 实现时调用 generic top-down，并保留其向 bottom-up 退化的可用性保证。
+ * 【入参】filp 可空借用，addr/len 为字节，pgoff 为页，flags/vm_flags 为策略位。
+ * 【出参/返回】候选地址或编码 errno；【注意事项】不取引用、不发布 VMA，锁由上层保证。
+ */
 unsigned long
 arch_get_unmapped_area_topdown(struct file *filp, unsigned long addr,
 			       unsigned long len, unsigned long pgoff,
 			       unsigned long flags, vm_flags_t vm_flags)
 {
+	/* 保持 arch hook ABI；通用实现负责高地址向下搜索、hint 和越界处理。 */
 	return generic_get_unmapped_area_topdown(filp, addr, len, pgoff, flags,
 						 vm_flags);
 }
 #endif
 
+/*
+ * mm_get_unmapped_area_vmflags() - 按当前 mm 布局选择体系结构选址 hook。
+ * 【业务背景】__get_unmapped_area 在无文件专用 hook 时调用；结果随后仍要做范围、对齐和
+ * LSM 检查。【入参】filp 可空借用，其余参数沿用 arch hook，vm_flags 影响 guard。
+ * 【出参/返回】原样返回 top-down/bottom-up 候选或 errno，无副作用与 ownership 变化。
+ * 【注意事项】读取 current->mm 的 MMF_TOPDOWN，调用者须保证地址空间布局稳定。
+ */
 unsigned long mm_get_unmapped_area_vmflags(struct file *filp, unsigned long addr,
 					   unsigned long len, unsigned long pgoff,
 					   unsigned long flags, vm_flags_t vm_flags)
@@ -1016,10 +1086,15 @@ __get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
 	if (offset_in_page(addr))
 		return -EINVAL;
 
+	/* 候选至此结构上有效，最后交给安全模块检查最低可映射地址等策略。 */
 	error = security_mmap_addr(addr);
 	return error ? error : addr;
 }
 
+/*
+ * 无内部 vm_flags 的导出包装：参数与 __get_unmapped_area 相同，返回候选地址或编码
+ * errno；不建立映射、不取得 mmap_lock，安全及边界检查由下层完成。
+ */
 unsigned long
 mm_get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
 		     unsigned long pgoff, unsigned long flags)
@@ -1111,6 +1186,13 @@ find_vma_prev(struct mm_struct *mm, unsigned long addr,
 unsigned long stack_guard_gap = 256UL<<PAGE_SHIFT;
 
 /* 早期启动解析十进制页数，完整消费字符串时发布为字节；始终返回“参数已处理”。 */
+/*
+ * cmdline_parse_stack_guard_gap() - 解析 stack_guard_gap= 启动参数。
+ * 【业务背景】__setup 在单线程早期启动阶段调用，之后栈扩展/选址读取全局字节值。
+ * 【入参】p 是内核命令行中 NUL 结尾的借用字符串，数值单位页。
+ * 【出参/返回】总返回 1 表示参数已消费；合法完整数值会更新 stack_guard_gap。
+ * 【注意事项】无并发、不可在运行期调用；非法或带尾随字符时保持缺省值。
+ */
 static int __init cmdline_parse_stack_guard_gap(char *p)
 {
 	unsigned long val;
@@ -1127,6 +1209,13 @@ __setup("stack_guard_gap=", cmdline_parse_stack_guard_gap);
 
 #ifdef CONFIG_STACK_GROWSUP
 /* 向上增长配置：持 mmap 写锁把 address 纳入 vma，返回 expand_upwards 的 errno。 */
+/*
+ * expand_stack_locked() - CONFIG_STACK_GROWSUP 下扩展一条向上生长栈。
+ * 【业务背景】find_extend_vma_locked 在 fault 地址落于前驱之后时调用，成功后重试访问。
+ * 【入参】vma 为写锁保护的借用 GROWSUP VMA，address 是待覆盖字节地址。
+ * 【出参/返回】0 或 expand_upwards errno；【注意事项】可触发记账/树更新并可能睡眠，
+ * 调用者必须持 mmap 写锁，失败后 VMA 保持下层定义的可用状态。
+ */
 int expand_stack_locked(struct vm_area_struct *vma, unsigned long address)
 {
 	return expand_upwards(vma, address);
@@ -1157,6 +1246,13 @@ struct vm_area_struct *find_extend_vma_locked(struct mm_struct *mm, unsigned lon
 }
 #else
 /* 向下增长配置：持 mmap 写锁把 address 纳入 vma，返回 expand_downwards 的 errno。 */
+/*
+ * expand_stack_locked() - 非 GROWSUP 配置下扩展一条向下生长栈。
+ * 【业务背景】find_extend_vma_locked 在 fault 地址位于后一 GROWSDOWN VMA 前调用。
+ * 【入参】vma 为写锁保护的借用 VMA，address 是待纳入的字节地址。
+ * 【出参/返回】0 或 expand_downwards errno；【注意事项】可睡眠并更新 VMA/统计，
+ * 调用者持 mmap 写锁，配置分支只改变增长方向，不改变锁与 ownership 契约。
+ */
 int expand_stack_locked(struct vm_area_struct *vma, unsigned long address)
 {
 	return expand_downwards(vma, address);
@@ -1272,6 +1368,13 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
 	return do_vmi_munmap(&vmi, mm, start, len, uf, false);
 }
 
+/*
+ * vm_munmap() - 内核调用者使用的 current->mm 范围解除映射包装。
+ * 【业务背景】内核子系统传入未解标签要求的地址，交由 __vm_munmap 自行锁定并拆 VMA；
+ * 返回后调用者可释放与该区间相关的上层资源。
+ * 【入参】start/len 为字节区间；【出参/返回】0 或 errno，无输入 ownership 转移。
+ * 【注意事项】进程上下文可睡眠，不执行 syscall 地址解标签，故调用者必须给规范地址。
+ */
 int vm_munmap(unsigned long start, size_t len)
 {
 	/* 内核调用包装让 __vm_munmap 自行加锁，但不使用系统调用式地址解标签。 */
@@ -1279,6 +1382,13 @@ int vm_munmap(unsigned long start, size_t len)
 }
 EXPORT_SYMBOL(vm_munmap);
 
+/*
+ * munmap() - 用户 ABI 的解除映射入口。
+ * 【业务背景】系统调用分派到此，去除体系结构地址 tag 后由 __vm_munmap 加写锁、拆分/
+ * 删除 VMA并完成 userfaultfd；用户态返回后区间不可再访问。
+ * 【入参】addr/len 为用户字节范围；【出参/返回】0 或校验/拆除 errno。
+ * 【注意事项】进程上下文可睡眠；下层负责锁和回滚，本层不持有 VMA 引用。
+ */
 SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
 {
 	/* 用户地址先移除体系结构 tag，再由 __vm_munmap 获取写锁并完成 userfaultfd。 */
@@ -1298,6 +1408,7 @@ SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
 SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 		unsigned long, prot, unsigned long, pgoff, unsigned long, flags)
 {
+
 	/* populate 是 do_mmap 输出；ret 默认 EINVAL，file 引用跨越 LSM 与写锁重验证。 */
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
@@ -1403,6 +1514,7 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 			if (next->vm_flags != vma->vm_flags)
 				goto out;
 
+			/* 覆盖终点落在当前段内即可停止；否则推进 prev 检查下一条边界。 */
 			if (start + size <= next->vm_end)
 				break;
 
@@ -1502,6 +1614,7 @@ unsigned long tear_down_vmas(struct mm_struct *mm, struct vma_iterator *vmi,
 	do {
 		if (vma->vm_flags & VM_ACCOUNT)
 			nr_accounted += vma_pages(vma);
+		/* detached 标记先于 close/free，阻止释放路径把它误作仍在树中的 VMA。 */
 		vma_mark_detached(vma);
 		remove_vma(vma);
 		count++;
@@ -1644,6 +1757,13 @@ static vm_fault_t special_mapping_fault(struct vm_fault *vmf);
  * Having a close hook prevents vma merging regardless of flags.
  */
 /* 特殊 VMA 被 munmap 或旧 mremap 关闭时转发可选 close；vma/sm 均为借用。 */
+/*
+ * special_mapping_close() - special_mapping_vmops 的关闭分派器。
+ * 【业务背景】VMA core 在 munmap 或 mremap 旧 VMA 关闭时调用，注册点是
+ * special_mapping_vmops.close；存在描述符回调时继续通知 vDSO/VVAR 等所有者。
+ * 【入参】vma 及 vm_private_data 中的 spec 均借用；【出参】void，无引用转移。
+ * 【注意事项】沿用 VMA close 上下文/锁，回调必须遵守该协议；close hook 也阻止合并。
+ */
 static void special_mapping_close(struct vm_area_struct *vma)
 {
 	const struct vm_special_mapping *sm = vma->vm_private_data;
@@ -1652,12 +1772,25 @@ static void special_mapping_close(struct vm_area_struct *vma)
 		sm->close(sm, vma);
 }
 
+/*
+ * special_mapping_name() - 向 VMA 名称查询者返回特殊映射名称。
+ * 【业务背景】/proc maps 等经 special_mapping_vmops.name 调用，以展示 [vdso] 类名称。
+ * 【入参】vma/spec 借用且由 VMA 生命周期稳定；【返回】借用字符串，可为 spec 定义值。
+ * 【注意事项】不睡眠、不取引用，调用者不得释放或修改返回存储。
+ */
 static const char *special_mapping_name(struct vm_area_struct *vma)
 {
 	/* /proc 等查询从稳定的 vm_private_data 返回静态/长期存活名称，不转移字符串 ownership。 */
 	return ((struct vm_special_mapping *)vma->vm_private_data)->name;
 }
 
+/*
+ * special_mapping_mremap() - 在特殊 VMA 移动后通知其描述符。
+ * 【业务背景】mremap core 经 vmops.mremap 调用；先禁止跨 current mm，再让可选回调
+ * 修正体系结构特殊页状态，成功后 mremap 继续提交。
+ * 【入参】new_vma 为借用的新 VMA；【返回】-EFAULT、描述符 errno 或无回调时 0。
+ * 【注意事项】沿用 mremap 锁上下文并可能调用回调；不转移 VMA/spec ownership。
+ */
 static int special_mapping_mremap(struct vm_area_struct *new_vma)
 {
 	/* 只允许 current->mm 内的特殊 VMA 重映射，再转发可选回调；无回调视为成功。 */
@@ -1672,6 +1805,13 @@ static int special_mapping_mremap(struct vm_area_struct *new_vma)
 	return 0;
 }
 
+/*
+ * special_mapping_split() - 拒绝拆分特殊映射。
+ * 【业务背景】VMA core 拟在 addr 拆分时经 vmops.may_split 调用；固定页数组必须保持
+ * 与单一 VMA 长度对应，因此选择此回调而非通用拆分。
+ * 【入参】vma 借用，addr 为候选拆分字节地址；【返回】恒 -EINVAL，无副作用。
+ * 【注意事项】不睡眠、不取引用；拒绝保证 pages/长度不变量贯穿 VMA 生命周期。
+ */
 static int special_mapping_split(struct vm_area_struct *vma, unsigned long addr)
 {
 	/*
@@ -1684,6 +1824,12 @@ static int special_mapping_split(struct vm_area_struct *vma, unsigned long addr)
 	return -EINVAL;
 }
 
+/*
+ * 特殊 VMA 的静态只读回调表，整个内核生命周期有效：close 在摘除时通知所有者；
+ * fault 为缺页取得 page；mremap 在移动后修正后端；name 为 /proc 提供借用名称；
+ * access=NULL 禁止远程访问；may_split 恒拒绝拆分。VMA core 在相应锁/引用协议下读取，
+ * 表本身无需引用计数；各字段与 vm_private_data 中的 vm_special_mapping 共同构成不变量。
+ */
 static const struct vm_operations_struct special_mapping_vmops = {
 	.close = special_mapping_close,
 	.fault = special_mapping_fault,
@@ -1695,6 +1841,13 @@ static const struct vm_operations_struct special_mapping_vmops = {
 	.may_split = special_mapping_split,
 };
 
+/*
+ * special_mapping_fault() - 为特殊 VMA fault 提供自定义或静态页后端。
+ * 【业务背景】缺页核心经 special_mapping_vmops.fault 调用；描述符自带 fault 时分派，
+ * 否则按 vmf->pgoff 索引 NULL 终止页数组，随后 fault core 安装返回页。
+ * 【入参】vmf/vma/spec 借用，pgoff 单位页；【返回】回调结果、0 或 VM_FAULT_SIGBUS。
+ * 【注意事项】命中静态页时 get_page 引用交给 fault core；pages/spec 必须比 VMA 长寿。
+ */
 static vm_fault_t special_mapping_fault(struct vm_fault *vmf)
 {
 	/* vmf/vma 借用；优先交给 spec fault，否则按 pgoff 在线性 page* 哨兵数组中定位。 */
@@ -1721,9 +1874,15 @@ static vm_fault_t special_mapping_fault(struct vm_fault *vmf)
 		return 0;
 	}
 
+	/* 页数组耗尽表示访问超出特殊映射后端，按设备式映射语义报告 SIGBUS。 */
 	return VM_FAULT_SIGBUS;
 }
 
+/*
+ * 特殊 VMA 的底层安装事务：mm/priv/ops 均由调用者持有，addr/len 为页范围，
+ * vm_flags 描述访问策略；成功返回已链接 VMA，失败返回 ERR_PTR，且释放未发布对象。
+ * 调用者必须持 mmap 写锁，priv 与 ops 的寿命不得短于所建 VMA。
+ */
 static struct vm_area_struct *__install_special_mapping(
 	struct mm_struct *mm,
 	unsigned long addr, unsigned long len,
@@ -1769,6 +1928,12 @@ out:
 	return ERR_PTR(ret);
 }
 
+/*
+ * vma_is_special_mapping() - 精确判断 VMA 是否由指定特殊描述符安装。
+ * 【业务背景】体系结构清理/识别路径用它区分同名或其他 vmops 的映射。
+ * 【入参】vma/sm 均借用且不可空；【返回】私有指针和专用 vmops 同时匹配才为 true。
+ * 【注意事项】调用者负责用 mmap_lock 等稳定 VMA；无引用、锁和睡眠副作用。
+ */
 bool vma_is_special_mapping(const struct vm_area_struct *vma,
 	const struct vm_special_mapping *sm)
 {
@@ -1839,6 +2004,7 @@ static const struct ctl_table mmap_table[] = {
 				/* 原生 ASLR 位数：0600，仅管理员可写并受 arch min/max 夹限。 */
 				.procname       = "mmap_rnd_bits",
 				.data           = &mmap_rnd_bits,
+				/* maxlen/mode/handler 与上下界共同约束一次 sysctl 写入。 */
 				.maxlen         = sizeof(mmap_rnd_bits),
 				.mode           = 0600,
 				.proc_handler   = proc_dointvec_minmax,
@@ -1851,6 +2017,7 @@ static const struct ctl_table mmap_table[] = {
 				/* compat ASLR 位数使用独立 arch 上下界，避免越过 32 位地址能力。 */
 				.procname       = "mmap_rnd_compat_bits",
 				.data           = &mmap_rnd_compat_bits,
+				/* compat 值独立存储，处理器通过 extra1/extra2 执行范围校验。 */
 				.maxlen         = sizeof(mmap_rnd_compat_bits),
 				.mode           = 0600,
 				.proc_handler   = proc_dointvec_minmax,
@@ -1865,6 +2032,13 @@ static const struct ctl_table mmap_table[] = {
  * initialise the percpu counter for VM, initialise VMA state.
  */
 /* 启动期初始化全局 committed-as 计数、可选 vm sysctl 表和 VMA 子系统；失败属内核 BUG。 */
+/*
+ * mmap_init() - 建立 mmap 子系统的全局启动状态。
+ * 【业务背景】内核 MM 初始化序列调用，先建立 committed-as percpu 计数，再注册 vm
+ * sysctl 并初始化 VMA 状态；完成后常规映射路径才能使用这些设施。
+ * 【入参】无；【出参】void，发布全局状态；计数初始化失败触发 VM_BUG_ON。
+ * 【注意事项】仅启动期、可分配内存且无并发调用；CONFIG_SYSCTL 只控制表注册步骤。
+ */
 void __init mmap_init(void)
 {
 	int ret;
@@ -1981,6 +2155,7 @@ static int reserve_mem_notifier(struct notifier_block *nb,
 				sysctl_user_reserve_kbytes);
 		}
 
+		/* 管理员预留同样不能超过当前全部空闲页折算值。 */
 		if (sysctl_admin_reserve_kbytes > free_kbytes) {
 			init_admin_reserve();
 			pr_info("vm.admin_reserve_kbytes reset to %lu\n",
@@ -1994,6 +2169,13 @@ static int reserve_mem_notifier(struct notifier_block *nb,
 	return NOTIFY_OK;
 }
 
+/*
+ * init_reserve_notifier() - 注册内存热插拔时的恢复预留调整回调。
+ * 【业务背景】subsys_initcall 调用并把 reserve_mem_notifier 接到 hotplug 链；以后 online/
+ * offline 事件据空闲内存修正 sysctl。
+ * 【入参】无；【返回】恒 0，使注册失败只记录日志而不阻断启动。
+ * 【注意事项】__meminit 启动上下文可睡眠；成功后 notifier 框架持有回调而非本函数资源。
+ */
 static int __meminit init_reserve_notifier(void)
 {
 	/* 启动期注册默认优先级回调；注册失败只告警，不阻止启动。 */
@@ -2057,6 +2239,16 @@ bool mmap_read_lock_maybe_expand(struct mm_struct *mm,
 	return true;
 }
 
+/*
+ * dup_mmap() - fork 时把父 mm 的 VMA 拓扑和页表事务性复制到未发布子 mm。
+ * 【业务背景】dup_mm/copy_mm 在创建子进程时调用；成功后调用者可继续发布子 task，
+ * 失败则销毁未完成子 mm。相比共享 CLONE_VM 路径，本函数建立独立地址空间。
+ * 【入参】mm 是调用者拥有且尚未发布的子对象，oldmm 是借用的已发布父对象。
+ * 【出参/返回】0 或 -EINTR/-ENOMEM/下层 errno；成功复制引用/策略/anon_vma/页表并完成
+ * userfaultfd，失败只清已建前缀、撤销 charge 并把子 mm 标为 MMF_UNSTABLE。
+ * 【注意事项】进程上下文可睡眠；父写锁后嵌套子写锁，文件/anon_vma 引用逐项获取，
+ * error labels 必须按相反次序释放，子 mm 在返回前始终不可被并发读者观察。
+ */
 __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 {
 	/*
@@ -2065,6 +2257,7 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 	 * file 反向映射和页表。成功返回 0、两锁均释放并完成 userfaultfd；失败返回 errno，
 	 * 只清理已初始化前缀、撤销承诺记账并标记子 mm 不稳定，调用者随后销毁整个 mm。
 	 */
+	/* 子 mm 未发布；本事务依次复制拓扑、逐 VMA 所有权和页表，再统一解锁/通知。 */
 	struct vm_area_struct *mpnt, *tmp;
 	int retval;
 	unsigned long charge = 0;

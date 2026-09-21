@@ -150,8 +150,8 @@
 |140|x|mm/internal.h|1146|320|0.279|10|
 |141|x|mm/nommu.c|1201|0|0.000|1201|
 |142|x|mm/damon/tests/core-kunit.h|1211|0|0.000|1211|
-|143|~|mm/mmap.c|1228|0|0.000|1228|
-|144||mm/memory_hotplug.c|1451|0|0.000|1451|
+|143|x|mm/mmap.c|1228|0|0.000|1228|
+|144|~|mm/memory_hotplug.c|1451|0|0.000|1451|
 |145||mm/kasan/kasan_test_c.c|1463|0|0.000|1463|
 |146||mm/kmemleak.c|1467|0|0.000|1467|
 |147||mm/zsmalloc.c|1486|0|0.000|1486|
